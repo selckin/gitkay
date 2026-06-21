@@ -181,7 +181,6 @@ fn build_ref_map(
 struct DiffLine {
     text: String,
     kind: LineKind,
-    #[allow(dead_code)] // consumed by later task (render)
     spans: Vec<highlight::Span>, // empty ⇒ render flat by `kind`
 }
 
@@ -532,7 +531,6 @@ fn diff_to_data(diff: &git2::Diff, title: &str) -> DiffData {
 /// Attach syntax-highlighted spans to each code line. File boundaries and
 /// languages come from the structured `files` list (clean paths), not the
 /// `--- /+++` display lines. Non-code lines are left with empty `spans`.
-#[allow(dead_code)] // consumed by later task (render)
 fn highlight_diff(lines: &mut [DiffLine], files: &[FileEntry], hl: &Highlighter) {
     let mut ordered: Vec<&FileEntry> = files.iter().collect();
     ordered.sort_by_key(|f| f.diff_line_idx);
