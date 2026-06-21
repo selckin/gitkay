@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod config;
-use config::Fonts;
+use config::{Fonts, Role};
 
 // ── Commit data ──────────────────────────────────────────────────────────
 
@@ -1142,12 +1142,13 @@ impl eframe::App for GitkApp {
                 ui.horizontal_centered(|ui| {
                     ui.label(egui::RichText::new("🔍").size(14.0));
                     let avail = ui.available_width() - 120.0; // leave space for match count
+                    let ui_font = self.fonts.font_id(Role::Ui);
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.search_text)
                             .id(search_id)
                             .desired_width(avail.max(100.0))
                             .hint_text("Search SHA, author, message...")
-                            .font(egui::FontId::monospace(13.0)),
+                            .font(ui_font),
                     );
                     if resp.changed() {
                         self.search_cursor = 0;
@@ -1246,7 +1247,10 @@ impl eframe::App for GitkApp {
                                         self.diff_context = self.diff_context.saturating_sub(1);
                                         diff_opts_changed = true;
                                     }
-                                    ui.monospace(self.diff_context.to_string());
+                                    ui.label(
+                                        egui::RichText::new(self.diff_context.to_string())
+                                            .font(self.fonts.font_id(Role::Ui)),
+                                    );
                                     if ui.small_button("+").clicked() {
                                         self.diff_context =
                                             self.diff_context.saturating_add(1).min(99);
@@ -1324,7 +1328,7 @@ impl eframe::App for GitkApp {
                                         };
                                         let ng = ui.painter().layout_no_wrap(
                                             short_path.to_string(),
-                                            egui::FontId::monospace(12.0),
+                                            self.fonts.font_id(Role::FileList),
                                             name_color,
                                         );
                                         ui.painter().galley(
@@ -1338,7 +1342,7 @@ impl eframe::App for GitkApp {
                                         if file.additions > 0 {
                                             let g = ui.painter().layout_no_wrap(
                                                 format!("+{}", file.additions),
-                                                egui::FontId::monospace(10.0),
+                                                self.fonts.file_stats_font_id(),
                                                 GREEN,
                                             );
                                             ui.painter().galley(
@@ -1351,7 +1355,7 @@ impl eframe::App for GitkApp {
                                         if file.deletions > 0 {
                                             let g = ui.painter().layout_no_wrap(
                                                 format!("-{}", file.deletions),
-                                                egui::FontId::monospace(10.0),
+                                                self.fonts.file_stats_font_id(),
                                                 RED,
                                             );
                                             ui.painter().galley(
@@ -1394,7 +1398,7 @@ impl eframe::App for GitkApp {
                         bottom: 0,
                     }))
                     .show_inside(ui, |ui| {
-                        ui.style_mut().override_font_id = Some(egui::FontId::monospace(13.0));
+                        ui.style_mut().override_font_id = Some(self.fonts.font_id(Role::Diff));
                         let scroll = egui::ScrollArea::both()
                             .id_salt("diff_scroll")
                             .auto_shrink([false, false])
@@ -1662,7 +1666,7 @@ impl eframe::App for GitkApp {
                                     (bg, color)
                                 }
                             };
-                            let font = egui::FontId::monospace(11.0);
+                            let font = self.fonts.font_id(Role::Refs);
                             let galley = painter.layout_no_wrap(ref_name.clone(), font, fg);
                             let label_w = galley.size().x + 10.0;
                             let label_rect = egui::Rect::from_min_size(
@@ -1679,7 +1683,7 @@ impl eframe::App for GitkApp {
                         let date_str = chrono::DateTime::from_timestamp(commit.time, 0)
                             .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
                             .unwrap_or_default();
-                        let date_font = egui::FontId::monospace(12.0);
+                        let date_font = self.fonts.font_id(Role::CommitMeta);
                         let date_galley =
                             painter.layout_no_wrap(date_str, date_font.clone(), SUBTEXT);
                         let date_w = date_galley.size().x;
@@ -1710,7 +1714,7 @@ impl eframe::App for GitkApp {
                         } else {
                             SUBTEXT // dim non-branch commits
                         };
-                        let summary_font = egui::FontId::monospace(13.0);
+                        let summary_font = self.fonts.font_id(Role::CommitSummary);
                         let summary_galley = painter.layout_no_wrap(
                             commit.summary.clone(),
                             summary_font,
