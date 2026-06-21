@@ -5,8 +5,9 @@ use eframe::egui;
 use two_face::re_exports::syntect;
 use two_face::theme::EmbeddedThemeName;
 
+use syntect::easy::HighlightLines;
 use syntect::highlighting::{Color as SynColor, Highlighter as SynHighlighter, Theme};
-use syntect::parsing::Scope;
+use syntect::parsing::{Scope, SyntaxSet};
 
 /// Default syntax theme when none is configured or the configured slug is unknown.
 // Consumed by later tasks (Highlighter config); allow until then.
@@ -200,6 +201,100 @@ impl DiffPalette {
     }
 }
 
+/// Owns the highlighting assets + active theme. Built lazily on the first diff.
+// Consumed by later tasks (diff render); allow until then.
+#[allow(dead_code)]
+pub struct Highlighter {
+    syntaxes: SyntaxSet,
+    theme: Theme,
+    palette: DiffPalette,
+}
+
+fn load_theme(slug: &str) -> (Theme, Option<String>) {
+    let set = two_face::theme::extra();
+    match theme_for_slug(slug) {
+        Some(name) => (set[name].clone(), None),
+        None => (
+            set[theme_for_slug(DEFAULT_THEME_SLUG).unwrap()].clone(),
+            Some(format!(
+                "unknown syntax theme {slug:?}; using {DEFAULT_THEME_SLUG}"
+            )),
+        ),
+    }
+}
+
+impl Highlighter {
+    /// Build the highlighter for `slug`. Deserializes the bundled syntax set
+    /// (multi-MB) once — call this lazily, not at startup.
+    // Consumed by later tasks (diff render); allow until then.
+    #[allow(dead_code)]
+    pub fn new(slug: &str) -> (Highlighter, Option<String>) {
+        let syntaxes = two_face::syntax::extra_newlines();
+        let (theme, warning) = load_theme(slug);
+        let palette = DiffPalette::from_theme(&theme);
+        (
+            Highlighter {
+                syntaxes,
+                theme,
+                palette,
+            },
+            warning,
+        )
+    }
+
+    /// Swap to a different theme (reuses the syntax set). Returns a warning if
+    /// the slug was unknown.
+    // Consumed by later tasks (diff render); allow until then.
+    #[allow(dead_code)]
+    pub fn set_theme(&mut self, slug: &str) -> Option<String> {
+        let (theme, warning) = load_theme(slug);
+        self.theme = theme;
+        self.palette = DiffPalette::from_theme(&self.theme);
+        warning
+    }
+
+    // Consumed by later tasks (diff render); allow until then.
+    #[allow(dead_code)]
+    pub fn palette(&self) -> &DiffPalette {
+        &self.palette
+    }
+
+    /// Fresh per-file highlight state, language chosen by the path's extension
+    /// (falling back to plain text).
+    // Consumed by later tasks (diff render); allow until then.
+    #[allow(dead_code)]
+    pub fn new_file_state(&self, path: &str) -> HighlightLines<'_> {
+        let syntax = std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(|ext| self.syntaxes.find_syntax_by_extension(ext))
+            .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text());
+        HighlightLines::new(syntax, &self.theme)
+    }
+
+    /// Tokenize one line of code (without its diff marker) into colored spans.
+    /// `state` carries multi-line parser state within the current file.
+    // Consumed by later tasks (diff render); allow until then.
+    #[allow(dead_code)]
+    pub fn tokenize_line(&self, state: &mut HighlightLines, code: &str) -> Vec<Span> {
+        let line = format!("{code}\n");
+        match state.highlight_line(&line, &self.syntaxes) {
+            Ok(ranges) => ranges
+                .into_iter()
+                .map(|(style, text)| {
+                    (
+                        syn_to_egui(style.foreground),
+                        text.trim_end_matches('\n').to_string(),
+                    )
+                })
+                .filter(|(_, t)| !t.is_empty())
+                .collect(),
+            // A grammar hiccup must never drop the line: render it plain.
+            Err(_) => vec![(self.palette.foreground, code.to_string())],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,6 +328,74 @@ mod tests {
     #[test]
     fn default_slug_resolves() {
         assert!(theme_for_slug(DEFAULT_THEME_SLUG).is_some());
+    }
+
+    #[test]
+    fn tokenizes_rust_into_multiple_spans() {
+        let (hl, warn) = Highlighter::new("catppuccin-mocha");
+        assert!(warn.is_none());
+        let mut state = hl.new_file_state("x.rs");
+        let spans = hl.tokenize_line(&mut state, "fn main() {}");
+        assert!(spans.len() >= 2, "expected multiple tokens, got {spans:?}");
+        // Reassembled text equals the input (no chars dropped).
+        let joined: String = spans.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(joined, "fn main() {}");
+    }
+
+    #[test]
+    fn unknown_extension_falls_back_to_plain_text() {
+        let (hl, _) = Highlighter::new("catppuccin-mocha");
+        let mut state = hl.new_file_state("file.unknownext");
+        let spans = hl.tokenize_line(&mut state, "just some text");
+        let joined: String = spans.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(joined, "just some text");
+    }
+
+    #[test]
+    fn tokenizes_multibyte_source_on_char_boundaries() {
+        let (hl, _) = Highlighter::new(
+            "catppuccin-mocha",
+            DiffBg::Fixed {
+                added: None,
+                deleted: None,
+            },
+        );
+        let mut state = hl.new_file_state("x.rs");
+        // Mixed multi-byte content: accented letters (2 bytes), an arrow (3),
+        // a Greek letter (2), an emoji (4). tokenize_line records byte ranges via
+        // pointer arithmetic and clamps the trailing '\n' off with `.min(code_len)`
+        // — every produced range must land on a UTF-8 char boundary, or the
+        // re-slice below panics mid-codepoint.
+        let code = "let s = \"café→λ 🦀\"; // δ";
+        let spans = hl.tokenize_line(&mut state, code);
+        let joined: String = spans.iter().map(|(_, r)| &code[r.start..r.end]).collect();
+        assert_eq!(joined, code, "spans must reassemble the multibyte line exactly");
+        // The internally-appended '\n' must never leak into a span range.
+        assert!(spans.iter().all(|(_, r)| r.end <= code.len()));
+    }
+
+    #[test]
+    fn empty_line_yields_no_spans() {
+        let (hl, _) = Highlighter::new(
+            "catppuccin-mocha",
+            DiffBg::Fixed {
+                added: None,
+                deleted: None,
+            },
+        );
+        let mut state = hl.new_file_state("x.rs");
+        // code_len == 0: every span's end clamps to 0, so the `start < end` guard
+        // drops them all. Must yield no spans (and not panic), not a span for '\n'.
+        let spans = hl.tokenize_line(&mut state, "");
+        assert!(spans.is_empty(), "empty line should yield no spans, got {spans:?}");
+    }
+
+    #[test]
+    fn unknown_slug_warns_and_falls_back() {
+        let (hl, warn) = Highlighter::new("no-such-theme");
+        assert!(warn.is_some());
+        // Falls back to the (dark) default, so a palette is still derived.
+        assert!(luminance(hl.palette().background) < 0.5);
     }
 
     #[test]
