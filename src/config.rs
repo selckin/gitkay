@@ -76,7 +76,7 @@ pub struct FamiliesSection {
 #[derive(Deserialize, Clone, Debug, PartialEq, Default)]
 #[serde(default)]
 pub struct SyntaxSection {
-    /// Theme slug (see highlight::THEMES / the [syntax] template comment).
+    /// Theme slug (see the `[syntax]` section in `default_template()` for valid slugs).
     /// None ⇒ default theme.
     // consumed by a later task
     #[allow(dead_code)]
