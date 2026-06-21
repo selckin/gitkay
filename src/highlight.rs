@@ -5,7 +5,8 @@ use eframe::egui;
 use two_face::re_exports::syntect;
 use two_face::theme::EmbeddedThemeName;
 
-use syntect::highlighting::Color as SynColor;
+use syntect::highlighting::{Color as SynColor, Highlighter as SynHighlighter, Theme};
+use syntect::parsing::Scope;
 
 /// Default syntax theme when none is configured or the configured slug is unknown.
 // Consumed by later tasks (Highlighter config); allow until then.
@@ -85,6 +86,120 @@ pub fn syn_to_egui(c: SynColor) -> egui::Color32 {
     egui::Color32::from_rgb(c.r, c.g, c.b)
 }
 
+/// Colors the diff pane draws with, all derived from the active theme where
+/// possible. App chrome does not use this — only the diff content pane does.
+// Consumed by later tasks (diff render); allow until then.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct DiffPalette {
+    pub background: egui::Color32,
+    pub foreground: egui::Color32,
+    pub added: egui::Color32,
+    pub deleted: egui::Color32,
+    pub hunk: egui::Color32,
+    pub file_header: egui::Color32,
+    pub dim: egui::Color32,
+    pub marker: egui::Color32,
+}
+
+/// Relative luminance (0..1) of an opaque color.
+// Consumed by later tasks (diff render); allow until then.
+#[allow(dead_code)]
+pub fn luminance(c: egui::Color32) -> f32 {
+    (0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32) / 255.0
+}
+
+// Consumed by later tasks (diff render); allow until then.
+#[allow(dead_code)]
+fn blend(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let m = |x: u8, y: u8| (x as f32 * (1.0 - t) + y as f32 * t).round() as u8;
+    egui::Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
+}
+
+/// First scope the theme actually defines (color differs from the default
+/// foreground), else None.
+// Consumed by later tasks (diff render); allow until then.
+#[allow(dead_code)]
+fn scope_color(
+    hl: &SynHighlighter,
+    default_fg: SynColor,
+    scopes: &[&str],
+) -> Option<egui::Color32> {
+    for s in scopes {
+        if let Ok(scope) = Scope::new(s) {
+            let style = hl.style_for_stack(&[scope]);
+            if style.foreground != default_fg {
+                return Some(syn_to_egui(style.foreground));
+            }
+        }
+    }
+    None
+}
+
+impl DiffPalette {
+    // Consumed by later tasks (diff render); allow until then.
+    #[allow(dead_code)]
+    pub fn from_theme(theme: &Theme) -> DiffPalette {
+        let hl = SynHighlighter::new(theme);
+        let default = hl.get_default();
+        let foreground = syn_to_egui(default.foreground);
+        let background = theme
+            .settings
+            .background
+            .map(syn_to_egui)
+            .unwrap_or_else(|| syn_to_egui(default.background));
+        let light = luminance(background) > 0.5;
+
+        let added = scope_color(
+            &hl,
+            default.foreground,
+            &["markup.inserted.diff", "markup.inserted"],
+        )
+        .unwrap_or_else(|| {
+            if light {
+                egui::Color32::from_rgb(35, 110, 45)
+            } else {
+                egui::Color32::from_rgb(120, 200, 130)
+            }
+        });
+        let deleted = scope_color(
+            &hl,
+            default.foreground,
+            &["markup.deleted.diff", "markup.deleted"],
+        )
+        .unwrap_or_else(|| {
+            if light {
+                egui::Color32::from_rgb(150, 40, 50)
+            } else {
+                egui::Color32::from_rgb(230, 130, 145)
+            }
+        });
+        let hunk = scope_color(&hl, default.foreground, &["meta.diff.range", "meta.diff"])
+            .unwrap_or(foreground);
+        let file_header =
+            scope_color(&hl, default.foreground, &["meta.diff.header"]).unwrap_or(foreground);
+        let dim = scope_color(&hl, default.foreground, &["comment"])
+            .or_else(|| theme.settings.gutter_foreground.map(syn_to_egui))
+            .unwrap_or_else(|| blend(foreground, background, 0.5));
+        let marker = theme
+            .settings
+            .gutter_foreground
+            .map(syn_to_egui)
+            .unwrap_or(foreground);
+
+        DiffPalette {
+            background,
+            foreground,
+            added,
+            deleted,
+            hunk,
+            file_header,
+            dim,
+            marker,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +233,21 @@ mod tests {
     #[test]
     fn default_slug_resolves() {
         assert!(theme_for_slug(DEFAULT_THEME_SLUG).is_some());
+    }
+
+    #[test]
+    fn mocha_palette_is_dark_with_distinct_diff_colors() {
+        let set = two_face::theme::extra();
+        let theme = &set[EmbeddedThemeName::CatppuccinMocha];
+        let p = DiffPalette::from_theme(theme);
+        // Catppuccin Mocha is a dark theme.
+        assert!(luminance(p.background) < 0.5, "background should be dark");
+        // It defines diff scopes, so added/deleted must differ from plain text.
+        assert_ne!(p.added, p.foreground, "added should come from a diff scope");
+        assert_ne!(
+            p.deleted, p.foreground,
+            "deleted should come from a diff scope"
+        );
+        assert_ne!(p.added, p.deleted, "added and deleted should differ");
     }
 }
