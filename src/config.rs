@@ -75,10 +75,23 @@ pub struct FamiliesSection {
 
 #[derive(Deserialize, Clone, Debug, PartialEq, Default)]
 #[serde(default)]
+pub struct SyntaxSection {
+    /// Theme slug (see highlight::THEMES / the [syntax] template comment).
+    /// None ⇒ default theme.
+    // consumed by a later task
+    #[allow(dead_code)]
+    pub(crate) theme: Option<String>,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
 pub struct Config {
     pub(crate) fonts: FontsSection,
     pub(crate) sizes: SizesSection,
     pub(crate) families: FamiliesSection,
+    // consumed by a later task
+    #[allow(dead_code)]
+    pub(crate) syntax: SyntaxSection,
 }
 
 /// Read + parse the config. A missing file is not an error (returns defaults);
@@ -184,7 +197,15 @@ fn default_template() -> String {
          # commit_meta = \"monospace\"\n\
          # refs = \"monospace\"\n\
          # file_list = \"monospace\"\n\
-         # ui = \"monospace\"\n",
+         # ui = \"monospace\"\n\
+         \n\
+         [syntax]\n\
+         # Diff syntax-highlighting theme. Any of:\n\
+         # catppuccin-mocha (default), catppuccin-macchiato, catppuccin-frappe,\n\
+         # catppuccin-latte, dracula, nord, gruvbox-dark, gruvbox-light, github,\n\
+         # solarized-dark, solarized-light, one-half-dark, two-dark, zenburn,\n\
+         # monokai-extended, sublime-snazzy, dark-neon, and more (see docs).\n\
+         # theme = \"catppuccin-mocha\"\n",
         diff = s.diff,
         commit_summary = s.commit_summary,
         commit_meta = s.commit_meta,
@@ -463,6 +484,25 @@ mod tests {
         // All values are commented out, so parsing yields the defaults.
         let cfg: Config = toml::from_str(&default_template()).unwrap();
         assert_eq!(cfg, Config::default());
+    }
+
+    #[test]
+    fn syntax_theme_parses() {
+        let cfg: Config = toml::from_str("[syntax]\ntheme = \"dracula\"\n").unwrap();
+        assert_eq!(cfg.syntax.theme.as_deref(), Some("dracula"));
+    }
+
+    #[test]
+    fn missing_syntax_section_is_none() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.syntax.theme, None);
+    }
+
+    #[test]
+    fn template_mentions_syntax_theme() {
+        let t = default_template();
+        assert!(t.contains("[syntax]"));
+        assert!(t.contains("theme ="));
     }
 
     #[test]
