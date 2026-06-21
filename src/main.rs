@@ -3,8 +3,8 @@ use eframe::egui;
 use git2::{DiffOptions, Repository, Sort};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // ── Commit data ──────────────────────────────────────────────────────────
 
@@ -54,10 +54,11 @@ fn load_commits(repo: &Repository, max: usize) -> Vec<CommitInfo> {
             // Actually: staged = index vs HEAD tree
             if let Some(head) = head_oid
                 && let Ok(head_commit) = repo.find_commit(head)
-                    && let Ok(head_tree) = head_commit.tree()
-                        && let Ok(diff) = repo.diff_tree_to_index(Some(&head_tree), None, None) {
-                            return diff.deltas().len() > 0;
-                        }
+                && let Ok(head_tree) = head_commit.tree()
+                && let Ok(diff) = repo.diff_tree_to_index(Some(&head_tree), None, None)
+            {
+                return diff.deltas().len() > 0;
+            }
             false
         });
 
@@ -226,7 +227,7 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid) -> DiffData {
             return DiffData {
                 lines: Vec::new(),
                 files: Vec::new(),
-            }
+            };
         }
     };
     let tree = match commit.tree() {
@@ -235,7 +236,7 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid) -> DiffData {
             return DiffData {
                 lines: Vec::new(),
                 files: Vec::new(),
-            }
+            };
         }
     };
     let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
@@ -247,7 +248,7 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid) -> DiffData {
             return DiffData {
                 lines: Vec::new(),
                 files: Vec::new(),
-            }
+            };
         }
     };
 
@@ -295,11 +296,12 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid) -> DiffData {
 
     // Stats
     if let Ok(stats) = diff.stats()
-        && let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80) {
-            for l in s.as_str().unwrap_or("").lines() {
-                lines.push(DiffLine::new(l, LineKind::Stat));
-            }
+        && let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80)
+    {
+        for l in s.as_str().unwrap_or("").lines() {
+            lines.push(DiffLine::new(l, LineKind::Stat));
         }
+    }
     lines.push(DiffLine::new("", LineKind::Context));
 
     // Patch — track which file we're in
@@ -376,7 +378,7 @@ fn get_working_tree_diff(repo: &Repository) -> DiffData {
             return DiffData {
                 lines: Vec::new(),
                 files: Vec::new(),
-            }
+            };
         }
     };
     diff_to_data(&diff, "Uncommitted changes (working tree)")
@@ -395,7 +397,7 @@ fn get_staged_diff(repo: &Repository) -> DiffData {
             return DiffData {
                 lines: Vec::new(),
                 files: Vec::new(),
-            }
+            };
         }
     };
     diff_to_data(&diff, "Staged changes (index)")
@@ -430,11 +432,12 @@ fn diff_to_data(diff: &git2::Diff, title: &str) -> DiffData {
 
     // Stats
     if let Ok(stats) = diff.stats()
-        && let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80) {
-            for l in s.as_str().unwrap_or("").lines() {
-                lines.push(DiffLine::new(l, LineKind::Stat));
-            }
+        && let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80)
+    {
+        for l in s.as_str().unwrap_or("").lines() {
+            lines.push(DiffLine::new(l, LineKind::Stat));
         }
+    }
     lines.push(DiffLine::new("", LineKind::Context));
 
     // Patch
@@ -958,7 +961,8 @@ impl eframe::App for GitkApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Auto-reload when git refs change
         if self.needs_reload.swap(false, Ordering::Relaxed)
-            && let Ok(repo) = Repository::discover(&self.repo_path) {
+            && let Ok(repo) = Repository::discover(&self.repo_path)
+        {
             self.reload_commits(&repo, None);
             self.load_selected_diff(&repo);
         }
@@ -1002,11 +1006,11 @@ impl eframe::App for GitkApp {
                         self.search_cursor = 0;
                         self.refresh_search_matches();
                         // Jump to first match
-                        if let Some(&idx) = self.search_matches.first() {
-                            if let Ok(repo) = Repository::discover(&self.repo_path) {
-                                let oid = self.commits[idx].oid;
-                                self.refresh_for_selection(&repo, oid);
-                            }
+                        if let Some(&idx) = self.search_matches.first()
+                            && let Ok(repo) = Repository::discover(&self.repo_path)
+                        {
+                            let oid = self.commits[idx].oid;
+                            self.refresh_for_selection(&repo, oid);
                         }
                     }
                     // Enter cycles through matches
@@ -1252,27 +1256,28 @@ impl eframe::App for GitkApp {
 
                     // Check click — select commit and copy SHA
                     if response.clicked()
-                        && let Some(pos) = response.interact_pointer_pos() {
-                            let row_offset = ((pos.y - top_left.y) / row_height) as usize;
-                            let clicked_idx = row_range.start + row_offset;
-                            if clicked_idx < num_commits {
-                                let commit = &self.commits[clicked_idx];
-                                let clicked_oid = commit.oid;
-                                // Copy SHA to both clipboards
-                                let sha = clicked_oid.to_string();
-                                ctx.copy_text(sha.clone());
-                                // Also set primary selection (middle-click paste)
-                                if let Ok(mut clip) = arboard::Clipboard::new() {
-                                    let _ = clip
-                                        .set()
-                                        .clipboard(arboard::LinuxClipboardKind::Primary)
-                                        .text(&sha);
-                                }
-                                self.copied_toast = Some(std::time::Instant::now());
-                                let repo = Repository::discover(&self.repo_path).unwrap();
-                                self.refresh_for_selection(&repo, clicked_oid);
+                        && let Some(pos) = response.interact_pointer_pos()
+                    {
+                        let row_offset = ((pos.y - top_left.y) / row_height) as usize;
+                        let clicked_idx = row_range.start + row_offset;
+                        if clicked_idx < num_commits {
+                            let commit = &self.commits[clicked_idx];
+                            let clicked_oid = commit.oid;
+                            // Copy SHA to both clipboards
+                            let sha = clicked_oid.to_string();
+                            ctx.copy_text(sha.clone());
+                            // Also set primary selection (middle-click paste)
+                            if let Ok(mut clip) = arboard::Clipboard::new() {
+                                let _ = clip
+                                    .set()
+                                    .clipboard(arboard::LinuxClipboardKind::Primary)
+                                    .text(&sha);
                             }
+                            self.copied_toast = Some(std::time::Instant::now());
+                            let repo = Repository::discover(&self.repo_path).unwrap();
+                            self.refresh_for_selection(&repo, clicked_oid);
                         }
+                    }
 
                     for idx in row_range.clone() {
                         let commit = &self.commits[idx];
@@ -1321,11 +1326,7 @@ impl eframe::App for GitkApp {
                                 row_rect.min,
                                 egui::vec2(3.0, row_rect.height()),
                             );
-                            painter.rect_filled(
-                                bar,
-                                0.0,
-                                egui::Color32::from_rgb(249, 226, 175),
-                            );
+                            painter.rect_filled(bar, 0.0, egui::Color32::from_rgb(249, 226, 175));
                         }
                         if self.selected != Some(idx)
                             && response.hover_pos().is_some_and(|p| row_rect.contains(p))
@@ -1788,9 +1789,18 @@ mod tests {
         let highlight = compute_branch_highlight(&commits, 0);
 
         assert!(highlight.contains(&0), "merge commit should be highlighted");
-        assert!(highlight.contains(&1), "first-parent side should be highlighted");
-        assert!(highlight.contains(&2), "merged branch tip should be highlighted");
-        assert!(highlight.contains(&3), "merged branch ancestry should be highlighted");
+        assert!(
+            highlight.contains(&1),
+            "first-parent side should be highlighted"
+        );
+        assert!(
+            highlight.contains(&2),
+            "merged branch tip should be highlighted"
+        );
+        assert!(
+            highlight.contains(&3),
+            "merged branch ancestry should be highlighted"
+        );
     }
 
     #[test]
