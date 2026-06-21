@@ -6,6 +6,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod config;
+
 // ── Commit data ──────────────────────────────────────────────────────────
 
 #[derive(Clone)]
