@@ -101,6 +101,12 @@ pub struct DiffPalette {
     pub file_header: egui::Color32,
     pub dim: egui::Color32,
     pub marker: egui::Color32,
+    /// Opaque full-row background for added/removed lines. Dark, saturated
+    /// green/red on dark themes (light pastels on light themes) — kept fixed by
+    /// luminance rather than derived from the theme's pastel diff scopes, so the
+    /// bands stay dark enough not to wash out the token colors on top.
+    pub added_bg: egui::Color32,
+    pub deleted_bg: egui::Color32,
 }
 
 /// Relative luminance (0..1) of an opaque color.
@@ -187,6 +193,17 @@ impl DiffPalette {
             .gutter_foreground
             .map(syn_to_egui)
             .unwrap_or(foreground);
+        let (added_bg, deleted_bg) = if light {
+            (
+                egui::Color32::from_rgb(202, 236, 202),
+                egui::Color32::from_rgb(252, 206, 206),
+            )
+        } else {
+            (
+                egui::Color32::from_rgb(10, 48, 10),
+                egui::Color32::from_rgb(64, 12, 14),
+            )
+        };
 
         DiffPalette {
             background,
@@ -197,6 +214,8 @@ impl DiffPalette {
             file_header,
             dim,
             marker,
+            added_bg,
+            deleted_bg,
         }
     }
 }
