@@ -192,6 +192,17 @@ impl DiffLine {
             spans: Vec::new(),
         }
     }
+
+    /// The line text without its leading `+`/`-` diff marker. Only Add/Del lines
+    /// carry a marker (git's origin char is excluded from context-line content),
+    /// so this strips exactly one byte for those and returns the full text
+    /// otherwise. The single authoritative place that knows the marker shape.
+    fn body(&self) -> &str {
+        match self.kind {
+            LineKind::Add | LineKind::Del => &self.text[1..],
+            _ => &self.text,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -380,10 +391,13 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings) -> D
             _ => "",
         };
         let content = std::str::from_utf8(line.content()).unwrap_or("");
-        lines.push(DiffLine::new(
-            &format!("{prefix}{}", content.trim_end_matches('\n')),
-            kind,
-        ));
+        // git2 delivers a multi-line file header (origin FILE_HDR) as ONE line
+        // with embedded newlines; split it so every DiffLine is exactly one
+        // visual line — the row-virtualized render allocates a fixed row height
+        // per line, so a multi-line entry would draw over the lines below it.
+        for piece in content.trim_end_matches('\n').split('\n') {
+            lines.push(DiffLine::new(&format!("{prefix}{piece}"), kind));
+        }
         true
     })
     .ok();
@@ -517,10 +531,13 @@ fn diff_to_data(diff: &git2::Diff, title: &str) -> DiffData {
             _ => "",
         };
         let content = std::str::from_utf8(line.content()).unwrap_or("");
-        lines.push(DiffLine::new(
-            &format!("{prefix}{}", content.trim_end_matches('\n')),
-            kind,
-        ));
+        // git2 delivers a multi-line file header (origin FILE_HDR) as ONE line
+        // with embedded newlines; split it so every DiffLine is exactly one
+        // visual line — the row-virtualized render allocates a fixed row height
+        // per line, so a multi-line entry would draw over the lines below it.
+        for piece in content.trim_end_matches('\n').split('\n') {
+            lines.push(DiffLine::new(&format!("{prefix}{piece}"), kind));
+        }
         true
     })
     .ok();
@@ -548,41 +565,50 @@ fn highlight_diff(lines: &mut [DiffLine], files: &[FileEntry], hl: &Highlighter)
         let len = lines.len();
         let mut state = hl.new_file_state(&file.path);
         for line in &mut lines[start..end.min(len)] {
-            // Marker stripping is kind-driven: content excludes git's origin
-            // char, so context lines have NO leading space — only Add/Del carry
-            // a +/- prefix to strip.
+            // Only code lines are tokenized; structural lines keep empty spans.
             let code = match line.kind {
-                LineKind::Add | LineKind::Del => &line.text[1..],
-                LineKind::Context => line.text.as_str(),
-                _ => continue, // structural line: leave spans empty
+                LineKind::Add | LineKind::Del | LineKind::Context => line.body(),
+                _ => continue,
             };
             line.spans = hl.tokenize_line(&mut state, code);
         }
     }
 }
 
-/// Resolve the `[syntax]` diff-background config into a `DiffBg`, warning on a
-/// bad mode or unparseable hex (and falling back to defaults).
-fn resolve_diff_bg(s: &config::SyntaxSection) -> DiffBg {
+/// Resolve the `[syntax]` diff-background config into a `DiffBg`, plus any
+/// warnings (bad mode or unparseable hex — each falls back to a default). The
+/// caller surfaces the warnings (stderr + the in-UI toast).
+fn resolve_diff_bg(s: &config::SyntaxSection) -> (DiffBg, Vec<String>) {
+    let mut warnings = Vec::new();
     let mode = s.diff_background.as_deref().unwrap_or("fixed");
     if mode == "theme" {
-        return DiffBg::Theme;
+        return (DiffBg::Theme, warnings);
     }
     if mode != "fixed" {
-        eprintln!("gitkay: unknown syntax.diff_background {mode:?}; using \"fixed\"");
+        warnings.push(format!(
+            "unknown syntax.diff_background {mode:?}; using \"fixed\""
+        ));
     }
-    DiffBg::Fixed {
-        added: parse_bg_hex("added_background", s.added_background.as_deref()),
-        deleted: parse_bg_hex("deleted_background", s.deleted_background.as_deref()),
-    }
+    let added = parse_bg_hex(
+        "added_background",
+        s.added_background.as_deref(),
+        &mut warnings,
+    );
+    let deleted = parse_bg_hex(
+        "deleted_background",
+        s.deleted_background.as_deref(),
+        &mut warnings,
+    );
+    (DiffBg::Fixed { added, deleted }, warnings)
 }
 
-/// Parse an optional `"#rrggbb"` background color, warning if it is set but invalid.
-fn parse_bg_hex(label: &str, v: Option<&str>) -> Option<egui::Color32> {
+/// Parse an optional `"#rrggbb"` background color, pushing a warning if it is
+/// set but invalid.
+fn parse_bg_hex(label: &str, v: Option<&str>, warnings: &mut Vec<String>) -> Option<egui::Color32> {
     let h = v?;
     let c = highlight::parse_hex(h);
     if c.is_none() {
-        eprintln!("gitkay: invalid syntax.{label} color {h:?}; using default");
+        warnings.push(format!("invalid syntax.{label} color {h:?}; using default"));
     }
     c
 }
@@ -620,11 +646,7 @@ fn diff_row_job(
         push(glyph, glyph_color);
         if line.spans.is_empty() {
             // No highlighting available: draw the marker-stripped body plain.
-            let body = match line.kind {
-                LineKind::Add | LineKind::Del => &line.text[1..],
-                _ => line.text.as_str(),
-            };
-            push(body, palette.foreground);
+            push(line.body(), palette.foreground);
         } else {
             for (color, text) in &line.spans {
                 push(text, *color);
@@ -1019,7 +1041,11 @@ impl GitkApp {
             .theme
             .clone()
             .unwrap_or_else(|| highlight::DEFAULT_THEME_SLUG.to_string());
-        let diff_bg = resolve_diff_bg(&cfg.syntax);
+        let (diff_bg, diff_bg_warnings) = resolve_diff_bg(&cfg.syntax);
+        for w in &diff_bg_warnings {
+            eprintln!("gitkay: {w}");
+            startup_issue = true;
+        }
         let (font_defs, fonts, font_warnings) = config::build_fonts(&cfg);
         if !font_warnings.is_empty() {
             startup_issue = true;
@@ -1324,7 +1350,14 @@ impl eframe::App for GitkApp {
                         .theme
                         .clone()
                         .unwrap_or_else(|| highlight::DEFAULT_THEME_SLUG.to_string());
-                    let new_diff_bg = resolve_diff_bg(&cfg.syntax);
+                    let (new_diff_bg, diff_bg_warnings) = resolve_diff_bg(&cfg.syntax);
+                    // Surface font + diff-background warnings (stderr now, toast
+                    // below) so config typos aren't silent on a headless desktop.
+                    let mut warned = !warns.is_empty();
+                    for w in &diff_bg_warnings {
+                        eprintln!("gitkay: {w}");
+                        warned = true;
+                    }
                     if new_enabled != self.syntax_enabled
                         || new_slug != self.theme_slug
                         || new_diff_bg != self.diff_bg
@@ -1336,16 +1369,13 @@ impl eframe::App for GitkApp {
                             && let Some(w) = hl.set_theme(&self.theme_slug, self.diff_bg)
                         {
                             eprintln!("gitkay: {w}");
+                            warned = true;
                         }
                         // Re-highlight the visible diff under the new settings
                         // (a no-op when syntax is now disabled).
                         self.diff_needs_highlight = true;
                     }
-                    if warns.is_empty() {
-                        self.config_error_toast = None;
-                    } else {
-                        self.config_error_toast = Some(std::time::Instant::now());
-                    }
+                    self.config_error_toast = warned.then(std::time::Instant::now);
                 }
                 Err(e) => {
                     eprintln!("gitkay: {e}");
@@ -1723,36 +1753,47 @@ impl eframe::App for GitkApp {
                     .frame(frame)
                     .show_inside(ui, |ui| {
                         ui.style_mut().override_font_id = Some(self.fonts.font_id(Role::Diff));
-                        let scroll = egui::ScrollArea::both()
-                            .id_salt("diff_scroll")
-                            .auto_shrink([false, false])
-                            .animated(false);
                         let scroll_target = self.diff_scroll_to.take();
-                        scroll.show(ui, |ui| {
-                            if let Some(palette) = &palette {
-                                // Themed render: flush rows so add/del bands are
-                                // continuous, token colors, +/- gutter.
-                                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                                let font_id = self.fonts.font_id(Role::Diff);
-                                for (i, line) in self.diff_lines.iter().enumerate() {
+                        if let Some(palette) = &palette {
+                            // Themed render, row-virtualized: only visible rows
+                            // get a LayoutJob (diffs can be tens of thousands of
+                            // lines). Rows are single-line, so height is uniform.
+                            let font_id = self.fonts.font_id(Role::Diff);
+                            let row_h = ui.fonts(|f| f.row_height(&font_id));
+                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                            let mut scroll = egui::ScrollArea::both()
+                                .id_salt("diff_scroll")
+                                .auto_shrink([false, false])
+                                .animated(false);
+                            // Jump-to-target works even when the row is off-screen
+                            // (it isn't laid out) by forcing the scroll offset.
+                            if let Some(t) = scroll_target {
+                                scroll = scroll.vertical_scroll_offset(t as f32 * row_h);
+                            }
+                            scroll.show_rows(ui, row_h, self.diff_lines.len(), |ui, rows| {
+                                for i in rows {
+                                    let line = &self.diff_lines[i];
                                     let (job, row_bg) =
                                         diff_row_job(line, palette, font_id.clone());
                                     let galley = ui.fonts(|f| f.layout_job(job));
                                     let width = ui.available_width().max(galley.size().x);
                                     let (rect, _resp) = ui.allocate_exact_size(
-                                        egui::vec2(width, galley.size().y),
+                                        egui::vec2(width, row_h),
                                         egui::Sense::hover(),
                                     );
                                     if let Some(bg) = row_bg {
                                         ui.painter().rect_filled(rect, 0.0, bg);
                                     }
                                     ui.painter().galley(rect.min, galley, palette.foreground);
-                                    if scroll_target == Some(i) {
-                                        ui.scroll_to_rect(rect, Some(egui::Align::TOP));
-                                    }
                                 }
-                            } else {
-                                // Original flat per-line coloring (syntax off).
+                            });
+                        } else {
+                            // Original flat per-line coloring (syntax off).
+                            let scroll = egui::ScrollArea::both()
+                                .id_salt("diff_scroll")
+                                .auto_shrink([false, false])
+                                .animated(false);
+                            scroll.show(ui, |ui| {
                                 for (i, line) in self.diff_lines.iter().enumerate() {
                                     let color = match line.kind {
                                         LineKind::Add => GREEN,
@@ -1769,8 +1810,8 @@ impl eframe::App for GitkApp {
                                         ui.scroll_to_rect(resp.rect, Some(egui::Align::TOP));
                                     }
                                 }
-                            }
-                        });
+                            });
+                        }
                     });
 
                 // The side panel already draws a separator at the divider that
@@ -2756,18 +2797,25 @@ mod tests {
 
     #[test]
     fn highlight_diff_colors_code_and_skips_structure() {
-        let (hl, _) = Highlighter::new("catppuccin-mocha", DiffBg::Fixed { added: None, deleted: None });
+        let (hl, _) = Highlighter::new(
+            "catppuccin-mocha",
+            DiffBg::Fixed {
+                added: None,
+                deleted: None,
+            },
+        );
         let mut lines = vec![
             DiffLine::new("commit abc123", LineKind::Meta),
             DiffLine::new("diff --git a/x.rs b/x.rs", LineKind::FileMeta),
             DiffLine::new("@@ -1 +1 @@", LineKind::Hunk),
             DiffLine::new("+fn main() {}", LineKind::Add),
+            DiffLine::new("-let old = 0;", LineKind::Del),
             DiffLine::new("let x = 1;", LineKind::Context),
         ];
         let files = vec![FileEntry {
             path: "x.rs".to_string(),
             additions: 1,
-            deletions: 0,
+            deletions: 1,
             diff_line_idx: 1, // file's diff starts at the "diff --git" line
         }];
 
@@ -2781,13 +2829,105 @@ mod tests {
         assert!(lines[2].spans.is_empty(), "hunk header is not code");
         assert!(lines[3].spans.len() >= 2, "added code line should tokenize");
         assert!(
-            !lines[4].spans.is_empty(),
+            lines[4].spans.len() >= 2,
+            "removed code line should tokenize"
+        );
+        assert!(
+            !lines[5].spans.is_empty(),
             "context code line should tokenize"
         );
 
-        // The Add line's marker must be stripped before tokenizing.
+        // The +/- marker must be stripped before tokenizing (both Add and Del).
         let added: String = lines[3].spans.iter().map(|(_, t)| t.as_str()).collect();
         assert_eq!(added, "fn main() {}");
+        let deleted: String = lines[4].spans.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(deleted, "let old = 0;");
+    }
+
+    #[test]
+    fn resolve_diff_bg_interprets_config() {
+        use config::SyntaxSection;
+        // Absent / default → fixed mode, no explicit colors, no warnings.
+        let (bg, warns) = resolve_diff_bg(&SyntaxSection::default());
+        assert_eq!(
+            bg,
+            DiffBg::Fixed {
+                added: None,
+                deleted: None
+            }
+        );
+        assert!(warns.is_empty());
+
+        // "theme" mode.
+        let (bg, warns) = resolve_diff_bg(&SyntaxSection {
+            diff_background: Some("theme".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(bg, DiffBg::Theme);
+        assert!(warns.is_empty());
+
+        // Explicit valid hex in fixed mode.
+        let (bg, warns) = resolve_diff_bg(&SyntaxSection {
+            diff_background: Some("fixed".to_string()),
+            added_background: Some("#0a300a".to_string()),
+            deleted_background: Some("#400c0e".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            bg,
+            DiffBg::Fixed {
+                added: Some(egui::Color32::from_rgb(10, 48, 10)),
+                deleted: Some(egui::Color32::from_rgb(64, 12, 14)),
+            }
+        );
+        assert!(warns.is_empty());
+
+        // Unknown mode → fixed fallback + one warning.
+        let (bg, warns) = resolve_diff_bg(&SyntaxSection {
+            diff_background: Some("teme".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            bg,
+            DiffBg::Fixed {
+                added: None,
+                deleted: None
+            }
+        );
+        assert_eq!(warns.len(), 1);
+
+        // Invalid hex → ignored (None) + one warning.
+        let (bg, warns) = resolve_diff_bg(&SyntaxSection {
+            added_background: Some("nothex".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            bg,
+            DiffBg::Fixed {
+                added: None,
+                deleted: None
+            }
+        );
+        assert_eq!(warns.len(), 1);
+    }
+
+    #[test]
+    fn diff_row_job_background_by_kind() {
+        let (hl, _) = Highlighter::new(
+            "catppuccin-mocha",
+            DiffBg::Fixed {
+                added: None,
+                deleted: None,
+            },
+        );
+        let palette = hl.palette().clone();
+        let fid = egui::FontId::monospace(13.0);
+        let bg =
+            |text: &str, kind| diff_row_job(&DiffLine::new(text, kind), &palette, fid.clone()).1;
+        assert_eq!(bg("+x", LineKind::Add), Some(palette.added_bg));
+        assert_eq!(bg("-x", LineKind::Del), Some(palette.deleted_bg));
+        assert_eq!(bg("x", LineKind::Context), None);
+        assert_eq!(bg("@@ -1 +1 @@", LineKind::Hunk), None);
     }
 
     #[test]
@@ -2795,7 +2935,13 @@ mod tests {
         // A binary/no-patch FileEntry has diff_line_idx == 0 (never set by the
         // diff printer). It must NOT cause the commit header at index 0 to be
         // tokenized as code.
-        let (hl, _) = Highlighter::new("catppuccin-mocha", DiffBg::Fixed { added: None, deleted: None });
+        let (hl, _) = Highlighter::new(
+            "catppuccin-mocha",
+            DiffBg::Fixed {
+                added: None,
+                deleted: None,
+            },
+        );
         let mut lines = vec![
             DiffLine::new("commit abc123", LineKind::Context), // index 0 — header
             DiffLine::new("+fn foo() {}", LineKind::Add),      // index 1 — real file patch
