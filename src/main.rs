@@ -563,6 +563,69 @@ fn highlight_diff(lines: &mut [DiffLine], files: &[FileEntry], hl: &Highlighter)
     }
 }
 
+/// Build the LayoutJob for one diff row plus its optional background tint.
+/// Code lines get a synthesized +/-/space gutter (drawn from `kind`, so context
+/// and changed lines share one column) then their token spans; structural lines
+/// render whole in one palette color.
+fn diff_row_job(
+    line: &DiffLine,
+    palette: &highlight::DiffPalette,
+    font_id: egui::FontId,
+) -> (egui::text::LayoutJob, Option<egui::Color32>) {
+    use egui::text::{LayoutJob, TextFormat};
+    let mut job = LayoutJob::default();
+    let mut push = |text: &str, color: egui::Color32| {
+        job.append(
+            text,
+            0.0,
+            TextFormat {
+                font_id: font_id.clone(),
+                color,
+                ..Default::default()
+            },
+        );
+    };
+
+    let is_code = matches!(line.kind, LineKind::Add | LineKind::Del | LineKind::Context);
+    if is_code {
+        let (glyph, glyph_color) = match line.kind {
+            LineKind::Add => ("+", palette.added),
+            LineKind::Del => ("-", palette.deleted),
+            _ => (" ", palette.marker),
+        };
+        push(glyph, glyph_color);
+        if line.spans.is_empty() {
+            // No highlighting available: draw the marker-stripped body plain.
+            let body = match line.kind {
+                LineKind::Add | LineKind::Del => &line.text[1..],
+                _ => line.text.as_str(),
+            };
+            push(body, palette.foreground);
+        } else {
+            for (color, text) in &line.spans {
+                push(text, *color);
+            }
+        }
+        let row_bg = match line.kind {
+            LineKind::Add => Some(palette.added_bg),
+            LineKind::Del => Some(palette.deleted_bg),
+            _ => None,
+        };
+        (job, row_bg)
+    } else {
+        let color = match line.kind {
+            LineKind::Hunk => palette.hunk,
+            LineKind::FileName => palette.file_header,
+            LineKind::FileMeta => palette.dim,
+            LineKind::Stat => palette.dim,
+            LineKind::Meta => palette.foreground,
+            _ => palette.foreground,
+        };
+        push(&line.text, color);
+        (job, None)
+    }
+}
+
 /// Compute the set of commit indices to emphasize for `start_idx`.
 /// Walks upward through first-parent children to stay on the selected lane,
 /// and downward through all parents so merged ancestry stays highlighted.
@@ -814,7 +877,6 @@ const BG: egui::Color32 = egui::Color32::from_rgb(30, 30, 46);
 const TEXT: egui::Color32 = egui::Color32::from_rgb(205, 214, 244);
 const SUBTEXT: egui::Color32 = egui::Color32::from_rgb(108, 112, 134);
 const SURFACE0: egui::Color32 = egui::Color32::from_rgb(49, 50, 68);
-const MAUVE: egui::Color32 = egui::Color32::from_rgb(203, 166, 247);
 const GREEN: egui::Color32 = egui::Color32::from_rgb(166, 227, 161);
 const RED: egui::Color32 = egui::Color32::from_rgb(243, 139, 168);
 const BLUE: egui::Color32 = egui::Color32::from_rgb(137, 180, 250);
@@ -1582,13 +1644,35 @@ impl eframe::App for GitkApp {
                 // the diff scrollbar from crowding the file-list resize bar — only
                 // when that sidebar is actually shown.
                 let diff_right_pad = if self.diff_files.is_empty() { 0 } else { 10 };
+                // The diff pane adopts the active theme's colors; fall back to
+                // Catppuccin chrome if the highlighter isn't built yet.
+                let palette = self
+                    .highlighter
+                    .as_ref()
+                    .map(|h| h.palette().clone())
+                    .unwrap_or(highlight::DiffPalette {
+                        background: BG,
+                        foreground: TEXT,
+                        added: GREEN,
+                        deleted: RED,
+                        hunk: BLUE,
+                        file_header: YELLOW,
+                        dim: SUBTEXT,
+                        marker: SUBTEXT,
+                        added_bg: egui::Color32::from_rgb(10, 48, 10),
+                        deleted_bg: egui::Color32::from_rgb(64, 12, 14),
+                    });
                 egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE.inner_margin(egui::Margin {
-                        left: 0,
-                        right: diff_right_pad,
-                        top: 0,
-                        bottom: 0,
-                    }))
+                    .frame(
+                        egui::Frame::NONE
+                            .fill(palette.background)
+                            .inner_margin(egui::Margin {
+                                left: 0,
+                                right: diff_right_pad,
+                                top: 0,
+                                bottom: 0,
+                            }),
+                    )
                     .show_inside(ui, |ui| {
                         ui.style_mut().override_font_id = Some(self.fonts.font_id(Role::Diff));
                         let scroll = egui::ScrollArea::both()
@@ -1597,20 +1681,25 @@ impl eframe::App for GitkApp {
                             .animated(false);
                         let scroll_target = self.diff_scroll_to.take();
                         scroll.show(ui, |ui| {
+                            // Rows are flush — no inter-row gap, so add/del tints
+                            // form a continuous band instead of leaving dark
+                            // strips of the theme background between lines.
+                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                            let font_id = self.fonts.font_id(Role::Diff);
                             for (i, line) in self.diff_lines.iter().enumerate() {
-                                let color = match line.kind {
-                                    LineKind::Add => GREEN,
-                                    LineKind::Del => RED,
-                                    LineKind::Hunk => BLUE,
-                                    LineKind::Meta => MAUVE,
-                                    LineKind::FileMeta => MAUVE,
-                                    LineKind::FileName => YELLOW,
-                                    LineKind::Stat => SUBTEXT,
-                                    LineKind::Context => TEXT,
-                                };
-                                let resp = ui.colored_label(color, &line.text);
+                                let (job, row_tint) = diff_row_job(line, &palette, font_id.clone());
+                                let galley = ui.fonts(|f| f.layout_job(job));
+                                let width = ui.available_width().max(galley.size().x);
+                                let (rect, _resp) = ui.allocate_exact_size(
+                                    egui::vec2(width, galley.size().y),
+                                    egui::Sense::hover(),
+                                );
+                                if let Some(t) = row_tint {
+                                    ui.painter().rect_filled(rect, 0.0, t);
+                                }
+                                ui.painter().galley(rect.min, galley, palette.foreground);
                                 if scroll_target == Some(i) {
-                                    ui.scroll_to_rect(resp.rect, Some(egui::Align::TOP));
+                                    ui.scroll_to_rect(rect, Some(egui::Align::TOP));
                                 }
                             }
                         });
