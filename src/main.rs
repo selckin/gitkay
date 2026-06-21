@@ -1219,6 +1219,21 @@ impl eframe::App for GitkApp {
                     let (defs, fonts, warns) = config::build_fonts(&cfg);
                     ctx.set_fonts(defs);
                     self.fonts = fonts;
+                    let new_slug = cfg
+                        .syntax
+                        .theme
+                        .clone()
+                        .unwrap_or_else(|| highlight::DEFAULT_THEME_SLUG.to_string());
+                    if new_slug != self.theme_slug {
+                        self.theme_slug = new_slug;
+                        if let Some(hl) = &mut self.highlighter
+                            && let Some(w) = hl.set_theme(&self.theme_slug)
+                        {
+                            eprintln!("gitkay: {w}");
+                        }
+                        // Re-derive spans for the visible diff under the new theme.
+                        self.diff_needs_highlight = true;
+                    }
                     if warns.is_empty() {
                         self.config_error_toast = None;
                     } else {
