@@ -76,10 +76,20 @@ pub struct FamiliesSection {
 #[derive(Deserialize, Clone, Debug, PartialEq, Default)]
 #[serde(default)]
 pub struct SyntaxSection {
+    /// Syntax-highlight diffs. `None`/`true` ⇒ syntect highlighting; `false` ⇒
+    /// the original flat per-line role coloring (no theme, no highlighter).
+    pub(crate) enabled: Option<bool>,
     /// Theme slug (see the `[syntax]` section in `default_template()` for valid slugs).
     /// None ⇒ default theme.
-    // consumed by a later task
     pub(crate) theme: Option<String>,
+    /// Add/remove row band source: `"fixed"` (default) ⇒ gitkay's dark/light
+    /// bands (see `added_background`/`deleted_background`); `"theme"` ⇒ derive
+    /// from the active theme's own diff colors.
+    pub(crate) diff_background: Option<String>,
+    /// Explicit add/remove band colors as `"#rrggbb"`, used in `"fixed"` mode.
+    /// Unset ⇒ built-in dark (or light, on light themes) defaults.
+    pub(crate) added_background: Option<String>,
+    pub(crate) deleted_background: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq, Default)]
@@ -88,7 +98,6 @@ pub struct Config {
     pub(crate) fonts: FontsSection,
     pub(crate) sizes: SizesSection,
     pub(crate) families: FamiliesSection,
-    // consumed by a later task
     pub(crate) syntax: SyntaxSection,
 }
 
@@ -198,12 +207,21 @@ fn default_template() -> String {
          # ui = \"monospace\"\n\
          \n\
          [syntax]\n\
+         # Syntax-highlight diffs. false = the original flat per-line coloring.\n\
+         # enabled = true\n\
          # Diff syntax-highlighting theme. Any of:\n\
          # catppuccin-mocha (default), catppuccin-macchiato, catppuccin-frappe,\n\
          # catppuccin-latte, dracula, nord, gruvbox-dark, gruvbox-light, github,\n\
          # solarized-dark, solarized-light, one-half-dark, two-dark, zenburn,\n\
          # monokai-extended, sublime-snazzy, dark-neon, and more (see docs).\n\
-         # theme = \"catppuccin-mocha\"\n",
+         # theme = \"catppuccin-mocha\"\n\
+         # Add/remove row band source: \"fixed\" (default) = the colors below\n\
+         # (dark by default, light pastels on light themes); \"theme\" = derive\n\
+         # from the active theme's own diff colors.\n\
+         # diff_background = \"fixed\"\n\
+         # Exact band colors for \"fixed\" mode, as \"#rrggbb\". Unset = defaults.\n\
+         # added_background = \"#0a300a\"\n\
+         # deleted_background = \"#400c0e\"\n",
         diff = s.diff,
         commit_summary = s.commit_summary,
         commit_meta = s.commit_meta,
@@ -494,6 +512,20 @@ mod tests {
     fn missing_syntax_section_is_none() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.syntax.theme, None);
+        assert_eq!(cfg.syntax.enabled, None);
+        assert_eq!(cfg.syntax.diff_background, None);
+        assert_eq!(cfg.syntax.added_background, None);
+    }
+
+    #[test]
+    fn syntax_options_parse() {
+        let cfg: Config = toml::from_str(
+            "[syntax]\nenabled = false\ndiff_background = \"theme\"\nadded_background = \"#0a300a\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.syntax.enabled, Some(false));
+        assert_eq!(cfg.syntax.diff_background.as_deref(), Some("theme"));
+        assert_eq!(cfg.syntax.added_background.as_deref(), Some("#0a300a"));
     }
 
     #[test]
