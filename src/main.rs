@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod config;
+mod highlight;
 use config::{Fonts, Role};
 
 // ── Commit data ──────────────────────────────────────────────────────────
