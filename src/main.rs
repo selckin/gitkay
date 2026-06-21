@@ -1207,6 +1207,7 @@ impl eframe::App for GitkApp {
                     if let Ok(repo) = Repository::discover(&self.repo_path) {
                         self.load_selected_diff(&repo);
                     }
+                    self.diff_scroll_to = Some(0); // new commit → reset diff view to top
                     self.graph_scroll_to = Some((idx, Some(egui::Align::Center)));
                 }
             } else if !self.commits.is_empty() {
@@ -1220,6 +1221,7 @@ impl eframe::App for GitkApp {
                     if let Ok(repo) = Repository::discover(&self.repo_path) {
                         self.load_selected_diff(&repo);
                     }
+                    self.diff_scroll_to = Some(0); // new commit → reset diff view to top
                     self.graph_scroll_to = Some((new, None));
                 }
             }
