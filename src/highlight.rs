@@ -77,6 +77,30 @@ pub fn syn_to_egui(c: SynColor) -> egui::Color32 {
     egui::Color32::from_rgb(c.r, c.g, c.b)
 }
 
+/// Parse a `"#rrggbb"` (or `"rrggbb"`) hex color. Returns None on bad input.
+pub fn parse_hex(s: &str) -> Option<egui::Color32> {
+    let s = s.strip_prefix('#').unwrap_or(s);
+    if s.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some(egui::Color32::from_rgb(r, g, b))
+}
+
+/// How the add/remove row backgrounds are chosen.
+#[derive(Clone, Copy, PartialEq)]
+pub enum DiffBg {
+    /// gitkay's bands: the given colors, or built-in dark/light defaults when None.
+    Fixed {
+        added: Option<egui::Color32>,
+        deleted: Option<egui::Color32>,
+    },
+    /// Derived from the active theme's own diff colors.
+    Theme,
+}
+
 /// Colors the diff pane draws with, all derived from the active theme where
 /// possible. App chrome does not use this — only the diff content pane does.
 #[derive(Clone)]
@@ -125,8 +149,30 @@ fn scope_color(
     None
 }
 
+/// First scope whose *background* the theme actually defines (differs from the
+/// theme's default background), else None. Used to honour a theme's own
+/// diff-line backgrounds when fixed diff colors are turned off.
+fn scope_bg(
+    hl: &SynHighlighter,
+    default_bg: SynColor,
+    scopes: &[&str],
+) -> Option<egui::Color32> {
+    for s in scopes {
+        if let Ok(scope) = Scope::new(s) {
+            let style = hl.style_for_stack(&[scope]);
+            if style.background != default_bg {
+                return Some(syn_to_egui(style.background));
+            }
+        }
+    }
+    None
+}
+
 impl DiffPalette {
-    pub fn from_theme(theme: &Theme) -> DiffPalette {
+    /// Build the palette from `theme`. `diff_bg` controls the add/del row
+    /// backgrounds: fixed colors (explicit or built-in dark/light defaults) or
+    /// colors derived from the theme's own diff scopes.
+    pub fn from_theme(theme: &Theme, diff_bg: DiffBg) -> DiffPalette {
         let hl = SynHighlighter::new(theme);
         let default = hl.get_default();
         let foreground = syn_to_egui(default.foreground);
@@ -173,16 +219,40 @@ impl DiffPalette {
             .gutter_foreground
             .map(syn_to_egui)
             .unwrap_or(foreground);
-        let (added_bg, deleted_bg) = if light {
-            (
-                egui::Color32::from_rgb(202, 236, 202),
-                egui::Color32::from_rgb(252, 206, 206),
-            )
-        } else {
-            (
-                egui::Color32::from_rgb(10, 48, 10),
-                egui::Color32::from_rgb(64, 12, 14),
-            )
+        let (added_bg, deleted_bg) = match diff_bg {
+            DiffBg::Fixed { added, deleted } => {
+                // Explicit config colors win; otherwise built-in defaults chosen
+                // by the theme's luminance.
+                let (def_added, def_deleted) = if light {
+                    (
+                        egui::Color32::from_rgb(202, 236, 202),
+                        egui::Color32::from_rgb(252, 206, 206),
+                    )
+                } else {
+                    (
+                        egui::Color32::from_rgb(10, 48, 10),
+                        egui::Color32::from_rgb(64, 12, 14),
+                    )
+                };
+                (added.unwrap_or(def_added), deleted.unwrap_or(def_deleted))
+            }
+            DiffBg::Theme => {
+                // Use the theme's own diff-line background if it defines one,
+                // else a subtle blend of its diff foreground over the pane.
+                let a = scope_bg(
+                    &hl,
+                    default.background,
+                    &["markup.inserted.diff", "markup.inserted"],
+                )
+                .unwrap_or_else(|| blend(background, added, 0.30));
+                let d = scope_bg(
+                    &hl,
+                    default.background,
+                    &["markup.deleted.diff", "markup.deleted"],
+                )
+                .unwrap_or_else(|| blend(background, deleted, 0.30));
+                (a, d)
+            }
         };
 
         DiffPalette {
@@ -223,10 +293,10 @@ fn load_theme(slug: &str) -> (Theme, Option<String>) {
 impl Highlighter {
     /// Build the highlighter for `slug`. Deserializes the bundled syntax set
     /// (multi-MB) once — call this lazily, not at startup.
-    pub fn new(slug: &str) -> (Highlighter, Option<String>) {
+    pub fn new(slug: &str, diff_bg: DiffBg) -> (Highlighter, Option<String>) {
         let syntaxes = two_face::syntax::extra_newlines();
         let (theme, warning) = load_theme(slug);
-        let palette = DiffPalette::from_theme(&theme);
+        let palette = DiffPalette::from_theme(&theme, diff_bg);
         (
             Highlighter {
                 syntaxes,
@@ -237,12 +307,12 @@ impl Highlighter {
         )
     }
 
-    /// Swap to a different theme (reuses the syntax set). Returns a warning if
-    /// the slug was unknown.
-    pub fn set_theme(&mut self, slug: &str) -> Option<String> {
+    /// Swap to a different theme and/or diff-background mode (reuses the syntax
+    /// set). Returns a warning if the slug was unknown.
+    pub fn set_theme(&mut self, slug: &str, diff_bg: DiffBg) -> Option<String> {
         let (theme, warning) = load_theme(slug);
         self.theme = theme;
-        self.palette = DiffPalette::from_theme(&self.theme);
+        self.palette = DiffPalette::from_theme(&self.theme, diff_bg);
         warning
     }
 
@@ -319,7 +389,7 @@ mod tests {
 
     #[test]
     fn tokenizes_rust_into_multiple_spans() {
-        let (hl, warn) = Highlighter::new("catppuccin-mocha");
+        let (hl, warn) = Highlighter::new("catppuccin-mocha", DiffBg::Fixed { added: None, deleted: None });
         assert!(warn.is_none());
         let mut state = hl.new_file_state("x.rs");
         let spans = hl.tokenize_line(&mut state, "fn main() {}");
@@ -331,7 +401,7 @@ mod tests {
 
     #[test]
     fn unknown_extension_falls_back_to_plain_text() {
-        let (hl, _) = Highlighter::new("catppuccin-mocha");
+        let (hl, _) = Highlighter::new("catppuccin-mocha", DiffBg::Fixed { added: None, deleted: None });
         let mut state = hl.new_file_state("file.unknownext");
         let spans = hl.tokenize_line(&mut state, "just some text");
         let joined: String = spans.iter().map(|(_, t)| t.as_str()).collect();
@@ -379,7 +449,7 @@ mod tests {
 
     #[test]
     fn unknown_slug_warns_and_falls_back() {
-        let (hl, warn) = Highlighter::new("no-such-theme");
+        let (hl, warn) = Highlighter::new("no-such-theme", DiffBg::Fixed { added: None, deleted: None });
         assert!(warn.is_some());
         // Falls back to the (dark) default, so a palette is still derived.
         assert!(luminance(hl.palette().background) < 0.5);
@@ -389,7 +459,7 @@ mod tests {
     fn mocha_palette_is_dark_with_distinct_diff_colors() {
         let set = two_face::theme::extra();
         let theme = &set[EmbeddedThemeName::CatppuccinMocha];
-        let p = DiffPalette::from_theme(theme);
+        let p = DiffPalette::from_theme(theme, DiffBg::Fixed { added: None, deleted: None });
         // Catppuccin Mocha is a dark theme.
         assert!(luminance(p.background) < 0.5, "background should be dark");
         // It defines diff scopes, so added/deleted must differ from plain text.
@@ -399,5 +469,42 @@ mod tests {
             "deleted should come from a diff scope"
         );
         assert_ne!(p.added, p.deleted, "added and deleted should differ");
+    }
+
+    #[test]
+    fn diff_bg_mode_controls_row_background() {
+        let set = two_face::theme::extra();
+        let theme = &set[EmbeddedThemeName::CatppuccinMocha];
+        let fixed = DiffPalette::from_theme(theme, DiffBg::Fixed { added: None, deleted: None });
+        let derived = DiffPalette::from_theme(theme, DiffBg::Theme);
+        // Fixed mode (no explicit colors) uses gitkay's dark-green default;
+        // theme mode pulls a different background from the theme.
+        assert_eq!(fixed.added_bg, egui::Color32::from_rgb(10, 48, 10));
+        assert_ne!(derived.added_bg, fixed.added_bg);
+    }
+
+    #[test]
+    fn explicit_fixed_colors_win() {
+        let set = two_face::theme::extra();
+        let theme = &set[EmbeddedThemeName::CatppuccinMocha];
+        let custom = egui::Color32::from_rgb(1, 2, 3);
+        let p = DiffPalette::from_theme(
+            theme,
+            DiffBg::Fixed {
+                added: Some(custom),
+                deleted: None,
+            },
+        );
+        assert_eq!(p.added_bg, custom);
+        // deleted falls back to the built-in dark default.
+        assert_eq!(p.deleted_bg, egui::Color32::from_rgb(64, 12, 14));
+    }
+
+    #[test]
+    fn parse_hex_roundtrips() {
+        assert_eq!(parse_hex("#0a300a"), Some(egui::Color32::from_rgb(10, 48, 10)));
+        assert_eq!(parse_hex("400c0e"), Some(egui::Color32::from_rgb(64, 12, 14)));
+        assert_eq!(parse_hex("#xyz"), None);
+        assert_eq!(parse_hex("#12345"), None);
     }
 }

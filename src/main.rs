@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 mod config;
 mod highlight;
 use config::{Fonts, Role};
-use highlight::Highlighter;
+use highlight::{DiffBg, Highlighter};
 
 // ── Commit data ──────────────────────────────────────────────────────────
 
@@ -561,6 +561,32 @@ fn highlight_diff(lines: &mut [DiffLine], files: &[FileEntry], hl: &Highlighter)
     }
 }
 
+/// Resolve the `[syntax]` diff-background config into a `DiffBg`, warning on a
+/// bad mode or unparseable hex (and falling back to defaults).
+fn resolve_diff_bg(s: &config::SyntaxSection) -> DiffBg {
+    let mode = s.diff_background.as_deref().unwrap_or("fixed");
+    if mode == "theme" {
+        return DiffBg::Theme;
+    }
+    if mode != "fixed" {
+        eprintln!("gitkay: unknown syntax.diff_background {mode:?}; using \"fixed\"");
+    }
+    DiffBg::Fixed {
+        added: parse_bg_hex("added_background", s.added_background.as_deref()),
+        deleted: parse_bg_hex("deleted_background", s.deleted_background.as_deref()),
+    }
+}
+
+/// Parse an optional `"#rrggbb"` background color, warning if it is set but invalid.
+fn parse_bg_hex(label: &str, v: Option<&str>) -> Option<egui::Color32> {
+    let h = v?;
+    let c = highlight::parse_hex(h);
+    if c.is_none() {
+        eprintln!("gitkay: invalid syntax.{label} color {h:?}; using default");
+    }
+    c
+}
+
 /// Build the LayoutJob for one diff row plus its optional background tint.
 /// Code lines get a synthesized +/-/space gutter (drawn from `kind`, so context
 /// and changed lines share one column) then their token spans; structural lines
@@ -879,6 +905,7 @@ const GREEN: egui::Color32 = egui::Color32::from_rgb(166, 227, 161);
 const RED: egui::Color32 = egui::Color32::from_rgb(243, 139, 168);
 const BLUE: egui::Color32 = egui::Color32::from_rgb(137, 180, 250);
 const YELLOW: egui::Color32 = egui::Color32::from_rgb(249, 226, 175);
+const MAUVE: egui::Color32 = egui::Color32::from_rgb(203, 166, 247);
 
 // ── App state ────────────────────────────────────────────────────────────
 
@@ -909,8 +936,10 @@ struct GitkApp {
     needs_config_reload: Arc<AtomicBool>, // set by the config-file watcher
     _config_watcher: Option<RecommendedWatcher>, // watches the config's parent dir so atomic-rename saves are caught
     config_error_toast: Option<std::time::Instant>, // transient parse-error notice
-    highlighter: Option<Highlighter>,            // built lazily on the first diff
+    highlighter: Option<Highlighter>,            // built lazily on the first diff (when syntax on)
+    syntax_enabled: bool,                        // false ⇒ original flat per-line coloring
     theme_slug: String,                          // configured syntax theme slug
+    diff_bg: DiffBg,                             // add/del row background mode + colors
     diff_needs_highlight: bool,                  // diff_lines changed; re-run highlight_diff
 }
 
@@ -984,11 +1013,13 @@ impl GitkApp {
                 }
             })
             .unwrap_or_default();
+        let syntax_enabled = cfg.syntax.enabled.unwrap_or(true);
         let theme_slug = cfg
             .syntax
             .theme
             .clone()
             .unwrap_or_else(|| highlight::DEFAULT_THEME_SLUG.to_string());
+        let diff_bg = resolve_diff_bg(&cfg.syntax);
         let (font_defs, fonts, font_warnings) = config::build_fonts(&cfg);
         if !font_warnings.is_empty() {
             startup_issue = true;
@@ -1132,7 +1163,9 @@ impl GitkApp {
             _config_watcher: config_watcher,
             config_error_toast: startup_issue.then(std::time::Instant::now),
             highlighter: None,
+            syntax_enabled,
             theme_slug,
+            diff_bg,
             diff_needs_highlight: true, // highlight the startup diff on first frame
         }
     }
@@ -1199,8 +1232,14 @@ impl GitkApp {
         if !self.diff_needs_highlight {
             return;
         }
+        // Syntax off ⇒ the original flat render path is used; never build the
+        // highlighter or tokenize (keeps the disabled mode cost-free).
+        if !self.syntax_enabled {
+            self.diff_needs_highlight = false;
+            return;
+        }
         if self.highlighter.is_none() {
-            let (hl, warning) = Highlighter::new(&self.theme_slug);
+            let (hl, warning) = Highlighter::new(&self.theme_slug, self.diff_bg);
             if let Some(w) = warning {
                 eprintln!("gitkay: {w}");
                 self.config_error_toast = Some(std::time::Instant::now());
@@ -1279,19 +1318,27 @@ impl eframe::App for GitkApp {
                     let (defs, fonts, warns) = config::build_fonts(&cfg);
                     ctx.set_fonts(defs);
                     self.fonts = fonts;
+                    let new_enabled = cfg.syntax.enabled.unwrap_or(true);
                     let new_slug = cfg
                         .syntax
                         .theme
                         .clone()
                         .unwrap_or_else(|| highlight::DEFAULT_THEME_SLUG.to_string());
-                    if new_slug != self.theme_slug {
+                    let new_diff_bg = resolve_diff_bg(&cfg.syntax);
+                    if new_enabled != self.syntax_enabled
+                        || new_slug != self.theme_slug
+                        || new_diff_bg != self.diff_bg
+                    {
+                        self.syntax_enabled = new_enabled;
                         self.theme_slug = new_slug;
+                        self.diff_bg = new_diff_bg;
                         if let Some(hl) = &mut self.highlighter
-                            && let Some(w) = hl.set_theme(&self.theme_slug)
+                            && let Some(w) = hl.set_theme(&self.theme_slug, self.diff_bg)
                         {
                             eprintln!("gitkay: {w}");
                         }
-                        // Re-derive spans for the visible diff under the new theme.
+                        // Re-highlight the visible diff under the new settings
+                        // (a no-op when syntax is now disabled).
                         self.diff_needs_highlight = true;
                     }
                     if warns.is_empty() {
@@ -1642,35 +1689,38 @@ impl eframe::App for GitkApp {
                 // the diff scrollbar from crowding the file-list resize bar — only
                 // when that sidebar is actually shown.
                 let diff_right_pad = if self.diff_files.is_empty() { 0 } else { 10 };
-                // The diff pane adopts the active theme's colors; fall back to
-                // Catppuccin chrome if the highlighter isn't built yet.
-                let palette = self
-                    .highlighter
-                    .as_ref()
-                    .map(|h| h.palette().clone())
-                    .unwrap_or(highlight::DiffPalette {
-                        background: BG,
-                        foreground: TEXT,
-                        added: GREEN,
-                        deleted: RED,
-                        hunk: BLUE,
-                        file_header: YELLOW,
-                        dim: SUBTEXT,
-                        marker: SUBTEXT,
-                        added_bg: egui::Color32::from_rgb(10, 48, 10),
-                        deleted_bg: egui::Color32::from_rgb(64, 12, 14),
-                    });
+                // With syntax on, the diff pane adopts the active theme's colors
+                // (falling back to Catppuccin chrome until the highlighter is
+                // built). With syntax off, `palette` is None and we render the
+                // original flat per-line coloring.
+                let palette = self.syntax_enabled.then(|| {
+                    self.highlighter
+                        .as_ref()
+                        .map(|h| h.palette().clone())
+                        .unwrap_or(highlight::DiffPalette {
+                            background: BG,
+                            foreground: TEXT,
+                            added: GREEN,
+                            deleted: RED,
+                            hunk: BLUE,
+                            file_header: YELLOW,
+                            dim: SUBTEXT,
+                            marker: SUBTEXT,
+                            added_bg: egui::Color32::from_rgb(10, 48, 10),
+                            deleted_bg: egui::Color32::from_rgb(64, 12, 14),
+                        })
+                });
+                let mut frame = egui::Frame::NONE.inner_margin(egui::Margin {
+                    left: 0,
+                    right: diff_right_pad,
+                    top: 0,
+                    bottom: 0,
+                });
+                if let Some(p) = &palette {
+                    frame = frame.fill(p.background);
+                }
                 egui::CentralPanel::default()
-                    .frame(
-                        egui::Frame::NONE
-                            .fill(palette.background)
-                            .inner_margin(egui::Margin {
-                                left: 0,
-                                right: diff_right_pad,
-                                top: 0,
-                                bottom: 0,
-                            }),
-                    )
+                    .frame(frame)
                     .show_inside(ui, |ui| {
                         ui.style_mut().override_font_id = Some(self.fonts.font_id(Role::Diff));
                         let scroll = egui::ScrollArea::both()
@@ -1679,25 +1729,45 @@ impl eframe::App for GitkApp {
                             .animated(false);
                         let scroll_target = self.diff_scroll_to.take();
                         scroll.show(ui, |ui| {
-                            // Rows are flush — no inter-row gap, so add/del tints
-                            // form a continuous band instead of leaving dark
-                            // strips of the theme background between lines.
-                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                            let font_id = self.fonts.font_id(Role::Diff);
-                            for (i, line) in self.diff_lines.iter().enumerate() {
-                                let (job, row_tint) = diff_row_job(line, &palette, font_id.clone());
-                                let galley = ui.fonts(|f| f.layout_job(job));
-                                let width = ui.available_width().max(galley.size().x);
-                                let (rect, _resp) = ui.allocate_exact_size(
-                                    egui::vec2(width, galley.size().y),
-                                    egui::Sense::hover(),
-                                );
-                                if let Some(t) = row_tint {
-                                    ui.painter().rect_filled(rect, 0.0, t);
+                            if let Some(palette) = &palette {
+                                // Themed render: flush rows so add/del bands are
+                                // continuous, token colors, +/- gutter.
+                                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                                let font_id = self.fonts.font_id(Role::Diff);
+                                for (i, line) in self.diff_lines.iter().enumerate() {
+                                    let (job, row_bg) =
+                                        diff_row_job(line, palette, font_id.clone());
+                                    let galley = ui.fonts(|f| f.layout_job(job));
+                                    let width = ui.available_width().max(galley.size().x);
+                                    let (rect, _resp) = ui.allocate_exact_size(
+                                        egui::vec2(width, galley.size().y),
+                                        egui::Sense::hover(),
+                                    );
+                                    if let Some(bg) = row_bg {
+                                        ui.painter().rect_filled(rect, 0.0, bg);
+                                    }
+                                    ui.painter().galley(rect.min, galley, palette.foreground);
+                                    if scroll_target == Some(i) {
+                                        ui.scroll_to_rect(rect, Some(egui::Align::TOP));
+                                    }
                                 }
-                                ui.painter().galley(rect.min, galley, palette.foreground);
-                                if scroll_target == Some(i) {
-                                    ui.scroll_to_rect(rect, Some(egui::Align::TOP));
+                            } else {
+                                // Original flat per-line coloring (syntax off).
+                                for (i, line) in self.diff_lines.iter().enumerate() {
+                                    let color = match line.kind {
+                                        LineKind::Add => GREEN,
+                                        LineKind::Del => RED,
+                                        LineKind::Hunk => BLUE,
+                                        LineKind::Meta => MAUVE,
+                                        LineKind::FileMeta => MAUVE,
+                                        LineKind::FileName => YELLOW,
+                                        LineKind::Stat => SUBTEXT,
+                                        LineKind::Context => TEXT,
+                                    };
+                                    let resp = ui.colored_label(color, &line.text);
+                                    if scroll_target == Some(i) {
+                                        ui.scroll_to_rect(resp.rect, Some(egui::Align::TOP));
+                                    }
                                 }
                             }
                         });
@@ -2686,7 +2756,7 @@ mod tests {
 
     #[test]
     fn highlight_diff_colors_code_and_skips_structure() {
-        let (hl, _) = Highlighter::new("catppuccin-mocha");
+        let (hl, _) = Highlighter::new("catppuccin-mocha", DiffBg::Fixed { added: None, deleted: None });
         let mut lines = vec![
             DiffLine::new("commit abc123", LineKind::Meta),
             DiffLine::new("diff --git a/x.rs b/x.rs", LineKind::FileMeta),
@@ -2725,7 +2795,7 @@ mod tests {
         // A binary/no-patch FileEntry has diff_line_idx == 0 (never set by the
         // diff printer). It must NOT cause the commit header at index 0 to be
         // tokenized as code.
-        let (hl, _) = Highlighter::new("catppuccin-mocha");
+        let (hl, _) = Highlighter::new("catppuccin-mocha", DiffBg::Fixed { added: None, deleted: None });
         let mut lines = vec![
             DiffLine::new("commit abc123", LineKind::Context), // index 0 — header
             DiffLine::new("+fn foo() {}", LineKind::Add),      // index 1 — real file patch
