@@ -849,6 +849,9 @@ struct GitkApp {
     needs_config_reload: Arc<AtomicBool>, // set by the config-file watcher
     _config_watcher: Option<RecommendedWatcher>, // watches the config's parent dir so atomic-rename saves are caught
     config_error_toast: Option<std::time::Instant>, // transient parse-error notice
+    highlighter: Option<Highlighter>,            // built lazily on the first diff
+    theme_slug: String,                          // configured syntax theme slug
+    diff_needs_highlight: bool,                  // diff_lines changed; re-run highlight_diff
 }
 
 /// Build a notify watcher whose callback sets `flag` and requests a repaint for
@@ -921,6 +924,11 @@ impl GitkApp {
                 }
             })
             .unwrap_or_default();
+        let theme_slug = cfg
+            .syntax
+            .theme
+            .clone()
+            .unwrap_or_else(|| highlight::DEFAULT_THEME_SLUG.to_string());
         let (font_defs, fonts, font_warnings) = config::build_fonts(&cfg);
         if !font_warnings.is_empty() {
             startup_issue = true;
@@ -1063,6 +1071,9 @@ impl GitkApp {
             needs_config_reload,
             _config_watcher: config_watcher,
             config_error_toast: startup_issue.then(std::time::Instant::now),
+            highlighter: None,
+            theme_slug,
+            diff_needs_highlight: true, // highlight the startup diff on first frame
         }
     }
 
@@ -1118,6 +1129,28 @@ impl GitkApp {
             self.diff_lines.clear();
             self.diff_files.clear();
         }
+        self.diff_needs_highlight = true;
+    }
+
+    /// Build the highlighter on first use and (re)highlight the current diff if
+    /// it changed. Cheap to call every frame: it's a no-op once `diff_needs_highlight`
+    /// is cleared.
+    fn ensure_diff_highlighted(&mut self) {
+        if !self.diff_needs_highlight {
+            return;
+        }
+        if self.highlighter.is_none() {
+            let (hl, warning) = Highlighter::new(&self.theme_slug);
+            if let Some(w) = warning {
+                eprintln!("gitkay: {w}");
+                self.config_error_toast = Some(std::time::Instant::now());
+            }
+            self.highlighter = Some(hl);
+        }
+        if let Some(hl) = &self.highlighter {
+            highlight_diff(&mut self.diff_lines, &self.diff_files, hl);
+        }
+        self.diff_needs_highlight = false;
     }
 
     fn reload_commits(&mut self, repo: &Repository, preferred_oid: Option<git2::Oid>) {
@@ -1198,6 +1231,8 @@ impl eframe::App for GitkApp {
                 }
             }
         }
+
+        self.ensure_diff_highlighted();
 
         let row_height = 20.0;
         let col_width = 12.0;
