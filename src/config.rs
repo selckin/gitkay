@@ -79,7 +79,6 @@ pub struct SyntaxSection {
     /// Theme slug (see the `[syntax]` section in `default_template()` for valid slugs).
     /// None ⇒ default theme.
     // consumed by a later task
-    #[allow(dead_code)]
     pub(crate) theme: Option<String>,
 }
 
@@ -90,7 +89,6 @@ pub struct Config {
     pub(crate) sizes: SizesSection,
     pub(crate) families: FamiliesSection,
     // consumed by a later task
-    #[allow(dead_code)]
     pub(crate) syntax: SyntaxSection,
 }
 

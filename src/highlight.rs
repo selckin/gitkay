@@ -10,16 +10,12 @@ use syntect::highlighting::{Color as SynColor, Highlighter as SynHighlighter, Th
 use syntect::parsing::{Scope, SyntaxSet};
 
 /// Default syntax theme when none is configured or the configured slug is unknown.
-// Consumed by later tasks (Highlighter config); allow until then.
-#[allow(dead_code)]
 pub const DEFAULT_THEME_SLUG: &str = "catppuccin-mocha";
 
 /// Clean kebab-case slug → two-face theme. This is the full selectable set
 /// (light and dark); it doubles as the validation list and the documented set
 /// in the config template. The special-purpose `Ansi` / `Base16` / `Base16-256`
 /// templates are intentionally omitted — they don't produce meaningful code colors.
-// Consumed by later tasks (Highlighter config); allow until then.
-#[allow(dead_code)]
 const THEMES: &[(&str, EmbeddedThemeName)] = &[
     ("catppuccin-mocha", EmbeddedThemeName::CatppuccinMocha),
     (
@@ -68,29 +64,21 @@ const THEMES: &[(&str, EmbeddedThemeName)] = &[
 ];
 
 /// Resolve a config slug to a two-face theme, or `None` if unknown.
-// Consumed by later tasks (Highlighter config); allow until then.
-#[allow(dead_code)]
 pub fn theme_for_slug(slug: &str) -> Option<EmbeddedThemeName> {
     THEMES.iter().find(|(s, _)| *s == slug).map(|(_, t)| *t)
 }
 
 /// A run of text sharing one foreground color, ready to append to a LayoutJob.
-// Consumed by later tasks (highlight_diff, render); allow until then.
-#[allow(dead_code)]
 pub type Span = (egui::Color32, String);
 
 /// Convert a syntect color to an opaque egui color (alpha is added separately
 /// for row tints).
-// Consumed by later tasks (highlight_diff, render); allow until then.
-#[allow(dead_code)]
 pub fn syn_to_egui(c: SynColor) -> egui::Color32 {
     egui::Color32::from_rgb(c.r, c.g, c.b)
 }
 
 /// Colors the diff pane draws with, all derived from the active theme where
 /// possible. App chrome does not use this — only the diff content pane does.
-// Consumed by later tasks (diff render); allow until then.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct DiffPalette {
     pub background: egui::Color32,
@@ -110,14 +98,10 @@ pub struct DiffPalette {
 }
 
 /// Relative luminance (0..1) of an opaque color.
-// Consumed by later tasks (diff render); allow until then.
-#[allow(dead_code)]
 pub fn luminance(c: egui::Color32) -> f32 {
     (0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32) / 255.0
 }
 
-// Consumed by later tasks (diff render); allow until then.
-#[allow(dead_code)]
 fn blend(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
     let m = |x: u8, y: u8| (x as f32 * (1.0 - t) + y as f32 * t).round() as u8;
     egui::Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
@@ -125,8 +109,6 @@ fn blend(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
 
 /// First scope the theme actually defines (color differs from the default
 /// foreground), else None.
-// Consumed by later tasks (diff render); allow until then.
-#[allow(dead_code)]
 fn scope_color(
     hl: &SynHighlighter,
     default_fg: SynColor,
@@ -144,8 +126,6 @@ fn scope_color(
 }
 
 impl DiffPalette {
-    // Consumed by later tasks (diff render); allow until then.
-    #[allow(dead_code)]
     pub fn from_theme(theme: &Theme) -> DiffPalette {
         let hl = SynHighlighter::new(theme);
         let default = hl.get_default();
@@ -221,8 +201,6 @@ impl DiffPalette {
 }
 
 /// Owns the highlighting assets + active theme. Built lazily on the first diff.
-// Consumed by later tasks (diff render); allow until then.
-#[allow(dead_code)]
 pub struct Highlighter {
     syntaxes: SyntaxSet,
     theme: Theme,
@@ -245,8 +223,6 @@ fn load_theme(slug: &str) -> (Theme, Option<String>) {
 impl Highlighter {
     /// Build the highlighter for `slug`. Deserializes the bundled syntax set
     /// (multi-MB) once — call this lazily, not at startup.
-    // Consumed by later tasks (diff render); allow until then.
-    #[allow(dead_code)]
     pub fn new(slug: &str) -> (Highlighter, Option<String>) {
         let syntaxes = two_face::syntax::extra_newlines();
         let (theme, warning) = load_theme(slug);
@@ -263,8 +239,6 @@ impl Highlighter {
 
     /// Swap to a different theme (reuses the syntax set). Returns a warning if
     /// the slug was unknown.
-    // Consumed by later tasks (diff render); allow until then.
-    #[allow(dead_code)]
     pub fn set_theme(&mut self, slug: &str) -> Option<String> {
         let (theme, warning) = load_theme(slug);
         self.theme = theme;
@@ -272,16 +246,12 @@ impl Highlighter {
         warning
     }
 
-    // Consumed by later tasks (diff render); allow until then.
-    #[allow(dead_code)]
     pub fn palette(&self) -> &DiffPalette {
         &self.palette
     }
 
     /// Fresh per-file highlight state, language chosen by the path's extension
     /// (falling back to plain text).
-    // Consumed by later tasks (diff render); allow until then.
-    #[allow(dead_code)]
     pub fn new_file_state(&self, path: &str) -> HighlightLines<'_> {
         let syntax = std::path::Path::new(path)
             .extension()
@@ -293,8 +263,6 @@ impl Highlighter {
 
     /// Tokenize one line of code (without its diff marker) into colored spans.
     /// `state` carries multi-line parser state within the current file.
-    // Consumed by later tasks (diff render); allow until then.
-    #[allow(dead_code)]
     pub fn tokenize_line(&self, state: &mut HighlightLines, code: &str) -> Vec<Span> {
         let line = format!("{code}\n");
         match state.highlight_line(&line, &self.syntaxes) {
