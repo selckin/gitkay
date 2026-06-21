@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 mod config;
 mod highlight;
 use config::{Fonts, Role};
+use highlight::Highlighter;
 
 // ── Commit data ──────────────────────────────────────────────────────────
 
@@ -180,6 +181,8 @@ fn build_ref_map(
 struct DiffLine {
     text: String,
     kind: LineKind,
+    #[allow(dead_code)] // consumed by later task (render)
+    spans: Vec<highlight::Span>, // empty ⇒ render flat by `kind`
 }
 
 impl DiffLine {
@@ -187,6 +190,7 @@ impl DiffLine {
         Self {
             text: text.to_string(),
             kind,
+            spans: Vec::new(),
         }
     }
 }
@@ -523,6 +527,40 @@ fn diff_to_data(diff: &git2::Diff, title: &str) -> DiffData {
     .ok();
 
     DiffData { lines, files }
+}
+
+/// Attach syntax-highlighted spans to each code line. File boundaries and
+/// languages come from the structured `files` list (clean paths), not the
+/// `--- /+++` display lines. Non-code lines are left with empty `spans`.
+#[allow(dead_code)] // consumed by later task (render)
+fn highlight_diff(lines: &mut [DiffLine], files: &[FileEntry], hl: &Highlighter) {
+    let mut ordered: Vec<&FileEntry> = files.iter().collect();
+    ordered.sort_by_key(|f| f.diff_line_idx);
+
+    for (i, file) in ordered.iter().enumerate() {
+        // diff_line_idx 0 == no patch region (header precedes every real file); skip.
+        if file.diff_line_idx == 0 {
+            continue;
+        }
+        let start = file.diff_line_idx;
+        let end = ordered.get(i + 1).map_or(lines.len(), |f| f.diff_line_idx);
+        if start >= lines.len() {
+            continue;
+        }
+        let len = lines.len();
+        let mut state = hl.new_file_state(&file.path);
+        for line in &mut lines[start..end.min(len)] {
+            // Marker stripping is kind-driven: content excludes git's origin
+            // char, so context lines have NO leading space — only Add/Del carry
+            // a +/- prefix to strip.
+            let code = match line.kind {
+                LineKind::Add | LineKind::Del => &line.text[1..],
+                LineKind::Context => line.text.as_str(),
+                _ => continue, // structural line: leave spans empty
+            };
+            line.spans = hl.tokenize_line(&mut state, code);
+        }
+    }
 }
 
 /// Compute the set of commit indices to emphasize for `start_idx`.
@@ -2507,5 +2545,78 @@ mod tests {
         assert_linear(&rows, &commits, 2, 4);
         assert_linear(&rows, &commits, 4, 6);
         assert_colors_consistent(&rows);
+    }
+
+    #[test]
+    fn highlight_diff_colors_code_and_skips_structure() {
+        let (hl, _) = Highlighter::new("catppuccin-mocha");
+        let mut lines = vec![
+            DiffLine::new("commit abc123", LineKind::Meta),
+            DiffLine::new("diff --git a/x.rs b/x.rs", LineKind::FileMeta),
+            DiffLine::new("@@ -1 +1 @@", LineKind::Hunk),
+            DiffLine::new("+fn main() {}", LineKind::Add),
+            DiffLine::new("let x = 1;", LineKind::Context),
+        ];
+        let files = vec![FileEntry {
+            path: "x.rs".to_string(),
+            additions: 1,
+            deletions: 0,
+            diff_line_idx: 1, // file's diff starts at the "diff --git" line
+        }];
+
+        highlight_diff(&mut lines, &files, &hl);
+
+        assert!(
+            lines[0].spans.is_empty(),
+            "meta header is outside any file range"
+        );
+        assert!(lines[1].spans.is_empty(), "file-meta line is not code");
+        assert!(lines[2].spans.is_empty(), "hunk header is not code");
+        assert!(lines[3].spans.len() >= 2, "added code line should tokenize");
+        assert!(
+            !lines[4].spans.is_empty(),
+            "context code line should tokenize"
+        );
+
+        // The Add line's marker must be stripped before tokenizing.
+        let added: String = lines[3].spans.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(added, "fn main() {}");
+    }
+
+    #[test]
+    fn highlight_diff_skips_no_patch_file_at_index_zero() {
+        // A binary/no-patch FileEntry has diff_line_idx == 0 (never set by the
+        // diff printer). It must NOT cause the commit header at index 0 to be
+        // tokenized as code.
+        let (hl, _) = Highlighter::new("catppuccin-mocha");
+        let mut lines = vec![
+            DiffLine::new("commit abc123", LineKind::Context), // index 0 — header
+            DiffLine::new("+fn foo() {}", LineKind::Add),      // index 1 — real file patch
+        ];
+        let files = vec![
+            FileEntry {
+                path: "bin.dat".to_string(),
+                additions: 0,
+                deletions: 0,
+                diff_line_idx: 0, // no-patch file — sentinel value
+            },
+            FileEntry {
+                path: "foo.rs".to_string(),
+                additions: 1,
+                deletions: 0,
+                diff_line_idx: 1, // real file starts here
+            },
+        ];
+
+        highlight_diff(&mut lines, &files, &hl);
+
+        assert!(
+            lines[0].spans.is_empty(),
+            "header at index 0 must not be tokenized by the no-patch file"
+        );
+        assert!(
+            !lines[1].spans.is_empty(),
+            "real file's code line must still be tokenized"
+        );
     }
 }
