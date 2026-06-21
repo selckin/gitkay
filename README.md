@@ -45,7 +45,8 @@
 - Virtual scrolling with lazy loading — handles repos with thousands of commits
 
 ### Diff Viewer
-- Syntax-highlighted diffs: additions in green, deletions in red, hunk headers in blue, file headers in yellow
+- True syntax-highlighted diffs (syntect): language-aware token colors over the chosen theme's background, with green/red row tints and a +/- gutter for additions/deletions
+- Selectable color theme via `[syntax] theme` in the config (any of 29 bundled themes — a curated allowlist; default Catppuccin Mocha), applied live on save; or turn highlighting off for the original flat per-line coloring
 - File list sidebar with per-file `+/-` stats
 - Click a file to jump to its diff section
 - Commit header with author, date, full message
@@ -144,10 +145,12 @@ gitkay /path/to/repo
 
 ## Architecture
 
-Rust app (~2100 lines in `src/main.rs`, plus `src/config.rs` for font config) with 44 unit tests:
+Rust app (~2900 lines in `src/main.rs`, plus `src/config.rs` for fonts + syntax
+config and `src/highlight.rs` for syntect highlighting) with 66 unit tests:
 
 - **egui** + **eframe** — native Wayland window with wgpu rendering
 - **git2** (libgit2) — repository access, revwalk, diff
+- **syntect** + **two-face** — language-aware diff syntax highlighting (pure-Rust fancy-regex backend, no C deps)
 - **chrono** — date formatting
 - **arboard** — clipboard (both clipboard and primary selection)
 
@@ -155,12 +158,23 @@ The graph layout uses a pipe-based algorithm where each lane tracks an OID and a
 
 ## Configuration
 
-gitkay runs with no configuration. To customise fonts, edit
+gitkay runs with no configuration. To customise it, edit
 `~/.config/gitkay/config.toml` — a fully-commented template with every default is
-written on first run. You can set a monospace and a proportional font family (by
-installed name, resolved from installed system fonts, or by explicit file path) and a size
-plus family for each text role: `diff`, `commit_summary`, `commit_meta`, `refs`,
-`file_list`, and `ui`. Changes apply live on save; no restart needed.
+written on first run. Changes apply live on save; no restart needed.
+
+**Fonts** (`[fonts]`, `[sizes]`, `[families]`): set a monospace and a proportional
+font family (by installed name, resolved from installed system fonts, or by explicit
+file path) and a size plus family for each text role: `diff`, `commit_summary`,
+`commit_meta`, `refs`, `file_list`, and `ui`.
+
+**Diff syntax highlighting** (`[syntax]`):
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `enabled` | `true` | `false` restores the original flat per-line coloring (no theme, no highlighter) |
+| `theme` | `"catppuccin-mocha"` | one of 29 bundled themes (e.g. `dracula`, `nord`, `gruvbox-dark`, `github`, `solarized-light`); unknown values warn and fall back |
+| `diff_background` | `"fixed"` | `"fixed"` uses the band colors below; `"theme"` derives add/remove backgrounds from the active theme |
+| `added_background` / `deleted_background` | built-in dark/light | explicit `"#rrggbb"` band colors for `"fixed"` mode |
 
 ## License
 
