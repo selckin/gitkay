@@ -342,6 +342,20 @@ impl Highlighter {
         HighlightLines::new(syntax, &self.theme)
     }
 
+    /// Force-compile the main-context regexes for the syntax matching `ext` by
+    /// tokenizing a couple of short dummy lines (an unknown extension warms plain
+    /// text — a cheap no-op). The compiled regexes are cached in the shared
+    /// `SyntaxSet`, so this populates the cache the real highlight worker reads.
+    /// Used by the startup prewarm to keep the first per-language compile off the
+    /// hot path.
+    #[allow(dead_code)]
+    pub fn warm_extension(&self, ext: &str) {
+        let mut state = self.new_file_state(&format!("warm.{ext}"));
+        for line in ["let x = 1; // s", "\"text\""] {
+            self.tokenize_line(&mut state, line);
+        }
+    }
+
     /// Tokenize one line of code (without its diff marker) into colored spans.
     /// `state` carries multi-line parser state within the current file.
     pub fn tokenize_line(&self, state: &mut HighlightLines, code: &str) -> Vec<Span> {
@@ -597,6 +611,19 @@ mod tests {
         );
         assert_eq!(parse_hex("#xyz"), None);
         assert_eq!(parse_hex("#12345"), None);
+    }
+
+    #[test]
+    fn warm_extension_compiles_and_still_tokenizes() {
+        let (hl, _) = Highlighter::new(
+            "catppuccin-mocha",
+            DiffBg::Fixed { added: None, deleted: None },
+        );
+        hl.warm_extension("rs"); // must not panic
+        // After warming, tokenizing Rust still works (keywords → multiple spans).
+        let mut state = hl.new_file_state("after.rs");
+        let spans = hl.tokenize_line(&mut state, "fn main() {}");
+        assert!(spans.len() >= 2, "rust line should tokenize into multiple spans");
     }
 
     #[test]
