@@ -76,6 +76,10 @@ const MAX_WARM_LANGS: usize = 12;
 /// pathologically deep trees (real repos nest far shallower). Deeper subtrees are
 /// skipped — the entry cap already bounds total work.
 const MAX_TREE_DEPTH: usize = 64;
+/// Prefetch: commits below the current selection to warm into the cache.
+const PREFETCH_BELOW: usize = 4;
+/// Prefetch: commits above the current selection to warm (closest-first).
+const PREFETCH_ABOVE: usize = 2;
 
 /// Everything a cached diff's content + spans depend on. `diff_bg` is excluded
 /// (it's a render-time tint, not baked into spans).
@@ -98,7 +102,6 @@ fn is_real_commit(oid: git2::Oid) -> bool {
 /// below (indices `selected+1 ..`), then up to `above` commits above
 /// (closest-first: `selected-1`, `selected-2`, …). Clamped to the slice bounds;
 /// virtual (uncommitted/staged) entries are excluded. Pure — fed the commit oids.
-#[allow(dead_code)] // wired into dispatch_prefetch in the prefetch wiring task
 fn prefetch_targets(
     oids: &[git2::Oid],
     selected: usize,
@@ -754,6 +757,17 @@ fn file_fully_highlighted(lines: &[DiffLine], start: usize, end: usize) -> bool 
         .all(|l| !l.kind.is_code() || l.spans.is_some())
 }
 
+/// True when the foreground worker has finished colouring the whole diff: every
+/// code line *inside a file range* is highlighted. Only file ranges are checked —
+/// the diff header has blank `Context` lines (which count as code) that live
+/// outside any file range and are never tokenized, so checking the whole
+/// `[0, len)` range would never be satisfied.
+fn diff_fully_highlighted(lines: &[DiffLine], files: &[FileEntry]) -> bool {
+    file_line_ranges(files, lines.len())
+        .iter()
+        .all(|&(_, start, end)| file_fully_highlighted(lines, start, end))
+}
+
 /// File ranges `(file_index, start, end)` that still need highlighting: every
 /// file with at least one not-yet-highlighted (`None`) code line, in file order.
 /// Fully-highlighted files (and structural-only files) are dropped so a cached
@@ -895,6 +909,11 @@ fn highlight_worker(job: HighlightJob) {
         "perf: worker gen {generation} done {:?} ({total_lines} lines)",
         started.elapsed()
     );
+    // Wake the UI once more now that the diff is fully coloured: the per-batch
+    // repaints stop when the last batch is sent, so without this the passive
+    // prefetch trigger (which polls `file_fully_highlighted` in `update`) may
+    // never get a frame to fire on once the app goes idle.
+    ctx.request_repaint();
 }
 
 /// Collect blob (file) names from `tree`, recursing into subtrees, until `out`
@@ -999,7 +1018,6 @@ fn prewarm_highlighter(
 /// fully highlight it, sending the finished `(key, DiffData)` back for the UI to
 /// cache. Bails as soon as a newer dispatch supersedes it (`epoch`). Pure
 /// optimization — any failure just warms fewer neighbours.
-#[allow(dead_code)] // spawned by dispatch_prefetch in the prefetch wiring task
 fn prefetch_worker(
     repo_path: String,
     keys: Vec<DiffCacheKey>,
@@ -1028,12 +1046,16 @@ fn prefetch_worker(
             context: key.context,
             ignore_ws: key.ignore_ws,
         };
+        let t = std::time::Instant::now();
+        log::debug!("prefetch: start {}", key.oid);
         let mut data = get_diff_data(&repo, key.oid, settings);
         highlight_diff(&mut data.lines, &data.files, &hl);
-        log::debug!("prefetch: cached {} ({} lines)", key.oid, data.lines.len());
+        let (oid, lines) = (key.oid, data.lines.len());
         if tx.send((key, data)).is_err() {
             return; // UI gone
         }
+        // Log only after the result actually reached the UI for caching.
+        log::debug!("prefetch: done {oid} ({lines} lines) in {:?}", t.elapsed());
         ctx.request_repaint();
     }
 }
@@ -1434,6 +1456,10 @@ struct GitkApp {
     diff_cache: DiffCache<DiffCacheKey, DiffData>, // diffs the user navigated away from
     current_diff_key: Option<DiffCacheKey>, // key the live diff_lines was built under (None ⇒ virtual/none)
     prewarm_rx: Option<mpsc::Receiver<Arc<Highlighter>>>, // startup-prewarmed highlighter, until installed
+    prefetch_tx: mpsc::Sender<(DiffCacheKey, DiffData)>,
+    prefetch_rx: mpsc::Receiver<(DiffCacheKey, DiffData)>,
+    prefetch_epoch: Arc<AtomicU64>, // bumped per dispatch; supersedes older prefetch workers
+    prefetched_gen: u64,            // diff_generation we last dispatched prefetch for
 }
 
 /// Widest diff line in characters — used to size the horizontal scroll content
@@ -1644,6 +1670,7 @@ impl GitkApp {
             .unwrap_or(200.0);
 
         let (highlight_tx, highlight_rx) = mpsc::channel();
+        let (prefetch_tx, prefetch_rx) = mpsc::channel();
         let diff_max_chars = max_line_chars(&diff_lines);
 
         // Eagerly warm the highlighter off-thread so the first cross-language diff
@@ -1720,6 +1747,10 @@ impl GitkApp {
             diff_cache: DiffCache::new(DIFF_CACHE_LINE_BUDGET),
             current_diff_key: None,
             prewarm_rx,
+            prefetch_tx,
+            prefetch_rx,
+            prefetch_epoch: Arc::new(AtomicU64::new(0)),
+            prefetched_gen: 0,
         }
     }
 
@@ -1789,6 +1820,7 @@ impl GitkApp {
 
         if let Some(sel) = self.selected.filter(|&s| s < self.commits.len()) {
             let oid = self.commits[sel].oid;
+            log::debug!("select: commit {oid} (#{sel})");
             let key = is_real_commit(oid).then(|| self.diff_cache_key(oid));
             let data = match key.as_ref().and_then(|k| self.diff_cache.remove(k)) {
                 Some(data) => {
@@ -1923,6 +1955,51 @@ impl GitkApp {
             log::warn!("highlight thread spawn failed; highlighting on the UI thread");
             self.highlight_priority = None;
             highlight_diff(&mut self.diff_lines, &self.diff_files, hl);
+        }
+    }
+
+    /// Spawn a background prefetch of the cacheable neighbours of the current
+    /// selection (4 below, 2 above), skipping any already cached or currently
+    /// live. Best-effort: only when a highlighter exists and a real commit is
+    /// selected.
+    fn dispatch_prefetch(&self, ctx: &egui::Context) {
+        let Some(sel) = self.selected else {
+            log::debug!("prefetch: skip — no commit selected");
+            return;
+        };
+        let Some(hl) = self.highlighter.clone() else {
+            log::debug!("prefetch: skip — highlighter not ready");
+            return;
+        };
+        let oids: Vec<git2::Oid> = self.commits.iter().map(|c| c.oid).collect();
+        let keys: Vec<DiffCacheKey> = prefetch_targets(&oids, sel, PREFETCH_BELOW, PREFETCH_ABOVE)
+            .into_iter()
+            .map(|oid| self.diff_cache_key(oid))
+            .filter(|k| !self.diff_cache.contains(k) && self.current_diff_key.as_ref() != Some(k))
+            .collect();
+        if keys.is_empty() {
+            log::debug!("prefetch: skip — neighbours of commit #{sel} already cached (or none)");
+            return;
+        }
+        let epoch = self.prefetch_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        let repo_path = self.repo_path.clone();
+        let current_epoch = Arc::clone(&self.prefetch_epoch);
+        let tx = self.prefetch_tx.clone();
+        let ctx = ctx.clone();
+        log::debug!("prefetch: dispatched {} around commit #{sel}", keys.len());
+        if std::thread::Builder::new()
+            .name("gitkay-prefetch".to_string())
+            .spawn(move || {
+                let work = std::panic::AssertUnwindSafe(move || {
+                    prefetch_worker(repo_path, keys, hl, epoch, current_epoch, tx, ctx)
+                });
+                if std::panic::catch_unwind(work).is_err() {
+                    log::warn!("prefetch thread panicked");
+                }
+            })
+            .is_err()
+        {
+            log::warn!("prefetch thread spawn failed");
         }
     }
 
@@ -2079,6 +2156,27 @@ impl eframe::App for GitkApp {
             }
         }
         self.ensure_diff_highlighted(ctx);
+
+        // Apply prefetched neighbour diffs into the cache — skip one that became
+        // the live diff in the meantime (load_selected_diff owns that key).
+        while let Ok((key, data)) = self.prefetch_rx.try_recv() {
+            if self.current_diff_key.as_ref() != Some(&key) {
+                let weight = data.lines.len();
+                self.diff_cache.insert(key, data, weight);
+            }
+        }
+        // Once the current diff is fully coloured, warm the neighbours (once per
+        // settled diff, tracked via diff_generation which is stable after a diff
+        // settles). Syntax-enabled only.
+        if self.syntax_enabled {
+            let current_gen = self.diff_generation.load(Ordering::Relaxed);
+            if self.prefetched_gen != current_gen
+                && diff_fully_highlighted(&self.diff_lines, &self.diff_files)
+            {
+                self.prefetched_gen = current_gen;
+                self.dispatch_prefetch(ctx);
+            }
+        }
 
         let row_height = 20.0;
         let col_width = 12.0;
@@ -3821,6 +3919,36 @@ mod tests {
         // One code line still None ⇒ not done.
         let partial = vec![highlighted, not_yet];
         assert!(!file_fully_highlighted(&partial, 0, 2));
+    }
+
+    #[test]
+    fn diff_fully_highlighted_ignores_untokenized_header_lines() {
+        let span = || (egui::Color32::WHITE, "x".to_string());
+        let mut a0 = DiffLine::new("+a", LineKind::Add);
+        a0.spans = Some(vec![span()]);
+        let mut a1 = DiffLine::new(" b", LineKind::Context);
+        a1.spans = Some(vec![span()]);
+        let lines = vec![
+            DiffLine::new("commit abc", LineKind::Meta), // 0 header (structural)
+            DiffLine::new("", LineKind::Context),        // 1 header blank — is_code, never tokenized (None)
+            a0,                                          // 2 file code (Some)
+            a1,                                          // 3 file code (Some)
+        ];
+        let files = vec![FileEntry {
+            path: "x.rs".to_string(),
+            additions: 1,
+            deletions: 0,
+            diff_line_idx: 2, // file's range starts at index 2
+        }];
+        // The blank Context header line (index 1) is None but outside any file
+        // range, so the diff still counts as fully highlighted. This is the bug
+        // that made the prefetch trigger never fire with file_fully_highlighted(0,len).
+        assert!(diff_fully_highlighted(&lines, &files));
+
+        // A None code line *inside* the file range ⇒ not done.
+        let mut partial = lines;
+        partial[3].spans = None;
+        assert!(!diff_fully_highlighted(&partial, &files));
     }
 
     #[test]
