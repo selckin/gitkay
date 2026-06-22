@@ -202,7 +202,7 @@ fn build_ref_map(
 struct DiffLine {
     text: String,
     kind: LineKind,
-    spans: Vec<highlight::Span>, // empty ⇒ render flat by `kind`
+    spans: Option<Vec<highlight::Span>>, // None ⇒ not highlighted yet; Some(..) ⇒ highlighted (maybe empty)
 }
 
 impl DiffLine {
@@ -210,7 +210,7 @@ impl DiffLine {
         Self {
             text: text.to_string(),
             kind,
-            spans: Vec::new(),
+            spans: None,
         }
     }
 
@@ -236,6 +236,14 @@ enum LineKind {
     FileMeta,
     FileName,
     Stat,
+}
+
+impl LineKind {
+    /// Code lines (additions, deletions, context) are the ones we syntax
+    /// highlight; structural lines (hunk/file headers, stats) are not.
+    fn is_code(self) -> bool {
+        matches!(self, LineKind::Add | LineKind::Del | LineKind::Context)
+    }
 }
 
 #[derive(Clone)]
@@ -610,12 +618,11 @@ fn tokenize_range(
 ) -> Vec<(usize, Vec<highlight::Span>)> {
     let mut updates = Vec::new();
     for (i, line) in lines.iter().enumerate().take(end).skip(start) {
-        // Only code lines are tokenized; structural lines keep empty spans.
-        let code = match line.kind {
-            LineKind::Add | LineKind::Del | LineKind::Context => line.body(),
-            _ => continue,
-        };
-        updates.push((i, hl.tokenize_line(state, code)));
+        // Only code lines are tokenized; structural lines keep no spans.
+        if !line.kind.is_code() {
+            continue;
+        }
+        updates.push((i, hl.tokenize_line(state, line.body())));
     }
     updates
 }
@@ -637,7 +644,7 @@ fn tokenize_file(
 fn highlight_diff(lines: &mut [DiffLine], files: &[FileEntry], hl: &Highlighter) {
     for (fi, start, end) in file_line_ranges(files, lines.len()) {
         for (i, spans) in tokenize_file(hl, lines, &files[fi], start, end) {
-            lines[i].spans = spans;
+            lines[i].spans = Some(spans);
         }
     }
 }
@@ -847,19 +854,19 @@ fn diff_row_job(
         );
     };
 
-    let is_code = matches!(line.kind, LineKind::Add | LineKind::Del | LineKind::Context);
-    if is_code {
+    if line.kind.is_code() {
         let (glyph, glyph_color) = match line.kind {
             LineKind::Add => ("+", palette.added),
             LineKind::Del => ("-", palette.deleted),
             _ => (" ", palette.marker),
         };
         push(glyph, glyph_color);
-        if line.spans.is_empty() {
-            // No highlighting available: draw the marker-stripped body plain.
+        // None (not highlighted) and Some(empty) (blank line) both render plain.
+        let spans = line.spans.as_deref().unwrap_or(&[]);
+        if spans.is_empty() {
             push(line.body(), palette.foreground);
         } else {
-            for (color, text) in &line.spans {
+            for (color, text) in spans {
                 push(text, *color);
             }
         }
@@ -1706,7 +1713,7 @@ impl eframe::App for GitkApp {
             if batch.generation == self.diff_generation.load(Ordering::Relaxed) {
                 for (i, spans) in batch.lines {
                     if let Some(line) = self.diff_lines.get_mut(i) {
-                        line.spans = spans;
+                        line.spans = Some(spans);
                     }
                 }
             }
@@ -3187,25 +3194,40 @@ mod tests {
         highlight_diff(&mut lines, &files, &hl);
 
         assert!(
-            lines[0].spans.is_empty(),
+            lines[0].spans.is_none(),
             "meta header is outside any file range"
         );
-        assert!(lines[1].spans.is_empty(), "file-meta line is not code");
-        assert!(lines[2].spans.is_empty(), "hunk header is not code");
-        assert!(lines[3].spans.len() >= 2, "added code line should tokenize");
+        assert!(lines[1].spans.is_none(), "file-meta line is not code");
+        assert!(lines[2].spans.is_none(), "hunk header is not code");
         assert!(
-            lines[4].spans.len() >= 2,
+            lines[3].spans.as_ref().unwrap().len() >= 2,
+            "added code line should tokenize"
+        );
+        assert!(
+            lines[4].spans.as_ref().unwrap().len() >= 2,
             "removed code line should tokenize"
         );
         assert!(
-            !lines[5].spans.is_empty(),
+            lines[5].spans.as_ref().is_some_and(|s| !s.is_empty()),
             "context code line should tokenize"
         );
 
         // The +/- marker must be stripped before tokenizing (both Add and Del).
-        let added: String = lines[3].spans.iter().map(|(_, t)| t.as_str()).collect();
+        let added: String = lines[3]
+            .spans
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|(_, t)| t.as_str())
+            .collect();
         assert_eq!(added, "fn main() {}");
-        let deleted: String = lines[4].spans.iter().map(|(_, t)| t.as_str()).collect();
+        let deleted: String = lines[4]
+            .spans
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|(_, t)| t.as_str())
+            .collect();
         assert_eq!(deleted, "let old = 0;");
     }
 
@@ -3406,11 +3428,11 @@ mod tests {
         highlight_diff(&mut lines, &files, &hl);
 
         assert!(
-            lines[0].spans.is_empty(),
+            lines[0].spans.is_none(),
             "header at index 0 must not be tokenized by the no-patch file"
         );
         assert!(
-            !lines[1].spans.is_empty(),
+            lines[1].spans.as_ref().is_some_and(|s| !s.is_empty()),
             "real file's code line must still be tokenized"
         );
     }
