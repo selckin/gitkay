@@ -346,6 +346,14 @@ impl Highlighter {
         HighlightLines::new(syntax, &self.theme)
     }
 
+    /// Whether syntect has a real grammar for files with extension `ext` (no
+    /// leading dot, e.g. `"rs"`). False for extensions with no syntax (`png`,
+    /// `pdf`, …) — the prewarm uses this to skip warming languages that don't
+    /// exist instead of wasting a warm-set slot on the plain-text fallback.
+    pub fn has_syntax(&self, ext: &str) -> bool {
+        self.syntaxes.find_syntax_by_extension(ext).is_some()
+    }
+
     /// Force-compile the main-context regexes for the syntax matching `ext` by
     /// tokenizing a couple of short dummy lines (an unknown extension warms plain
     /// text — a cheap no-op). The compiled regexes are cached in the shared
