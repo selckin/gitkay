@@ -995,6 +995,49 @@ fn prewarm_highlighter(
     );
 }
 
+/// Background prefetch: for each neighbour `DiffCacheKey`, compute its diff and
+/// fully highlight it, sending the finished `(key, DiffData)` back for the UI to
+/// cache. Bails as soon as a newer dispatch supersedes it (`epoch`). Pure
+/// optimization — any failure just warms fewer neighbours.
+#[allow(dead_code)] // spawned by dispatch_prefetch in the prefetch wiring task
+fn prefetch_worker(
+    repo_path: String,
+    keys: Vec<DiffCacheKey>,
+    hl: Arc<Highlighter>,
+    epoch: u64,
+    current_epoch: Arc<AtomicU64>,
+    tx: mpsc::Sender<(DiffCacheKey, DiffData)>,
+    ctx: egui::Context,
+) {
+    // Superseded before we even ran — don't open the repo.
+    if epoch != current_epoch.load(Ordering::Relaxed) {
+        return;
+    }
+    let repo = match Repository::discover(&repo_path) {
+        Ok(r) => r,
+        Err(e) => {
+            log::debug!("prefetch: repo discover failed: {e}");
+            return;
+        }
+    };
+    for key in keys {
+        if epoch != current_epoch.load(Ordering::Relaxed) {
+            return; // user moved on
+        }
+        let settings = DiffSettings {
+            context: key.context,
+            ignore_ws: key.ignore_ws,
+        };
+        let mut data = get_diff_data(&repo, key.oid, settings);
+        highlight_diff(&mut data.lines, &data.files, &hl);
+        log::debug!("prefetch: cached {} ({} lines)", key.oid, data.lines.len());
+        if tx.send((key, data)).is_err() {
+            return; // UI gone
+        }
+        ctx.request_repaint();
+    }
+}
+
 /// Resolve the `[syntax]` diff-background config into a `DiffBg`, plus any
 /// warnings (bad mode or unparseable hex — each falls back to a default). The
 /// caller surfaces the warnings (stderr + the in-UI toast).
