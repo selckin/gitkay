@@ -40,6 +40,14 @@ impl<K: Clone + Eq + Hash, V> DiffCache<K, V> {
         Some(entry.value)
     }
 
+    /// Whether `key` is cached, without touching LRU recency — a peek, unlike the
+    /// move-out `remove`. Used by the prefetch dispatch to skip already-cached
+    /// neighbours.
+    #[allow(dead_code)] // wired into dispatch_prefetch in the prefetch wiring task
+    pub fn contains(&self, key: &K) -> bool {
+        self.entries.contains_key(key)
+    }
+
     /// Insert (or overwrite) an entry of the given weight, then evict the
     /// least-recently-used entries until `total <= budget` — but always keep at
     /// least one entry, so a single value larger than the budget is still cached
@@ -125,6 +133,21 @@ mod tests {
         c.insert(2, 2, 40); // total 50 ⇒ fits, nothing evicted
         assert_eq!(c.remove(&1), Some(11));
         assert_eq!(c.remove(&2), Some(2));
+    }
+
+    #[test]
+    fn contains_peeks_without_touching_lru() {
+        let mut c: DiffCache<u32, u32> = DiffCache::new(30);
+        c.insert(1, 1, 15);
+        c.insert(2, 2, 15); // total 30, key 1 is LRU
+        assert!(c.contains(&1));
+        assert!(!c.contains(&3));
+        // contains(&1) must NOT refresh recency: inserting a third entry over budget
+        // must still evict key 1 (the LRU). If contains() bumped it, key 2 would go.
+        c.insert(3, 3, 15); // total 45 > 30 → evict LRU
+        assert!(!c.contains(&1), "key 1 was LRU; contains() must not have refreshed it");
+        assert!(c.contains(&2));
+        assert!(c.contains(&3));
     }
 
     #[test]
