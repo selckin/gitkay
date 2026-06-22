@@ -746,6 +746,25 @@ struct HighlightJob {
 /// the file it's tokenizing scrolls out of view while a visible file is pending,
 /// it re-queues the rest and switches — so selecting a file never waits behind a
 /// large off-screen one. It bails as soon as a newer highlight pass supersedes it.
+/// The most common file extensions in `paths`: distinct, lowercased, sorted by
+/// descending frequency (ties by name ascending), capped at `cap`. Paths with no
+/// extension are ignored. Pure — the prewarm scan feeds it HEAD-tree file names.
+#[allow(dead_code)]
+fn top_extensions(paths: impl Iterator<Item = String>, cap: usize) -> Vec<String> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for path in paths {
+        if let Some(ext) = std::path::Path::new(&path)
+            .extension()
+            .and_then(|e| e.to_str())
+        {
+            *counts.entry(ext.to_lowercase()).or_insert(0) += 1;
+        }
+    }
+    let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked.into_iter().take(cap).map(|(ext, _)| ext).collect()
+}
+
 fn highlight_worker(job: HighlightJob) {
     let HighlightJob {
         hl,
@@ -3615,5 +3634,36 @@ mod tests {
         assert_eq!(c.remove(&key("light", true)), None, "different theme ⇒ miss");
         assert_eq!(c.remove(&key("dark", false)), None, "different enabled ⇒ miss");
         assert_eq!(c.remove(&key("dark", true)), Some(1), "same key ⇒ hit");
+    }
+
+    #[test]
+    fn top_extensions_ranks_dedups_and_caps() {
+        let paths = [
+            "src/main.rs", "src/lib.rs", "a/b.rs", "UPPER.RS", // rs ×4 (case-insensitive)
+            "x.py", "y.py",                                    // py ×2
+            "z.md",                                            // md ×1
+            "Makefile", ".gitignore",                          // no extension → skipped
+        ]
+        .into_iter()
+        .map(String::from);
+        assert_eq!(
+            top_extensions(paths, 2),
+            vec!["rs".to_string(), "py".to_string()]
+        );
+    }
+
+    #[test]
+    fn top_extensions_tiebreak_is_name_ascending() {
+        let paths = ["a.zz", "b.aa"].into_iter().map(String::from); // each ×1
+        assert_eq!(
+            top_extensions(paths, 2),
+            vec!["aa".to_string(), "zz".to_string()]
+        );
+    }
+
+    #[test]
+    fn top_extensions_skips_extensionless_and_lowercases() {
+        let paths = ["Makefile", "README", "X.TXT"].into_iter().map(String::from);
+        assert_eq!(top_extensions(paths, 10), vec!["txt".to_string()]);
     }
 }
