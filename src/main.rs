@@ -11,6 +11,7 @@ mod config;
 mod diff_cache;
 mod highlight;
 use config::{Fonts, Role};
+use diff_cache::DiffCache;
 use highlight::{DiffBg, HighlightLines, Highlighter};
 
 /// One file's worth of finished highlight spans, sent worker → UI. Tagged with
@@ -60,6 +61,27 @@ fn oid_uncommitted() -> git2::Oid {
 /// Sentinel OID for the "staged changes" virtual entry.
 fn oid_staged() -> git2::Oid {
     git2::Oid::from_bytes(&[0xFE; 20]).unwrap()
+}
+
+/// Total cached diff lines before the LRU starts evicting. ~50–100 MB at this
+/// size (each token holds its own `String`); tunable.
+const DIFF_CACHE_LINE_BUDGET: usize = 100_000;
+
+/// Everything a cached diff's content + spans depend on. `diff_bg` is excluded
+/// (it's a render-time tint, not baked into spans).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct DiffCacheKey {
+    oid: git2::Oid,
+    context: u32,
+    ignore_ws: bool,
+    theme: String,
+    enabled: bool,
+}
+
+/// Real commits are cacheable; the virtual uncommitted/staged entries are not
+/// (their content tracks the working tree, so a fixed pseudo-oid would go stale).
+fn is_real_commit(oid: git2::Oid) -> bool {
+    oid != oid_uncommitted() && oid != oid_staged()
 }
 
 fn is_virtual_oid(oid: git2::Oid) -> bool {
@@ -1210,6 +1232,8 @@ struct GitkApp {
     highlight_rx: mpsc::Receiver<HighlightBatch>,
     highlight_priority: Option<Arc<VisibleRange>>, // visible file range (lo, hi) the worker prioritises
     diff_max_chars: usize, // widest diff line (chars); sizes the virtualized h-scroll for off-screen lines
+    diff_cache: DiffCache<DiffCacheKey, DiffData>, // diffs the user navigated away from
+    current_diff_key: Option<DiffCacheKey>, // key the live diff_lines was built under (None ⇒ virtual/none)
 }
 
 /// Widest diff line in characters — used to size the horizontal scroll content
@@ -1459,6 +1483,8 @@ impl GitkApp {
             highlight_tx,
             highlight_rx,
             highlight_priority: None,
+            diff_cache: DiffCache::new(DIFF_CACHE_LINE_BUDGET),
+            current_diff_key: None,
         }
     }
 
@@ -1503,24 +1529,56 @@ impl GitkApp {
         }
     }
 
+    fn diff_cache_key(&self, oid: git2::Oid) -> DiffCacheKey {
+        DiffCacheKey {
+            oid,
+            context: self.diff_context,
+            ignore_ws: self.diff_ignore_ws,
+            theme: self.theme_slug.clone(),
+            enabled: self.syntax_enabled,
+        }
+    }
+
     fn load_selected_diff(&mut self, repo: &Repository) {
-        if let Some(sel) = self.selected
-            && sel < self.commits.len()
-        {
-            let t = std::time::Instant::now();
-            let data = get_diff_data(repo, self.commits[sel].oid, self.diff_settings());
-            log::debug!(
-                "perf: get_diff_data {:?} ({} lines, {} files) for {}",
-                t.elapsed(),
-                data.lines.len(),
-                data.files.len(),
-                self.commits[sel].oid
-            );
+        // Stash the outgoing diff under its stored key (a move, not a clone) so a
+        // later revisit restores it — content and spans — instantly. Only set
+        // for real commits, so virtual diffs are never cached.
+        if let Some(key) = self.current_diff_key.take() {
+            let data = DiffData {
+                lines: std::mem::take(&mut self.diff_lines),
+                files: std::mem::take(&mut self.diff_files),
+            };
+            let weight = data.lines.len();
+            self.diff_cache.insert(key, data, weight);
+        }
+
+        if let Some(sel) = self.selected.filter(|&s| s < self.commits.len()) {
+            let oid = self.commits[sel].oid;
+            let key = is_real_commit(oid).then(|| self.diff_cache_key(oid));
+            let data = match key.as_ref().and_then(|k| self.diff_cache.remove(k)) {
+                Some(data) => {
+                    log::debug!("perf: diff cache hit ({} lines) for {oid}", data.lines.len());
+                    data
+                }
+                None => {
+                    let t = std::time::Instant::now();
+                    let data = get_diff_data(repo, oid, self.diff_settings());
+                    log::debug!(
+                        "perf: get_diff_data {:?} ({} lines, {} files) for {oid}",
+                        t.elapsed(),
+                        data.lines.len(),
+                        data.files.len()
+                    );
+                    data
+                }
+            };
             self.diff_lines = data.lines;
             self.diff_files = data.files;
+            self.current_diff_key = key;
         } else {
             self.diff_lines.clear();
             self.diff_files.clear();
+            self.current_diff_key = None;
         }
         self.diff_max_chars = max_line_chars(&self.diff_lines);
         self.invalidate_diff_highlight();
@@ -1715,10 +1773,24 @@ impl eframe::App for GitkApp {
                             }
                             self.highlighter = Some(Arc::new(new_hl));
                         }
-                        // Re-highlight the visible diff under the new settings
-                        // (a no-op when syntax is now disabled). Bumps the
-                        // generation so an in-flight old-theme worker's queued
-                        // spans are dropped, not applied for a frame.
+                        // Re-highlight the visible diff under the new settings.
+                        // Reset live spans to None so the worker re-colours every
+                        // file (the skip-done filter would otherwise keep the old
+                        // theme's colours), preserving the invariant that a `Some`
+                        // spans value always reflects the current (theme, enabled).
+                        for line in &mut self.diff_lines {
+                            line.spans = None;
+                        }
+                        // Re-key the live diff so its eventual stash lands under
+                        // the new theme/enabled, not the old key.
+                        let (rekey_theme, rekey_enabled) =
+                            (self.theme_slug.clone(), self.syntax_enabled);
+                        if let Some(key) = &mut self.current_diff_key {
+                            key.theme = rekey_theme;
+                            key.enabled = rekey_enabled;
+                        }
+                        // Bumps the generation so an in-flight old-theme worker's
+                        // queued spans are dropped, not applied for a frame.
                         self.invalidate_diff_highlight();
                     }
                     self.config_error_toast = warned.then(std::time::Instant::now);
@@ -3527,5 +3599,21 @@ mod tests {
             .map(|(fi, _, _)| fi)
             .collect();
         assert_eq!(pending, vec![1], "only file B (index 1) still needs work");
+    }
+
+    #[test]
+    fn diff_cache_key_includes_theme_and_enabled() {
+        let key = |theme: &str, enabled: bool| DiffCacheKey {
+            oid: git2::Oid::zero(),
+            context: 3,
+            ignore_ws: false,
+            theme: theme.to_string(),
+            enabled,
+        };
+        let mut c: DiffCache<DiffCacheKey, u32> = DiffCache::new(100);
+        c.insert(key("dark", true), 1, 1);
+        assert_eq!(c.remove(&key("light", true)), None, "different theme ⇒ miss");
+        assert_eq!(c.remove(&key("dark", false)), None, "different enabled ⇒ miss");
+        assert_eq!(c.remove(&key("dark", true)), Some(1), "same key ⇒ hit");
     }
 }
