@@ -132,7 +132,44 @@ fn is_virtual_oid(oid: git2::Oid) -> bool {
     oid == oid_uncommitted() || oid == oid_staged()
 }
 
-fn load_commits(repo: &Repository, max: usize) -> Vec<CommitInfo> {
+/// Apply one `<rev>` token to the revwalk: `^X` hides, `A..B` hides A + pushes B,
+/// `A...B` pushes both + hides their merge-base, else pushes the single rev. Each
+/// endpoint is resolved with `revparse_single` (so `HEAD~3`, `@{u}`, tags, etc.
+/// all work); lookup failures are logged and skipped.
+fn push_rev_token(revwalk: &mut git2::Revwalk, repo: &Repository, tok: &str) {
+    let resolve = |s: &str| repo.revparse_single(s).map(|o| o.id());
+    match cli::rev_token_kind(tok) {
+        cli::RevTokenKind::Single(s) => match resolve(&s) {
+            Ok(id) => {
+                revwalk.push(id).ok();
+            }
+            Err(e) => log::warn!("gitkay: bad revision '{s}': {e}"),
+        },
+        cli::RevTokenKind::Exclude(s) => match resolve(&s) {
+            Ok(id) => {
+                revwalk.hide(id).ok();
+            }
+            Err(e) => log::warn!("gitkay: bad revision '{s}': {e}"),
+        },
+        cli::RevTokenKind::Range(a, b) => {
+            if let (Ok(ia), Ok(ib)) = (resolve(&a), resolve(&b)) {
+                revwalk.hide(ia).ok();
+                revwalk.push(ib).ok();
+            }
+        }
+        cli::RevTokenKind::Symmetric(a, b) => {
+            if let (Ok(ia), Ok(ib)) = (resolve(&a), resolve(&b)) {
+                revwalk.push(ia).ok();
+                revwalk.push(ib).ok();
+                if let Ok(base) = repo.merge_base(ia, ib) {
+                    revwalk.hide(base).ok();
+                }
+            }
+        }
+    }
+}
+
+fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitInfo> {
     let ref_map = build_ref_map(repo);
     let head_oid = repo.head().ok().and_then(|h| h.target());
 
@@ -192,12 +229,16 @@ fn load_commits(repo: &Repository, max: usize) -> Vec<CommitInfo> {
         Err(_) => return commits,
     };
     revwalk.set_sorting(Sort::TIME | Sort::TOPOLOGICAL).ok();
-    revwalk.push_head().ok();
-    if let Ok(branches) = repo.branches(None) {
-        for branch in branches.flatten() {
-            if let Some(oid) = branch.0.get().target() {
-                revwalk.push(oid).ok();
-            }
+    if scope.all {
+        // Everything: branches, remotes, tags.
+        revwalk.push_glob("refs/heads/*").ok();
+        revwalk.push_glob("refs/remotes/*").ok();
+        revwalk.push_glob("refs/tags/*").ok();
+    } else if scope.revs.is_empty() {
+        revwalk.push_head().ok(); // default: the current branch only
+    } else {
+        for tok in &scope.revs {
+            push_rev_token(&mut revwalk, repo, tok);
         }
     }
     let mut seen = HashSet::new();
@@ -1447,6 +1488,7 @@ struct GitkApp {
     diff_scroll_to: Option<usize>,
     graph_scroll_to: Option<(usize, Option<egui::Align>)>, // (commit index, alignment) to scroll to in graph view
     repo_path: String,
+    scope: cli::Scope, // CLI ref/path scope, set once at startup
     search_text: String,
     search_matches: Vec<usize>,
     search_cursor: usize,
@@ -1534,7 +1576,7 @@ fn show_toast(
 }
 
 impl GitkApp {
-    fn new(cc: &eframe::CreationContext<'_>, repo_path: String) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, repo_path: String, scope: cli::Scope) -> Self {
         let mut style = (*cc.egui_ctx.style()).clone();
         style.visuals = egui::Visuals::dark();
         style.visuals.panel_fill = BG;
@@ -1609,7 +1651,7 @@ impl GitkApp {
         }
 
         let repo = Repository::discover(&repo_path).expect("Not a git repository");
-        let commits = load_commits(&repo, 200);
+        let commits = load_commits(&repo, 200, &scope);
         let graph_rows = layout_graph(&commits);
 
         // Restore persisted diff options before the first diff is generated, so
@@ -1738,6 +1780,7 @@ impl GitkApp {
             diff_scroll_to: None,
             graph_scroll_to: None,
             repo_path,
+            scope,
             search_text: String::new(),
             search_matches: Vec::new(),
             search_cursor: 0,
@@ -2032,7 +2075,7 @@ impl GitkApp {
             .and_then(|sel| self.commits.get(sel))
             .map(|commit| commit.oid);
 
-        self.commits = load_commits(repo, count);
+        self.commits = load_commits(repo, count, &self.scope);
         self.graph_rows = layout_graph(&self.commits);
         self.all_loaded = self.commits.len() < count;
         self.refresh_search_matches();
@@ -3008,7 +3051,7 @@ impl eframe::App for GitkApp {
                     // Lazy load: when near the bottom, load more commits
                     if !self.all_loaded && last_row + 50 >= num_commits {
                         let repo = Repository::discover(&self.repo_path).unwrap();
-                        let more = load_commits(&repo, self.commits.len() + 500);
+                        let more = load_commits(&repo, self.commits.len() + 500, &self.scope);
                         self.all_loaded = more.len() <= self.commits.len();
                         self.commits = more;
                         self.graph_rows = layout_graph(&self.commits);
@@ -3022,12 +3065,40 @@ fn main() -> eframe::Result {
     // Warnings show by default; set e.g. RUST_LOG=gitkay=debug for timing logs.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
-    let repo_path = std::env::args().nth(1).unwrap_or_else(|| ".".to_string());
-
-    if Repository::discover(&repo_path).is_err() {
-        log::error!("not a git repository: {repo_path}");
-        std::process::exit(1);
-    }
+    let raw = match cli::parse_flags(std::env::args().skip(1)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("gitkay: {e}");
+            std::process::exit(2);
+        }
+    };
+    let repo_path = raw.repo_dir.clone().unwrap_or_else(|| ".".to_string());
+    let repo = match Repository::discover(&repo_path) {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("gitkay: not a git repository: {repo_path}");
+            std::process::exit(1);
+        }
+    };
+    // Classify positional tokens into revs vs paths against the real repo.
+    let is_rev = |tok: &str| match cli::rev_token_kind(tok) {
+        cli::RevTokenKind::Single(s) | cli::RevTokenKind::Exclude(s) => {
+            repo.revparse_single(&s).is_ok()
+        }
+        cli::RevTokenKind::Range(a, b) | cli::RevTokenKind::Symmetric(a, b) => {
+            repo.revparse_single(&a).is_ok() && repo.revparse_single(&b).is_ok()
+        }
+    };
+    let is_path = |tok: &str| std::path::Path::new(tok).exists();
+    let (revs, paths) = match cli::classify(&raw.pre, &raw.post, is_rev, is_path) {
+        Ok(rp) => rp,
+        Err(e) => {
+            eprintln!("gitkay: {e}");
+            std::process::exit(2);
+        }
+    };
+    let scope = cli::Scope { all: raw.all, revs, paths };
+    drop(repo); // GitkApp re-discovers from repo_path
 
     let title = {
         let repo = Repository::discover(&repo_path).unwrap();
@@ -3059,7 +3130,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "gitkay",
         options,
-        Box::new(move |cc| Ok(Box::new(GitkApp::new(cc, repo_path)))),
+        Box::new(move |cc| Ok(Box::new(GitkApp::new(cc, repo_path, scope)))),
     )
 }
 
@@ -4102,5 +4173,89 @@ mod tests {
         let oids = vec![oid_uncommitted(), oid_staged(), real(2), real(3), real(4)];
         // selected = 2 (first real); below 4 → 3,4; above 2 → indices 1,0 = virtual → excluded.
         assert_eq!(prefetch_targets(&oids, 2, 4, 2), vec![real(3), real(4)]);
+    }
+
+    fn temp_repo() -> (tempfile::TempDir, git2::Repository) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "t").unwrap();
+        cfg.set_str("user.email", "t@example.com").unwrap();
+        (dir, repo)
+    }
+
+    fn commit_file(repo: &git2::Repository, path: &str, content: &str, msg: &str) -> git2::Oid {
+        let root = repo.workdir().unwrap();
+        let full = root.join(path);
+        if let Some(p) = full.parent() {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        std::fs::write(&full, content).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new(path)).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = repo.signature().unwrap();
+        let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents)
+            .unwrap()
+    }
+
+    fn scope(all: bool, revs: &[&str]) -> cli::Scope {
+        cli::Scope {
+            all,
+            revs: revs.iter().map(|s| s.to_string()).collect(),
+            paths: Vec::new(),
+        }
+    }
+
+    fn summaries(commits: &[CommitInfo]) -> Vec<String> {
+        commits
+            .iter()
+            .filter(|c| is_real_commit(c.oid))
+            .map(|c| c.summary.clone())
+            .collect()
+    }
+
+    #[test]
+    fn default_scope_is_current_branch_only() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.txt", "1", "base");
+        // a side branch with a unique commit, while HEAD stays on the base branch
+        let base = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("side", &base, false).unwrap();
+        // commit on the current branch
+        commit_file(&repo, "a.txt", "2", "on-main");
+        // commit only on side (check it out, commit, switch back)
+        repo.set_head("refs/heads/side").unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        commit_file(&repo, "b.txt", "x", "on-side");
+        repo.set_head("refs/heads/master").unwrap_or_else(|_| repo.set_head("refs/heads/main").unwrap());
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+
+        // Default (HEAD only): no "on-side".
+        let def = summaries(&load_commits(&repo, 100, &scope(false, &[])));
+        assert!(def.contains(&"on-main".to_string()));
+        assert!(!def.contains(&"on-side".to_string()), "default must not show other branches");
+
+        // --all: includes "on-side".
+        let all = summaries(&load_commits(&repo, 100, &scope(true, &[])));
+        assert!(all.contains(&"on-side".to_string()), "--all must show all branches");
+    }
+
+    #[test]
+    fn range_scope_excludes_base() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.txt", "1", "c1");
+        let c2 = commit_file(&repo, "a.txt", "2", "c2");
+        let c3 = commit_file(&repo, "a.txt", "3", "c3");
+        // c2..c3 → only c3
+        let s = scope(false, &[&format!("{c2}..{c3}")]);
+        let got = summaries(&load_commits(&repo, 100, &s));
+        assert_eq!(got, vec!["c3".to_string()]);
+        let _ = c2; // silence unused if formatting changes
     }
 }

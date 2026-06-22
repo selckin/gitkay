@@ -1,12 +1,12 @@
 //! Pure parsing of gitkay's command line into a `Scope`. Knows nothing of git or
 //! egui: `classify` takes `is_rev`/`is_path` predicates so it's testable without a
 //! repo. Grammar: `gitkay [-C <dir>] [--all] [<rev>...] [-- <path>...]`.
-#![allow(dead_code)] // wired into main in the next task; remove there
 
 /// The resolved command-line scope.
 pub struct Scope {
     pub all: bool,
     pub revs: Vec<String>,
+    #[allow(dead_code)] // used in Task 3 (path filtering)
     pub paths: Vec<String>,
 }
 
