@@ -55,6 +55,8 @@ impl<K: Clone + Eq + Hash, V> DiffCache<K, V> {
             self.total -= old.weight;
         }
         self.total += weight;
+        let mut evicted_n = 0usize;
+        let mut evicted_lines = 0usize;
         while self.total > self.budget && self.entries.len() > 1 {
             let lru = self
                 .entries
@@ -64,7 +66,25 @@ impl<K: Clone + Eq + Hash, V> DiffCache<K, V> {
                 .expect("len > 1 ⇒ non-empty");
             if let Some(evicted) = self.entries.remove(&lru) {
                 self.total -= evicted.weight;
+                evicted_n += 1;
+                evicted_lines += evicted.weight;
             }
+        }
+        if evicted_n > 0 {
+            log::debug!(
+                "diff cache: insert {weight} lines, evicted {evicted_n} ({evicted_lines} lines) \
+                 → {} entries / {} lines (budget {})",
+                self.entries.len(),
+                self.total,
+                self.budget
+            );
+        } else {
+            log::debug!(
+                "diff cache: insert {weight} lines → {} entries / {} lines (budget {})",
+                self.entries.len(),
+                self.total,
+                self.budget
+            );
         }
     }
 }
