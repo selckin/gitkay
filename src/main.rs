@@ -4,12 +4,32 @@ use git2::{DiffOptions, Repository, Sort};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
 
 mod config;
 mod highlight;
 use config::{Fonts, Role};
-use highlight::{DiffBg, Highlighter};
+use highlight::{DiffBg, HighlightLines, Highlighter};
+
+/// One file's worth of finished highlight spans, sent worker → UI. Tagged with
+/// the generation it was computed for so stale results are dropped.
+struct HighlightBatch {
+    generation: u64,
+    /// `(line index, spans)` for each code line in the file.
+    lines: Vec<(usize, Vec<highlight::Span>)>,
+}
+
+/// The visible diff-file range the UI publishes (lock-free) for the background
+/// worker to prioritise. `lo..=hi` are the on-screen files; `page_lo..=page_hi`
+/// extend that by one viewport's worth of *lines* in each direction (computed
+/// from row positions, so it's line-accurate regardless of file sizes).
+struct VisibleRange {
+    lo: AtomicUsize,
+    hi: AtomicUsize,
+    page_lo: AtomicUsize,
+    page_hi: AtomicUsize,
+}
 
 // ── Commit data ──────────────────────────────────────────────────────────
 
@@ -545,34 +565,224 @@ fn diff_to_data(diff: &git2::Diff, title: &str) -> DiffData {
     DiffData { lines, files }
 }
 
-/// Attach syntax-highlighted spans to each code line. File boundaries and
-/// languages come from the structured `files` list (clean paths), not the
-/// `--- /+++` display lines. Non-code lines are left with empty `spans`.
-fn highlight_diff(lines: &mut [DiffLine], files: &[FileEntry], hl: &Highlighter) {
-    let mut ordered: Vec<&FileEntry> = files.iter().collect();
-    ordered.sort_by_key(|f| f.diff_line_idx);
+/// Each file's `(file index, start, end)` line range, ordered by start. File
+/// boundaries come from the structured `files` list (clean paths), not the
+/// `--- /+++` display lines. No-patch files (`diff_line_idx == 0`, the header
+/// precedes every real file) are skipped; `end` is clamped to `total_lines`.
+fn file_line_ranges(files: &[FileEntry], total_lines: usize) -> Vec<(usize, usize, usize)> {
+    let mut sorted: Vec<usize> = (0..files.len())
+        .filter(|&i| files[i].diff_line_idx != 0)
+        .collect();
+    sorted.sort_by_key(|&i| files[i].diff_line_idx);
+    sorted
+        .iter()
+        .enumerate()
+        .map(|(k, &i)| {
+            let start = files[i].diff_line_idx;
+            let end = sorted
+                .get(k + 1)
+                .map_or(total_lines, |&j| files[j].diff_line_idx);
+            (i, start.min(total_lines), end.min(total_lines))
+        })
+        .collect()
+}
 
-    for (i, file) in ordered.iter().enumerate() {
-        // diff_line_idx 0 == no patch region (header precedes every real file); skip.
-        if file.diff_line_idx == 0 {
-            continue;
-        }
-        let start = file.diff_line_idx;
-        let end = ordered.get(i + 1).map_or(lines.len(), |f| f.diff_line_idx);
-        if start >= lines.len() {
-            continue;
-        }
-        let len = lines.len();
-        let mut state = hl.new_file_state(&file.path);
-        for line in &mut lines[start..end.min(len)] {
-            // Only code lines are tokenized; structural lines keep empty spans.
-            let code = match line.kind {
-                LineKind::Add | LineKind::Del | LineKind::Context => line.body(),
-                _ => continue,
-            };
-            line.spans = hl.tokenize_line(&mut state, code);
+/// Index of the file whose patch region contains `line` (the last file starting
+/// at or before it), or 0 when `line` is in the pre-file header region.
+fn file_index_at_line(files: &[FileEntry], line: usize) -> usize {
+    files
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, f)| f.diff_line_idx != 0 && f.diff_line_idx <= line)
+        .map_or(0, |(i, _)| i)
+}
+
+/// Tokenize lines `[start, end)` into `(line index, spans)` updates, advancing
+/// the per-file highlight `state`. Structural lines are skipped.
+fn tokenize_range(
+    hl: &Highlighter,
+    lines: &[DiffLine],
+    state: &mut HighlightLines<'_>,
+    start: usize,
+    end: usize,
+) -> Vec<(usize, Vec<highlight::Span>)> {
+    let mut updates = Vec::new();
+    for (i, line) in lines.iter().enumerate().take(end).skip(start) {
+        // Only code lines are tokenized; structural lines keep empty spans.
+        let code = match line.kind {
+            LineKind::Add | LineKind::Del | LineKind::Context => line.body(),
+            _ => continue,
+        };
+        updates.push((i, hl.tokenize_line(state, code)));
+    }
+    updates
+}
+
+/// Tokenize one whole file's code lines (fresh per-file state).
+fn tokenize_file(
+    hl: &Highlighter,
+    lines: &[DiffLine],
+    file: &FileEntry,
+    start: usize,
+    end: usize,
+) -> Vec<(usize, Vec<highlight::Span>)> {
+    let mut state = hl.new_file_state(&file.path);
+    tokenize_range(hl, lines, &mut state, start, end)
+}
+
+/// Attach syntax-highlighted spans to each code line, synchronously. Used for
+/// small diffs; large ones go through `highlight_worker` instead.
+fn highlight_diff(lines: &mut [DiffLine], files: &[FileEntry], hl: &Highlighter) {
+    for (fi, start, end) in file_line_ranges(files, lines.len()) {
+        for (i, spans) in tokenize_file(hl, lines, &files[fi], start, end) {
+            lines[i].spans = spans;
         }
     }
+}
+
+/// Index into `pending` of the file to tokenize next, given the visible file
+/// range `[lo, hi]`. Order: the visible files top-to-bottom (so the file you
+/// clicked / are looking at colours first); then one viewport's worth of files
+/// just *below*; then one viewport *above*; then the rest downward; then the
+/// rest upward — so the next page in either scroll direction is ready before the
+/// far ends. `pending` is in file order, so position/rposition pick the nearest
+/// in each band. Falls back to the first remaining file if `lo`/`hi` are stale.
+fn pick_file(
+    pending: &[(usize, usize, usize)],
+    lo: usize,
+    hi: usize,
+    page_lo: usize,
+    page_hi: usize,
+) -> usize {
+    pending
+        .iter()
+        .position(|&(fi, _, _)| (lo..=hi).contains(&fi)) // visible
+        .or_else(|| {
+            pending
+                .iter()
+                .position(|&(fi, _, _)| fi > hi && fi <= page_hi)
+        }) // page below
+        .or_else(|| {
+            pending
+                .iter()
+                .rposition(|&(fi, _, _)| fi < lo && fi >= page_lo)
+        }) // page above
+        .or_else(|| pending.iter().position(|&(fi, _, _)| fi > page_hi)) // rest below
+        .or_else(|| pending.iter().rposition(|&(fi, _, _)| fi < page_lo)) // rest above
+        .unwrap_or(0)
+}
+
+/// Everything a background highlight worker owns for one diff.
+struct HighlightJob {
+    hl: Arc<Highlighter>,
+    lines: Vec<DiffLine>,
+    files: Vec<FileEntry>,
+    /// This worker's pass number; it stops once `current_gen` moves past it.
+    generation: u64,
+    current_gen: Arc<AtomicU64>,
+    /// Visible file range (lo, hi) the UI updates each frame.
+    priority: Arc<VisibleRange>,
+    tx: mpsc::Sender<HighlightBatch>,
+    ctx: egui::Context,
+}
+
+/// Background highlighting: tokenize a large diff file-by-file (in line chunks),
+/// posting spans back as it goes so highlighting fills in progressively. Each
+/// round it picks the next file by `pick_file` — visible first, then a page
+/// below, a page above, then the rest down and up. It also preempts mid-file: if
+/// the file it's tokenizing scrolls out of view while a visible file is pending,
+/// it re-queues the rest and switches — so selecting a file never waits behind a
+/// large off-screen one. It bails as soon as a newer highlight pass supersedes it.
+fn highlight_worker(job: HighlightJob) {
+    let HighlightJob {
+        hl,
+        lines,
+        files,
+        generation,
+        current_gen,
+        priority,
+        tx,
+        ctx,
+    } = job;
+
+    // Lines per chunk between priority/cancellation re-checks. Small enough to
+    // switch quickly, large enough that the per-chunk overhead is negligible.
+    const CHUNK: usize = 256;
+
+    // This worker is superseded once a newer highlight pass has started.
+    let superseded = || current_gen.load(Ordering::Relaxed) != generation;
+
+    // Repaint the first result immediately (so a small diff highlights with no
+    // visible plain flash); throttle the rest to coalesce a chunk storm.
+    let mut first_result = true;
+    let started = std::time::Instant::now();
+    let total_lines = lines.len();
+    let mut pending = file_line_ranges(&files, lines.len());
+    while !pending.is_empty() {
+        if superseded() {
+            log::debug!(
+                "perf: worker gen {generation} superseded after {:?}",
+                started.elapsed()
+            );
+            return;
+        }
+        let lo = priority.lo.load(Ordering::Relaxed);
+        let hi = priority.hi.load(Ordering::Relaxed);
+        let page_lo = priority.page_lo.load(Ordering::Relaxed);
+        let page_hi = priority.page_hi.load(Ordering::Relaxed);
+        let (fi, start, end) = pending.remove(pick_file(&pending, lo, hi, page_lo, page_hi));
+
+        let mut state = hl.new_file_state(&files[fi].path);
+        let mut pos = start;
+        while pos < end {
+            let chunk_end = (pos + CHUNK).min(end);
+            let updates = tokenize_range(&hl, &lines, &mut state, pos, chunk_end);
+            if !updates.is_empty() {
+                // Receiver gone (app closing) → stop.
+                if tx
+                    .send(HighlightBatch {
+                        generation,
+                        lines: updates,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                if first_result {
+                    ctx.request_repaint();
+                    first_result = false;
+                } else {
+                    // Coalesce wakeups: a huge diff emits hundreds of chunks, but
+                    // the UI only needs to repaint at ~60fps to show progress.
+                    ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                }
+            }
+            pos = chunk_end;
+            if pos < end {
+                // Cancelled mid-file by a newer diff/theme → stop immediately.
+                if superseded() {
+                    return;
+                }
+                // Preempt: if this file is no longer visible but another pending
+                // file now is, re-queue it (from its ORIGINAL start, so the
+                // resume re-derives parser state — a multi-line construct opened
+                // before `pos` would otherwise mis-colour the remainder) and
+                // switch. The already-sent prefix is harmlessly overwritten.
+                let lo = priority.lo.load(Ordering::Relaxed);
+                let hi = priority.hi.load(Ordering::Relaxed);
+                let visible = |x: usize| (lo..=hi).contains(&x);
+                if !visible(fi) && pending.iter().any(|&(f, _, _)| visible(f)) {
+                    pending.push((fi, start, end));
+                    break;
+                }
+            }
+        }
+    }
+    log::debug!(
+        "perf: worker gen {generation} done {:?} ({total_lines} lines)",
+        started.elapsed()
+    );
 }
 
 /// Resolve the `[syntax]` diff-background config into a `DiffBg`, plus any
@@ -958,11 +1168,27 @@ struct GitkApp {
     needs_config_reload: Arc<AtomicBool>, // set by the config-file watcher
     _config_watcher: Option<RecommendedWatcher>, // watches the config's parent dir so atomic-rename saves are caught
     config_error_toast: Option<std::time::Instant>, // transient parse-error notice
-    highlighter: Option<Highlighter>,            // built lazily on the first diff (when syntax on)
+    highlighter: Option<Arc<Highlighter>>,       // built lazily on the first diff (when syntax on)
     syntax_enabled: bool,                        // false ⇒ original flat per-line coloring
     theme_slug: String,                          // configured syntax theme slug
     diff_bg: DiffBg,                             // add/del row background mode + colors
     diff_needs_highlight: bool,                  // diff_lines changed; re-run highlight_diff
+    diff_generation: Arc<AtomicU64>, // bumped each highlight pass; lets stale workers bail + results drop
+    highlight_tx: mpsc::Sender<HighlightBatch>, // worker → UI: per-file span updates
+    highlight_rx: mpsc::Receiver<HighlightBatch>,
+    highlight_priority: Option<Arc<VisibleRange>>, // visible file range (lo, hi) the worker prioritises
+    diff_max_chars: usize, // widest diff line (chars); sizes the virtualized h-scroll for off-screen lines
+}
+
+/// Widest diff line in characters — used to size the horizontal scroll content
+/// when rows are virtualized (only visible rows are laid out, so egui can't
+/// otherwise know an off-screen line is wide). Assumes a monospace diff font.
+fn max_line_chars(lines: &[DiffLine]) -> usize {
+    lines
+        .iter()
+        .map(|l| l.text.chars().count())
+        .max()
+        .unwrap_or(0)
 }
 
 /// Build a notify watcher whose callback sets `flag` and requests a repaint for
@@ -982,7 +1208,7 @@ fn make_watcher(
             ctx.request_repaint();
         }
     })
-    .map_err(|e| eprintln!("gitkay: watcher: {e}"))
+    .map_err(|e| log::warn!("watcher: {e}"))
     .ok()
 }
 
@@ -1029,7 +1255,7 @@ impl GitkApp {
             .map(|p| match config::read_config(p) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("gitkay: {e}; using defaults");
+                    log::warn!("{e}; using defaults");
                     startup_issue = true;
                     config::Config::default()
                 }
@@ -1043,7 +1269,7 @@ impl GitkApp {
             .unwrap_or_else(|| highlight::DEFAULT_THEME_SLUG.to_string());
         let (diff_bg, diff_bg_warnings) = resolve_diff_bg(&cfg.syntax);
         for w in &diff_bg_warnings {
-            eprintln!("gitkay: {w}");
+            log::warn!("{w}");
             startup_issue = true;
         }
         let (font_defs, fonts, font_warnings) = config::build_fonts(&cfg);
@@ -1068,13 +1294,13 @@ impl GitkApp {
                 ) && event.paths.iter().any(|p| p == &cfg_file)
             })?;
             w.watch(&parent, RecursiveMode::NonRecursive)
-                .map_err(|e| eprintln!("gitkay: config watcher: {e}"))
+                .map_err(|e| log::warn!("config watcher: {e}"))
                 .ok()?;
             Some(w)
         });
 
         if config_path.is_some() && config_watcher.is_none() {
-            eprintln!("gitkay: live-reload disabled (config watcher failed to start)");
+            log::warn!("live-reload disabled (config watcher failed to start)");
             startup_issue = true;
         }
 
@@ -1161,6 +1387,9 @@ impl GitkApp {
             .and_then(|s| eframe::get_value(s, "file_list_width"))
             .unwrap_or(200.0);
 
+        let (highlight_tx, highlight_rx) = mpsc::channel();
+        let diff_max_chars = max_line_chars(&diff_lines);
+
         Self {
             commits,
             graph_rows,
@@ -1188,11 +1417,16 @@ impl GitkApp {
             needs_config_reload,
             _config_watcher: config_watcher,
             config_error_toast: startup_issue.then(std::time::Instant::now),
+            diff_max_chars,
             highlighter: None,
             syntax_enabled,
             theme_slug,
             diff_bg,
             diff_needs_highlight: true, // highlight the startup diff on first frame
+            diff_generation: Arc::new(AtomicU64::new(0)),
+            highlight_tx,
+            highlight_rx,
+            highlight_priority: None,
         }
     }
 
@@ -1241,20 +1475,41 @@ impl GitkApp {
         if let Some(sel) = self.selected
             && sel < self.commits.len()
         {
+            let t = std::time::Instant::now();
             let data = get_diff_data(repo, self.commits[sel].oid, self.diff_settings());
+            log::debug!(
+                "perf: get_diff_data {:?} ({} lines, {} files) for {}",
+                t.elapsed(),
+                data.lines.len(),
+                data.files.len(),
+                self.commits[sel].oid
+            );
             self.diff_lines = data.lines;
             self.diff_files = data.files;
         } else {
             self.diff_lines.clear();
             self.diff_files.clear();
         }
+        self.diff_max_chars = max_line_chars(&self.diff_lines);
+        self.invalidate_diff_highlight();
+    }
+
+    /// Mark the current diff as needing (re)highlighting and bump the generation
+    /// so any in-flight worker's already-queued results for the previous
+    /// diff/theme are dropped by the drain instead of landing on the new diff.
+    fn invalidate_diff_highlight(&mut self) {
         self.diff_needs_highlight = true;
+        self.diff_generation.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Build the highlighter on first use and (re)highlight the current diff if
-    /// it changed. Cheap to call every frame: it's a no-op once `diff_needs_highlight`
-    /// is cleared.
-    fn ensure_diff_highlighted(&mut self) {
+    /// it changed. Tokenization always runs on a background thread (the diff
+    /// renders plain until the worker's spans arrive), because the FIRST time
+    /// syntect tokenizes a given language it compiles that language's regexes
+    /// (~0.5s with the fancy-regex backend) — doing that on the UI thread froze
+    /// the window on commit selection. Cheap to call every frame: a no-op once
+    /// `diff_needs_highlight` is cleared.
+    fn ensure_diff_highlighted(&mut self, ctx: &egui::Context) {
         if !self.diff_needs_highlight {
             return;
         }
@@ -1265,17 +1520,65 @@ impl GitkApp {
             return;
         }
         if self.highlighter.is_none() {
+            let t = std::time::Instant::now();
             let (hl, warning) = Highlighter::new(&self.theme_slug, self.diff_bg);
+            log::debug!(
+                "perf: built highlighter (syntax set load) {:?}",
+                t.elapsed()
+            );
             if let Some(w) = warning {
-                eprintln!("gitkay: {w}");
+                log::warn!("{w}");
                 self.config_error_toast = Some(std::time::Instant::now());
             }
-            self.highlighter = Some(hl);
+            self.highlighter = Some(Arc::new(hl));
         }
-        if let Some(hl) = &self.highlighter {
+        let Some(hl) = &self.highlighter else {
+            return;
+        };
+        self.diff_needs_highlight = false;
+        // Bump the generation so any worker started for a previous diff/theme
+        // bails early and its result is discarded on arrival.
+        let generation = self.diff_generation.fetch_add(1, Ordering::Relaxed) + 1;
+
+        if self.diff_lines.is_empty() {
+            self.highlight_priority = None;
+            return;
+        }
+        log::debug!(
+            "perf: async highlight spawned ({} lines)",
+            self.diff_lines.len()
+        );
+        // Tokenize off-thread, file-by-file, prioritising the files the render
+        // marks visible. The diff is already shown plain.
+        let priority = Arc::new(VisibleRange {
+            lo: AtomicUsize::new(0),
+            hi: AtomicUsize::new(0),
+            page_lo: AtomicUsize::new(0),
+            page_hi: AtomicUsize::new(0),
+        });
+        self.highlight_priority = Some(Arc::clone(&priority));
+        let job = HighlightJob {
+            hl: Arc::clone(hl),
+            lines: self.diff_lines.clone(),
+            files: self.diff_files.clone(),
+            generation,
+            current_gen: Arc::clone(&self.diff_generation),
+            priority,
+            tx: self.highlight_tx.clone(),
+            ctx: ctx.clone(),
+        };
+        // `Builder::spawn` returns Err on thread exhaustion (vs `spawn`, which
+        // panics). On failure, highlight synchronously so the diff still gets
+        // coloured rather than staying plain forever.
+        if std::thread::Builder::new()
+            .name("gitkay-highlight".to_string())
+            .spawn(move || highlight_worker(job))
+            .is_err()
+        {
+            log::warn!("highlight thread spawn failed; highlighting on the UI thread");
+            self.highlight_priority = None;
             highlight_diff(&mut self.diff_lines, &self.diff_files, hl);
         }
-        self.diff_needs_highlight = false;
     }
 
     fn reload_commits(&mut self, repo: &Repository, preferred_oid: Option<git2::Oid>) {
@@ -1355,7 +1658,7 @@ impl eframe::App for GitkApp {
                     // below) so config typos aren't silent on a headless desktop.
                     let mut warned = !warns.is_empty();
                     for w in &diff_bg_warnings {
-                        eprintln!("gitkay: {w}");
+                        log::warn!("{w}");
                         warned = true;
                     }
                     if new_enabled != self.syntax_enabled
@@ -1365,26 +1668,49 @@ impl eframe::App for GitkApp {
                         self.syntax_enabled = new_enabled;
                         self.theme_slug = new_slug;
                         self.diff_bg = new_diff_bg;
-                        if let Some(hl) = &mut self.highlighter
-                            && let Some(w) = hl.set_theme(&self.theme_slug, self.diff_bg)
-                        {
-                            eprintln!("gitkay: {w}");
-                            warned = true;
+                        // Rebuild the (shared) highlighter for the new theme,
+                        // reusing its syntax set. A new Arc leaves any in-flight
+                        // worker holding the old one valid.
+                        if self.highlighter.is_some() {
+                            let (new_hl, w) = self
+                                .highlighter
+                                .as_ref()
+                                .unwrap()
+                                .with_theme(&self.theme_slug, self.diff_bg);
+                            if let Some(w) = w {
+                                log::warn!("{w}");
+                                warned = true;
+                            }
+                            self.highlighter = Some(Arc::new(new_hl));
                         }
                         // Re-highlight the visible diff under the new settings
-                        // (a no-op when syntax is now disabled).
-                        self.diff_needs_highlight = true;
+                        // (a no-op when syntax is now disabled). Bumps the
+                        // generation so an in-flight old-theme worker's queued
+                        // spans are dropped, not applied for a frame.
+                        self.invalidate_diff_highlight();
                     }
                     self.config_error_toast = warned.then(std::time::Instant::now);
                 }
                 Err(e) => {
-                    eprintln!("gitkay: {e}");
+                    log::warn!("{e}");
                     self.config_error_toast = Some(std::time::Instant::now());
                 }
             }
         }
 
-        self.ensure_diff_highlighted();
+        // Apply finished background-highlight results (one batch per file) for
+        // the current diff; drop stale ones (the diff or theme changed since the
+        // worker was spawned).
+        while let Ok(batch) = self.highlight_rx.try_recv() {
+            if batch.generation == self.diff_generation.load(Ordering::Relaxed) {
+                for (i, spans) in batch.lines {
+                    if let Some(line) = self.diff_lines.get_mut(i) {
+                        line.spans = spans;
+                    }
+                }
+            }
+        }
+        self.ensure_diff_highlighted(ctx);
 
         let row_height = 20.0;
         let col_width = 12.0;
@@ -1770,7 +2096,34 @@ impl eframe::App for GitkApp {
                             if let Some(t) = scroll_target {
                                 scroll = scroll.vertical_scroll_offset(t as f32 * row_h);
                             }
+                            // Size the horizontal scroll to the widest line in
+                            // the whole diff — virtualization only lays out
+                            // visible rows, so egui can't otherwise know an
+                            // off-screen line is wide. Monospace assumption.
+                            let char_w = ui.fonts(|f| f.glyph_width(&font_id, ' '));
+                            let content_w = (self.diff_max_chars as f32 + 1.0) * char_w;
                             scroll.show_rows(ui, row_h, self.diff_lines.len(), |ui, rows| {
+                                ui.set_min_width(content_w);
+                                // Tell the background worker which files are on
+                                // screen so it tokenizes those first, plus the
+                                // file range one viewport (in rows) above/below
+                                // for read-ahead. Skip an empty row range (e.g. a
+                                // zero-height pane), which would yield hi < lo.
+                                if let Some(p) = &self.highlight_priority
+                                    && rows.start < rows.end
+                                {
+                                    let vh = rows.end - rows.start; // viewport height in rows
+                                    let files = &self.diff_files;
+                                    let lo = file_index_at_line(files, rows.start);
+                                    let hi = file_index_at_line(files, rows.end - 1);
+                                    let page_lo =
+                                        file_index_at_line(files, rows.start.saturating_sub(vh));
+                                    let page_hi = file_index_at_line(files, rows.end - 1 + vh);
+                                    p.lo.store(lo, Ordering::Relaxed);
+                                    p.hi.store(hi, Ordering::Relaxed);
+                                    p.page_lo.store(page_lo, Ordering::Relaxed);
+                                    p.page_hi.store(page_hi, Ordering::Relaxed);
+                                }
                                 for i in rows {
                                     let line = &self.diff_lines[i];
                                     let (job, row_bg) =
@@ -1894,8 +2247,16 @@ impl eframe::App for GitkApp {
                                     .text(&sha);
                             }
                             self.copied_toast = Some(std::time::Instant::now());
-                            let repo = Repository::discover(&self.repo_path).unwrap();
-                            self.refresh_for_selection(&repo, clicked_oid);
+                            // The clicked commit is already loaded at clicked_idx
+                            // — select it and load its diff, exactly like arrow-key
+                            // nav. No commit-list reload / graph relayout (that's
+                            // only needed to jump to a not-yet-loaded commit, e.g.
+                            // a search hit), which was blocking the UI on click.
+                            self.set_selected(clicked_idx);
+                            if let Ok(repo) = Repository::discover(&self.repo_path) {
+                                self.load_selected_diff(&repo);
+                            }
+                            self.diff_scroll_to = Some(0); // reset diff view to top
                         }
                     }
 
@@ -2170,10 +2531,13 @@ impl eframe::App for GitkApp {
 }
 
 fn main() -> eframe::Result {
+    // Warnings show by default; set e.g. RUST_LOG=gitkay=debug for timing logs.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+
     let repo_path = std::env::args().nth(1).unwrap_or_else(|| ".".to_string());
 
     if Repository::discover(&repo_path).is_err() {
-        eprintln!("Not a git repository: {repo_path}");
+        log::error!("not a git repository: {repo_path}");
         std::process::exit(1);
     }
 
@@ -2909,6 +3273,83 @@ mod tests {
             }
         );
         assert_eq!(warns.len(), 1);
+    }
+
+    #[test]
+    fn file_ranges_and_index_lookup() {
+        let f = |path: &str, idx| FileEntry {
+            path: path.to_string(),
+            additions: 0,
+            deletions: 0,
+            diff_line_idx: idx,
+        };
+        // File "a" at line 2, a no-patch file (idx 0, skipped), file "b" at 5.
+        let files = vec![f("a", 2), f("bin", 0), f("b", 5)];
+
+        // Ranges: ordered by start, no-patch skipped, end = next start / total.
+        assert_eq!(file_line_ranges(&files, 9), vec![(0, 2, 5), (2, 5, 9)]);
+
+        // Line → containing file (header region maps to 0).
+        assert_eq!(file_index_at_line(&files, 0), 0); // header, before any file
+        assert_eq!(file_index_at_line(&files, 2), 0); // inclusive left edge of "a"
+        assert_eq!(file_index_at_line(&files, 3), 0); // inside "a"
+        assert_eq!(file_index_at_line(&files, 5), 2); // first line of "b"
+        assert_eq!(file_index_at_line(&files, 8), 2); // inside "b"
+        assert_eq!(file_index_at_line(&files, 999), 2); // past the last file → last file
+    }
+
+    #[test]
+    fn unsorted_files_and_clamping() {
+        let f = |idx| FileEntry {
+            path: "x".to_string(),
+            additions: 0,
+            deletions: 0,
+            diff_line_idx: idx,
+        };
+        // Input out of order: ranges must still come out start-ordered.
+        let files = vec![f(5), f(2)];
+        assert_eq!(file_line_ranges(&files, 9), vec![(1, 2, 5), (0, 5, 9)]);
+        // total_lines below a start clamps both ends to total.
+        assert_eq!(file_line_ranges(&files, 3), vec![(1, 2, 3), (0, 3, 3)]);
+    }
+
+    #[test]
+    fn pick_file_visible_page_below_page_above_rest() {
+        // `pending` in file order: (file index, start, end).
+        let p = |fis: &[usize]| -> Vec<(usize, usize, usize)> {
+            fis.iter().map(|&fi| (fi, fi, fi + 1)).collect()
+        };
+        // Files 0..=9, viewport shows 3..=4, page bounds 1..=6: page below = 5,6;
+        // page above = 1,2; rest below = 7,8,9; rest above = 0.
+        // The file index that gets picked next, for the given remaining set:
+        let picked = |fis: &[usize]| -> usize {
+            let pend = p(fis);
+            pend[pick_file(&pend, 3, 4, 1, 6)].0
+        };
+        assert_eq!(picked(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]), 3); // visible top
+        assert_eq!(picked(&[0, 1, 2, 4, 5, 6, 7, 8, 9]), 4); // visible
+        assert_eq!(picked(&[0, 1, 2, 5, 6, 7, 8, 9]), 5); // page below, nearest
+        assert_eq!(picked(&[0, 1, 2, 6, 7, 8, 9]), 6); // page below
+        assert_eq!(picked(&[0, 1, 2, 7, 8, 9]), 2); // page above, nearest
+        assert_eq!(picked(&[0, 1, 7, 8, 9]), 1); // page above
+        assert_eq!(picked(&[0, 7, 8, 9]), 7); // rest below, downward
+        assert_eq!(picked(&[0, 8, 9]), 8);
+        assert_eq!(picked(&[0]), 0); // rest above
+        // Stale range past all files: no panic, picks something.
+        assert_eq!(pick_file(&p(&[3, 4]), 9, 9, 9, 9), 1);
+    }
+
+    #[test]
+    fn diff_line_body_strips_marker_by_kind() {
+        assert_eq!(DiffLine::new("+added", LineKind::Add).body(), "added");
+        assert_eq!(DiffLine::new("-removed", LineKind::Del).body(), "removed");
+        assert_eq!(
+            DiffLine::new("context", LineKind::Context).body(),
+            "context"
+        );
+        assert_eq!(DiffLine::new("@@ hunk", LineKind::Hunk).body(), "@@ hunk");
+        // A marker-only add/del line → empty body, no panic.
+        assert_eq!(DiffLine::new("+", LineKind::Add).body(), "");
     }
 
     #[test]
