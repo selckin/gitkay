@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 
 mod config;
+mod diff_cache;
 mod highlight;
 use config::{Fonts, Role};
 use highlight::{DiffBg, HighlightLines, Highlighter};
