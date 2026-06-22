@@ -1129,12 +1129,16 @@ fn diff_row_job(
         };
         push(glyph, glyph_color);
         // None (not highlighted) and Some(empty) (blank line) both render plain.
+        // Spans hold byte ranges into `body`, so slice rather than copy.
+        let body = line.body();
         let spans = line.spans.as_deref().unwrap_or(&[]);
         if spans.is_empty() {
-            push(line.body(), palette.foreground);
+            push(body, palette.foreground);
         } else {
-            for (color, text) in spans {
-                push(text, *color);
+            for (color, range) in spans {
+                if let Some(text) = body.get(range.start..range.end) {
+                    push(text, *color);
+                }
             }
         }
         let row_bg = match line.kind {
@@ -3670,21 +3674,24 @@ mod tests {
             "context code line should tokenize"
         );
 
-        // The +/- marker must be stripped before tokenizing (both Add and Del).
+        // The +/- marker must be stripped before tokenizing (both Add and Del);
+        // spans are byte ranges into body(), so reassembling them yields the body.
+        let body3 = lines[3].body();
         let added: String = lines[3]
             .spans
             .as_ref()
             .unwrap()
             .iter()
-            .map(|(_, t)| t.as_str())
+            .map(|(_, r)| &body3[r.start..r.end])
             .collect();
         assert_eq!(added, "fn main() {}");
+        let body4 = lines[4].body();
         let deleted: String = lines[4]
             .spans
             .as_ref()
             .unwrap()
             .iter()
-            .map(|(_, t)| t.as_str())
+            .map(|(_, r)| &body4[r.start..r.end])
             .collect();
         assert_eq!(deleted, "let old = 0;");
     }
@@ -3897,7 +3904,7 @@ mod tests {
 
     #[test]
     fn file_fully_highlighted_predicate() {
-        let span = || (egui::Color32::WHITE, "a".to_string());
+        let span = || (egui::Color32::WHITE, 0..1);
         let mut highlighted = DiffLine::new("+a", LineKind::Add);
         highlighted.spans = Some(vec![span()]);
         let mut blank_done = DiffLine::new("+", LineKind::Add);
@@ -3923,7 +3930,7 @@ mod tests {
 
     #[test]
     fn diff_fully_highlighted_ignores_untokenized_header_lines() {
-        let span = || (egui::Color32::WHITE, "x".to_string());
+        let span = || (egui::Color32::WHITE, 0..1);
         let mut a0 = DiffLine::new("+a", LineKind::Add);
         a0.spans = Some(vec![span()]);
         let mut a1 = DiffLine::new(" b", LineKind::Context);
@@ -3955,7 +3962,7 @@ mod tests {
     fn pending_files_skips_fully_highlighted() {
         // file A starts at line 1 [1,3): both code lines Some ⇒ done.
         // file B starts at line 3 [3,5): one code line None ⇒ pending.
-        let span = || (egui::Color32::WHITE, "x".to_string());
+        let span = || (egui::Color32::WHITE, 0..1);
         let mut a0 = DiffLine::new("+a0", LineKind::Add);
         a0.spans = Some(vec![span()]);
         let mut a1 = DiffLine::new("+a1", LineKind::Add);
