@@ -800,17 +800,27 @@ struct HighlightJob {
 /// the file it's tokenizing scrolls out of view while a visible file is pending,
 /// it re-queues the rest and switches — so selecting a file never waits behind a
 /// large off-screen one. It bails as soon as a newer highlight pass supersedes it.
-/// The most common file extensions in `paths`: distinct, lowercased, sorted by
-/// descending frequency (ties by name ascending), capped at `cap`. Paths with no
-/// extension are ignored. Pure — the prewarm scan feeds it HEAD-tree file names.
-fn top_extensions(paths: impl Iterator<Item = String>, cap: usize) -> Vec<String> {
+/// The most common file extensions in `paths` that `keep` accepts: distinct,
+/// lowercased, sorted by descending frequency (ties by name ascending), capped at
+/// `cap`. Paths with no extension are ignored, and `keep` is applied *before* the
+/// cap — so the result is the top `cap` *kept* extensions (the prewarm passes a
+/// "has a syntect grammar" check so binary extensions like png/pdf can't take a
+/// warm slot). Pure — the prewarm scan feeds it HEAD-tree file names.
+fn top_extensions(
+    paths: impl Iterator<Item = String>,
+    cap: usize,
+    keep: impl Fn(&str) -> bool,
+) -> Vec<String> {
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for path in paths {
         if let Some(ext) = std::path::Path::new(&path)
             .extension()
             .and_then(|e| e.to_str())
         {
-            *counts.entry(ext.to_lowercase()).or_insert(0) += 1;
+            let ext = ext.to_lowercase();
+            if keep(&ext) {
+                *counts.entry(ext).or_insert(0) += 1;
+            }
         }
     }
     let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
@@ -951,7 +961,12 @@ fn collect_tree_blob_names(
 
 /// The repo's most common languages (by file extension) in the HEAD tree, capped.
 /// Returns an empty list on any failure (no HEAD, unborn/empty repo, etc.).
-fn repo_head_extensions(repo: &git2::Repository, max_entries: usize, cap: usize) -> Vec<String> {
+fn repo_head_extensions(
+    repo: &git2::Repository,
+    max_entries: usize,
+    cap: usize,
+    hl: &Highlighter,
+) -> Vec<String> {
     let Ok(head) = repo.head() else {
         return Vec::new();
     };
@@ -960,7 +975,9 @@ fn repo_head_extensions(repo: &git2::Repository, max_entries: usize, cap: usize)
     };
     let mut names = Vec::new();
     collect_tree_blob_names(repo, &tree, max_entries, 0, &mut names);
-    top_extensions(names.into_iter(), cap)
+    // Only count extensions syntect can actually highlight — png/pdf/binary
+    // extensions have no grammar and would waste a slot in the warm set.
+    top_extensions(names.into_iter(), cap, |ext| hl.has_syntax(ext))
 }
 
 /// Background prewarm: build the highlighter off the UI thread, hand it to the UI
@@ -992,7 +1009,7 @@ fn prewarm_highlighter(
     ctx.request_repaint();
 
     let exts = match git2::Repository::discover(&repo_path) {
-        Ok(repo) => repo_head_extensions(&repo, MAX_TREE_ENTRIES, MAX_WARM_LANGS),
+        Ok(repo) => repo_head_extensions(&repo, MAX_TREE_ENTRIES, MAX_WARM_LANGS, &hl),
         Err(e) => {
             log::debug!("prewarm: repo discover failed: {e}; no languages warmed");
             return;
@@ -4027,7 +4044,7 @@ mod tests {
         .into_iter()
         .map(String::from);
         assert_eq!(
-            top_extensions(paths, 2),
+            top_extensions(paths, 2, |_| true),
             vec!["rs".to_string(), "py".to_string()]
         );
     }
@@ -4036,7 +4053,7 @@ mod tests {
     fn top_extensions_tiebreak_is_name_ascending() {
         let paths = ["a.zz", "b.aa"].into_iter().map(String::from); // each ×1
         assert_eq!(
-            top_extensions(paths, 2),
+            top_extensions(paths, 2, |_| true),
             vec!["aa".to_string(), "zz".to_string()]
         );
     }
@@ -4044,7 +4061,21 @@ mod tests {
     #[test]
     fn top_extensions_skips_extensionless_and_lowercases() {
         let paths = ["Makefile", "README", "X.TXT"].into_iter().map(String::from);
-        assert_eq!(top_extensions(paths, 10), vec!["txt".to_string()]);
+        assert_eq!(top_extensions(paths, 10, |_| true), vec!["txt".to_string()]);
+    }
+
+    #[test]
+    fn top_extensions_keep_filters_before_cap() {
+        // png is the most frequent extension but `keep` rejects it (no grammar);
+        // it must not consume a slot, so the top-2 are the kept rs/py.
+        let paths = ["a.png", "b.png", "c.png", "x.rs", "y.rs", "z.py"]
+            .into_iter()
+            .map(String::from);
+        let keep = |ext: &str| ext != "png";
+        assert_eq!(
+            top_extensions(paths, 2, keep),
+            vec!["rs".to_string(), "py".to_string()]
+        );
     }
 
     #[test]
