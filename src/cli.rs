@@ -6,14 +6,16 @@
 pub struct Scope {
     pub all: bool,
     pub revs: Vec<String>,
-    #[allow(dead_code)] // used in Task 3 (path filtering)
     pub paths: Vec<String>,
 }
 
 /// Flags + raw positional tokens, before rev/path classification.
+#[derive(Default)]
 pub struct RawArgs {
     pub repo_dir: Option<String>,
     pub all: bool,
+    pub help: bool,        // -h / --help: print usage and exit
+    pub version: bool,     // -V / --version: print version and exit
     pub pre: Vec<String>,  // positional tokens before `--`
     pub post: Vec<String>, // positional tokens after `--` (always paths)
 }
@@ -43,6 +45,11 @@ pub fn parse_flags(args: impl Iterator<Item = String>) -> Result<RawArgs, String
         }
         if arg == "--" {
             after_dashdash = true;
+        } else if arg == "--help" || arg == "-h" {
+            // Short-circuit so help wins even alongside other (or invalid) args.
+            return Ok(RawArgs { help: true, ..Default::default() });
+        } else if arg == "--version" || arg == "-V" {
+            return Ok(RawArgs { version: true, ..Default::default() });
         } else if arg == "--all" {
             all = true;
         } else if arg == "-C" {
@@ -55,7 +62,7 @@ pub fn parse_flags(args: impl Iterator<Item = String>) -> Result<RawArgs, String
             pre.push(arg);
         }
     }
-    Ok(RawArgs { repo_dir, all, pre, post })
+    Ok(RawArgs { repo_dir, all, pre, post, ..Default::default() })
 }
 
 /// Split positional tokens into revs and paths. Revs come first; the first token
@@ -162,6 +169,20 @@ mod tests {
         let (revs, paths) = classify(&[], &v(&["gone.rs"]), |_| false, |_| false).unwrap();
         assert!(revs.is_empty());
         assert_eq!(paths, v(&["gone.rs"]));
+    }
+
+    #[test]
+    fn parse_flags_help_and_version() {
+        assert!(parse_flags(v(&["--help"]).into_iter()).unwrap().help);
+        assert!(parse_flags(v(&["-h"]).into_iter()).unwrap().help);
+        assert!(parse_flags(v(&["--version"]).into_iter()).unwrap().version);
+        assert!(parse_flags(v(&["-V"]).into_iter()).unwrap().version);
+        // help wins even alongside an arg that would otherwise error
+        assert!(parse_flags(v(&["--help", "--bogus"]).into_iter()).unwrap().help);
+        // after `--`, `--help` is a path, not the flag
+        let r = parse_flags(v(&["--", "--help"]).into_iter()).unwrap();
+        assert!(!r.help);
+        assert_eq!(r.post, v(&["--help"]));
     }
 
     #[test]
