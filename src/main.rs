@@ -72,6 +72,10 @@ const DIFF_CACHE_LINE_BUDGET: usize = 100_000;
 const MAX_TREE_ENTRIES: usize = 5_000;
 /// Prewarm: most languages whose regexes we compile ahead of time.
 const MAX_WARM_LANGS: usize = 12;
+/// Prewarm: max HEAD-tree recursion depth, bounding the prewarm thread's stack on
+/// pathologically deep trees (real repos nest far shallower). Deeper subtrees are
+/// skipped — the entry cap already bounds total work.
+const MAX_TREE_DEPTH: usize = 64;
 
 /// Everything a cached diff's content + spans depend on. `diff_bg` is excluded
 /// (it's a render-time tint, not baked into spans).
@@ -864,12 +868,13 @@ fn highlight_worker(job: HighlightJob) {
 }
 
 /// Collect blob (file) names from `tree`, recursing into subtrees, until `out`
-/// reaches `max` entries. Names only — no blob reads. Best-effort: unreadable
-/// subtrees are skipped.
+/// reaches `max` entries or `depth` reaches `MAX_TREE_DEPTH`. Names only — no blob
+/// reads. Best-effort: unreadable subtrees are skipped.
 fn collect_tree_blob_names(
     repo: &git2::Repository,
     tree: &git2::Tree,
     max: usize,
+    depth: usize,
     out: &mut Vec<String>,
 ) {
     for entry in tree.iter() {
@@ -882,9 +887,12 @@ fn collect_tree_blob_names(
                     out.push(name.to_string());
                 }
             }
-            Some(git2::ObjectType::Tree) => {
+            // Stop recursing past the depth cap so a pathologically deep tree
+            // can't overflow this thread's stack (the entry cap bounds total work,
+            // not recursion depth — deeply nested empty dirs would recurse freely).
+            Some(git2::ObjectType::Tree) if depth < MAX_TREE_DEPTH => {
                 if let Ok(subtree) = repo.find_tree(entry.id()) {
-                    collect_tree_blob_names(repo, &subtree, max, out);
+                    collect_tree_blob_names(repo, &subtree, max, depth + 1, out);
                 }
             }
             _ => {}
@@ -902,7 +910,7 @@ fn repo_head_extensions(repo: &git2::Repository, max_entries: usize, cap: usize)
         return Vec::new();
     };
     let mut names = Vec::new();
-    collect_tree_blob_names(repo, &tree, max_entries, &mut names);
+    collect_tree_blob_names(repo, &tree, max_entries, 0, &mut names);
     top_extensions(names.into_iter(), cap)
 }
 
@@ -918,7 +926,13 @@ fn prewarm_highlighter(
     ctx: egui::Context,
 ) {
     let t = std::time::Instant::now();
-    let (hl, _warning) = Highlighter::new(&theme_slug, diff_bg);
+    let (hl, warning) = Highlighter::new(&theme_slug, diff_bg);
+    // Surface a bad-theme-slug warning to the log even though the UI re-derives
+    // (and re-warns) via with_theme at install — the install warning is lost if
+    // the config is corrected before the prewarm is installed.
+    if let Some(w) = warning {
+        log::warn!("prewarm: {w}");
+    }
     let hl = Arc::new(hl);
     log::debug!("prewarm: highlighter built off-thread in {:?}", t.elapsed());
     // Hand the highlighter to the UI immediately so the first diff can install
@@ -936,6 +950,7 @@ fn prewarm_highlighter(
         }
     };
     if exts.is_empty() {
+        log::debug!("prewarm: no recognised file extensions in HEAD tree; warmed 0 languages");
         return;
     }
     let t = std::time::Instant::now();
@@ -1568,8 +1583,20 @@ impl GitkApp {
             let theme_pw = theme_slug.clone();
             match std::thread::Builder::new()
                 .name("gitkay-prewarm".to_string())
-                .spawn(move || prewarm_highlighter(repo_path_pw, theme_pw, diff_bg, tx, ctx))
-            {
+                // Catch a panic in the (detached) prewarm thread so it's logged
+                // rather than a silent stderr message — e.g. if warm_extension
+                // panics after the highlighter was already sent and installed.
+                .spawn(move || {
+                    let work =
+                        std::panic::AssertUnwindSafe(move || {
+                            prewarm_highlighter(repo_path_pw, theme_pw, diff_bg, tx, ctx)
+                        });
+                    if std::panic::catch_unwind(work).is_err() {
+                        log::warn!(
+                            "prewarm thread panicked; highlighting falls back to the installed or synchronous highlighter"
+                        );
+                    }
+                }) {
                 Ok(_) => Some(rx),
                 Err(e) => {
                     log::warn!("prewarm thread spawn failed: {e}; first diff builds the highlighter synchronously");
@@ -1913,6 +1940,15 @@ impl eframe::App for GitkApp {
                         self.syntax_enabled = new_enabled;
                         self.theme_slug = new_slug;
                         self.diff_bg = new_diff_bg;
+                        // If syntax was just turned off, drop any in-flight prewarm
+                        // receiver: it would otherwise linger as a dead channel, and
+                        // on re-enable a still-warming thread could leave the diff
+                        // plain (the Empty branch returns and the thread's single
+                        // request_repaint already fired). Re-enabling then takes the
+                        // synchronous build path.
+                        if !self.syntax_enabled {
+                            self.prewarm_rx = None;
+                        }
                         // Rebuild the (shared) highlighter for the new theme,
                         // reusing its syntax set. A new Arc leaves any in-flight
                         // worker holding the old one valid.
