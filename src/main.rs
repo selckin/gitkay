@@ -69,10 +69,8 @@ const DIFF_CACHE_LINE_BUDGET: usize = 100_000;
 /// Prewarm: most files scanned in the HEAD tree to rank languages by frequency.
 /// Frequencies converge long before this, so the top languages are the same on a
 /// 5k- or 500k-file tree.
-#[allow(dead_code)]
 const MAX_TREE_ENTRIES: usize = 5_000;
 /// Prewarm: most languages whose regexes we compile ahead of time.
-#[allow(dead_code)]
 const MAX_WARM_LANGS: usize = 12;
 
 /// Everything a cached diff's content + spans depend on. `diff_bg` is excluded
@@ -757,7 +755,6 @@ struct HighlightJob {
 /// The most common file extensions in `paths`: distinct, lowercased, sorted by
 /// descending frequency (ties by name ascending), capped at `cap`. Paths with no
 /// extension are ignored. Pure — the prewarm scan feeds it HEAD-tree file names.
-#[allow(dead_code)]
 fn top_extensions(paths: impl Iterator<Item = String>, cap: usize) -> Vec<String> {
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for path in paths {
@@ -869,7 +866,6 @@ fn highlight_worker(job: HighlightJob) {
 /// Collect blob (file) names from `tree`, recursing into subtrees, until `out`
 /// reaches `max` entries. Names only — no blob reads. Best-effort: unreadable
 /// subtrees are skipped.
-#[allow(dead_code)]
 fn collect_tree_blob_names(
     repo: &git2::Repository,
     tree: &git2::Tree,
@@ -898,7 +894,6 @@ fn collect_tree_blob_names(
 
 /// The repo's most common languages (by file extension) in the HEAD tree, capped.
 /// Returns an empty list on any failure (no HEAD, unborn/empty repo, etc.).
-#[allow(dead_code)]
 fn repo_head_extensions(repo: &git2::Repository, max_entries: usize, cap: usize) -> Vec<String> {
     let Ok(head) = repo.head() else {
         return Vec::new();
@@ -915,7 +910,6 @@ fn repo_head_extensions(repo: &git2::Repository, max_entries: usize, cap: usize)
 /// at once, then compile the regexes for the repo's most common languages through
 /// the shared `SyntaxSet` so the first diff in each is already coloured. Pure
 /// optimization — any failure simply warms fewer or no languages.
-#[allow(dead_code)]
 fn prewarm_highlighter(
     repo_path: String,
     theme_slug: String,
@@ -1351,6 +1345,7 @@ struct GitkApp {
     diff_max_chars: usize, // widest diff line (chars); sizes the virtualized h-scroll for off-screen lines
     diff_cache: DiffCache<DiffCacheKey, DiffData>, // diffs the user navigated away from
     current_diff_key: Option<DiffCacheKey>, // key the live diff_lines was built under (None ⇒ virtual/none)
+    prewarm_rx: Option<mpsc::Receiver<Arc<Highlighter>>>, // startup-prewarmed highlighter, until installed
 }
 
 /// Widest diff line in characters — used to size the horizontal scroll content
@@ -1563,6 +1558,28 @@ impl GitkApp {
         let (highlight_tx, highlight_rx) = mpsc::channel();
         let diff_max_chars = max_line_chars(&diff_lines);
 
+        // Eagerly warm the highlighter off-thread so the first cross-language diff
+        // is already coloured. Only when syntax is on; on spawn failure, fall back
+        // to the lazy/synchronous build (prewarm_rx = None).
+        let prewarm_rx = if syntax_enabled {
+            let (tx, rx) = mpsc::channel();
+            let ctx = cc.egui_ctx.clone();
+            let repo_path_pw = repo_path.clone();
+            let theme_pw = theme_slug.clone();
+            match std::thread::Builder::new()
+                .name("gitkay-prewarm".to_string())
+                .spawn(move || prewarm_highlighter(repo_path_pw, theme_pw, diff_bg, tx, ctx))
+            {
+                Ok(_) => Some(rx),
+                Err(e) => {
+                    log::warn!("prewarm thread spawn failed: {e}; first diff builds the highlighter synchronously");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             commits,
             graph_rows,
@@ -1602,6 +1619,7 @@ impl GitkApp {
             highlight_priority: None,
             diff_cache: DiffCache::new(DIFF_CACHE_LINE_BUDGET),
             current_diff_key: None,
+            prewarm_rx,
         }
     }
 
@@ -1727,17 +1745,37 @@ impl GitkApp {
             return;
         }
         if self.highlighter.is_none() {
-            let t = std::time::Instant::now();
-            let (hl, warning) = Highlighter::new(&self.theme_slug, self.diff_bg);
-            log::debug!(
-                "perf: built highlighter (syntax set load) {:?}",
-                t.elapsed()
-            );
-            if let Some(w) = warning {
-                log::warn!("{w}");
-                self.config_error_toast = Some(std::time::Instant::now());
+            match self.prewarm_rx.as_ref().map(|rx| rx.try_recv()) {
+                // Prewarmed highlighter ready: install it, re-deriving the palette
+                // for the current theme (it may have changed since startup) — this
+                // reuses the warm SyntaxSet.
+                Some(Ok(prewarmed)) => {
+                    let (hl, warning) = prewarmed.with_theme(&self.theme_slug, self.diff_bg);
+                    if let Some(w) = warning {
+                        log::warn!("{w}");
+                        self.config_error_toast = Some(std::time::Instant::now());
+                    }
+                    self.highlighter = Some(Arc::new(hl));
+                    self.prewarm_rx = None;
+                }
+                // Still building off-thread: render plain this frame and retry next
+                // — leave diff_needs_highlight set. The prewarm thread calls
+                // request_repaint when it sends, so a next frame happens.
+                Some(Err(mpsc::TryRecvError::Empty)) => return,
+                // No prewarm (syntax toggled on mid-session) or the thread died:
+                // build synchronously, as before.
+                Some(Err(mpsc::TryRecvError::Disconnected)) | None => {
+                    self.prewarm_rx = None;
+                    let t = std::time::Instant::now();
+                    let (hl, warning) = Highlighter::new(&self.theme_slug, self.diff_bg);
+                    log::debug!("perf: built highlighter (sync fallback) {:?}", t.elapsed());
+                    if let Some(w) = warning {
+                        log::warn!("{w}");
+                        self.config_error_toast = Some(std::time::Instant::now());
+                    }
+                    self.highlighter = Some(Arc::new(hl));
+                }
             }
-            self.highlighter = Some(Arc::new(hl));
         }
         let Some(hl) = &self.highlighter else {
             return;

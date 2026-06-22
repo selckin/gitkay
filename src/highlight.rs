@@ -348,7 +348,6 @@ impl Highlighter {
     /// `SyntaxSet`, so this populates the cache the real highlight worker reads.
     /// Used by the startup prewarm to keep the first per-language compile off the
     /// hot path.
-    #[allow(dead_code)]
     pub fn warm_extension(&self, ext: &str) {
         let mut state = self.new_file_state(&format!("warm.{ext}"));
         for line in ["let x = 1; // s", "\"text\""] {
