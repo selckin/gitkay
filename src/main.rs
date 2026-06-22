@@ -99,6 +99,89 @@ fn is_real_commit(oid: git2::Oid) -> bool {
     oid != oid_uncommitted() && oid != oid_staged()
 }
 
+/// Lexically normalize a `/`-separated relative path: drop `.` and empty segments,
+/// resolve `..` against a preceding normal segment. Never touches the filesystem, so
+/// it works on pathspecs for files that no longer exist.
+fn normalize_rel(path: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if matches!(out.last(), Some(&s) if s != "..") {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            s => out.push(s),
+        }
+    }
+    out.join("/")
+}
+
+/// Translate a user-supplied path token into a repo-root-relative pathspec. `prefix`
+/// is the run directory's location inside the repo (e.g. "src" when started in
+/// `<repo>/src`). Relative tokens are joined onto `prefix`; absolute tokens are made
+/// relative to `workdir`. A token that resolves to the repo root (e.g. `.` at the
+/// top) yields "" — the caller drops those so they impose no restriction.
+fn token_to_pathspec(token: &str, prefix: &str, workdir: &std::path::Path) -> String {
+    let p = std::path::Path::new(token);
+    if p.is_absolute() {
+        match p.strip_prefix(workdir) {
+            Ok(rel) => normalize_rel(&rel.to_string_lossy().replace('\\', "/")),
+            Err(_) => token.to_string(), // outside the repo — will simply match nothing
+        }
+    } else {
+        normalize_rel(&format!("{prefix}/{token}"))
+    }
+}
+
+/// The parenthetical scope shown in the window title, e.g. `--all`, `main`,
+/// `a..b -- src`. Empty when the default (current branch, no path filter) is active.
+fn scope_title_suffix(scope: &cli::Scope) -> String {
+    let mut head: Vec<String> = Vec::new();
+    if scope.all {
+        head.push("--all".to_string());
+    }
+    head.extend(scope.revs.iter().cloned());
+    let mut s = head.join(" ");
+    if !scope.paths.is_empty() {
+        if !s.is_empty() {
+            s.push(' ');
+        }
+        s.push_str("-- ");
+        s.push_str(&scope.paths.join(" "));
+    }
+    s
+}
+
+fn print_help() {
+    print!(
+        r#"gitkay — a git history viewer
+
+USAGE:
+    gitkay [-C <dir>] [--all] [<rev>...] [-- <path>...]
+
+OPTIONS:
+    -C <dir>        Run as if started in <dir>
+    --all           Show all refs (branches, remotes, tags), not just the current branch
+    -h, --help      Print this help and exit
+    -V, --version   Print version and exit
+
+ARGS:
+    <rev>...        Revisions to show: <rev>, <a>..<b>, <a>...<b>, ^<rev>
+                    (default: the current branch)
+    <path>...       Limit history and diffs to commits touching these paths
+                    (relative to the current directory, like git)
+"#
+    );
+}
+
+fn print_version() {
+    println!("gitkay {}", env!("CARGO_PKG_VERSION"));
+}
+
 /// The real-commit oids to prefetch around `selected`: up to `below` commits
 /// below (indices `selected+1 ..`), then up to `above` commits above
 /// (closest-first: `selected-1`, `selected-2`, …). Clamped to the slice bounds;
@@ -3189,6 +3272,14 @@ fn main() -> eframe::Result {
             std::process::exit(2);
         }
     };
+    if raw.help {
+        print_help();
+        return Ok(());
+    }
+    if raw.version {
+        print_version();
+        return Ok(());
+    }
     let repo_path = raw.repo_dir.clone().unwrap_or_else(|| ".".to_string());
     let repo = match Repository::discover(&repo_path) {
         Ok(r) => r,
@@ -3197,6 +3288,26 @@ fn main() -> eframe::Result {
             std::process::exit(1);
         }
     };
+
+    // Paths are taken relative to where gitkay runs (the `-C` dir, or the cwd) and
+    // rewritten to repo-root-relative pathspecs, like git. `prefix` is that run
+    // directory's location inside the repo (empty at the repo root).
+    let run_dir = match &raw.repo_dir {
+        Some(d) => std::fs::canonicalize(d).unwrap_or_else(|_| std::path::PathBuf::from(d)),
+        None => std::env::current_dir().unwrap_or_default(),
+    };
+    let workdir = repo.workdir().map(|w| w.to_path_buf());
+    let prefix = workdir
+        .as_ref()
+        .and_then(|w| std::fs::canonicalize(w).ok())
+        .zip(std::fs::canonicalize(&run_dir).ok())
+        .and_then(|(w, c)| {
+            c.strip_prefix(&w)
+                .ok()
+                .map(|r| r.to_string_lossy().replace('\\', "/"))
+        })
+        .unwrap_or_default();
+
     // Classify positional tokens into revs vs paths against the real repo.
     let is_rev = |tok: &str| match cli::rev_token_kind(tok) {
         cli::RevTokenKind::Single(s) | cli::RevTokenKind::Exclude(s) => {
@@ -3206,13 +3317,25 @@ fn main() -> eframe::Result {
             repo.revparse_single(&a).is_ok() && repo.revparse_single(&b).is_ok()
         }
     };
-    let is_path = |tok: &str| std::path::Path::new(tok).exists();
-    let (revs, paths) = match cli::classify(&raw.pre, &raw.post, is_rev, is_path) {
+    // Existence is checked relative to the run dir, so `gitkay foo.rs` in a subdir
+    // resolves against that subdir — the path the user actually typed.
+    let is_path = |tok: &str| run_dir.join(tok).exists();
+    let (revs, raw_paths) = match cli::classify(&raw.pre, &raw.post, is_rev, is_path) {
         Ok(rp) => rp,
         Err(e) => {
             eprintln!("gitkay: {e}");
             std::process::exit(2);
         }
+    };
+    // Rewrite each path to a repo-root-relative pathspec; drop any that resolve to the
+    // repo root (e.g. `.` at the top, or `gitkay .` whose dir is the whole repo).
+    let paths: Vec<String> = match &workdir {
+        Some(w) => raw_paths
+            .iter()
+            .map(|p| token_to_pathspec(p, &prefix, w))
+            .filter(|p| !p.is_empty())
+            .collect(),
+        None => raw_paths, // bare repo: no worktree to anchor paths against
     };
     let scope = cli::Scope { all: raw.all, revs, paths };
     drop(repo); // GitkApp re-discovers from repo_path
@@ -3224,7 +3347,12 @@ fn main() -> eframe::Result {
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .unwrap_or("gitkay");
-        format!("gitkay — {workdir}")
+        let suffix = scope_title_suffix(&scope);
+        if suffix.is_empty() {
+            format!("gitkay — {workdir}")
+        } else {
+            format!("gitkay — {workdir} ({suffix})")
+        }
     };
 
     let options = eframe::NativeOptions {
@@ -4440,6 +4568,47 @@ mod tests {
         );
         // No filter: the row shows.
         assert!(has_uncommitted_row(Vec::new()));
+    }
+
+    #[test]
+    fn normalize_rel_resolves_dot_and_dotdot() {
+        assert_eq!(normalize_rel("src/./foo"), "src/foo");
+        assert_eq!(normalize_rel("src/../foo"), "foo");
+        assert_eq!(normalize_rel("a//b"), "a/b");
+        assert_eq!(normalize_rel("src/.."), "");
+        assert_eq!(normalize_rel("./."), "");
+        assert_eq!(normalize_rel("/foo"), "foo"); // leading slash from an empty prefix
+    }
+
+    #[test]
+    fn token_to_pathspec_anchors_relative_to_prefix() {
+        let wd = std::path::Path::new("/repo"); // only consulted for absolute tokens
+        // In <repo>/src, `.` is the whole src dir.
+        assert_eq!(token_to_pathspec(".", "src", wd), "src");
+        assert_eq!(token_to_pathspec("foo.rs", "src", wd), "src/foo.rs");
+        assert_eq!(token_to_pathspec("../README", "src", wd), "README");
+        // At the repo root `.` is the whole repo → "" (dropped by the caller).
+        assert_eq!(token_to_pathspec(".", "", wd), "");
+        assert_eq!(token_to_pathspec("a/b", "", wd), "a/b");
+        // Absolute token under the worktree → made repo-root-relative.
+        assert_eq!(token_to_pathspec("/repo/src/foo.rs", "src", wd), "src/foo.rs");
+    }
+
+    #[test]
+    fn scope_title_suffix_formats() {
+        let s = |all: bool, revs: &[&str], paths: &[&str]| cli::Scope {
+            all,
+            revs: revs.iter().map(|x| x.to_string()).collect(),
+            paths: paths.iter().map(|x| x.to_string()).collect(),
+        };
+        assert_eq!(scope_title_suffix(&s(false, &[], &[])), "");
+        assert_eq!(scope_title_suffix(&s(true, &[], &[])), "--all");
+        assert_eq!(scope_title_suffix(&s(false, &["main"], &[])), "main");
+        assert_eq!(scope_title_suffix(&s(false, &[], &["src"])), "-- src");
+        assert_eq!(
+            scope_title_suffix(&s(false, &["a..b"], &["src", "x"])),
+            "a..b -- src x"
+        );
     }
 
     #[test]
