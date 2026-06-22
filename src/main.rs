@@ -66,6 +66,14 @@ fn oid_staged() -> git2::Oid {
 /// Total cached diff lines before the LRU starts evicting. ~50–100 MB at this
 /// size (each token holds its own `String`); tunable.
 const DIFF_CACHE_LINE_BUDGET: usize = 100_000;
+/// Prewarm: most files scanned in the HEAD tree to rank languages by frequency.
+/// Frequencies converge long before this, so the top languages are the same on a
+/// 5k- or 500k-file tree.
+#[allow(dead_code)]
+const MAX_TREE_ENTRIES: usize = 5_000;
+/// Prewarm: most languages whose regexes we compile ahead of time.
+#[allow(dead_code)]
+const MAX_WARM_LANGS: usize = 12;
 
 /// Everything a cached diff's content + spans depend on. `diff_bg` is excluded
 /// (it's a render-time tint, not baked into spans).
@@ -855,6 +863,96 @@ fn highlight_worker(job: HighlightJob) {
     log::debug!(
         "perf: worker gen {generation} done {:?} ({total_lines} lines)",
         started.elapsed()
+    );
+}
+
+/// Collect blob (file) names from `tree`, recursing into subtrees, until `out`
+/// reaches `max` entries. Names only — no blob reads. Best-effort: unreadable
+/// subtrees are skipped.
+#[allow(dead_code)]
+fn collect_tree_blob_names(
+    repo: &git2::Repository,
+    tree: &git2::Tree,
+    max: usize,
+    out: &mut Vec<String>,
+) {
+    for entry in tree.iter() {
+        if out.len() >= max {
+            return;
+        }
+        match entry.kind() {
+            Some(git2::ObjectType::Blob) => {
+                if let Some(name) = entry.name() {
+                    out.push(name.to_string());
+                }
+            }
+            Some(git2::ObjectType::Tree) => {
+                if let Ok(subtree) = repo.find_tree(entry.id()) {
+                    collect_tree_blob_names(repo, &subtree, max, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The repo's most common languages (by file extension) in the HEAD tree, capped.
+/// Returns an empty list on any failure (no HEAD, unborn/empty repo, etc.).
+#[allow(dead_code)]
+fn repo_head_extensions(repo: &git2::Repository, max_entries: usize, cap: usize) -> Vec<String> {
+    let Ok(head) = repo.head() else {
+        return Vec::new();
+    };
+    let Ok(tree) = head.peel_to_tree() else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    collect_tree_blob_names(repo, &tree, max_entries, &mut names);
+    top_extensions(names.into_iter(), cap)
+}
+
+/// Background prewarm: build the highlighter off the UI thread, hand it to the UI
+/// at once, then compile the regexes for the repo's most common languages through
+/// the shared `SyntaxSet` so the first diff in each is already coloured. Pure
+/// optimization — any failure simply warms fewer or no languages.
+#[allow(dead_code)]
+fn prewarm_highlighter(
+    repo_path: String,
+    theme_slug: String,
+    diff_bg: DiffBg,
+    tx: mpsc::Sender<Arc<Highlighter>>,
+    ctx: egui::Context,
+) {
+    let t = std::time::Instant::now();
+    let (hl, _warning) = Highlighter::new(&theme_slug, diff_bg);
+    let hl = Arc::new(hl);
+    log::debug!("prewarm: highlighter built off-thread in {:?}", t.elapsed());
+    // Hand the highlighter to the UI immediately so the first diff can install
+    // and highlight; warming continues below through the same shared SyntaxSet.
+    if tx.send(Arc::clone(&hl)).is_err() {
+        return; // UI gone
+    }
+    ctx.request_repaint();
+
+    let exts = match git2::Repository::discover(&repo_path) {
+        Ok(repo) => repo_head_extensions(&repo, MAX_TREE_ENTRIES, MAX_WARM_LANGS),
+        Err(e) => {
+            log::debug!("prewarm: repo discover failed: {e}; no languages warmed");
+            return;
+        }
+    };
+    if exts.is_empty() {
+        return;
+    }
+    let t = std::time::Instant::now();
+    for ext in &exts {
+        hl.warm_extension(ext);
+    }
+    log::debug!(
+        "prewarm: warmed {} languages {:?} in {:?}",
+        exts.len(),
+        exts,
+        t.elapsed()
     );
 }
 
