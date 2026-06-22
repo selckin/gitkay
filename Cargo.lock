@@ -1541,6 +1541,7 @@ dependencies = [
  "log",
  "notify",
  "serde",
+ "tempfile",
  "toml",
  "two-face",
 ]
