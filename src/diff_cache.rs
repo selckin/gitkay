@@ -35,15 +35,27 @@ impl<K: Clone + Eq + Hash, V> DiffCache<K, V> {
     /// the value and is expected to re-`insert` it when done — the cache never
     /// retains the value the caller is actively using.
     pub fn remove(&mut self, key: &K) -> Option<V> {
-        let entry = self.entries.remove(key)?;
-        self.total -= entry.weight;
-        Some(entry.value)
+        match self.entries.remove(key) {
+            Some(entry) => {
+                self.total -= entry.weight;
+                log::debug!(
+                    "diff cache: remove HIT ({} lines) → {} entries / {} lines",
+                    entry.weight,
+                    self.entries.len(),
+                    self.total
+                );
+                Some(entry.value)
+            }
+            None => {
+                log::debug!("diff cache: remove MISS → {} entries", self.entries.len());
+                None
+            }
+        }
     }
 
     /// Whether `key` is cached, without touching LRU recency — a peek, unlike the
     /// move-out `remove`. Used by the prefetch dispatch to skip already-cached
     /// neighbours.
-    #[allow(dead_code)] // wired into dispatch_prefetch in the prefetch wiring task
     pub fn contains(&self, key: &K) -> bool {
         self.entries.contains_key(key)
     }
