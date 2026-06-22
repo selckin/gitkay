@@ -70,8 +70,12 @@ pub fn theme_for_slug(slug: &str) -> Option<EmbeddedThemeName> {
     THEMES.iter().find(|(s, _)| *s == slug).map(|(_, t)| *t)
 }
 
-/// A run of text sharing one foreground color, ready to append to a LayoutJob.
-pub type Span = (egui::Color32, String);
+/// A run of text sharing one foreground color: the color plus the byte range
+/// `[start, end)` of the run *within the line's own text* (`DiffLine::body()`).
+/// Storing a range instead of an owned `String` avoids duplicating the line text
+/// (the line already owns it) and the per-token allocation — roughly halving the
+/// memory a highlighted (and cached) diff holds.
+pub type Span = (egui::Color32, std::ops::Range<usize>);
 
 /// Convert a syntect color to an opaque egui color (alpha is discarded — diff
 /// rows are painted opaque).
@@ -358,20 +362,25 @@ impl Highlighter {
     /// Tokenize one line of code (without its diff marker) into colored spans.
     /// `state` carries multi-line parser state within the current file.
     pub fn tokenize_line(&self, state: &mut HighlightLines, code: &str) -> Vec<Span> {
+        // syntect needs a trailing newline; it returns each token as a `&str`
+        // slice of `line`, so a token's byte offset within `line` equals its
+        // offset within `code` (the '\n' is appended last). We record that range
+        // rather than copying the text — the range indexes into `code`, which is
+        // exactly `DiffLine::body()` at render time.
         let line = format!("{code}\n");
+        let base = line.as_ptr() as usize;
+        let code_len = code.len();
         match state.highlight_line(&line, &self.syntaxes) {
             Ok(ranges) => ranges
                 .into_iter()
-                .map(|(style, text)| {
-                    (
-                        syn_to_egui(style.foreground),
-                        text.trim_end_matches('\n').to_string(),
-                    )
+                .filter_map(|(style, text)| {
+                    let start = text.as_ptr() as usize - base;
+                    let end = (start + text.len()).min(code_len); // drop the trailing '\n'
+                    (start < end).then(|| (syn_to_egui(style.foreground), start..end))
                 })
-                .filter(|(_, t)| !t.is_empty())
                 .collect(),
             // A grammar hiccup must never drop the line: render it plain.
-            Err(_) => vec![(self.palette.foreground, code.to_string())],
+            Err(_) => vec![(self.palette.foreground, 0..code_len)],
         }
     }
 }
@@ -422,11 +431,12 @@ mod tests {
         );
         assert!(warn.is_none());
         let mut state = hl.new_file_state("x.rs");
-        let spans = hl.tokenize_line(&mut state, "fn main() {}");
+        let code = "fn main() {}";
+        let spans = hl.tokenize_line(&mut state, code);
         assert!(spans.len() >= 2, "expected multiple tokens, got {spans:?}");
-        // Reassembled text equals the input (no chars dropped).
-        let joined: String = spans.iter().map(|(_, t)| t.as_str()).collect();
-        assert_eq!(joined, "fn main() {}");
+        // Reassembled ranges cover the input exactly (no chars dropped).
+        let joined: String = spans.iter().map(|(_, r)| &code[r.start..r.end]).collect();
+        assert_eq!(joined, code);
     }
 
     #[test]
@@ -439,9 +449,10 @@ mod tests {
             },
         );
         let mut state = hl.new_file_state("file.unknownext");
-        let spans = hl.tokenize_line(&mut state, "just some text");
-        let joined: String = spans.iter().map(|(_, t)| t.as_str()).collect();
-        assert_eq!(joined, "just some text");
+        let code = "just some text";
+        let spans = hl.tokenize_line(&mut state, code);
+        let joined: String = spans.iter().map(|(_, r)| &code[r.start..r.end]).collect();
+        assert_eq!(joined, code);
     }
 
     #[test]
