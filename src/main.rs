@@ -169,33 +169,85 @@ fn push_rev_token(revwalk: &mut git2::Revwalk, repo: &Repository, tok: &str) {
     }
 }
 
+/// Restrict `opts` to `paths` (each becomes a pathspec). Empty `paths` leaves `opts`
+/// unrestricted. One place for the `-- <path>` pathspec so commit-filtering, the
+/// uncommitted/staged detection, and every diff all scope identically.
+fn apply_pathspec(opts: &mut DiffOptions, paths: &[String]) {
+    for p in paths {
+        opts.pathspec(p.as_str());
+    }
+}
+
+/// Whether `commit`'s diff against its first parent (or the empty tree for a root
+/// commit) touches any of `paths`. Used for the `-- <path>` commit filter.
+fn commit_touches_paths(repo: &Repository, commit: &git2::Commit, paths: &[String]) -> bool {
+    let tree = match commit.tree() {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+    let mut opts = DiffOptions::new();
+    apply_pathspec(&mut opts, paths);
+    repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))
+        .map(|d| d.deltas().len() > 0)
+        .unwrap_or(false)
+}
+
+/// Map `parents` through `nearest` (oid → its nearest kept ancestors), flattening and
+/// de-duplicating. A parent absent from `nearest` (one beyond the walked window) is
+/// kept as-is, so its lane still points at the real ancestor and resolves once more
+/// history loads. Used by the `-- <path>` parent-rewriting (history simplification).
+fn rewrite_parents(
+    parents: &[git2::Oid],
+    nearest: &std::collections::HashMap<git2::Oid, Vec<git2::Oid>>,
+) -> Vec<git2::Oid> {
+    let mut out: Vec<git2::Oid> = Vec::new();
+    for p in parents {
+        match nearest.get(p) {
+            Some(ancestors) => {
+                for a in ancestors {
+                    if !out.contains(a) {
+                        out.push(*a);
+                    }
+                }
+            }
+            None => {
+                if !out.contains(p) {
+                    out.push(*p);
+                }
+            }
+        }
+    }
+    out
+}
+
 fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitInfo> {
     let ref_map = build_ref_map(repo);
     let head_oid = repo.head().ok().and_then(|h| h.target());
 
     let mut commits = Vec::new();
 
-    // Check for staged changes (index vs HEAD)
-    let has_staged = repo
-        .diff_index_to_workdir(None, None)
-        .ok()
-        .is_some_and(|_| {
-            // Actually: staged = index vs HEAD tree
-            if let Some(head) = head_oid
-                && let Ok(head_commit) = repo.find_commit(head)
-                && let Ok(head_tree) = head_commit.tree()
-                && let Ok(diff) = repo.diff_tree_to_index(Some(&head_tree), None, None)
-            {
-                return diff.deltas().len() > 0;
-            }
-            false
-        });
-
-    // Check for uncommitted changes (workdir vs index)
-    let has_uncommitted = repo
-        .diff_index_to_workdir(None, None)
-        .ok()
+    // Staged = index vs HEAD tree. Scoped to the active `-- <path>` filter, so a
+    // staged change outside the path doesn't add a virtual row on its own lane.
+    let has_staged = head_oid
+        .and_then(|head| repo.find_commit(head).ok())
+        .and_then(|head_commit| head_commit.tree().ok())
+        .and_then(|head_tree| {
+            let mut opts = DiffOptions::new();
+            apply_pathspec(&mut opts, &scope.paths);
+            repo.diff_tree_to_index(Some(&head_tree), None, Some(&mut opts))
+                .ok()
+        })
         .is_some_and(|diff| diff.deltas().len() > 0);
+
+    // Uncommitted = workdir vs index, scoped to the same path filter.
+    let has_uncommitted = {
+        let mut opts = DiffOptions::new();
+        apply_pathspec(&mut opts, &scope.paths);
+        repo.diff_index_to_workdir(None, Some(&mut opts))
+            .ok()
+            .is_some_and(|diff| diff.deltas().len() > 0)
+    };
 
     // Add virtual entries at the top
     if has_uncommitted {
@@ -241,25 +293,75 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
             push_rev_token(&mut revwalk, repo, tok);
         }
     }
+    let build_info = |oid: git2::Oid, commit: &git2::Commit, parents: Vec<git2::Oid>| CommitInfo {
+        oid,
+        summary: commit.summary().unwrap_or("").to_string(),
+        author: commit.author().name().unwrap_or("").to_string(),
+        time: commit.time().seconds(),
+        parents,
+        refs: ref_map.get(&oid).cloned().unwrap_or_default(),
+    };
+
     let mut seen = HashSet::new();
-    for oid in revwalk.flatten() {
-        if !seen.insert(oid) {
-            continue;
-        }
-        if let Ok(commit) = repo.find_commit(oid) {
-            let refs = ref_map.get(&oid).cloned().unwrap_or_default();
-            commits.push(CommitInfo {
-                oid,
-                summary: commit.summary().unwrap_or("").to_string(),
-                author: commit.author().name().unwrap_or("").to_string(),
-                time: commit.time().seconds(),
-                parents: commit.parent_ids().collect(),
-                refs,
-            });
-            if commits.len() >= max {
-                break;
+    if scope.paths.is_empty() {
+        for oid in revwalk.flatten() {
+            if !seen.insert(oid) {
+                continue;
+            }
+            if let Ok(commit) = repo.find_commit(oid) {
+                commits.push(build_info(oid, &commit, commit.parent_ids().collect()));
+                if commits.len() >= max {
+                    break;
+                }
             }
         }
+    } else {
+        // Path filter: drop commits that don't touch the pathspec, then rewrite each
+        // surviving commit's parents to its nearest surviving ancestor — git's history
+        // simplification. Without the rewrite the graph can't connect kept commits
+        // across the dropped ones, so every commit lands on its own lane.
+        let virtual_count = commits.len(); // uncommitted/staged entries already pushed
+        // 1. Walk newest→oldest, recording every commit's parents; keep the ones that
+        //    touch the path until we have `max` of them.
+        let mut walked: Vec<(git2::Oid, Vec<git2::Oid>)> = Vec::new();
+        let mut kept: Vec<CommitInfo> = Vec::new();
+        let mut kept_set: HashSet<git2::Oid> = HashSet::new();
+        for oid in revwalk.flatten() {
+            if !seen.insert(oid) {
+                continue;
+            }
+            let Ok(commit) = repo.find_commit(oid) else {
+                continue;
+            };
+            let parents: Vec<git2::Oid> = commit.parent_ids().collect();
+            walked.push((oid, parents.clone()));
+            if commit_touches_paths(repo, &commit, &scope.paths) {
+                kept_set.insert(oid);
+                kept.push(build_info(oid, &commit, parents));
+                if kept.len() >= max {
+                    break;
+                }
+            }
+        }
+        // 2. nearest[oid] = its nearest kept ancestors. `walked` is topological (each
+        //    child precedes its parents), so a single oldest→newest pass resolves every
+        //    parent before its child — no recursion, safe on deep histories.
+        let mut nearest: std::collections::HashMap<git2::Oid, Vec<git2::Oid>> =
+            std::collections::HashMap::new();
+        for (oid, parents) in walked.iter().rev() {
+            let resolved = if kept_set.contains(oid) {
+                vec![*oid]
+            } else {
+                rewrite_parents(parents, &nearest)
+            };
+            nearest.insert(*oid, resolved);
+        }
+        // 3. Rewrite the kept commits' parents (and the virtual entries', so a dropped
+        //    HEAD doesn't orphan them) to the nearest kept ancestors.
+        for info in commits[..virtual_count].iter_mut().chain(kept.iter_mut()) {
+            info.parents = rewrite_parents(&info.parents, &nearest);
+        }
+        commits.extend(kept);
     }
     commits
 }
@@ -380,13 +482,13 @@ fn diff_opts(settings: DiffSettings) -> DiffOptions {
     opts
 }
 
-fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings) -> DiffData {
+fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, paths: &[String]) -> DiffData {
     // Handle virtual entries
     if oid == oid_uncommitted() {
-        return get_working_tree_diff(repo, settings);
+        return get_working_tree_diff(repo, settings, paths);
     }
     if oid == oid_staged() {
-        return get_staged_diff(repo, settings);
+        return get_staged_diff(repo, settings, paths);
     }
 
     let commit = match repo.find_commit(oid) {
@@ -410,6 +512,7 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings) -> D
     let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
 
     let mut opts = diff_opts(settings);
+    apply_pathspec(&mut opts, paths);
     let diff = match repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts)) {
         Ok(d) => d,
         Err(_) => {
@@ -542,8 +645,9 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings) -> D
 }
 
 /// Generate diff for uncommitted working tree changes (workdir vs index).
-fn get_working_tree_diff(repo: &Repository, settings: DiffSettings) -> DiffData {
+fn get_working_tree_diff(repo: &Repository, settings: DiffSettings, paths: &[String]) -> DiffData {
     let mut opts = diff_opts(settings);
+    apply_pathspec(&mut opts, paths);
     let diff = match repo.diff_index_to_workdir(None, Some(&mut opts)) {
         Ok(d) => d,
         Err(_) => {
@@ -557,13 +661,14 @@ fn get_working_tree_diff(repo: &Repository, settings: DiffSettings) -> DiffData 
 }
 
 /// Generate diff for staged changes (index vs HEAD).
-fn get_staged_diff(repo: &Repository, settings: DiffSettings) -> DiffData {
+fn get_staged_diff(repo: &Repository, settings: DiffSettings, paths: &[String]) -> DiffData {
     let head_tree = repo
         .head()
         .ok()
         .and_then(|h| h.peel_to_commit().ok())
         .and_then(|c| c.tree().ok());
     let mut opts = diff_opts(settings);
+    apply_pathspec(&mut opts, paths);
     let diff = match repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut opts)) {
         Ok(d) => d,
         Err(_) => {
@@ -1077,9 +1182,11 @@ fn prewarm_highlighter(
 /// fully highlight it, sending the finished `(key, DiffData)` back for the UI to
 /// cache. Bails as soon as a newer dispatch supersedes it (`epoch`). Pure
 /// optimization — any failure just warms fewer neighbours.
+#[allow(clippy::too_many_arguments)]
 fn prefetch_worker(
     repo_path: String,
     keys: Vec<DiffCacheKey>,
+    paths: Vec<String>,
     hl: Arc<Highlighter>,
     epoch: u64,
     current_epoch: Arc<AtomicU64>,
@@ -1107,7 +1214,7 @@ fn prefetch_worker(
         };
         let t = std::time::Instant::now();
         log::debug!("prefetch: start {}", key.oid);
-        let mut data = get_diff_data(&repo, key.oid, settings);
+        let mut data = get_diff_data(&repo, key.oid, settings, &paths);
         highlight_diff(&mut data.lines, &data.files, &hl);
         let (oid, lines) = (key.oid, data.lines.len());
         if tx.send((key, data)).is_err() {
@@ -1652,6 +1759,15 @@ impl GitkApp {
 
         let repo = Repository::discover(&repo_path).expect("Not a git repository");
         let commits = load_commits(&repo, 200, &scope);
+        // A path filter that matches nothing yields a silently empty graph; say so
+        // once at startup. Paths are matched repo-root-relative (a path given from
+        // a subdirectory won't match — a known limitation).
+        if !scope.paths.is_empty() && !commits.iter().any(|c| is_real_commit(c.oid)) {
+            log::warn!(
+                "no commits match path filter {:?} (paths are repo-root-relative)",
+                scope.paths
+            );
+        }
         let graph_rows = layout_graph(&commits);
 
         // Restore persisted diff options before the first diff is generated, so
@@ -1672,7 +1788,7 @@ impl GitkApp {
 
         // Auto-select first commit and load its diff
         let (diff_lines, diff_files) = if let Some(first) = commits.first() {
-            let data = get_diff_data(&repo, first.oid, diff_settings);
+            let data = get_diff_data(&repo, first.oid, diff_settings, &scope.paths);
             (data.lines, data.files)
         } else {
             (Vec::new(), Vec::new())
@@ -1894,7 +2010,7 @@ impl GitkApp {
                 }
                 None => {
                     let t = std::time::Instant::now();
-                    let data = get_diff_data(repo, oid, self.diff_settings());
+                    let data = get_diff_data(repo, oid, self.diff_settings(), &self.scope.paths);
                     log::debug!(
                         "perf: get_diff_data {:?} ({} lines, {} files) for {oid}",
                         t.elapsed(),
@@ -2048,6 +2164,7 @@ impl GitkApp {
         }
         let epoch = self.prefetch_epoch.fetch_add(1, Ordering::Relaxed) + 1;
         let repo_path = self.repo_path.clone();
+        let paths = self.scope.paths.clone();
         let current_epoch = Arc::clone(&self.prefetch_epoch);
         let tx = self.prefetch_tx.clone();
         let ctx = ctx.clone();
@@ -2056,7 +2173,7 @@ impl GitkApp {
             .name("gitkay-prefetch".to_string())
             .spawn(move || {
                 let work = std::panic::AssertUnwindSafe(move || {
-                    prefetch_worker(repo_path, keys, hl, epoch, current_epoch, tx, ctx)
+                    prefetch_worker(repo_path, keys, paths, hl, epoch, current_epoch, tx, ctx)
                 });
                 if std::panic::catch_unwind(work).is_err() {
                     log::warn!("prefetch thread panicked");
@@ -4247,6 +4364,85 @@ mod tests {
     }
 
     #[test]
+    fn path_filter_keeps_only_matching_commits_and_scopes_diff() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.txt", "1", "touch-a");
+        commit_file(&repo, "b.txt", "1", "touch-b");
+        let c3 = commit_file(&repo, "a.txt", "2", "touch-a-again");
+
+        let mut s = cli::Scope { all: false, revs: Vec::new(), paths: vec!["a.txt".to_string()] };
+        // Commit graph: only commits touching a.txt.
+        let got = summaries(&load_commits(&repo, 100, &s));
+        assert_eq!(got, vec!["touch-a-again".to_string(), "touch-a".to_string()]);
+        assert!(!got.contains(&"touch-b".to_string()));
+
+        // Diff of c3 is scoped to a.txt: its file list is exactly [a.txt].
+        let data = get_diff_data(&repo, c3, DiffSettings { context: 3, ignore_ws: false }, &s.paths);
+        let files: Vec<&str> = data.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(files, vec!["a.txt"]);
+
+        // Empty path filter ⇒ unfiltered (sanity).
+        s.paths.clear();
+        assert!(summaries(&load_commits(&repo, 100, &s)).contains(&"touch-b".to_string()));
+    }
+
+    #[test]
+    fn path_filter_rewrites_parents_to_nearest_kept_ancestor() {
+        // c1 (a.txt) ← c2 (b.txt, dropped) ← c3 (a.txt). Filtering on a.txt drops c2,
+        // and c3's parent must be REWRITTEN from c2 to c1 so the graph can connect the
+        // two kept commits instead of stranding each on its own lane.
+        let (_d, repo) = temp_repo();
+        let c1 = commit_file(&repo, "a.txt", "1", "a-1");
+        commit_file(&repo, "b.txt", "1", "b-only"); // dropped by the a.txt filter
+        let c3 = commit_file(&repo, "a.txt", "2", "a-2");
+
+        let s = cli::Scope { all: false, revs: Vec::new(), paths: vec!["a.txt".to_string()] };
+        let got = load_commits(&repo, 100, &s);
+        let real: Vec<&CommitInfo> = got.iter().filter(|c| is_real_commit(c.oid)).collect();
+
+        assert_eq!(
+            real.iter().map(|c| c.summary.as_str()).collect::<Vec<_>>(),
+            vec!["a-2", "a-1"]
+        );
+        // c3's parent rewritten across the dropped c2 to c1 (the connectivity fix).
+        assert_eq!(real[0].oid, c3);
+        assert_eq!(real[0].parents, vec![c1]);
+        // c1 is a root commit: no parents.
+        assert_eq!(real[1].oid, c1);
+        assert!(real[1].parents.is_empty());
+    }
+
+    #[test]
+    fn path_filter_hides_uncommitted_row_when_changes_are_outside_path() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.txt", "1", "a-1");
+        commit_file(&repo, "b.txt", "1", "b-1");
+        // Uncommitted modification to a tracked file, b.txt only.
+        std::fs::write(repo.workdir().unwrap().join("b.txt"), "dirty").unwrap();
+
+        let has_uncommitted_row =
+            |paths: Vec<String>| -> bool {
+                let s = cli::Scope { all: false, revs: Vec::new(), paths };
+                load_commits(&repo, 100, &s)
+                    .iter()
+                    .any(|c| c.oid == oid_uncommitted())
+            };
+
+        // Filter on a.txt: the b.txt change is outside the path → no virtual row.
+        assert!(
+            !has_uncommitted_row(vec!["a.txt".to_string()]),
+            "uncommitted row must not show when no change touches the filtered path"
+        );
+        // Filter on b.txt: the change is in-path → the row shows.
+        assert!(
+            has_uncommitted_row(vec!["b.txt".to_string()]),
+            "uncommitted row must show when a change touches the filtered path"
+        );
+        // No filter: the row shows.
+        assert!(has_uncommitted_row(Vec::new()));
+    }
+
+    #[test]
     fn range_scope_excludes_base() {
         let (_d, repo) = temp_repo();
         commit_file(&repo, "a.txt", "1", "c1");
@@ -4256,6 +4452,5 @@ mod tests {
         let s = scope(false, &[&format!("{c2}..{c3}")]);
         let got = summaries(&load_commits(&repo, 100, &s));
         assert_eq!(got, vec!["c3".to_string()]);
-        let _ = c2; // silence unused if formatting changes
     }
 }
