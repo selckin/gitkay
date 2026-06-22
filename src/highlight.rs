@@ -1,11 +1,13 @@
 //! Syntax highlighting for the diff view: owns the syntect SyntaxSet, the active
 //! theme, and a theme-derived diff palette. Built lazily on the first diff.
 
+use std::sync::Arc;
+
 use eframe::egui;
 use two_face::re_exports::syntect;
 use two_face::theme::EmbeddedThemeName;
 
-use syntect::easy::HighlightLines;
+pub use syntect::easy::HighlightLines;
 use syntect::highlighting::{Color as SynColor, Highlighter as SynHighlighter, Theme};
 use syntect::parsing::{Scope, SyntaxSet};
 
@@ -267,8 +269,11 @@ impl DiffPalette {
 }
 
 /// Owns the highlighting assets + active theme. Built lazily on the first diff.
+/// `Send + Sync` so it can be shared with a background highlighting worker via
+/// `Arc`; the multi-MB syntax set lives behind its own `Arc` so a theme swap
+/// reuses it instead of reloading.
 pub struct Highlighter {
-    syntaxes: SyntaxSet,
+    syntaxes: Arc<SyntaxSet>,
     theme: Theme,
     palette: DiffPalette,
 }
@@ -292,7 +297,7 @@ impl Highlighter {
     /// Build the highlighter for `slug`. Deserializes the bundled syntax set
     /// (multi-MB) once — call this lazily, not at startup.
     pub fn new(slug: &str, diff_bg: DiffBg) -> (Highlighter, Option<String>) {
-        let syntaxes = two_face::syntax::extra_newlines();
+        let syntaxes = Arc::new(two_face::syntax::extra_newlines());
         let (theme, warning) = load_theme(slug);
         let palette = DiffPalette::from_theme(&theme, diff_bg);
         (
@@ -305,13 +310,21 @@ impl Highlighter {
         )
     }
 
-    /// Swap to a different theme and/or diff-background mode (reuses the syntax
-    /// set). Returns a warning if the slug was unknown.
-    pub fn set_theme(&mut self, slug: &str, diff_bg: DiffBg) -> Option<String> {
+    /// A new highlighter with a different theme and/or diff-background mode,
+    /// reusing this one's syntax set (a cheap `Arc` clone — no reload). Returns
+    /// a warning if the slug was unknown. The old instance stays valid for any
+    /// in-flight worker still holding it.
+    pub fn with_theme(&self, slug: &str, diff_bg: DiffBg) -> (Highlighter, Option<String>) {
         let (theme, warning) = load_theme(slug);
-        self.theme = theme;
-        self.palette = DiffPalette::from_theme(&self.theme, diff_bg);
-        warning
+        let palette = DiffPalette::from_theme(&theme, diff_bg);
+        (
+            Highlighter {
+                syntaxes: Arc::clone(&self.syntaxes),
+                theme,
+                palette,
+            },
+            warning,
+        )
     }
 
     pub fn palette(&self) -> &DiffPalette {
@@ -533,10 +546,10 @@ mod tests {
     }
 
     #[test]
-    fn set_theme_swaps_palette() {
-        // Build on a dark theme, switch to a light one — the palette background
+    fn with_theme_swaps_palette() {
+        // Build on a dark theme, derive a light one — the palette background
         // must follow (dark → light).
-        let (mut hl, _) = Highlighter::new(
+        let (hl, _) = Highlighter::new(
             "catppuccin-mocha",
             DiffBg::Fixed {
                 added: None,
@@ -544,7 +557,7 @@ mod tests {
             },
         );
         assert!(luminance(hl.palette().background) < 0.5);
-        let warn = hl.set_theme(
+        let (hl2, warn) = hl.with_theme(
             "catppuccin-latte",
             DiffBg::Fixed {
                 added: None,
@@ -552,7 +565,7 @@ mod tests {
             },
         );
         assert!(warn.is_none());
-        assert!(luminance(hl.palette().background) > 0.5);
+        assert!(luminance(hl2.palette().background) > 0.5);
     }
 
     #[test]

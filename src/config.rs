@@ -376,7 +376,7 @@ pub fn build_fonts(cfg: &Config) -> (egui::FontDefinitions, Fonts, Vec<String>) 
             ),
             Err(e) => {
                 let msg = format!("failed to read font {path:?}: {e}");
-                eprintln!("gitkay: {msg}");
+                log::warn!("{msg}");
                 warnings.push(msg);
             }
         }
@@ -399,7 +399,7 @@ pub fn build_fonts(cfg: &Config) -> (egui::FontDefinitions, Fonts, Vec<String>) 
             ),
             Err(e) => {
                 let msg = format!("failed to read font {path:?}: {e}");
-                eprintln!("gitkay: {msg}");
+                log::warn!("{msg}");
                 warnings.push(msg);
             }
         }
