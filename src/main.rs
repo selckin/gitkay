@@ -681,6 +681,28 @@ fn pick_file(
         .unwrap_or(0)
 }
 
+/// True when every code line in `[start, end)` has been highlighted (`Some`).
+/// Structural lines never carry spans and are ignored; a range with no code
+/// lines is vacuously done.
+fn file_fully_highlighted(lines: &[DiffLine], start: usize, end: usize) -> bool {
+    lines
+        .iter()
+        .take(end)
+        .skip(start)
+        .all(|l| !l.kind.is_code() || l.spans.is_some())
+}
+
+/// File ranges `(file_index, start, end)` that still need highlighting: every
+/// file with at least one not-yet-highlighted (`None`) code line, in file order.
+/// Fully-highlighted files (and structural-only files) are dropped so a cached
+/// or partially-highlighted diff only re-tokenizes what's missing.
+fn pending_files(lines: &[DiffLine], files: &[FileEntry]) -> Vec<(usize, usize, usize)> {
+    file_line_ranges(files, lines.len())
+        .into_iter()
+        .filter(|&(_, start, end)| !file_fully_highlighted(lines, start, end))
+        .collect()
+}
+
 /// Everything a background highlight worker owns for one diff.
 struct HighlightJob {
     hl: Arc<Highlighter>,
@@ -726,7 +748,9 @@ fn highlight_worker(job: HighlightJob) {
     let mut first_result = true;
     let started = std::time::Instant::now();
     let total_lines = lines.len();
-    let mut pending = file_line_ranges(&files, lines.len());
+    // Only files with unhighlighted code lines; a fully-cached diff yields an
+    // empty list, so the worker exits immediately with no work.
+    let mut pending = pending_files(&lines, &files);
     while !pending.is_empty() {
         if superseded() {
             log::debug!(
@@ -3435,5 +3459,73 @@ mod tests {
             lines[1].spans.as_ref().is_some_and(|s| !s.is_empty()),
             "real file's code line must still be tokenized"
         );
+    }
+
+    #[test]
+    fn file_fully_highlighted_predicate() {
+        let span = || (egui::Color32::WHITE, "a".to_string());
+        let mut highlighted = DiffLine::new("+a", LineKind::Add);
+        highlighted.spans = Some(vec![span()]);
+        let mut blank_done = DiffLine::new("+", LineKind::Add);
+        blank_done.spans = Some(vec![]); // highlighted, produced no tokens
+        let not_yet = DiffLine::new("+b", LineKind::Add); // spans None
+
+        // Structural-only range is vacuously done.
+        let structural = vec![DiffLine::new("@@ -1 +1 @@", LineKind::Hunk)];
+        assert!(file_fully_highlighted(&structural, 0, 1));
+
+        // All code lines Some (incl. a blank Some(empty)); structural ignored.
+        let done = vec![
+            highlighted.clone(),
+            blank_done.clone(),
+            DiffLine::new("@@ -1 +1 @@", LineKind::Hunk),
+        ];
+        assert!(file_fully_highlighted(&done, 0, 3));
+
+        // One code line still None ⇒ not done.
+        let partial = vec![highlighted, not_yet];
+        assert!(!file_fully_highlighted(&partial, 0, 2));
+    }
+
+    #[test]
+    fn pending_files_skips_fully_highlighted() {
+        // file A starts at line 1 [1,3): both code lines Some ⇒ done.
+        // file B starts at line 3 [3,5): one code line None ⇒ pending.
+        let span = || (egui::Color32::WHITE, "x".to_string());
+        let mut a0 = DiffLine::new("+a0", LineKind::Add);
+        a0.spans = Some(vec![span()]);
+        let mut a1 = DiffLine::new("+a1", LineKind::Add);
+        a1.spans = Some(vec![span()]);
+        let mut b0 = DiffLine::new("+b0", LineKind::Add);
+        b0.spans = Some(vec![span()]);
+        let b1 = DiffLine::new("+b1", LineKind::Add); // None ⇒ B not done
+
+        let lines = vec![
+            DiffLine::new("diff --git", LineKind::FileMeta), // 0 (pre-file header)
+            a0,
+            a1, // file A: [1,3)
+            b0,
+            b1, // file B: [3,5)
+        ];
+        let files = vec![
+            FileEntry {
+                path: "a.rs".to_string(),
+                additions: 2,
+                deletions: 0,
+                diff_line_idx: 1,
+            },
+            FileEntry {
+                path: "b.rs".to_string(),
+                additions: 2,
+                deletions: 0,
+                diff_line_idx: 3,
+            },
+        ];
+
+        let pending: Vec<usize> = pending_files(&lines, &files)
+            .into_iter()
+            .map(|(fi, _, _)| fi)
+            .collect();
+        assert_eq!(pending, vec![1], "only file B (index 1) still needs work");
     }
 }
