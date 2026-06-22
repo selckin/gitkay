@@ -94,6 +94,36 @@ fn is_real_commit(oid: git2::Oid) -> bool {
     oid != oid_uncommitted() && oid != oid_staged()
 }
 
+/// The real-commit oids to prefetch around `selected`: up to `below` commits
+/// below (indices `selected+1 ..`), then up to `above` commits above
+/// (closest-first: `selected-1`, `selected-2`, …). Clamped to the slice bounds;
+/// virtual (uncommitted/staged) entries are excluded. Pure — fed the commit oids.
+#[allow(dead_code)] // wired into dispatch_prefetch in the prefetch wiring task
+fn prefetch_targets(
+    oids: &[git2::Oid],
+    selected: usize,
+    below: usize,
+    above: usize,
+) -> Vec<git2::Oid> {
+    let mut out = Vec::new();
+    for i in (selected + 1)..=(selected + below) {
+        if let Some(&oid) = oids.get(i)
+            && is_real_commit(oid)
+        {
+            out.push(oid);
+        }
+    }
+    for d in 1..=above {
+        if let Some(i) = selected.checked_sub(d)
+            && let Some(&oid) = oids.get(i)
+            && is_real_commit(oid)
+        {
+            out.push(oid);
+        }
+    }
+    out
+}
+
 fn is_virtual_oid(oid: git2::Oid) -> bool {
     oid == oid_uncommitted() || oid == oid_staged()
 }
@@ -3837,5 +3867,30 @@ mod tests {
     fn top_extensions_skips_extensionless_and_lowercases() {
         let paths = ["Makefile", "README", "X.TXT"].into_iter().map(String::from);
         assert_eq!(top_extensions(paths, 10), vec!["txt".to_string()]);
+    }
+
+    #[test]
+    fn prefetch_targets_below_first_then_above_closest_first() {
+        let real = |n: u8| git2::Oid::from_bytes(&[n; 20]).unwrap();
+        // indices: 0=uncommitted, 1=staged (virtual), 2..=8 real
+        let oids = vec![
+            oid_uncommitted(),
+            oid_staged(),
+            real(2), real(3), real(4), real(5), real(6), real(7), real(8),
+        ];
+        // selected = 5 (real(5)); below 4 → indices 6,7,8 (9 is out of range);
+        // above 2 → indices 4,3 (closest-first).
+        assert_eq!(
+            prefetch_targets(&oids, 5, 4, 2),
+            vec![real(6), real(7), real(8), real(4), real(3)]
+        );
+    }
+
+    #[test]
+    fn prefetch_targets_excludes_virtual_entries() {
+        let real = |n: u8| git2::Oid::from_bytes(&[n; 20]).unwrap();
+        let oids = vec![oid_uncommitted(), oid_staged(), real(2), real(3), real(4)];
+        // selected = 2 (first real); below 4 → 3,4; above 2 → indices 1,0 = virtual → excluded.
+        assert_eq!(prefetch_targets(&oids, 2, 4, 2), vec![real(3), real(4)]);
     }
 }
