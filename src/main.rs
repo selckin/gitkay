@@ -1766,7 +1766,11 @@ fn show_toast(
 }
 
 impl GitkApp {
-    fn new(cc: &eframe::CreationContext<'_>, repo_path: String, scope: cli::Scope) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        repo_path: String,
+        scope: cli::Scope,
+    ) -> Result<Self, String> {
         let mut style = (*cc.egui_ctx.style()).clone();
         style.visuals = egui::Visuals::dark();
         style.visuals.panel_fill = BG;
@@ -1840,7 +1844,8 @@ impl GitkApp {
             startup_issue = true;
         }
 
-        let repo = Repository::discover(&repo_path).expect("Not a git repository");
+        let repo = Repository::discover(&repo_path)
+            .map_err(|e| format!("not a git repository: {repo_path}: {e}"))?;
         let commits = load_commits(&repo, 200, &scope);
         // A path filter that matches nothing yields a silently empty graph; say so
         // once at startup. Paths are matched repo-root-relative (a path given from
@@ -1970,7 +1975,7 @@ impl GitkApp {
             None
         };
 
-        Self {
+        Ok(Self {
             commits,
             graph_rows,
             selected: Some(0),
@@ -2015,7 +2020,7 @@ impl GitkApp {
             prefetch_rx,
             prefetch_epoch: Arc::new(AtomicU64::new(0)),
             prefetched_gen: 0,
-        }
+        })
     }
 
     fn refresh_search_matches(&mut self) {
@@ -2542,9 +2547,10 @@ impl eframe::App for GitkApp {
                             self.search_cursor =
                                 (self.search_cursor + 1) % self.search_matches.len();
                             let idx = self.search_matches[self.search_cursor];
-                            let repo = Repository::discover(&self.repo_path).unwrap();
-                            let oid = self.commits[idx].oid;
-                            self.refresh_for_selection(&repo, oid);
+                            if let Ok(repo) = Repository::discover(&self.repo_path) {
+                                let oid = self.commits[idx].oid;
+                                self.refresh_for_selection(&repo, oid);
+                            }
                         }
                         resp.request_focus();
                     }
@@ -3249,8 +3255,10 @@ impl eframe::App for GitkApp {
                     }
 
                     // Lazy load: when near the bottom, load more commits
-                    if !self.all_loaded && last_row + 50 >= num_commits {
-                        let repo = Repository::discover(&self.repo_path).unwrap();
+                    if !self.all_loaded
+                        && last_row + 50 >= num_commits
+                        && let Ok(repo) = Repository::discover(&self.repo_path)
+                    {
                         let more = load_commits(&repo, self.commits.len() + 500, &self.scope);
                         self.all_loaded = more.len() <= self.commits.len();
                         self.commits = more;
@@ -3338,10 +3346,10 @@ fn main() -> eframe::Result {
         None => raw_paths, // bare repo: no worktree to anchor paths against
     };
     let scope = cli::Scope { all: raw.all, revs, paths };
-    drop(repo); // GitkApp re-discovers from repo_path
 
+    // Build the window title from the repo we already discovered, before dropping
+    // it — re-discovering here and unwrapping would panic on a TOCTOU removal.
     let title = {
-        let repo = Repository::discover(&repo_path).unwrap();
         let workdir = repo
             .workdir()
             .and_then(|p| p.file_name())
@@ -3354,6 +3362,7 @@ fn main() -> eframe::Result {
             format!("gitkay — {workdir} ({suffix})")
         }
     };
+    drop(repo); // GitkApp re-discovers from repo_path
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -3375,7 +3384,11 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "gitkay",
         options,
-        Box::new(move |cc| Ok(Box::new(GitkApp::new(cc, repo_path, scope)))),
+        Box::new(move |cc| {
+            GitkApp::new(cc, repo_path, scope)
+                .map(|app| Box::new(app) as Box<dyn eframe::App>)
+                .map_err(|e| e.into())
+        }),
     )
 }
 
