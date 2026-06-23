@@ -82,6 +82,12 @@ const PREFETCH_BELOW: usize = 4;
 /// Prefetch: commits above the current selection to warm (closest-first).
 const PREFETCH_ABOVE: usize = 2;
 
+/// Debounce window for watcher-triggered reloads: a burst of `.git` writes
+/// (rebase, fetch) coalesces into one reload after it settles, instead of a
+/// synchronous history walk per event. Short enough that a single commit /
+/// checkout still feels immediate.
+const RELOAD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// Everything a cached diff's content + spans depend on. `diff_bg` is excluded
 /// (it's a render-time tint, not baked into spans).
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -1745,6 +1751,7 @@ struct GitkApp {
     copied_toast: Option<std::time::Instant>,
     all_loaded: bool,
     needs_reload: Arc<AtomicBool>,
+    reload_armed_at: Option<std::time::Instant>, // debounce timer for watcher reloads
     _watcher: Option<RecommendedWatcher>,
     branch_highlight: HashSet<usize>, // indices of commits on the same branch as selected
     diff_panel_height: f32,           // persisted diff-panel splitter height (see App::save)
@@ -2070,6 +2077,7 @@ impl GitkApp {
             copied_toast: None,
             all_loaded,
             needs_reload,
+            reload_armed_at: None,
             _watcher: watcher,
             branch_highlight: HashSet::new(),
             diff_panel_height,
@@ -2401,12 +2409,25 @@ impl eframe::App for GitkApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Auto-reload when git refs change
-        if self.needs_reload.swap(false, Ordering::Relaxed)
-            && let Ok(repo) = Repository::discover(&self.repo_path)
-        {
-            self.reload_commits(&repo, None);
-            self.load_selected_diff(&repo);
+        // Auto-reload when git refs change, debounced: a new .git event (re)arms
+        // a timer, and the reload runs only once the writes settle. This collapses
+        // the burst of ref/index churn from a rebase or fetch into a single
+        // (synchronous) history walk instead of one per event.
+        if self.needs_reload.swap(false, Ordering::Relaxed) {
+            self.reload_armed_at = Some(std::time::Instant::now());
+        }
+        if let Some(armed) = self.reload_armed_at {
+            let elapsed = armed.elapsed();
+            if elapsed >= RELOAD_DEBOUNCE {
+                self.reload_armed_at = None;
+                if let Ok(repo) = Repository::discover(&self.repo_path) {
+                    self.reload_commits(&repo, None);
+                    self.load_selected_diff(&repo);
+                }
+            } else {
+                // Wake up when the debounce window closes to run the reload.
+                ctx.request_repaint_after(RELOAD_DEBOUNCE - elapsed);
+            }
         }
 
         // Live-reload fonts when the config file changes. On a parse error, keep
