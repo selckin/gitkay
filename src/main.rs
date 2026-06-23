@@ -1954,8 +1954,14 @@ impl GitkApp {
                 )
             });
             if let Some(ref mut w) = watcher {
-                // Watch worktree-specific files
-                let _ = w.watch(&git_dir.join("HEAD"), RecursiveMode::NonRecursive);
+                // HEAD and refs are the reload-critical watches and always exist
+                // in a git dir, so a failure to watch them is worth surfacing.
+                // index / packed-refs can legitimately be absent (nothing staged,
+                // no packed refs), so those stay best-effort and silent.
+                let mut failed: Vec<String> = Vec::new();
+                if let Err(e) = w.watch(&git_dir.join("HEAD"), RecursiveMode::NonRecursive) {
+                    failed.push(format!("HEAD ({e})"));
+                }
                 let _ = w.watch(&git_dir.join("index"), RecursiveMode::NonRecursive);
 
                 // Watch refs — in a worktree, refs live in the main repo's
@@ -1976,10 +1982,22 @@ impl GitkApp {
                 } else {
                     git_dir.clone()
                 };
-                let _ = w.watch(&refs_dir.join("refs"), RecursiveMode::Recursive);
+                if let Err(e) = w.watch(&refs_dir.join("refs"), RecursiveMode::Recursive) {
+                    failed.push(format!("refs ({e})"));
+                }
                 let _ = w.watch(&refs_dir.join("packed-refs"), RecursiveMode::NonRecursive);
-                if refs_dir != git_dir {
-                    let _ = w.watch(&refs_dir.join("HEAD"), RecursiveMode::NonRecursive);
+                if refs_dir != git_dir
+                    && let Err(e) = w.watch(&refs_dir.join("HEAD"), RecursiveMode::NonRecursive)
+                {
+                    failed.push(format!("commondir HEAD ({e})"));
+                }
+
+                if !failed.is_empty() {
+                    log::warn!(
+                        "live-reload degraded (could not watch .git: {})",
+                        failed.join(", ")
+                    );
+                    startup_issue = true;
                 }
             }
             watcher
