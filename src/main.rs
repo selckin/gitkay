@@ -614,7 +614,7 @@ fn show_virtualized_diff(
     mut on_visible: impl FnMut(std::ops::Range<usize>),
     mut build_row: impl FnMut(usize) -> (egui::text::LayoutJob, Option<egui::Color32>, egui::Color32),
 ) {
-    let row_h = ui.fonts(|f| f.row_height(font_id));
+    let row_h = ui.fonts_mut(|f| f.row_height(font_id));
     ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
     let mut scroll = egui::ScrollArea::both()
         .id_salt("diff_scroll")
@@ -628,14 +628,14 @@ fn show_virtualized_diff(
     // Size the horizontal scroll to the widest line in the whole diff —
     // virtualization only lays out visible rows, so egui can't otherwise know an
     // off-screen line is wide. Monospace assumption.
-    let char_w = ui.fonts(|f| f.glyph_width(font_id, ' '));
+    let char_w = ui.fonts_mut(|f| f.glyph_width(font_id, ' '));
     let content_w = (content_chars as f32 + 1.0) * char_w;
     scroll.show_rows(ui, row_h, n_lines, |ui, rows| {
         ui.set_min_width(content_w);
         on_visible(rows.clone());
         for i in rows {
             let (job, row_bg, fallback) = build_row(i);
-            let galley = ui.fonts(|f| f.layout_job(job));
+            let galley = ui.fonts_mut(|f| f.layout_job(job));
             let width = ui.available_width().max(galley.size().x);
             let (rect, _resp) =
                 ui.allocate_exact_size(egui::vec2(width, row_h), egui::Sense::hover());
@@ -1893,14 +1893,14 @@ impl GitkApp {
         repo_path: String,
         scope: cli::Scope,
     ) -> Result<Self, String> {
-        let mut style = (*cc.egui_ctx.style()).clone();
+        let mut style = (*cc.egui_ctx.global_style()).clone();
         style.visuals = egui::Visuals::dark();
         style.visuals.panel_fill = BG;
         style.visuals.window_fill = BG;
         style.visuals.extreme_bg_color = BG;
         style.visuals.faint_bg_color = SURFACE0;
         style.visuals.override_text_color = Some(TEXT);
-        cc.egui_ctx.set_style(style);
+        cc.egui_ctx.set_global_style(style);
 
         // ── Fonts & sizes config ──
         // Optional ~/.config/gitkay/config.toml. With no file (or the freshly
@@ -2478,7 +2478,11 @@ impl eframe::App for GitkApp {
         eframe::set_value(storage, "diff_ignore_ws", &self.diff_ignore_ws);
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 0.34 split App::update into ui/logic; we keep one body and take a cheap
+        // (Arc) clone of the Context so the existing ctx-based logic is unchanged,
+        // while the top-level panels attach to `ui` via show_inside.
+        let ctx = ui.ctx().clone();
         // Auto-reload when git refs change, debounced: a new .git event (re)arms
         // a timer, and the reload runs only once the writes settle. This collapses
         // the burst of ref/index churn from a rebase or fetch into a single
@@ -2620,7 +2624,7 @@ impl eframe::App for GitkApp {
                 applied_highlight = true;
             }
         }
-        self.ensure_diff_highlighted(ctx);
+        self.ensure_diff_highlighted(&ctx);
 
         // Apply prefetched neighbour diffs into the cache — skip one that became
         // the live diff in the meantime (load_selected_diff owns that key).
@@ -2645,7 +2649,7 @@ impl eframe::App for GitkApp {
                 self.last_highlight_check_gen = current_gen;
                 if diff_fully_highlighted(&self.diff_lines, &self.diff_files) {
                     self.prefetched_gen = current_gen;
-                    self.dispatch_prefetch(ctx);
+                    self.dispatch_prefetch(&ctx);
                 }
             }
         }
@@ -2718,9 +2722,9 @@ impl eframe::App for GitkApp {
         }
 
         // ── Top panel: search bar ──
-        egui::TopBottomPanel::top("search_panel")
-            .exact_height(28.0)
-            .show(ctx, |ui| {
+        egui::Panel::top("search_panel")
+            .exact_size(28.0)
+            .show_inside(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.label(egui::RichText::new("🔍").size(14.0));
                     let avail = ui.available_width() - 120.0; // leave space for match count
@@ -2793,11 +2797,11 @@ impl eframe::App for GitkApp {
         // across window resizes, so growing the window grows the diff (the
         // central panel below), not the commit list. ──
         let saved_commit_h = self.commit_panel_height;
-        let commit_panel = egui::TopBottomPanel::top("commit_panel")
+        let commit_panel = egui::Panel::top("commit_panel")
             .resizable(true)
-            .min_height(120.0)
-            .default_height(saved_commit_h)
-            .show(ctx, |ui| {
+            .min_size(120.0)
+            .default_size(saved_commit_h)
+            .show_inside(ui, |ui| {
                 let num_commits = self.commits.len();
                 let graph_width = (self
                     .graph_rows
@@ -3153,10 +3157,10 @@ impl eframe::App for GitkApp {
         // the commit list and absorbs window resizes. ──
         egui::CentralPanel::default()
             .frame(
-                egui::Frame::side_top_panel(&ctx.style())
+                egui::Frame::side_top_panel(&ctx.global_style())
                     .inner_margin(egui::Margin::symmetric(4, 0)),
             )
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 // A divider line below the commit list, plus a small strip so the
                 // commit-panel splitter handle and the hover toolbar don't overlap.
                 ui.add_space(3.0);
@@ -3191,7 +3195,7 @@ impl eframe::App for GitkApp {
                     let area = egui::Area::new(egui::Id::new("diff_opts_toolbar"))
                         .order(egui::Order::Foreground)
                         .fixed_pos(toolbar_pos)
-                        .show(ctx, |ui| {
+                        .show(&ctx, |ui| {
                             egui::Frame::popup(ui.style()).show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.label("Context:");
@@ -3232,11 +3236,11 @@ impl eframe::App for GitkApp {
                 let mut divider: Option<egui::Rect> = None;
                 if !self.diff_files.is_empty() {
                     let saved_w = self.file_list_width;
-                    let file_panel = egui::SidePanel::right("file_list_panel")
+                    let file_panel = egui::Panel::right("file_list_panel")
                         .resizable(true)
-                        .default_width(saved_w)
-                        .min_width(140.0)
-                        .max_width(400.0)
+                        .default_size(saved_w)
+                        .min_size(140.0)
+                        .max_size(400.0)
                         .frame(egui::Frame::NONE)
                         .show_inside(ui, |ui| {
                             ui.label(
