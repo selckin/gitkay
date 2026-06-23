@@ -228,52 +228,50 @@ fn is_virtual_oid(oid: git2::Oid) -> bool {
 fn push_rev_token(revwalk: &mut git2::Revwalk, repo: &Repository, tok: &str) {
     let resolve = |s: &str| repo.revparse_single(s).map(|o| o.id());
     match cli::rev_token_kind(tok) {
-        cli::RevTokenKind::Single(s) => match resolve(&s) {
-            Ok(id) => {
-                revwalk.push(id).ok();
+        cli::RevTokenKind::Single(s) => {
+            let r = resolve(&s);
+            if let Ok(id) = &r {
+                revwalk.push(*id).ok();
             }
-            Err(e) => log::warn!("gitkay: bad revision '{s}': {e}"),
-        },
-        cli::RevTokenKind::Exclude(s) => match resolve(&s) {
-            Ok(id) => {
-                revwalk.hide(id).ok();
+            warn_bad_rev(&s, &r);
+        }
+        cli::RevTokenKind::Exclude(s) => {
+            let r = resolve(&s);
+            if let Ok(id) = &r {
+                revwalk.hide(*id).ok();
             }
-            Err(e) => log::warn!("gitkay: bad revision '{s}': {e}"),
-        },
-        cli::RevTokenKind::Range(a, b) => match (resolve(&a), resolve(&b)) {
-            (Ok(ia), Ok(ib)) => {
-                revwalk.hide(ia).ok();
-                revwalk.push(ib).ok();
+            warn_bad_rev(&s, &r);
+        }
+        cli::RevTokenKind::Range(a, b) => {
+            let (ra, rb) = (resolve(&a), resolve(&b));
+            if let (Ok(ia), Ok(ib)) = (&ra, &rb) {
+                revwalk.hide(*ia).ok();
+                revwalk.push(*ib).ok();
             }
-            (ra, rb) => warn_bad_endpoints(&a, ra, &b, rb),
-        },
-        cli::RevTokenKind::Symmetric(a, b) => match (resolve(&a), resolve(&b)) {
-            (Ok(ia), Ok(ib)) => {
-                revwalk.push(ia).ok();
-                revwalk.push(ib).ok();
-                if let Ok(base) = repo.merge_base(ia, ib) {
+            warn_bad_rev(&a, &ra);
+            warn_bad_rev(&b, &rb);
+        }
+        cli::RevTokenKind::Symmetric(a, b) => {
+            let (ra, rb) = (resolve(&a), resolve(&b));
+            if let (Ok(ia), Ok(ib)) = (&ra, &rb) {
+                revwalk.push(*ia).ok();
+                revwalk.push(*ib).ok();
+                if let Ok(base) = repo.merge_base(*ia, *ib) {
                     revwalk.hide(base).ok();
                 }
             }
-            (ra, rb) => warn_bad_endpoints(&a, ra, &b, rb),
-        },
+            warn_bad_rev(&a, &ra);
+            warn_bad_rev(&b, &rb);
+        }
     }
 }
 
-/// Log whichever endpoint(s) of an `A..B` / `A...B` range failed to resolve, so a
-/// typo'd range silently contributing zero commits is at least visible in the log
-/// (matching the single-rev `bad revision` warning).
-fn warn_bad_endpoints(
-    a: &str,
-    ra: Result<git2::Oid, git2::Error>,
-    b: &str,
-    rb: Result<git2::Oid, git2::Error>,
-) {
-    if let Err(e) = ra {
-        log::warn!("gitkay: bad revision '{a}': {e}");
-    }
-    if let Err(e) = rb {
-        log::warn!("gitkay: bad revision '{b}': {e}");
+/// Log a `<rev>` token that failed to resolve, so a typo — a single rev or a
+/// range endpoint — contributing zero commits to the walk is visible in the log
+/// rather than silently dropped. A no-op on `Ok`.
+fn warn_bad_rev(rev: &str, result: &Result<git2::Oid, git2::Error>) {
+    if let Err(e) = result {
+        log::warn!("gitkay: bad revision '{rev}': {e}");
     }
 }
 
@@ -593,6 +591,55 @@ fn flat_line_color(kind: LineKind) -> egui::Color32 {
     }
 }
 
+/// Render `n_lines` rows of the diff with row virtualization — only the visible
+/// rows get a LayoutJob (diffs can be tens of thousands of lines, all uniform
+/// single-line height). `on_visible` receives the visible row range (the themed
+/// path uses it to tell the highlight worker which files are on screen; the flat
+/// path passes a no-op). `build_row` produces each row's job, an optional
+/// background tint, and the galley fallback colour. Shared by both render paths
+/// so the scroll/offset/width scaffold lives in one place.
+fn show_virtualized_diff(
+    ui: &mut egui::Ui,
+    font_id: &egui::FontId,
+    n_lines: usize,
+    content_chars: usize,
+    scroll_target: Option<usize>,
+    mut on_visible: impl FnMut(std::ops::Range<usize>),
+    mut build_row: impl FnMut(usize) -> (egui::text::LayoutJob, Option<egui::Color32>, egui::Color32),
+) {
+    let row_h = ui.fonts(|f| f.row_height(font_id));
+    ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+    let mut scroll = egui::ScrollArea::both()
+        .id_salt("diff_scroll")
+        .auto_shrink([false, false])
+        .animated(false);
+    // Jump-to-target works even when the row is off-screen (it isn't laid out)
+    // by forcing the scroll offset.
+    if let Some(t) = scroll_target {
+        scroll = scroll.vertical_scroll_offset(t as f32 * row_h);
+    }
+    // Size the horizontal scroll to the widest line in the whole diff —
+    // virtualization only lays out visible rows, so egui can't otherwise know an
+    // off-screen line is wide. Monospace assumption.
+    let char_w = ui.fonts(|f| f.glyph_width(font_id, ' '));
+    let content_w = (content_chars as f32 + 1.0) * char_w;
+    scroll.show_rows(ui, row_h, n_lines, |ui, rows| {
+        ui.set_min_width(content_w);
+        on_visible(rows.clone());
+        for i in rows {
+            let (job, row_bg, fallback) = build_row(i);
+            let galley = ui.fonts(|f| f.layout_job(job));
+            let width = ui.available_width().max(galley.size().x);
+            let (rect, _resp) =
+                ui.allocate_exact_size(egui::vec2(width, row_h), egui::Sense::hover());
+            if let Some(bg) = row_bg {
+                ui.painter().rect_filled(rect, 0.0, bg);
+            }
+            ui.painter().galley(rect.min, galley, fallback);
+        }
+    });
+}
+
 #[derive(Clone)]
 struct FileEntry {
     path: String,
@@ -608,6 +655,17 @@ struct FileEntry {
 struct DiffData {
     lines: Vec<DiffLine>,
     files: Vec<FileEntry>,
+}
+
+impl DiffData {
+    /// An empty diff — returned when a git2 operation fails (the error is logged
+    /// at the call site before returning this).
+    fn empty() -> Self {
+        DiffData {
+            lines: Vec::new(),
+            files: Vec::new(),
+        }
+    }
 }
 
 /// Diff rendering options controlled from the toolbar.
@@ -637,20 +695,14 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, path
         Ok(c) => c,
         Err(e) => {
             log::warn!("gitkay: cannot load commit {oid}: {e}");
-            return DiffData {
-                lines: Vec::new(),
-                files: Vec::new(),
-            };
+            return DiffData::empty();
         }
     };
     let tree = match commit.tree() {
         Ok(t) => t,
         Err(e) => {
             log::warn!("gitkay: cannot read tree for {oid}: {e}");
-            return DiffData {
-                lines: Vec::new(),
-                files: Vec::new(),
-            };
+            return DiffData::empty();
         }
     };
     let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
@@ -661,10 +713,7 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, path
         Ok(d) => d,
         Err(e) => {
             log::warn!("gitkay: cannot diff commit {oid}: {e}");
-            return DiffData {
-                lines: Vec::new(),
-                files: Vec::new(),
-            };
+            return DiffData::empty();
         }
     };
 
@@ -797,10 +846,7 @@ fn get_working_tree_diff(repo: &Repository, settings: DiffSettings, paths: &[Str
         Ok(d) => d,
         Err(e) => {
             log::warn!("gitkay: cannot diff working tree: {e}");
-            return DiffData {
-                lines: Vec::new(),
-                files: Vec::new(),
-            };
+            return DiffData::empty();
         }
     };
     diff_to_data(&diff, "Uncommitted changes (working tree)")
@@ -819,10 +865,7 @@ fn get_staged_diff(repo: &Repository, settings: DiffSettings, paths: &[String]) 
         Ok(d) => d,
         Err(e) => {
             log::warn!("gitkay: cannot diff staged changes: {e}");
-            return DiffData {
-                lines: Vec::new(),
-                files: Vec::new(),
-            };
+            return DiffData::empty();
         }
     };
     diff_to_data(&diff, "Staged changes (index)")
@@ -2930,103 +2973,66 @@ impl eframe::App for GitkApp {
                         ui.style_mut().override_font_id = Some(self.fonts.font_id(Role::Diff));
                         let scroll_target = self.diff_scroll_to.take();
                         if let Some(palette) = &palette {
-                            // Themed render, row-virtualized: only visible rows
-                            // get a LayoutJob (diffs can be tens of thousands of
-                            // lines). Rows are single-line, so height is uniform.
+                            // Themed render: row colours come from the theme's token
+                            // spans plus an add/del background tint.
                             let font_id = self.fonts.font_id(Role::Diff);
-                            let row_h = ui.fonts(|f| f.row_height(&font_id));
-                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                            let mut scroll = egui::ScrollArea::both()
-                                .id_salt("diff_scroll")
-                                .auto_shrink([false, false])
-                                .animated(false);
-                            // Jump-to-target works even when the row is off-screen
-                            // (it isn't laid out) by forcing the scroll offset.
-                            if let Some(t) = scroll_target {
-                                scroll = scroll.vertical_scroll_offset(t as f32 * row_h);
-                            }
-                            // Size the horizontal scroll to the widest line in
-                            // the whole diff — virtualization only lays out
-                            // visible rows, so egui can't otherwise know an
-                            // off-screen line is wide. Monospace assumption.
-                            let char_w = ui.fonts(|f| f.glyph_width(&font_id, ' '));
-                            let content_w = (self.diff_max_chars as f32 + 1.0) * char_w;
-                            scroll.show_rows(ui, row_h, self.diff_lines.len(), |ui, rows| {
-                                ui.set_min_width(content_w);
-                                // Tell the background worker which files are on
-                                // screen so it tokenizes those first, plus the
-                                // file range one viewport (in rows) above/below
-                                // for read-ahead. Skip an empty row range (e.g. a
-                                // zero-height pane), which would yield hi < lo.
-                                if let Some(p) = &self.highlight_priority
-                                    && rows.start < rows.end
-                                {
-                                    let vh = rows.end - rows.start; // viewport height in rows
-                                    let files = &self.diff_files;
-                                    let lo = file_index_at_line(files, rows.start);
-                                    let hi = file_index_at_line(files, rows.end - 1);
-                                    let page_lo =
-                                        file_index_at_line(files, rows.start.saturating_sub(vh));
-                                    let page_hi = file_index_at_line(files, rows.end - 1 + vh);
-                                    p.lo.store(lo, Ordering::Relaxed);
-                                    p.hi.store(hi, Ordering::Relaxed);
-                                    p.page_lo.store(page_lo, Ordering::Relaxed);
-                                    p.page_hi.store(page_hi, Ordering::Relaxed);
-                                }
-                                for i in rows {
-                                    let line = &self.diff_lines[i];
-                                    let (job, row_bg) =
-                                        diff_row_job(line, palette, font_id.clone());
-                                    let galley = ui.fonts(|f| f.layout_job(job));
-                                    let width = ui.available_width().max(galley.size().x);
-                                    let (rect, _resp) = ui.allocate_exact_size(
-                                        egui::vec2(width, row_h),
-                                        egui::Sense::hover(),
-                                    );
-                                    if let Some(bg) = row_bg {
-                                        ui.painter().rect_filled(rect, 0.0, bg);
+                            let lines = &self.diff_lines;
+                            let files = &self.diff_files;
+                            let priority = self.highlight_priority.as_ref();
+                            show_virtualized_diff(
+                                ui,
+                                &font_id,
+                                lines.len(),
+                                self.diff_max_chars,
+                                scroll_target,
+                                |rows| {
+                                    // Tell the background worker which files are on
+                                    // screen so it tokenizes those first, plus the
+                                    // file range one viewport (in rows) above/below
+                                    // for read-ahead.
+                                    if let Some(p) = priority
+                                        && rows.start < rows.end
+                                    {
+                                        let vh = rows.end - rows.start;
+                                        let lo = file_index_at_line(files, rows.start);
+                                        let hi = file_index_at_line(files, rows.end - 1);
+                                        let page_lo =
+                                            file_index_at_line(files, rows.start.saturating_sub(vh));
+                                        let page_hi = file_index_at_line(files, rows.end - 1 + vh);
+                                        p.lo.store(lo, Ordering::Relaxed);
+                                        p.hi.store(hi, Ordering::Relaxed);
+                                        p.page_lo.store(page_lo, Ordering::Relaxed);
+                                        p.page_hi.store(page_hi, Ordering::Relaxed);
                                     }
-                                    ui.painter().galley(rect.min, galley, palette.foreground);
-                                }
-                            });
+                                },
+                                |i| {
+                                    let (job, row_bg) =
+                                        diff_row_job(&lines[i], palette, font_id.clone());
+                                    (job, row_bg, palette.foreground)
+                                },
+                            );
                         } else {
-                            // Flat per-line colouring (syntax off), row-virtualized
-                            // like the themed path above so a huge diff doesn't
-                            // re-lay out every line each frame. Rows are single-line,
-                            // so the height is uniform.
+                            // Flat per-line colouring (syntax off): one colour per
+                            // LineKind, no token spans, no row tint.
                             let font_id = self.fonts.font_id(Role::Diff);
-                            let row_h = ui.fonts(|f| f.row_height(&font_id));
-                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                            let mut scroll = egui::ScrollArea::both()
-                                .id_salt("diff_scroll")
-                                .auto_shrink([false, false])
-                                .animated(false);
-                            // Off-screen jump target: force the scroll offset (the
-                            // row isn't laid out, so scroll_to_rect can't reach it).
-                            if let Some(t) = scroll_target {
-                                scroll = scroll.vertical_scroll_offset(t as f32 * row_h);
-                            }
-                            let char_w = ui.fonts(|f| f.glyph_width(&font_id, ' '));
-                            let content_w = (self.diff_max_chars as f32 + 1.0) * char_w;
-                            scroll.show_rows(ui, row_h, self.diff_lines.len(), |ui, rows| {
-                                ui.set_min_width(content_w);
-                                for i in rows {
-                                    let line = &self.diff_lines[i];
-                                    let color = flat_line_color(line.kind);
+                            let lines = &self.diff_lines;
+                            show_virtualized_diff(
+                                ui,
+                                &font_id,
+                                lines.len(),
+                                self.diff_max_chars,
+                                scroll_target,
+                                |_rows| {},
+                                |i| {
+                                    let color = flat_line_color(lines[i].kind);
                                     let job = egui::text::LayoutJob::simple_singleline(
-                                        line.text.clone(),
+                                        lines[i].text.clone(),
                                         font_id.clone(),
                                         color,
                                     );
-                                    let galley = ui.fonts(|f| f.layout_job(job));
-                                    let width = ui.available_width().max(galley.size().x);
-                                    let (rect, _resp) = ui.allocate_exact_size(
-                                        egui::vec2(width, row_h),
-                                        egui::Sense::hover(),
-                                    );
-                                    ui.painter().galley(rect.min, galley, color);
-                                }
-                            });
+                                    (job, None, color)
+                                },
+                            );
                         }
                     });
 
