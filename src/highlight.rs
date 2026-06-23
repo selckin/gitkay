@@ -297,13 +297,31 @@ fn load_theme(slug: &str) -> (Theme, Option<String>) {
     }
 }
 
+/// Load the theme blob for `slug` and derive its palette in one step — the
+/// single place a slug + `diff_bg` maps to a `DiffPalette`. Loads only the theme
+/// blob (NOT the multi-MB syntax set). Returns a warning if the slug was unknown
+/// (defaulted).
+fn theme_and_palette(slug: &str, diff_bg: DiffBg) -> (Theme, DiffPalette, Option<String>) {
+    let (theme, warning) = load_theme(slug);
+    let palette = DiffPalette::from_theme(&theme, diff_bg);
+    (theme, palette, warning)
+}
+
+/// Derive just the diff palette for `slug` + `diff_bg`. Loads only the theme blob
+/// (NOT the multi-MB syntax set), so it's cheap enough for the syntax-off render
+/// and the pre-highlighter fallback — both colour from the theme without
+/// tokenizing. Returns a warning if the slug was unknown (defaulted).
+pub fn palette_for(slug: &str, diff_bg: DiffBg) -> (DiffPalette, Option<String>) {
+    let (_theme, palette, warning) = theme_and_palette(slug, diff_bg);
+    (palette, warning)
+}
+
 impl Highlighter {
     /// Build the highlighter for `slug`. Deserializes the bundled syntax set
     /// (multi-MB) once — call this lazily, not at startup.
     pub fn new(slug: &str, diff_bg: DiffBg) -> (Highlighter, Option<String>) {
         let syntaxes = Arc::new(two_face::syntax::extra_newlines());
-        let (theme, warning) = load_theme(slug);
-        let palette = DiffPalette::from_theme(&theme, diff_bg);
+        let (theme, palette, warning) = theme_and_palette(slug, diff_bg);
         (
             Highlighter {
                 syntaxes,
@@ -319,8 +337,7 @@ impl Highlighter {
     /// a warning if the slug was unknown. The old instance stays valid for any
     /// in-flight worker still holding it.
     pub fn with_theme(&self, slug: &str, diff_bg: DiffBg) -> (Highlighter, Option<String>) {
-        let (theme, warning) = load_theme(slug);
-        let palette = DiffPalette::from_theme(&theme, diff_bg);
+        let (theme, palette, warning) = theme_and_palette(slug, diff_bg);
         (
             Highlighter {
                 syntaxes: Arc::clone(&self.syntaxes),
