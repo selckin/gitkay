@@ -14,7 +14,7 @@ egui = "0.34"
 git2 = "0.21"
 chrono = "0.4"
 arboard = "3"
-notify = "7"
+notify = "8"
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.1.2"
 fontdb = "0.23.0"
