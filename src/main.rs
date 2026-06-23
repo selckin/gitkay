@@ -1795,7 +1795,7 @@ struct GitkApp {
     reload_armed_at: Option<std::time::Instant>, // debounce timer for watcher reloads
     _watcher: Option<RecommendedWatcher>,
     branch_highlight: HashSet<usize>, // indices of commits on the same branch as selected
-    diff_panel_height: f32,           // persisted diff-panel splitter height (see App::save)
+    commit_panel_height: f32,         // persisted commit-list panel height (see App::save)
     file_list_width: f32,             // persisted file-list sidebar width (see App::save)
     diff_context: u32,                // diff context lines (persisted)
     diff_ignore_ws: bool,             // ignore all whitespace in diffs (persisted)
@@ -2066,9 +2066,9 @@ impl GitkApp {
         };
 
         // Restore the persisted layout sizes (written in App::save).
-        let diff_panel_height: f32 = cc
+        let commit_panel_height: f32 = cc
             .storage
-            .and_then(|s| eframe::get_value(s, "diff_panel_height"))
+            .and_then(|s| eframe::get_value(s, "commit_panel_height"))
             .unwrap_or(300.0);
         let file_list_width: f32 = cc
             .storage
@@ -2132,7 +2132,7 @@ impl GitkApp {
             reload_armed_at: None,
             _watcher: watcher,
             branch_highlight: HashSet::new(),
-            diff_panel_height,
+            commit_panel_height,
             file_list_width,
             diff_context,
             diff_ignore_ws,
@@ -2455,7 +2455,7 @@ impl eframe::App for GitkApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, "diff_panel_height", &self.diff_panel_height);
+        eframe::set_value(storage, "commit_panel_height", &self.commit_panel_height);
         eframe::set_value(storage, "file_list_width", &self.file_list_width);
         eframe::set_value(storage, "diff_context", &self.diff_context);
         eframe::set_value(storage, "diff_ignore_ws", &self.diff_ignore_ws);
@@ -2761,18 +2761,376 @@ impl eframe::App for GitkApp {
                 });
             });
 
-        // ── Bottom panel: diff view + file list ──
-        let saved_panel_h = self.diff_panel_height;
-        let diff_panel = egui::TopBottomPanel::bottom("diff_panel")
+        // ── Commit list: a resizable top panel. egui remembers its height
+        // across window resizes, so growing the window grows the diff (the
+        // central panel below), not the commit list. ──
+        let saved_commit_h = self.commit_panel_height;
+        let commit_panel = egui::TopBottomPanel::top("commit_panel")
             .resizable(true)
-            .min_height(100.0)
-            .default_height(saved_panel_h)
+            .min_height(120.0)
+            .default_height(saved_commit_h)
+            .show(ctx, |ui| {
+                let num_commits = self.commits.len();
+                let graph_width = (self
+                    .graph_rows
+                    .iter()
+                    .map(|r| r.num_cols)
+                    .max()
+                    .unwrap_or(1)
+                    .min(max_graph_cols) as f32)
+                    * col_width
+                    + 8.0;
+
+                let panel_height = ui.available_height();
+                let graph_scroll_to = self.graph_scroll_to.take();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // Total content height
+                        let total_content = num_commits as f32 * row_height;
+                        let total_height = total_content.max(panel_height);
+
+                        // Spacer before visible rows
+                        let scroll_offset = ui.clip_rect().min.y - ui.cursor().min.y;
+                        let first_row = (scroll_offset / row_height).floor().max(0.0) as usize;
+                        let visible_rows = (panel_height / row_height).ceil() as usize + 2;
+                        let last_row = (first_row + visible_rows).min(num_commits);
+                        let row_range = first_row..last_row;
+
+                        // Pre-spacer
+                        if first_row > 0 {
+                            ui.allocate_space(egui::vec2(0.0, first_row as f32 * row_height));
+                        }
+
+                        let rows_height = (last_row - first_row) as f32 * row_height;
+                        let (response, painter) = ui.allocate_painter(
+                            egui::vec2(ui.available_width(), rows_height),
+                            egui::Sense::click(),
+                        );
+                        let top_left = response.rect.min;
+
+                        // Check click — select commit and copy SHA
+                        if response.clicked()
+                            && let Some(pos) = response.interact_pointer_pos()
+                        {
+                            let row_offset = ((pos.y - top_left.y) / row_height) as usize;
+                            let clicked_idx = row_range.start + row_offset;
+                            if clicked_idx < num_commits {
+                                let commit = &self.commits[clicked_idx];
+                                let clicked_oid = commit.oid;
+                                // Copy SHA to both clipboards
+                                let sha = clicked_oid.to_string();
+                                ctx.copy_text(sha.clone());
+                                // Also set primary selection (middle-click paste)
+                                if let Ok(mut clip) = arboard::Clipboard::new() {
+                                    let _ = clip
+                                        .set()
+                                        .clipboard(arboard::LinuxClipboardKind::Primary)
+                                        .text(&sha);
+                                }
+                                self.copied_toast = Some(std::time::Instant::now());
+                                // The clicked commit is already loaded at clicked_idx
+                                // — select it and load its diff, exactly like arrow-key
+                                // nav. No commit-list reload / graph relayout (that's
+                                // only needed to jump to a not-yet-loaded commit, e.g.
+                                // a search hit), which was blocking the UI on click.
+                                self.set_selected(clicked_idx);
+                                if let Ok(repo) = Repository::discover(&self.repo_path) {
+                                    self.load_selected_diff(&repo);
+                                }
+                                self.diff_scroll_to = Some(0); // reset diff view to top
+                            }
+                        }
+
+                        for idx in row_range.clone() {
+                            let commit = &self.commits[idx];
+                            let gr = &self.graph_rows[idx];
+                            let row_offset = (idx - row_range.start) as f32;
+                            let y_center = top_left.y + row_offset * row_height + row_height / 2.0;
+                            let y_top = y_center - row_height / 2.0;
+                            let y_bottom = y_center + row_height / 2.0;
+
+                            // Row background
+                            let row_rect = egui::Rect::from_min_size(
+                                egui::pos2(top_left.x, y_top),
+                                egui::vec2(response.rect.width(), row_height),
+                            );
+
+                            let is_search_match = !self.search_matches.is_empty()
+                                && self.search_matches.binary_search(&idx).is_ok();
+                            let is_uncommitted = commit.oid == oid_uncommitted();
+                            let is_staged = commit.oid == oid_staged();
+                            let is_branch_member = self.branch_highlight.contains(&idx);
+
+                            // Branch members: no background, handled via brighter text below
+                            if is_uncommitted {
+                                painter.rect_filled(
+                                    row_rect,
+                                    0.0,
+                                    egui::Color32::from_rgba_unmultiplied(243, 139, 168, 18),
+                                );
+                            } else if is_staged {
+                                painter.rect_filled(
+                                    row_rect,
+                                    0.0,
+                                    egui::Color32::from_rgba_unmultiplied(166, 227, 161, 18),
+                                );
+                            }
+
+                            if self.selected == Some(idx) {
+                                painter.rect_filled(
+                                    row_rect,
+                                    0.0,
+                                    egui::Color32::from_rgba_unmultiplied(203, 166, 247, 40),
+                                );
+                            } else if is_search_match {
+                                // Yellow accent bar on the left edge
+                                let bar = egui::Rect::from_min_size(
+                                    row_rect.min,
+                                    egui::vec2(3.0, row_rect.height()),
+                                );
+                                painter.rect_filled(bar, 0.0, egui::Color32::from_rgb(249, 226, 175));
+                            }
+                            if self.selected != Some(idx)
+                                && response.hover_pos().is_some_and(|p| row_rect.contains(p))
+                            {
+                                painter.rect_filled(
+                                    row_rect,
+                                    0.0,
+                                    egui::Color32::from_rgba_unmultiplied(203, 166, 247, 12),
+                                );
+                            }
+
+                            let gx = |col: usize| -> f32 {
+                                top_left.x + col as f32 * col_width + col_width / 2.0
+                            };
+
+                            // ── Graph ──
+                            for &(from, to, color_col) in &gr.lines {
+                                let c = graph_color(color_col).linear_multiply(if from == to {
+                                    0.5
+                                } else {
+                                    0.7
+                                });
+                                let stroke = egui::Stroke::new(2.0, c);
+                                let x_top = gx(from);
+                                let x_bot = gx(to);
+
+                                // Check if this line passes through the node
+                                let touches_node = from == gr.node_col || to == gr.node_col;
+
+                                // Check if this node has an incoming line from above
+                                let has_incoming = idx > 0
+                                    && self.graph_rows[idx - 1]
+                                        .lines
+                                        .iter()
+                                        .any(|&(_, to, _)| to == gr.node_col);
+
+                                if !touches_node {
+                                    // Straight or diagonal, doesn't touch the node
+                                    painter.line_segment(
+                                        [egui::pos2(x_top, y_top), egui::pos2(x_bot, y_bottom)],
+                                        stroke,
+                                    );
+                                } else if from == to && from == gr.node_col {
+                                    // Node's own lane continuation: split around dot
+                                    if has_incoming {
+                                        painter.line_segment(
+                                            [
+                                                egui::pos2(x_top, y_top),
+                                                egui::pos2(x_top, y_center - dot_radius - 1.0),
+                                            ],
+                                            stroke,
+                                        );
+                                    }
+                                    painter.line_segment(
+                                        [
+                                            egui::pos2(x_bot, y_center + dot_radius + 1.0),
+                                            egui::pos2(x_bot, y_bottom),
+                                        ],
+                                        stroke,
+                                    );
+                                } else if from == gr.node_col {
+                                    // Outgoing from node: dot center → target column bottom
+                                    painter.line_segment(
+                                        [
+                                            egui::pos2(gx(gr.node_col), y_center),
+                                            egui::pos2(x_bot, y_bottom),
+                                        ],
+                                        stroke,
+                                    );
+                                } else if to == gr.node_col {
+                                    // Incoming to node: source column top → dot center
+                                    painter.line_segment(
+                                        [
+                                            egui::pos2(x_top, y_top),
+                                            egui::pos2(gx(gr.node_col), y_center),
+                                        ],
+                                        stroke,
+                                    );
+                                }
+                            }
+
+                            // Commit dot
+                            painter.circle_filled(
+                                egui::pos2(gx(gr.node_col), y_center),
+                                dot_radius,
+                                graph_color(gr.node_color),
+                            );
+
+                            // ── Text ──
+                            let text_x = top_left.x + graph_width;
+                            let mut cursor_x = text_x;
+
+                            // Ref labels — unique color per ref name
+                            for (ref_name, kind) in &commit.refs {
+                                let (bg, fg) = match kind {
+                                    RefKind::Head => (egui::Color32::from_rgb(80, 40, 50), RED),
+                                    RefKind::Tag => (egui::Color32::from_rgb(60, 55, 30), YELLOW),
+                                    RefKind::Branch | RefKind::Remote => {
+                                        // Unique color per branch/remote name
+                                        let color = ref_color(ref_name);
+                                        let bg = egui::Color32::from_rgba_unmultiplied(
+                                            (color.r() / 4).max(20),
+                                            (color.g() / 4).max(20),
+                                            (color.b() / 4).max(20),
+                                            200,
+                                        );
+                                        (bg, color)
+                                    }
+                                };
+                                let font = self.fonts.font_id(Role::Refs);
+                                let galley = painter.layout_no_wrap(ref_name.clone(), font, fg);
+                                let label_w = galley.size().x + 10.0;
+                                let label_rect = egui::Rect::from_min_size(
+                                    egui::pos2(cursor_x, y_center - 8.0),
+                                    egui::vec2(label_w, 16.0),
+                                );
+                                painter.rect_filled(label_rect, 4.0, bg);
+                                painter.galley(egui::pos2(cursor_x + 5.0, y_center - 7.0), galley, fg);
+                                cursor_x += label_w + 4.0;
+                            }
+
+                            // Author + date (right-aligned) — compute first to know where summary must stop
+                            let right_x = row_rect.max.x;
+                            let date_str = chrono::DateTime::from_timestamp(commit.time, 0)
+                                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                                .unwrap_or_default();
+                            let date_font = self.fonts.font_id(Role::CommitMeta);
+                            let date_galley =
+                                painter.layout_no_wrap(date_str, date_font.clone(), SUBTEXT);
+                            let date_w = date_galley.size().x;
+
+                            // Short SHA
+                            let short_sha = if is_virtual_oid(commit.oid) {
+                                String::new()
+                            } else {
+                                format!("{:.7}", commit.oid)
+                            };
+                            let sha_galley =
+                                painter.layout_no_wrap(short_sha, date_font.clone(), SUBTEXT);
+                            let sha_w = sha_galley.size().x;
+
+                            let a_color = author_color(&commit.author);
+                            let author_galley =
+                                painter.layout_no_wrap(commit.author.clone(), date_font, a_color);
+                            let author_w = author_galley.size().x;
+
+                            let author_date_x = right_x - date_w - author_w - sha_w - 40.0;
+
+                            // Summary — truncate to available space before author
+                            let summary_max_w = (author_date_x - cursor_x - 12.0).max(20.0);
+                            let has_highlight = !self.branch_highlight.is_empty();
+                            let search_active = !self.search_matches.is_empty();
+                            let summary_color = if search_active || !has_highlight || is_branch_member {
+                                TEXT
+                            } else {
+                                SUBTEXT // dim non-branch commits
+                            };
+                            let summary_font = self.fonts.font_id(Role::CommitSummary);
+                            let summary_galley = painter.layout_no_wrap(
+                                commit.summary.clone(),
+                                summary_font,
+                                summary_color,
+                            );
+                            // Clip to not overflow into author/date
+                            let summary_clip = egui::Rect::from_min_max(
+                                egui::pos2(cursor_x + 4.0, y_top),
+                                egui::pos2(cursor_x + 4.0 + summary_max_w, y_bottom),
+                            );
+                            painter.with_clip_rect(summary_clip).galley(
+                                egui::pos2(cursor_x + 4.0, y_center - 7.0),
+                                summary_galley,
+                                TEXT,
+                            );
+
+                            // Draw SHA, author, date (right-aligned)
+                            let mut rx = author_date_x;
+                            if sha_w > 0.0 {
+                                painter.galley(egui::pos2(rx, y_center - 7.0), sha_galley, SUBTEXT);
+                                rx += sha_w + 8.0;
+                            }
+                            painter.galley(egui::pos2(rx, y_center - 7.0), author_galley, a_color);
+                            painter.galley(
+                                egui::pos2(right_x - date_w - 8.0, y_center - 7.0),
+                                date_galley,
+                                SUBTEXT,
+                            );
+                        }
+
+                        // Scroll to target commit if requested
+                        if let Some((target_idx, align)) = graph_scroll_to {
+                            // Compute the target rect in the scroll content's coordinate space.
+                            // The content origin is at top_left.y - (first_row as f32 * row_height)
+                            // (since top_left is after the pre-spacer).
+                            let content_origin_y = top_left.y - first_row as f32 * row_height;
+                            let target_y = content_origin_y + target_idx as f32 * row_height;
+                            let target_rect = egui::Rect::from_min_size(
+                                egui::pos2(top_left.x, target_y),
+                                egui::vec2(1.0, row_height),
+                            );
+                            ui.scroll_to_rect(target_rect, align);
+                        }
+
+                        // Post-spacer to maintain correct total scroll height
+                        let drawn_bottom = last_row as f32 * row_height;
+                        let remaining = total_height - drawn_bottom;
+                        if remaining > 0.0 {
+                            ui.allocate_space(egui::vec2(0.0, remaining));
+                        }
+
+                        // Lazy load: when near the bottom, load more commits
+                        if !self.all_loaded
+                            && last_row + 50 >= num_commits
+                            && let Ok(repo) = Repository::discover(&self.repo_path)
+                        {
+                            let more = load_commits(&repo, self.commits.len() + 500, &self.scope);
+                            self.all_loaded = more.len() <= self.commits.len();
+                            self.commits = more;
+                            self.graph_rows = layout_graph(&self.commits);
+                        }
+                    });
+            });
+        // Persist the commit-list height only on an actual resize-drag, so a
+        // window-clamped frame can't ratchet the saved value down across runs
+        // (mirrors the file-list panel).
+        if ctx
+            .read_response(egui::Id::new("commit_panel").with("__resize"))
+            .is_some_and(|r| r.dragged())
+        {
+            self.commit_panel_height = commit_panel.response.rect.height();
+        }
+
+        // ── Diff view: the central panel, so it fills the height left below
+        // the commit list and absorbs window resizes. ──
+        egui::CentralPanel::default()
             .frame(
                 egui::Frame::side_top_panel(&ctx.style())
                     .inner_margin(egui::Margin::symmetric(4, 0)),
             )
             .show(ctx, |ui| {
-                // Wider resize grab area
+                // A divider line below the commit list, plus a small strip so the
+                // commit-panel splitter handle and the hover toolbar don't overlap.
                 ui.add_space(3.0);
                 ui.separator();
                 ui.add_space(2.0);
@@ -3058,359 +3416,6 @@ impl eframe::App for GitkApp {
                     ui.painter().vline(r.left() - 5.0, r.y_range(), stroke);
                 }
             });
-        // Remember the splitter height for next launch (persisted in App::save),
-        // but only on an actual resize-drag — capturing every frame would persist
-        // a window-clamped height and ratchet the saved value down.
-        if ctx
-            .read_response(egui::Id::new("diff_panel").with("__resize"))
-            .is_some_and(|r| r.dragged())
-        {
-            self.diff_panel_height = diff_panel.response.rect.height();
-        }
-
-        // ── Central panel: commit graph + list ──
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let num_commits = self.commits.len();
-            let graph_width = (self
-                .graph_rows
-                .iter()
-                .map(|r| r.num_cols)
-                .max()
-                .unwrap_or(1)
-                .min(max_graph_cols) as f32)
-                * col_width
-                + 8.0;
-
-            let panel_height = ui.available_height();
-            let graph_scroll_to = self.graph_scroll_to.take();
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    // Total content height
-                    let total_content = num_commits as f32 * row_height;
-                    let total_height = total_content.max(panel_height);
-
-                    // Spacer before visible rows
-                    let scroll_offset = ui.clip_rect().min.y - ui.cursor().min.y;
-                    let first_row = (scroll_offset / row_height).floor().max(0.0) as usize;
-                    let visible_rows = (panel_height / row_height).ceil() as usize + 2;
-                    let last_row = (first_row + visible_rows).min(num_commits);
-                    let row_range = first_row..last_row;
-
-                    // Pre-spacer
-                    if first_row > 0 {
-                        ui.allocate_space(egui::vec2(0.0, first_row as f32 * row_height));
-                    }
-
-                    let rows_height = (last_row - first_row) as f32 * row_height;
-                    let (response, painter) = ui.allocate_painter(
-                        egui::vec2(ui.available_width(), rows_height),
-                        egui::Sense::click(),
-                    );
-                    let top_left = response.rect.min;
-
-                    // Check click — select commit and copy SHA
-                    if response.clicked()
-                        && let Some(pos) = response.interact_pointer_pos()
-                    {
-                        let row_offset = ((pos.y - top_left.y) / row_height) as usize;
-                        let clicked_idx = row_range.start + row_offset;
-                        if clicked_idx < num_commits {
-                            let commit = &self.commits[clicked_idx];
-                            let clicked_oid = commit.oid;
-                            // Copy SHA to both clipboards
-                            let sha = clicked_oid.to_string();
-                            ctx.copy_text(sha.clone());
-                            // Also set primary selection (middle-click paste)
-                            if let Ok(mut clip) = arboard::Clipboard::new() {
-                                let _ = clip
-                                    .set()
-                                    .clipboard(arboard::LinuxClipboardKind::Primary)
-                                    .text(&sha);
-                            }
-                            self.copied_toast = Some(std::time::Instant::now());
-                            // The clicked commit is already loaded at clicked_idx
-                            // — select it and load its diff, exactly like arrow-key
-                            // nav. No commit-list reload / graph relayout (that's
-                            // only needed to jump to a not-yet-loaded commit, e.g.
-                            // a search hit), which was blocking the UI on click.
-                            self.set_selected(clicked_idx);
-                            if let Ok(repo) = Repository::discover(&self.repo_path) {
-                                self.load_selected_diff(&repo);
-                            }
-                            self.diff_scroll_to = Some(0); // reset diff view to top
-                        }
-                    }
-
-                    for idx in row_range.clone() {
-                        let commit = &self.commits[idx];
-                        let gr = &self.graph_rows[idx];
-                        let row_offset = (idx - row_range.start) as f32;
-                        let y_center = top_left.y + row_offset * row_height + row_height / 2.0;
-                        let y_top = y_center - row_height / 2.0;
-                        let y_bottom = y_center + row_height / 2.0;
-
-                        // Row background
-                        let row_rect = egui::Rect::from_min_size(
-                            egui::pos2(top_left.x, y_top),
-                            egui::vec2(response.rect.width(), row_height),
-                        );
-
-                        let is_search_match = !self.search_matches.is_empty()
-                            && self.search_matches.binary_search(&idx).is_ok();
-                        let is_uncommitted = commit.oid == oid_uncommitted();
-                        let is_staged = commit.oid == oid_staged();
-                        let is_branch_member = self.branch_highlight.contains(&idx);
-
-                        // Branch members: no background, handled via brighter text below
-                        if is_uncommitted {
-                            painter.rect_filled(
-                                row_rect,
-                                0.0,
-                                egui::Color32::from_rgba_unmultiplied(243, 139, 168, 18),
-                            );
-                        } else if is_staged {
-                            painter.rect_filled(
-                                row_rect,
-                                0.0,
-                                egui::Color32::from_rgba_unmultiplied(166, 227, 161, 18),
-                            );
-                        }
-
-                        if self.selected == Some(idx) {
-                            painter.rect_filled(
-                                row_rect,
-                                0.0,
-                                egui::Color32::from_rgba_unmultiplied(203, 166, 247, 40),
-                            );
-                        } else if is_search_match {
-                            // Yellow accent bar on the left edge
-                            let bar = egui::Rect::from_min_size(
-                                row_rect.min,
-                                egui::vec2(3.0, row_rect.height()),
-                            );
-                            painter.rect_filled(bar, 0.0, egui::Color32::from_rgb(249, 226, 175));
-                        }
-                        if self.selected != Some(idx)
-                            && response.hover_pos().is_some_and(|p| row_rect.contains(p))
-                        {
-                            painter.rect_filled(
-                                row_rect,
-                                0.0,
-                                egui::Color32::from_rgba_unmultiplied(203, 166, 247, 12),
-                            );
-                        }
-
-                        let gx = |col: usize| -> f32 {
-                            top_left.x + col as f32 * col_width + col_width / 2.0
-                        };
-
-                        // ── Graph ──
-                        for &(from, to, color_col) in &gr.lines {
-                            let c = graph_color(color_col).linear_multiply(if from == to {
-                                0.5
-                            } else {
-                                0.7
-                            });
-                            let stroke = egui::Stroke::new(2.0, c);
-                            let x_top = gx(from);
-                            let x_bot = gx(to);
-
-                            // Check if this line passes through the node
-                            let touches_node = from == gr.node_col || to == gr.node_col;
-
-                            // Check if this node has an incoming line from above
-                            let has_incoming = idx > 0
-                                && self.graph_rows[idx - 1]
-                                    .lines
-                                    .iter()
-                                    .any(|&(_, to, _)| to == gr.node_col);
-
-                            if !touches_node {
-                                // Straight or diagonal, doesn't touch the node
-                                painter.line_segment(
-                                    [egui::pos2(x_top, y_top), egui::pos2(x_bot, y_bottom)],
-                                    stroke,
-                                );
-                            } else if from == to && from == gr.node_col {
-                                // Node's own lane continuation: split around dot
-                                if has_incoming {
-                                    painter.line_segment(
-                                        [
-                                            egui::pos2(x_top, y_top),
-                                            egui::pos2(x_top, y_center - dot_radius - 1.0),
-                                        ],
-                                        stroke,
-                                    );
-                                }
-                                painter.line_segment(
-                                    [
-                                        egui::pos2(x_bot, y_center + dot_radius + 1.0),
-                                        egui::pos2(x_bot, y_bottom),
-                                    ],
-                                    stroke,
-                                );
-                            } else if from == gr.node_col {
-                                // Outgoing from node: dot center → target column bottom
-                                painter.line_segment(
-                                    [
-                                        egui::pos2(gx(gr.node_col), y_center),
-                                        egui::pos2(x_bot, y_bottom),
-                                    ],
-                                    stroke,
-                                );
-                            } else if to == gr.node_col {
-                                // Incoming to node: source column top → dot center
-                                painter.line_segment(
-                                    [
-                                        egui::pos2(x_top, y_top),
-                                        egui::pos2(gx(gr.node_col), y_center),
-                                    ],
-                                    stroke,
-                                );
-                            }
-                        }
-
-                        // Commit dot
-                        painter.circle_filled(
-                            egui::pos2(gx(gr.node_col), y_center),
-                            dot_radius,
-                            graph_color(gr.node_color),
-                        );
-
-                        // ── Text ──
-                        let text_x = top_left.x + graph_width;
-                        let mut cursor_x = text_x;
-
-                        // Ref labels — unique color per ref name
-                        for (ref_name, kind) in &commit.refs {
-                            let (bg, fg) = match kind {
-                                RefKind::Head => (egui::Color32::from_rgb(80, 40, 50), RED),
-                                RefKind::Tag => (egui::Color32::from_rgb(60, 55, 30), YELLOW),
-                                RefKind::Branch | RefKind::Remote => {
-                                    // Unique color per branch/remote name
-                                    let color = ref_color(ref_name);
-                                    let bg = egui::Color32::from_rgba_unmultiplied(
-                                        (color.r() / 4).max(20),
-                                        (color.g() / 4).max(20),
-                                        (color.b() / 4).max(20),
-                                        200,
-                                    );
-                                    (bg, color)
-                                }
-                            };
-                            let font = self.fonts.font_id(Role::Refs);
-                            let galley = painter.layout_no_wrap(ref_name.clone(), font, fg);
-                            let label_w = galley.size().x + 10.0;
-                            let label_rect = egui::Rect::from_min_size(
-                                egui::pos2(cursor_x, y_center - 8.0),
-                                egui::vec2(label_w, 16.0),
-                            );
-                            painter.rect_filled(label_rect, 4.0, bg);
-                            painter.galley(egui::pos2(cursor_x + 5.0, y_center - 7.0), galley, fg);
-                            cursor_x += label_w + 4.0;
-                        }
-
-                        // Author + date (right-aligned) — compute first to know where summary must stop
-                        let right_x = row_rect.max.x;
-                        let date_str = chrono::DateTime::from_timestamp(commit.time, 0)
-                            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                            .unwrap_or_default();
-                        let date_font = self.fonts.font_id(Role::CommitMeta);
-                        let date_galley =
-                            painter.layout_no_wrap(date_str, date_font.clone(), SUBTEXT);
-                        let date_w = date_galley.size().x;
-
-                        // Short SHA
-                        let short_sha = if is_virtual_oid(commit.oid) {
-                            String::new()
-                        } else {
-                            format!("{:.7}", commit.oid)
-                        };
-                        let sha_galley =
-                            painter.layout_no_wrap(short_sha, date_font.clone(), SUBTEXT);
-                        let sha_w = sha_galley.size().x;
-
-                        let a_color = author_color(&commit.author);
-                        let author_galley =
-                            painter.layout_no_wrap(commit.author.clone(), date_font, a_color);
-                        let author_w = author_galley.size().x;
-
-                        let author_date_x = right_x - date_w - author_w - sha_w - 40.0;
-
-                        // Summary — truncate to available space before author
-                        let summary_max_w = (author_date_x - cursor_x - 12.0).max(20.0);
-                        let has_highlight = !self.branch_highlight.is_empty();
-                        let search_active = !self.search_matches.is_empty();
-                        let summary_color = if search_active || !has_highlight || is_branch_member {
-                            TEXT
-                        } else {
-                            SUBTEXT // dim non-branch commits
-                        };
-                        let summary_font = self.fonts.font_id(Role::CommitSummary);
-                        let summary_galley = painter.layout_no_wrap(
-                            commit.summary.clone(),
-                            summary_font,
-                            summary_color,
-                        );
-                        // Clip to not overflow into author/date
-                        let summary_clip = egui::Rect::from_min_max(
-                            egui::pos2(cursor_x + 4.0, y_top),
-                            egui::pos2(cursor_x + 4.0 + summary_max_w, y_bottom),
-                        );
-                        painter.with_clip_rect(summary_clip).galley(
-                            egui::pos2(cursor_x + 4.0, y_center - 7.0),
-                            summary_galley,
-                            TEXT,
-                        );
-
-                        // Draw SHA, author, date (right-aligned)
-                        let mut rx = author_date_x;
-                        if sha_w > 0.0 {
-                            painter.galley(egui::pos2(rx, y_center - 7.0), sha_galley, SUBTEXT);
-                            rx += sha_w + 8.0;
-                        }
-                        painter.galley(egui::pos2(rx, y_center - 7.0), author_galley, a_color);
-                        painter.galley(
-                            egui::pos2(right_x - date_w - 8.0, y_center - 7.0),
-                            date_galley,
-                            SUBTEXT,
-                        );
-                    }
-
-                    // Scroll to target commit if requested
-                    if let Some((target_idx, align)) = graph_scroll_to {
-                        // Compute the target rect in the scroll content's coordinate space.
-                        // The content origin is at top_left.y - (first_row as f32 * row_height)
-                        // (since top_left is after the pre-spacer).
-                        let content_origin_y = top_left.y - first_row as f32 * row_height;
-                        let target_y = content_origin_y + target_idx as f32 * row_height;
-                        let target_rect = egui::Rect::from_min_size(
-                            egui::pos2(top_left.x, target_y),
-                            egui::vec2(1.0, row_height),
-                        );
-                        ui.scroll_to_rect(target_rect, align);
-                    }
-
-                    // Post-spacer to maintain correct total scroll height
-                    let drawn_bottom = last_row as f32 * row_height;
-                    let remaining = total_height - drawn_bottom;
-                    if remaining > 0.0 {
-                        ui.allocate_space(egui::vec2(0.0, remaining));
-                    }
-
-                    // Lazy load: when near the bottom, load more commits
-                    if !self.all_loaded
-                        && last_row + 50 >= num_commits
-                        && let Ok(repo) = Repository::discover(&self.repo_path)
-                    {
-                        let more = load_commits(&repo, self.commits.len() + 500, &self.scope);
-                        self.all_loaded = more.len() <= self.commits.len();
-                        self.commits = more;
-                        self.graph_rows = layout_graph(&self.commits);
-                    }
-                });
-        });
     }
 }
 
