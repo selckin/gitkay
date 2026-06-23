@@ -1370,6 +1370,11 @@ fn resolve_diff_bg(s: &config::SyntaxSection) -> (DiffBg, Vec<String>) {
     let mut warnings = Vec::new();
     let mode = s.diff_background.as_deref().unwrap_or("fixed");
     if mode == "theme" {
+        // The bands come from the theme here, so the parsed colours are unused —
+        // but still validate any explicitly set band hex so a malformed value
+        // isn't silently swallowed.
+        parse_bg_hex("added_background", s.added_background.as_deref(), &mut warnings);
+        parse_bg_hex("deleted_background", s.deleted_background.as_deref(), &mut warnings);
         return (DiffBg::Theme, warnings);
     }
     if mode != "fixed" {
@@ -4108,6 +4113,25 @@ mod tests {
             .map(|(_, r)| &body4[r.start..r.end])
             .collect();
         assert_eq!(deleted, "let old = 0;");
+    }
+
+    #[test]
+    fn resolve_diff_bg_theme_mode_still_validates_band_hex() {
+        use config::SyntaxSection;
+        // In theme mode the band colours come from the theme and are ignored, but
+        // a malformed value is still a config error and must be surfaced (the
+        // function's doc promises a warning on unparseable hex).
+        let (bg, warns) = resolve_diff_bg(&SyntaxSection {
+            diff_background: Some("theme".to_string()),
+            added_background: Some("nothex".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(bg, DiffBg::Theme);
+        assert_eq!(
+            warns.len(),
+            1,
+            "malformed band hex must warn even in theme mode"
+        );
     }
 
     #[test]
