@@ -418,7 +418,7 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
     }
     let build_info = |oid: git2::Oid, commit: &git2::Commit, parents: Vec<git2::Oid>| CommitInfo {
         oid,
-        summary: commit.summary().unwrap_or("").to_string(),
+        summary: commit.summary().ok().flatten().unwrap_or("").to_string(),
         author: commit.author().name().unwrap_or("").to_string(),
         time: commit.time().seconds(),
         parents,
@@ -501,7 +501,7 @@ fn build_ref_map(
             let Some(oid) = reference.target() else {
                 continue;
             };
-            let Some(shorthand) = reference.shorthand() else {
+            let Ok(shorthand) = reference.shorthand() else {
                 continue;
             };
             let name = reference.name().unwrap_or("");
@@ -762,7 +762,7 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, path
         ));
     }
     lines.push(DiffLine::new("", LineKind::Context));
-    if let Some(msg) = commit.message() {
+    if let Ok(msg) = commit.message() {
         for l in msg.lines() {
             lines.push(DiffLine::new(&format!("    {l}"), LineKind::Meta));
         }
@@ -1293,7 +1293,7 @@ fn collect_tree_blob_names(
         }
         match entry.kind() {
             Some(git2::ObjectType::Blob) => {
-                if let Some(name) = entry.name() {
+                if let Ok(name) = entry.name() {
                     out.push(name.to_string());
                 }
             }
@@ -4579,7 +4579,7 @@ mod tests {
     #[test]
     fn diff_cache_key_includes_theme_enabled_and_show_stats() {
         let key = |theme: &str, enabled: bool, show_stats: bool| DiffCacheKey {
-            oid: git2::Oid::zero(),
+            oid: git2::Oid::ZERO_SHA1,
             context: 3,
             ignore_ws: false,
             theme: theme.to_string(),
