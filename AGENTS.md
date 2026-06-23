@@ -6,7 +6,7 @@ Native Wayland git history viewer — gitk, but okay. Built with Rust + egui.
 
 ```sh
 cargo build --release
-cargo test                # 44 tests (16 graph/highlight + 28 config)
+cargo test                # 106 tests (44 main + 32 config + 17 highlight + 7 cli + 6 diff-cache)
 cp target/release/gitkay ~/.local/bin/
 ```
 
@@ -17,8 +17,12 @@ Rust deps of note: `fontdb` (system-font name → file lookup), `dirs` (XDG path
 
 ## Architecture
 
-App at `src/main.rs` (~2100 lines) plus `src/config.rs` (font/size config:
-TOML parsing, fontdb resolution + cache, role→FontId map). `main.rs` has three sections:
+App at `src/main.rs` (~4800 lines) plus extracted modules: `src/config.rs`
+(font/size + `[syntax]` config: TOML parsing, fontdb resolution + cache,
+role→FontId map), `src/highlight.rs` (syntect highlighter, theme/palette
+resolution, per-line tokenization), `src/diff_cache.rs` (line-budget LRU cache),
+and `src/cli.rs` (pure argv parser, rev-vs-path classification). `main.rs` has
+three sections:
 
 ### Data Layer
 - `load_commits()` — revwalk via `git2`, topological + time order, precomputed ref map
@@ -44,9 +48,13 @@ TOML parsing, fontdb resolution + cache, role→FontId map). `main.rs` has three
 - **Text**: summary clipped via `with_clip_rect`. Authors colored by hash. Refs colored by name hash (12-color extended palette)
 - **Clipboard**: SHA copied to both clipboard + primary selection on click
 
-## Tests (16)
+## Tests
 
-All use fake OIDs via `oid(n)` — no real git repo needed.
+106 tests total (per-file breakdown under Build / Test above). The graph-layout
+tests listed below live in `main.rs` and all use fake OIDs via `oid(n)` — no real
+git repo needed; the `config`, `highlight`, `cli`, and `diff_cache` modules each
+carry their own `#[cfg(test)]` suite (TOML parsing + clamping, theme/palette
+resolution, rev-vs-path classification, LRU eviction).
 
 - `test_linear_history` — 4 commits, col 0, no diagonals
 - `test_simple_branch_and_merge` — merge diagonal, first parent col 0

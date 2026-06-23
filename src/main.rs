@@ -1063,13 +1063,6 @@ struct HighlightJob {
     ctx: egui::Context,
 }
 
-/// Background highlighting: tokenize a large diff file-by-file (in line chunks),
-/// posting spans back as it goes so highlighting fills in progressively. Each
-/// round it picks the next file by `pick_file` — visible first, then a page
-/// below, a page above, then the rest down and up. It also preempts mid-file: if
-/// the file it's tokenizing scrolls out of view while a visible file is pending,
-/// it re-queues the rest and switches — so selecting a file never waits behind a
-/// large off-screen one. It bails as soon as a newer highlight pass supersedes it.
 /// The most common file extensions in `paths` that `keep` accepts: distinct,
 /// lowercased, sorted by descending frequency (ties by name ascending), capped at
 /// `cap`. Paths with no extension are ignored, and `keep` is applied *before* the
@@ -1098,6 +1091,13 @@ fn top_extensions(
     ranked.into_iter().take(cap).map(|(ext, _)| ext).collect()
 }
 
+/// Background highlighting: tokenize a large diff file-by-file (in line chunks),
+/// posting spans back as it goes so highlighting fills in progressively. Each
+/// round it picks the next file by `pick_file` — visible first, then a page
+/// below, a page above, then the rest down and up. It also preempts mid-file: if
+/// the file it's tokenizing scrolls out of view while a visible file is pending,
+/// it re-queues the rest and switches — so selecting a file never waits behind a
+/// large off-screen one. It bails as soon as a newer highlight pass supersedes it.
 fn highlight_worker(job: HighlightJob) {
     let HighlightJob {
         hl,
@@ -1513,7 +1513,6 @@ fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
     let oid_set: HashSet<git2::Oid> = commits.iter().map(|c| c.oid).collect();
 
     for commit in commits {
-        // Find which column this commit is in
         // Find which column this commit is in. If multiple lanes point
         // to this commit (convergence), pick the first and mark others
         // for merge lines.

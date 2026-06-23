@@ -145,8 +145,10 @@ gitkay /path/to/repo
 
 ## Architecture
 
-Rust app (~2900 lines in `src/main.rs`, plus `src/config.rs` for fonts + syntax
-config and `src/highlight.rs` for syntect highlighting) with 66 unit tests:
+Rust app (~4800 lines in `src/main.rs`, plus `src/config.rs` for fonts + syntax
+config, `src/highlight.rs` for syntect highlighting, `src/diff_cache.rs` for the
+line-budget LRU diff cache, and `src/cli.rs` for argument parsing) with 106 unit
+tests:
 
 - **egui** + **eframe** — native Wayland window with wgpu rendering
 - **git2** (libgit2) — repository access, revwalk, diff
