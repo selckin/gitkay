@@ -44,6 +44,7 @@ struct CommitInfo {
     time: i64,
     parents: Vec<git2::Oid>,
     refs: Vec<(String, RefKind)>,
+    follow_path: Option<String>, // in --follow mode, the file's name at this commit
 }
 
 #[derive(Clone, PartialEq)]
@@ -164,7 +165,7 @@ fn scope_title_suffix(scope: &cli::Scope) -> String {
         if !s.is_empty() {
             s.push(' ');
         }
-        s.push_str("-- ");
+        s.push_str(if scope.follow { "follow " } else { "-- " });
         s.push_str(&scope.paths.join(" "));
     }
     s
@@ -177,11 +178,13 @@ fn print_help() {
 USAGE:
     gitkay [-C <dir>] [--all] [<rev>...] [-- <path>...]
     gitkay [-C <dir>] --reflog [<ref>]
+    gitkay [-C <dir>] --follow [<rev>...] <path>
 
 OPTIONS:
     -C <dir>        Run as if started in <dir>
     --all           Show all refs (branches, remotes, tags), not just the current branch
     --reflog        Show <ref>'s reflog (default HEAD) instead of its history
+    --follow        Follow a single <path> across renames (exactly one path)
     -h, --help      Print this help and exit
     -V, --version   Print version and exit
 
@@ -318,6 +321,57 @@ fn commit_touches_paths(repo: &Repository, commit: &git2::Commit, paths: &[Strin
     }
 }
 
+/// Whether `commit` introduces `path` — present in its tree but absent from its first
+/// parent's. A `--follow` rename can only happen where the file is added, so this gates
+/// the (more expensive) rename detection in `rename_source`.
+fn file_added(commit: &git2::Commit, path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    let in_commit = commit.tree().ok().and_then(|t| t.get_path(p).ok()).is_some();
+    let in_parent = commit
+        .parent(0)
+        .ok()
+        .and_then(|par| par.tree().ok())
+        .and_then(|t| t.get_path(p).ok())
+        .is_some();
+    in_commit && !in_parent
+}
+
+/// If `commit` renamed some file to `new_path`, the file's old name; else None. Runs
+/// git2 rename detection over the whole commit-vs-parent diff (the old name can be
+/// anywhere), so `--follow` can keep tracing the file backwards across the rename.
+fn rename_source(repo: &Repository, commit: &git2::Commit, new_path: &str) -> Option<String> {
+    // No parent (a root commit) → nothing to rename from, quietly.
+    let parent = commit.parent(0).ok()?;
+    let detect = || -> Result<Option<String>, git2::Error> {
+        let tree = commit.tree()?;
+        let parent_tree = parent.tree()?;
+        let mut diff = repo.diff_tree_to_tree(Some(&parent_tree), Some(&tree), None)?;
+        let mut opts = git2::DiffFindOptions::new();
+        opts.renames(true);
+        diff.find_similar(Some(&mut opts))?;
+        Ok(diff
+            .deltas()
+            .find(|d| {
+                d.status() == git2::Delta::Renamed
+                    && d.new_file().path().and_then(|p| p.to_str()) == Some(new_path)
+            })
+            .and_then(|d| d.old_file().path().and_then(|p| p.to_str()).map(String::from)))
+    };
+    match detect() {
+        Ok(old) => old,
+        // A clean "no rename" returns Ok(None); an *error* here means --follow may
+        // silently stop tracing the file at this commit, so say so — matching the
+        // sibling commit_touches_paths, which logs its diff failures too.
+        Err(e) => {
+            log::warn!(
+                "follow: rename detection failed at {}; history may stop here: {e}",
+                commit.id()
+            );
+            None
+        }
+    }
+}
+
 /// Map `parents` through `nearest` (oid → its nearest kept ancestors), flattening and
 /// de-duplicating. A parent absent from `nearest` (one beyond the walked window) is
 /// kept as-is, so its lane still points at the real ancestor and resolves once more
@@ -395,6 +449,7 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
                 head_oid.into_iter().collect()
             },
             refs: vec![("working tree".to_string(), RefKind::Head)],
+            follow_path: None,
         });
     }
     if has_staged {
@@ -405,6 +460,7 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
             time: chrono::Utc::now().timestamp(),
             parents: head_oid.into_iter().collect(),
             refs: vec![("index".to_string(), RefKind::Tag)],
+            follow_path: None,
         });
     }
 
@@ -440,6 +496,7 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
         time: commit.time().seconds(),
         parents,
         refs: ref_map.get(&oid).cloned().unwrap_or_default(),
+        follow_path: None,
     };
 
     let mut seen = HashSet::new();
@@ -466,6 +523,10 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
         let mut walked: Vec<(git2::Oid, Vec<git2::Oid>)> = Vec::new();
         let mut kept: Vec<CommitInfo> = Vec::new();
         let mut kept_set: HashSet<git2::Oid> = HashSet::new();
+        // In --follow mode we track the single path's name as it changes across
+        // renames, recording each kept commit's name so its diff can follow too.
+        let mut follow_path: Option<String> =
+            scope.follow.then(|| scope.paths.first().cloned()).flatten();
         for oid in revwalk.flatten() {
             if !seen.insert(oid) {
                 continue;
@@ -475,9 +536,24 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
             };
             let parents: Vec<git2::Oid> = commit.parent_ids().collect();
             walked.push((oid, parents.clone()));
-            if commit_touches_paths(repo, &commit, &scope.paths) {
+            let touched = match &follow_path {
+                Some(p) => commit_touches_paths(repo, &commit, std::slice::from_ref(p)),
+                None => commit_touches_paths(repo, &commit, &scope.paths),
+            };
+            if touched {
                 kept_set.insert(oid);
-                kept.push(build_info(oid, &commit, parents));
+                let mut info = build_info(oid, &commit, parents);
+                if let Some(p) = follow_path.clone() {
+                    info.follow_path = Some(p.clone());
+                    // If the file was renamed into `p` at this commit, follow the
+                    // old name back through the rest of history.
+                    if file_added(&commit, &p)
+                        && let Some(old) = rename_source(repo, &commit, &p)
+                    {
+                        follow_path = Some(old);
+                    }
+                }
+                kept.push(info);
                 if kept.len() >= max {
                     break;
                 }
@@ -558,6 +634,7 @@ fn load_reflog(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitI
             time: committer.when().seconds(),
             parents: Vec::new(),
             refs: vec![(format!("{refname}@{{{i}}}"), RefKind::Reflog)],
+            follow_path: None,
         });
     }
     out
@@ -1461,8 +1538,7 @@ fn prewarm_highlighter(
 #[allow(clippy::too_many_arguments)]
 fn prefetch_worker(
     repo_path: String,
-    keys: Vec<DiffCacheKey>,
-    paths: Vec<String>,
+    jobs: Vec<(DiffCacheKey, Vec<String>)>,
     hl: Arc<Highlighter>,
     epoch: u64,
     current_epoch: Arc<AtomicU64>,
@@ -1480,7 +1556,7 @@ fn prefetch_worker(
             return;
         }
     };
-    for key in keys {
+    for (key, paths) in jobs {
         if epoch != current_epoch.load(Ordering::Relaxed) {
             return; // user moved on
         }
@@ -2309,6 +2385,23 @@ impl GitkApp {
         }
     }
 
+    /// Pathspec to scope a commit's diff to. In --follow mode this is the file's
+    /// name *at that commit* (so a pre-rename commit resolves under its old name);
+    /// otherwise the global path filter. The one place every diff entry point —
+    /// the selected diff and the prefetch worker — resolves the path.
+    fn diff_paths_for_oid(&self, oid: git2::Oid) -> Vec<String> {
+        if self.scope.follow {
+            self.commits
+                .iter()
+                .find(|c| c.oid == oid)
+                .and_then(|c| c.follow_path.clone())
+                .map(|p| vec![p])
+                .unwrap_or_else(|| self.scope.paths.clone())
+        } else {
+            self.scope.paths.clone()
+        }
+    }
+
     fn diff_cache_key(&self, oid: git2::Oid) -> DiffCacheKey {
         DiffCacheKey {
             oid,
@@ -2344,7 +2437,8 @@ impl GitkApp {
                 }
                 None => {
                     let t = std::time::Instant::now();
-                    let data = get_diff_data(repo, oid, self.diff_settings(), &self.scope.paths);
+                    let diff_paths = self.diff_paths_for_oid(oid);
+                    let data = get_diff_data(repo, oid, self.diff_settings(), &diff_paths);
                     log::debug!(
                         "perf: get_diff_data {:?} ({} lines, {} files) for {oid}",
                         t.elapsed(),
@@ -2487,27 +2581,33 @@ impl GitkApp {
             return;
         };
         let oids: Vec<git2::Oid> = self.commits.iter().map(|c| c.oid).collect();
-        let keys: Vec<DiffCacheKey> = prefetch_targets(&oids, sel, PREFETCH_BELOW, PREFETCH_ABOVE)
-            .into_iter()
-            .map(|oid| self.diff_cache_key(oid))
-            .filter(|k| !self.diff_cache.contains(k) && self.current_diff_key.as_ref() != Some(k))
-            .collect();
-        if keys.is_empty() {
+        // Each target carries its own pathspec, so --follow prefetches a pre-rename
+        // commit under its old name (not the global path) — matching the single diff
+        // path that load_selected_diff would use, so the oid-keyed cache can't be
+        // poisoned by a wrong-path prefetch.
+        let jobs: Vec<(DiffCacheKey, Vec<String>)> =
+            prefetch_targets(&oids, sel, PREFETCH_BELOW, PREFETCH_ABOVE)
+                .into_iter()
+                .map(|oid| (self.diff_cache_key(oid), self.diff_paths_for_oid(oid)))
+                .filter(|(k, _)| {
+                    !self.diff_cache.contains(k) && self.current_diff_key.as_ref() != Some(k)
+                })
+                .collect();
+        if jobs.is_empty() {
             log::debug!("prefetch: skip — neighbours of commit #{sel} already cached (or none)");
             return;
         }
         let epoch = self.prefetch_epoch.fetch_add(1, Ordering::Relaxed) + 1;
         let repo_path = self.repo_path.clone();
-        let paths = self.scope.paths.clone();
         let current_epoch = Arc::clone(&self.prefetch_epoch);
         let tx = self.prefetch_tx.clone();
         let ctx = ctx.clone();
-        log::debug!("prefetch: dispatched {} around commit #{sel}", keys.len());
+        log::debug!("prefetch: dispatched {} around commit #{sel}", jobs.len());
         if std::thread::Builder::new()
             .name("gitkay-prefetch".to_string())
             .spawn(move || {
                 let work = std::panic::AssertUnwindSafe(move || {
-                    prefetch_worker(repo_path, keys, paths, hl, epoch, current_epoch, tx, ctx)
+                    prefetch_worker(repo_path, jobs, hl, epoch, current_epoch, tx, ctx)
                 });
                 if std::panic::catch_unwind(work).is_err() {
                     log::warn!("prefetch thread panicked");
@@ -3622,7 +3722,18 @@ fn main() -> eframe::Result {
             .collect(),
         None => raw_paths, // bare repo: no worktree to anchor paths against
     };
-    let scope = cli::Scope { all: raw.all, revs, paths, reflog: raw.reflog };
+    // --follow tracks exactly one path across renames (like git); reject misuse.
+    if raw.follow {
+        if raw.reflog {
+            eprintln!("gitkay: --follow and --reflog cannot be combined");
+            std::process::exit(2);
+        }
+        if paths.len() != 1 {
+            eprintln!("gitkay: --follow requires exactly one path");
+            std::process::exit(2);
+        }
+    }
+    let scope = cli::Scope { all: raw.all, revs, paths, reflog: raw.reflog, follow: raw.follow };
 
     // Build the window title from the repo we already discovered, before dropping
     // it — re-discovering here and unwrapping would panic on a TOCTOU removal.
@@ -3692,6 +3803,7 @@ mod tests {
             time: 0,
             parents: parents.iter().map(|p| oid(*p)).collect(),
             refs: vec![],
+            follow_path: None,
         }
     }
 
@@ -4786,12 +4898,26 @@ mod tests {
             .unwrap()
     }
 
+    /// Stage a rename `old` -> `new` (the file is already moved on disk) and commit.
+    fn commit_rename(repo: &git2::Repository, old: &str, new: &str, msg: &str) -> git2::Oid {
+        let mut index = repo.index().unwrap();
+        index.remove_path(std::path::Path::new(old)).unwrap();
+        index.add_path(std::path::Path::new(new)).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = repo.signature().unwrap();
+        let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents)
+            .unwrap()
+    }
+
     fn scope(all: bool, revs: &[&str]) -> cli::Scope {
         cli::Scope {
             all,
             revs: revs.iter().map(|s| s.to_string()).collect(),
             paths: Vec::new(),
-            reflog: false,
+            ..Default::default()
         }
     }
 
@@ -4842,7 +4968,7 @@ mod tests {
             all: false,
             revs: Vec::new(),
             paths: vec!["a.txt".to_string()],
-            reflog: false,
+            ..Default::default()
         };
         // Commit graph: only commits touching a.txt.
         let got = summaries(&load_commits(&repo, 100, &s));
@@ -4908,7 +5034,7 @@ mod tests {
             all: false,
             revs: Vec::new(),
             paths: vec!["a.txt".to_string()],
-            reflog: false,
+            ..Default::default()
         };
         let got = load_commits(&repo, 100, &s);
         let real: Vec<&CommitInfo> = got.iter().filter(|c| is_real_commit(c.oid)).collect();
@@ -4935,7 +5061,7 @@ mod tests {
 
         let has_uncommitted_row =
             |paths: Vec<String>| -> bool {
-                let s = cli::Scope { all: false, revs: Vec::new(), paths, reflog: false };
+                let s = cli::Scope { all: false, revs: Vec::new(), paths, ..Default::default() };
                 load_commits(&repo, 100, &s)
                     .iter()
                     .any(|c| c.oid == oid_uncommitted())
@@ -4973,7 +5099,7 @@ mod tests {
             all,
             revs: revs.iter().map(|s| s.to_string()).collect(),
             paths: Vec::new(),
-            reflog: false,
+            ..Default::default()
         };
 
         // Default (current-branch) view shows your local state.
@@ -5017,7 +5143,7 @@ mod tests {
             all,
             revs: revs.iter().map(|x| x.to_string()).collect(),
             paths: paths.iter().map(|x| x.to_string()).collect(),
-            reflog: false,
+            ..Default::default()
         };
         assert_eq!(scope_title_suffix(&s(false, &[], &[])), "");
         assert_eq!(scope_title_suffix(&s(true, &[], &[])), "--all");
@@ -5056,5 +5182,35 @@ mod tests {
         assert!(rows[0].parents.is_empty());
         assert_eq!(rows[0].refs[0].0, "HEAD@{0}");
         assert!(matches!(rows[0].refs[0].1, RefKind::Reflog));
+    }
+
+    #[test]
+    fn follow_traces_a_file_across_a_rename() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "old.txt", "one\ntwo\nthree\n", "create old");
+        // Rename old.txt -> new.txt (identical content, so rename detection sees it).
+        let wd = repo.workdir().unwrap().to_path_buf();
+        std::fs::rename(wd.join("old.txt"), wd.join("new.txt")).unwrap();
+        commit_rename(&repo, "old.txt", "new.txt", "rename to new");
+        commit_file(&repo, "new.txt", "one\ntwo CHANGED\nthree\n", "edit new");
+
+        let scope = cli::Scope {
+            follow: true,
+            paths: vec!["new.txt".to_string()],
+            ..Default::default()
+        };
+        let rows = load_commits(&repo, 100, &scope);
+        let summaries: Vec<_> = rows.iter().map(|c| c.summary.clone()).collect();
+        // Without --follow the pre-rename commit would be dropped; with it, all
+        // three are present.
+        assert!(
+            summaries.contains(&"create old".to_string()),
+            "pre-rename commit must be followed: {summaries:?}"
+        );
+        // The pre-rename commit's diff follows the OLD name; the newest the new one.
+        let create = rows.iter().find(|c| c.summary == "create old").unwrap();
+        assert_eq!(create.follow_path.as_deref(), Some("old.txt"));
+        let edit = rows.iter().find(|c| c.summary == "edit new").unwrap();
+        assert_eq!(edit.follow_path.as_deref(), Some("new.txt"));
     }
 }
