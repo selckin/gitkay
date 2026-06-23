@@ -577,17 +577,23 @@ impl LineKind {
     }
 }
 
-/// Flat per-line colour for the syntax-off diff render (no theme/spans).
-fn flat_line_color(kind: LineKind) -> egui::Color32 {
+/// One colour per `LineKind`, taken from the active theme's palette. The
+/// syntax-off render uses this for every line; `diff_row_job` uses it for its
+/// non-code lines (hunk/file header/meta/stat) so both paths share one colour
+/// source. Note the syntax-on path colours Add/Del/Context *bodies* with
+/// `palette.foreground` (only the +/- marker and a row tint carry the add/del
+/// colour), so the two modes agree on non-code lines but intentionally differ
+/// on code lines.
+fn kind_color(kind: LineKind, palette: &highlight::DiffPalette) -> egui::Color32 {
     match kind {
-        LineKind::Add => GREEN,
-        LineKind::Del => RED,
-        LineKind::Hunk => BLUE,
-        LineKind::Meta => MAUVE,
-        LineKind::FileMeta => MAUVE,
-        LineKind::FileName => YELLOW,
-        LineKind::Stat => SUBTEXT,
-        LineKind::Context => TEXT,
+        LineKind::Add => palette.added,
+        LineKind::Del => palette.deleted,
+        LineKind::Hunk => palette.hunk,
+        LineKind::FileName => palette.file_header,
+        LineKind::FileMeta => palette.dim,
+        LineKind::Stat => palette.dim,
+        LineKind::Meta => palette.foreground,
+        LineKind::Context => palette.foreground,
     }
 }
 
@@ -1507,15 +1513,9 @@ fn diff_row_job(
         };
         (job, row_bg)
     } else {
-        let color = match line.kind {
-            LineKind::Hunk => palette.hunk,
-            LineKind::FileName => palette.file_header,
-            LineKind::FileMeta => palette.dim,
-            LineKind::Stat => palette.dim,
-            LineKind::Meta => palette.foreground,
-            _ => palette.foreground,
-        };
-        push(&line.text, color);
+        // Non-code lines (hunk/file header/meta/stat) take one flat colour,
+        // shared with the syntax-off render via `kind_color`.
+        push(&line.text, kind_color(line.kind, palette));
         (job, None)
     }
 }
@@ -1772,9 +1772,7 @@ const SUBTEXT: egui::Color32 = egui::Color32::from_rgb(108, 112, 134);
 const SURFACE0: egui::Color32 = egui::Color32::from_rgb(49, 50, 68);
 const GREEN: egui::Color32 = egui::Color32::from_rgb(166, 227, 161);
 const RED: egui::Color32 = egui::Color32::from_rgb(243, 139, 168);
-const BLUE: egui::Color32 = egui::Color32::from_rgb(137, 180, 250);
 const YELLOW: egui::Color32 = egui::Color32::from_rgb(249, 226, 175);
-const MAUVE: egui::Color32 = egui::Color32::from_rgb(203, 166, 247);
 
 // ── App state ────────────────────────────────────────────────────────────
 
@@ -1811,6 +1809,7 @@ struct GitkApp {
     syntax_enabled: bool,                        // false ⇒ original flat per-line coloring
     theme_slug: String,                          // configured syntax theme slug
     diff_bg: DiffBg,                             // add/del row background mode + colors
+    diff_palette: highlight::DiffPalette,        // theme-derived diff colours (both modes)
     diff_needs_highlight: bool,                  // diff_lines changed; re-run highlight_diff
     diff_generation: Arc<AtomicU64>, // bumped each highlight pass; lets stale workers bail + results drop
     highlight_tx: mpsc::Sender<HighlightBatch>, // worker → UI: per-file span updates
@@ -1920,6 +1919,16 @@ impl GitkApp {
             .unwrap_or_else(|| highlight::DEFAULT_THEME_SLUG.to_string());
         let (diff_bg, diff_bg_warnings) = resolve_diff_bg(&cfg.syntax);
         for w in &diff_bg_warnings {
+            log::warn!("{w}");
+            startup_issue = true;
+        }
+        // The diff palette is always derived from the configured theme (cheap —
+        // theme blob only, no grammars). Surface a bad-slug warning here, where
+        // the theme is first resolved, regardless of syntax mode (the prewarm /
+        // lazy highlighter build may also report it, but only once a diff is
+        // shown — flagging it here means a typo'd theme is caught at startup).
+        let (diff_palette, dp_warn) = highlight::palette_for(&theme_slug, diff_bg);
+        if let Some(w) = dp_warn {
             log::warn!("{w}");
             startup_issue = true;
         }
@@ -2138,6 +2147,7 @@ impl GitkApp {
             syntax_enabled,
             theme_slug,
             diff_bg,
+            diff_palette,
             diff_needs_highlight: true, // highlight the startup diff on first frame
             diff_generation: Arc::new(AtomicU64::new(0)),
             highlight_tx,
@@ -2513,20 +2523,31 @@ impl eframe::App for GitkApp {
                         if !self.syntax_enabled {
                             self.prewarm_rx = None;
                         }
-                        // Rebuild the (shared) highlighter for the new theme,
-                        // reusing its syntax set. A new Arc leaves any in-flight
-                        // worker holding the old one valid.
-                        if self.highlighter.is_some() {
+                        // Refresh the theme-derived palette (used by the syntax-off
+                        // render and as the pre-highlighter fallback) and rebuild
+                        // the highlighter for the new theme. When a highlighter
+                        // exists, take the palette from its rebuild so the theme
+                        // blob is loaded once, not twice; a new Arc leaves any
+                        // in-flight worker holding the old one valid. Either way
+                        // surface a bad-slug warning, regardless of syntax mode.
+                        let dp_warn = if self.highlighter.is_some() {
                             let (new_hl, w) = self
                                 .highlighter
                                 .as_ref()
                                 .unwrap()
                                 .with_theme(&self.theme_slug, self.diff_bg);
-                            if let Some(w) = w {
-                                log::warn!("{w}");
-                                warned = true;
-                            }
+                            self.diff_palette = new_hl.palette().clone();
                             self.highlighter = Some(Arc::new(new_hl));
+                            w
+                        } else {
+                            let (palette, w) =
+                                highlight::palette_for(&self.theme_slug, self.diff_bg);
+                            self.diff_palette = palette;
+                            w
+                        };
+                        if let Some(w) = dp_warn {
+                            log::warn!("{w}");
+                            warned = true;
                         }
                         // Re-highlight the visible diff under the new settings.
                         // Reset live spans to None so the worker re-colours every
@@ -2937,26 +2958,16 @@ impl eframe::App for GitkApp {
                 // the diff scrollbar from crowding the file-list resize bar — only
                 // when that sidebar is actually shown.
                 let diff_right_pad = if self.diff_files.is_empty() { 0 } else { 10 };
-                // With syntax on, the diff pane adopts the active theme's colors
-                // (falling back to Catppuccin chrome until the highlighter is
-                // built). With syntax off, `palette` is None and we render the
-                // original flat per-line coloring.
+                // The diff palette is always derived from the active theme
+                // (self.diff_palette). With syntax on we prefer the highlighter's
+                // copy once built and fall back to the theme palette until then;
+                // with syntax off `palette` is None and the flat path uses
+                // self.diff_palette directly.
                 let palette = self.syntax_enabled.then(|| {
                     self.highlighter
                         .as_ref()
                         .map(|h| h.palette().clone())
-                        .unwrap_or(highlight::DiffPalette {
-                            background: BG,
-                            foreground: TEXT,
-                            added: GREEN,
-                            deleted: RED,
-                            hunk: BLUE,
-                            file_header: YELLOW,
-                            dim: SUBTEXT,
-                            marker: SUBTEXT,
-                            added_bg: egui::Color32::from_rgb(10, 48, 10),
-                            deleted_bg: egui::Color32::from_rgb(64, 12, 14),
-                        })
+                        .unwrap_or_else(|| self.diff_palette.clone())
                 });
                 let mut frame = egui::Frame::NONE.inner_margin(egui::Margin {
                     left: 0,
@@ -2964,9 +2975,9 @@ impl eframe::App for GitkApp {
                     top: 0,
                     bottom: 0,
                 });
-                if let Some(p) = &palette {
-                    frame = frame.fill(p.background);
-                }
+                // The diff pane always uses the theme background, so syntax-off on a
+                // light theme gets a light pane too (not dark text on a dark pane).
+                frame = frame.fill(self.diff_palette.background);
                 egui::CentralPanel::default()
                     .frame(frame)
                     .show_inside(ui, |ui| {
@@ -3013,9 +3024,11 @@ impl eframe::App for GitkApp {
                             );
                         } else {
                             // Flat per-line colouring (syntax off): one colour per
-                            // LineKind, no token spans, no row tint.
+                            // LineKind from the theme palette, no token spans, no
+                            // row tint.
                             let font_id = self.fonts.font_id(Role::Diff);
                             let lines = &self.diff_lines;
+                            let palette = &self.diff_palette;
                             show_virtualized_diff(
                                 ui,
                                 &font_id,
@@ -3024,7 +3037,7 @@ impl eframe::App for GitkApp {
                                 scroll_target,
                                 |_rows| {},
                                 |i| {
-                                    let color = flat_line_color(lines[i].kind);
+                                    let color = kind_color(lines[i].kind, palette);
                                     let job = egui::text::LayoutJob::simple_singleline(
                                         lines[i].text.clone(),
                                         font_id.clone(),
@@ -4401,16 +4414,29 @@ mod tests {
     }
 
     #[test]
-    fn flat_line_color_maps_each_kind() {
-        // The syntax-off diff render colours each line purely by its LineKind.
-        assert_eq!(flat_line_color(LineKind::Add), GREEN);
-        assert_eq!(flat_line_color(LineKind::Del), RED);
-        assert_eq!(flat_line_color(LineKind::Hunk), BLUE);
-        assert_eq!(flat_line_color(LineKind::Meta), MAUVE);
-        assert_eq!(flat_line_color(LineKind::FileMeta), MAUVE);
-        assert_eq!(flat_line_color(LineKind::FileName), YELLOW);
-        assert_eq!(flat_line_color(LineKind::Stat), SUBTEXT);
-        assert_eq!(flat_line_color(LineKind::Context), TEXT);
+    fn kind_color_maps_each_kind() {
+        // Both render paths colour each line by its LineKind from the palette.
+        let c = |n| egui::Color32::from_rgb(n, n, n);
+        let p = highlight::DiffPalette {
+            background: c(1),
+            foreground: c(2),
+            added: c(3),
+            deleted: c(4),
+            hunk: c(5),
+            file_header: c(6),
+            dim: c(7),
+            marker: c(8),
+            added_bg: c(9),
+            deleted_bg: c(10),
+        };
+        assert_eq!(kind_color(LineKind::Add, &p), p.added);
+        assert_eq!(kind_color(LineKind::Del, &p), p.deleted);
+        assert_eq!(kind_color(LineKind::Hunk, &p), p.hunk);
+        assert_eq!(kind_color(LineKind::FileName, &p), p.file_header);
+        assert_eq!(kind_color(LineKind::FileMeta, &p), p.dim);
+        assert_eq!(kind_color(LineKind::Stat, &p), p.dim);
+        assert_eq!(kind_color(LineKind::Meta, &p), p.foreground);
+        assert_eq!(kind_color(LineKind::Context, &p), p.foreground);
     }
 
     #[test]
