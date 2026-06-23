@@ -234,21 +234,40 @@ fn push_rev_token(revwalk: &mut git2::Revwalk, repo: &Repository, tok: &str) {
             }
             Err(e) => log::warn!("gitkay: bad revision '{s}': {e}"),
         },
-        cli::RevTokenKind::Range(a, b) => {
-            if let (Ok(ia), Ok(ib)) = (resolve(&a), resolve(&b)) {
+        cli::RevTokenKind::Range(a, b) => match (resolve(&a), resolve(&b)) {
+            (Ok(ia), Ok(ib)) => {
                 revwalk.hide(ia).ok();
                 revwalk.push(ib).ok();
             }
-        }
-        cli::RevTokenKind::Symmetric(a, b) => {
-            if let (Ok(ia), Ok(ib)) = (resolve(&a), resolve(&b)) {
+            (ra, rb) => warn_bad_endpoints(&a, ra, &b, rb),
+        },
+        cli::RevTokenKind::Symmetric(a, b) => match (resolve(&a), resolve(&b)) {
+            (Ok(ia), Ok(ib)) => {
                 revwalk.push(ia).ok();
                 revwalk.push(ib).ok();
                 if let Ok(base) = repo.merge_base(ia, ib) {
                     revwalk.hide(base).ok();
                 }
             }
-        }
+            (ra, rb) => warn_bad_endpoints(&a, ra, &b, rb),
+        },
+    }
+}
+
+/// Log whichever endpoint(s) of an `A..B` / `A...B` range failed to resolve, so a
+/// typo'd range silently contributing zero commits is at least visible in the log
+/// (matching the single-rev `bad revision` warning).
+fn warn_bad_endpoints(
+    a: &str,
+    ra: Result<git2::Oid, git2::Error>,
+    b: &str,
+    rb: Result<git2::Oid, git2::Error>,
+) {
+    if let Err(e) = ra {
+        log::warn!("gitkay: bad revision '{a}': {e}");
+    }
+    if let Err(e) = rb {
+        log::warn!("gitkay: bad revision '{b}': {e}");
     }
 }
 
@@ -266,14 +285,23 @@ fn apply_pathspec(opts: &mut DiffOptions, paths: &[String]) {
 fn commit_touches_paths(repo: &Repository, commit: &git2::Commit, paths: &[String]) -> bool {
     let tree = match commit.tree() {
         Ok(t) => t,
-        Err(_) => return false,
+        Err(e) => {
+            log::warn!("gitkay: cannot read tree for {}: {e}", commit.id());
+            return false;
+        }
     };
     let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
     let mut opts = DiffOptions::new();
     apply_pathspec(&mut opts, paths);
-    repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))
-        .map(|d| d.deltas().len() > 0)
-        .unwrap_or(false)
+    match repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts)) {
+        Ok(d) => d.deltas().len() > 0,
+        Err(e) => {
+            // Treat as "doesn't touch the path" but say so: otherwise a transient
+            // diff failure silently drops a matching commit from the filtered graph.
+            log::warn!("gitkay: cannot diff {} for path filter: {e}", commit.id());
+            false
+        }
+    }
 }
 
 /// Map `parents` through `nearest` (oid → its nearest kept ancestors), flattening and
@@ -363,14 +391,21 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
         Ok(r) => r,
         Err(_) => return commits,
     };
-    revwalk.set_sorting(Sort::TIME | Sort::TOPOLOGICAL).ok();
+    if let Err(e) = revwalk.set_sorting(Sort::TIME | Sort::TOPOLOGICAL) {
+        log::warn!("gitkay: cannot set commit sort order: {e}");
+    }
     if scope.all {
         // Everything: branches, remotes, tags.
-        revwalk.push_glob("refs/heads/*").ok();
-        revwalk.push_glob("refs/remotes/*").ok();
-        revwalk.push_glob("refs/tags/*").ok();
+        for glob in ["refs/heads/*", "refs/remotes/*", "refs/tags/*"] {
+            if let Err(e) = revwalk.push_glob(glob) {
+                log::warn!("gitkay: cannot walk {glob}: {e}");
+            }
+        }
     } else if scope.revs.is_empty() {
-        revwalk.push_head().ok(); // default: the current branch only
+        // default: the current branch only
+        if let Err(e) = revwalk.push_head() {
+            log::warn!("gitkay: cannot walk HEAD: {e}");
+        }
     } else {
         for tok in &scope.revs {
             push_rev_token(&mut revwalk, repo, tok);
@@ -576,7 +611,8 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, path
 
     let commit = match repo.find_commit(oid) {
         Ok(c) => c,
-        Err(_) => {
+        Err(e) => {
+            log::warn!("gitkay: cannot load commit {oid}: {e}");
             return DiffData {
                 lines: Vec::new(),
                 files: Vec::new(),
@@ -585,7 +621,8 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, path
     };
     let tree = match commit.tree() {
         Ok(t) => t,
-        Err(_) => {
+        Err(e) => {
+            log::warn!("gitkay: cannot read tree for {oid}: {e}");
             return DiffData {
                 lines: Vec::new(),
                 files: Vec::new(),
@@ -598,7 +635,8 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, path
     apply_pathspec(&mut opts, paths);
     let diff = match repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts)) {
         Ok(d) => d,
-        Err(_) => {
+        Err(e) => {
+            log::warn!("gitkay: cannot diff commit {oid}: {e}");
             return DiffData {
                 lines: Vec::new(),
                 files: Vec::new(),
@@ -722,7 +760,7 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, path
         }
         true
     })
-    .ok();
+    .unwrap_or_else(|e| log::warn!("gitkay: error rendering diff patch: {e}"));
 
     DiffData { lines, files }
 }
@@ -733,7 +771,8 @@ fn get_working_tree_diff(repo: &Repository, settings: DiffSettings, paths: &[Str
     apply_pathspec(&mut opts, paths);
     let diff = match repo.diff_index_to_workdir(None, Some(&mut opts)) {
         Ok(d) => d,
-        Err(_) => {
+        Err(e) => {
+            log::warn!("gitkay: cannot diff working tree: {e}");
             return DiffData {
                 lines: Vec::new(),
                 files: Vec::new(),
@@ -754,7 +793,8 @@ fn get_staged_diff(repo: &Repository, settings: DiffSettings, paths: &[String]) 
     apply_pathspec(&mut opts, paths);
     let diff = match repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut opts)) {
         Ok(d) => d,
-        Err(_) => {
+        Err(e) => {
+            log::warn!("gitkay: cannot diff staged changes: {e}");
             return DiffData {
                 lines: Vec::new(),
                 files: Vec::new(),
@@ -864,7 +904,7 @@ fn diff_to_data(diff: &git2::Diff, title: &str) -> DiffData {
         }
         true
     })
-    .ok();
+    .unwrap_or_else(|e| log::warn!("gitkay: error rendering diff patch: {e}"));
 
     DiffData { lines, files }
 }
