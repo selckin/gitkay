@@ -1774,6 +1774,7 @@ struct GitkApp {
     prefetch_rx: mpsc::Receiver<(DiffCacheKey, DiffData)>,
     prefetch_epoch: Arc<AtomicU64>, // bumped per dispatch; supersedes older prefetch workers
     prefetched_gen: u64,            // diff_generation we last dispatched prefetch for
+    last_highlight_check_gen: u64,  // diff_generation we last ran diff_fully_highlighted for
 }
 
 /// Widest diff line in characters — used to size the horizontal scroll content
@@ -2098,6 +2099,7 @@ impl GitkApp {
             prefetch_rx,
             prefetch_epoch: Arc::new(AtomicU64::new(0)),
             prefetched_gen: 0,
+            last_highlight_check_gen: 0,
         })
     }
 
@@ -2494,6 +2496,7 @@ impl eframe::App for GitkApp {
         // Apply finished background-highlight results (one batch per file) for
         // the current diff; drop stale ones (the diff or theme changed since the
         // worker was spawned).
+        let mut applied_highlight = false;
         while let Ok(batch) = self.highlight_rx.try_recv() {
             if batch.generation == self.diff_generation.load(Ordering::Relaxed) {
                 for (i, spans) in batch.lines {
@@ -2501,6 +2504,7 @@ impl eframe::App for GitkApp {
                         line.spans = Some(spans);
                     }
                 }
+                applied_highlight = true;
             }
         }
         self.ensure_diff_highlighted(ctx);
@@ -2518,11 +2522,18 @@ impl eframe::App for GitkApp {
         // settles). Syntax-enabled only.
         if self.syntax_enabled {
             let current_gen = self.diff_generation.load(Ordering::Relaxed);
-            if self.prefetched_gen != current_gen
-                && diff_fully_highlighted(&self.diff_lines, &self.diff_files)
-            {
-                self.prefetched_gen = current_gen;
-                self.dispatch_prefetch(ctx);
+            // diff_fully_highlighted is O(lines); it can only flip to true when new
+            // spans arrive (a batch was applied) or a fresh diff loaded. Skipping
+            // the scan on the other repaints during the highlight window (scroll,
+            // hover) avoids re-scanning the whole diff for nothing.
+            let maybe_settled =
+                applied_highlight || self.last_highlight_check_gen != current_gen;
+            if self.prefetched_gen != current_gen && maybe_settled {
+                self.last_highlight_check_gen = current_gen;
+                if diff_fully_highlighted(&self.diff_lines, &self.diff_files) {
+                    self.prefetched_gen = current_gen;
+                    self.dispatch_prefetch(ctx);
+                }
             }
         }
 
