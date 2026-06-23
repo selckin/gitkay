@@ -94,11 +94,21 @@ pub struct SyntaxSection {
 
 #[derive(Deserialize, Clone, Debug, PartialEq, Default)]
 #[serde(default)]
+pub struct DiffSection {
+    /// Show the diffstat block (per-file change list + summary) between the
+    /// commit message and the patch. `None`/`true` ⇒ shown; `false` ⇒ hidden.
+    /// The file-list sidebar is independent and always shown.
+    pub(crate) show_stats: Option<bool>,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
 pub struct Config {
     pub(crate) fonts: FontsSection,
     pub(crate) sizes: SizesSection,
     pub(crate) families: FamiliesSection,
     pub(crate) syntax: SyntaxSection,
+    pub(crate) diff: DiffSection,
 }
 
 /// Read + parse the config. A missing file is not an error (returns defaults);
@@ -221,7 +231,13 @@ fn default_template() -> String {
          # diff_background = \"fixed\"\n\
          # Exact band colors for \"fixed\" mode, as \"#rrggbb\". Unset = defaults.\n\
          # added_background = \"#0a300a\"\n\
-         # deleted_background = \"#400c0e\"\n",
+         # deleted_background = \"#400c0e\"\n\
+         \n\
+         [diff]\n\
+         # Show the diffstat block (per-file change list + summary) between the\n\
+         # commit message and the patch. false = hide it; the file-list sidebar\n\
+         # still lists every changed file.\n\
+         # show_stats = true\n",
         diff = s.diff,
         commit_summary = s.commit_summary,
         commit_meta = s.commit_meta,
@@ -526,6 +542,25 @@ mod tests {
         assert_eq!(cfg.syntax.enabled, Some(false));
         assert_eq!(cfg.syntax.diff_background.as_deref(), Some("theme"));
         assert_eq!(cfg.syntax.added_background.as_deref(), Some("#0a300a"));
+    }
+
+    #[test]
+    fn diff_show_stats_parses() {
+        let cfg: Config = toml::from_str("[diff]\nshow_stats = false\n").unwrap();
+        assert_eq!(cfg.diff.show_stats, Some(false));
+    }
+
+    #[test]
+    fn missing_diff_section_is_none() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.diff.show_stats, None);
+    }
+
+    #[test]
+    fn template_mentions_diff_show_stats() {
+        let t = default_template();
+        assert!(t.contains("[diff]"));
+        assert!(t.contains("show_stats ="));
     }
 
     #[test]
