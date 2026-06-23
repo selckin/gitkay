@@ -573,6 +573,20 @@ impl LineKind {
     }
 }
 
+/// Flat per-line colour for the syntax-off diff render (no theme/spans).
+fn flat_line_color(kind: LineKind) -> egui::Color32 {
+    match kind {
+        LineKind::Add => GREEN,
+        LineKind::Del => RED,
+        LineKind::Hunk => BLUE,
+        LineKind::Meta => MAUVE,
+        LineKind::FileMeta => MAUVE,
+        LineKind::FileName => YELLOW,
+        LineKind::Stat => SUBTEXT,
+        LineKind::Context => TEXT,
+    }
+}
+
 #[derive(Clone)]
 struct FileEntry {
     path: String,
@@ -2917,27 +2931,41 @@ impl eframe::App for GitkApp {
                                 }
                             });
                         } else {
-                            // Original flat per-line coloring (syntax off).
-                            let scroll = egui::ScrollArea::both()
+                            // Flat per-line colouring (syntax off), row-virtualized
+                            // like the themed path above so a huge diff doesn't
+                            // re-lay out every line each frame. Rows are single-line,
+                            // so the height is uniform.
+                            let font_id = self.fonts.font_id(Role::Diff);
+                            let row_h = ui.fonts(|f| f.row_height(&font_id));
+                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                            let mut scroll = egui::ScrollArea::both()
                                 .id_salt("diff_scroll")
                                 .auto_shrink([false, false])
                                 .animated(false);
-                            scroll.show(ui, |ui| {
-                                for (i, line) in self.diff_lines.iter().enumerate() {
-                                    let color = match line.kind {
-                                        LineKind::Add => GREEN,
-                                        LineKind::Del => RED,
-                                        LineKind::Hunk => BLUE,
-                                        LineKind::Meta => MAUVE,
-                                        LineKind::FileMeta => MAUVE,
-                                        LineKind::FileName => YELLOW,
-                                        LineKind::Stat => SUBTEXT,
-                                        LineKind::Context => TEXT,
-                                    };
-                                    let resp = ui.colored_label(color, &line.text);
-                                    if scroll_target == Some(i) {
-                                        ui.scroll_to_rect(resp.rect, Some(egui::Align::TOP));
-                                    }
+                            // Off-screen jump target: force the scroll offset (the
+                            // row isn't laid out, so scroll_to_rect can't reach it).
+                            if let Some(t) = scroll_target {
+                                scroll = scroll.vertical_scroll_offset(t as f32 * row_h);
+                            }
+                            let char_w = ui.fonts(|f| f.glyph_width(&font_id, ' '));
+                            let content_w = (self.diff_max_chars as f32 + 1.0) * char_w;
+                            scroll.show_rows(ui, row_h, self.diff_lines.len(), |ui, rows| {
+                                ui.set_min_width(content_w);
+                                for i in rows {
+                                    let line = &self.diff_lines[i];
+                                    let color = flat_line_color(line.kind);
+                                    let job = egui::text::LayoutJob::simple_singleline(
+                                        line.text.clone(),
+                                        font_id.clone(),
+                                        color,
+                                    );
+                                    let galley = ui.fonts(|f| f.layout_job(job));
+                                    let width = ui.available_width().max(galley.size().x);
+                                    let (rect, _resp) = ui.allocate_exact_size(
+                                        egui::vec2(width, row_h),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().galley(rect.min, galley, color);
                                 }
                             });
                         }
@@ -4286,6 +4314,19 @@ mod tests {
             lines[1].spans.as_ref().is_some_and(|s| !s.is_empty()),
             "real file's code line must still be tokenized"
         );
+    }
+
+    #[test]
+    fn flat_line_color_maps_each_kind() {
+        // The syntax-off diff render colours each line purely by its LineKind.
+        assert_eq!(flat_line_color(LineKind::Add), GREEN);
+        assert_eq!(flat_line_color(LineKind::Del), RED);
+        assert_eq!(flat_line_color(LineKind::Hunk), BLUE);
+        assert_eq!(flat_line_color(LineKind::Meta), MAUVE);
+        assert_eq!(flat_line_color(LineKind::FileMeta), MAUVE);
+        assert_eq!(flat_line_color(LineKind::FileName), YELLOW);
+        assert_eq!(flat_line_color(LineKind::Stat), SUBTEXT);
+        assert_eq!(flat_line_color(LineKind::Context), TEXT);
     }
 
     #[test]
