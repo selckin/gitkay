@@ -686,6 +686,7 @@ struct DiffLine {
     text: String,
     kind: LineKind,
     spans: Option<Vec<highlight::Span>>, // None ⇒ not highlighted yet; Some(..) ⇒ highlighted (maybe empty)
+    emphasis: Vec<std::ops::Range<usize>>, // word-diff changed byte ranges in body(); empty ⇒ none
 }
 
 impl DiffLine {
@@ -694,6 +695,7 @@ impl DiffLine {
             text: text.to_string(),
             kind,
             spans: None,
+            emphasis: Vec::new(),
         }
     }
 
@@ -705,6 +707,141 @@ impl DiffLine {
         match self.kind {
             LineKind::Add | LineKind::Del => &self.text[1..],
             _ => &self.text,
+        }
+    }
+}
+
+/// Split `s` into word-diff tokens: maximal `[A-Za-z0-9_]` runs are single tokens,
+/// every other character is its own token (whitespace and punctuation included).
+/// Each token carries its byte range in `s` and its text.
+fn word_tokens(s: &str) -> Vec<(std::ops::Range<usize>, &str)> {
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut out = Vec::new();
+    let mut chars = s.char_indices().peekable();
+    while let Some(&(start, c)) = chars.peek() {
+        if is_word(c) {
+            let mut end = start;
+            while let Some(&(i, c)) = chars.peek() {
+                if is_word(c) {
+                    end = i + c.len_utf8();
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            out.push((start..end, &s[start..end]));
+        } else {
+            let end = start + c.len_utf8();
+            chars.next();
+            out.push((start..end, &s[start..end]));
+        }
+    }
+    out
+}
+
+/// Indices of the tokens in `a` and `b` that are NOT in a longest common
+/// subsequence (by text) — the changed tokens on each side. O(n·m), fine for one
+/// short line.
+fn changed_tokens(a: &[&str], b: &[&str]) -> (Vec<usize>, Vec<usize>) {
+    let (n, m) = (a.len(), b.len());
+    // dp[i][j] = LCS length of a[i..] and b[j..].
+    let mut dp = vec![vec![0u16; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if a[i] == b[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    let (mut a_ch, mut b_ch) = (Vec::new(), Vec::new());
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            a_ch.push(i);
+            i += 1;
+        } else {
+            b_ch.push(j);
+            j += 1;
+        }
+    }
+    a_ch.extend(i..n);
+    b_ch.extend(j..m);
+    (a_ch, b_ch)
+}
+
+/// Byte ranges of the given (ascending) changed token indices, merging tokens that
+/// are contiguous in the source so a changed run becomes one highlight.
+fn merge_token_ranges(
+    tokens: &[(std::ops::Range<usize>, &str)],
+    changed: &[usize],
+) -> Vec<std::ops::Range<usize>> {
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    for &idx in changed {
+        let r = tokens[idx].0.clone();
+        match out.last_mut() {
+            Some(last) if last.end == r.start => last.end = r.end,
+            _ => out.push(r),
+        }
+    }
+    out
+}
+
+/// Word-level changed ranges for a `-`/`+` line pair, in each body's coordinates.
+fn line_emphasis(del: &str, add: &str) -> (Vec<std::ops::Range<usize>>, Vec<std::ops::Range<usize>>) {
+    let dt = word_tokens(del);
+    let at = word_tokens(add);
+    let ds: Vec<&str> = dt.iter().map(|(_, s)| *s).collect();
+    let as_: Vec<&str> = at.iter().map(|(_, s)| *s).collect();
+    let (d_ch, a_ch) = changed_tokens(&ds, &as_);
+    (merge_token_ranges(&dt, &d_ch), merge_token_ranges(&at, &a_ch))
+}
+
+/// Fill in each line's word-diff `emphasis` ranges. A change block (a run of `-`
+/// lines followed by a run of `+` lines) is intra-line diffed only when the two
+/// runs have equal length, pairing them 1:1 — the common "edited in place" case.
+/// Max body length (bytes) for which word-diff is computed; above this the LCS
+/// table grows too large and the highlight isn't readable anyway.
+const MAX_WORD_DIFF_LINE: usize = 2048;
+
+fn compute_word_emphasis(lines: &mut [DiffLine]) {
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].kind != LineKind::Del {
+            i += 1;
+            continue;
+        }
+        let del_start = i;
+        while i < lines.len() && lines[i].kind == LineKind::Del {
+            i += 1;
+        }
+        let add_start = i;
+        while i < lines.len() && lines[i].kind == LineKind::Add {
+            i += 1;
+        }
+        let dn = add_start - del_start;
+        let an = i - add_start;
+        if dn == an {
+            for k in 0..dn {
+                // The LCS table is O(tokens²) and there are at most body.len()
+                // tokens (each is ≥1 byte), so the byte length bounds it — skip very
+                // long lines (minified JS, one-line JSON) that would blow up memory
+                // for a word-diff nobody can read anyway.
+                if lines[del_start + k].body().len() > MAX_WORD_DIFF_LINE
+                    || lines[add_start + k].body().len() > MAX_WORD_DIFF_LINE
+                {
+                    continue;
+                }
+                let del_body = lines[del_start + k].body().to_string();
+                let add_body = lines[add_start + k].body().to_string();
+                let (de, ae) = line_emphasis(&del_body, &add_body);
+                lines[del_start + k].emphasis = de;
+                lines[add_start + k].emphasis = ae;
+            }
         }
     }
 }
@@ -999,6 +1136,7 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, path
     })
     .unwrap_or_else(|e| log::warn!("gitkay: error rendering diff patch: {e}"));
 
+    compute_word_emphasis(&mut lines);
     DiffData { lines, files }
 }
 
@@ -1138,6 +1276,7 @@ fn diff_to_data(diff: &git2::Diff, title: &str, show_stats: bool) -> DiffData {
     })
     .unwrap_or_else(|e| log::warn!("gitkay: error rendering diff patch: {e}"));
 
+    compute_word_emphasis(&mut lines);
     DiffData { lines, files }
 }
 
@@ -1626,45 +1765,137 @@ fn parse_bg_hex(label: &str, v: Option<&str>, warnings: &mut Vec<String>) -> Opt
 /// Code lines get a synthesized +/-/space gutter (drawn from `kind`, so context
 /// and changed lines share one column) then their token spans; structural lines
 /// render whole in one palette color.
+/// Linear blend of two opaque colours (`t` toward `b`).
+fn blend(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let m = |x: u8, y: u8| (x as f32 * (1.0 - t) + y as f32 * t).round() as u8;
+    egui::Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
+}
+
+/// Word-diff highlight colour for a changed run on a `kind` line: a brighter patch
+/// than the row tint, blending the row background toward the diff accent colour.
+fn emphasis_bg(kind: LineKind, palette: &highlight::DiffPalette) -> egui::Color32 {
+    let (bg, accent) = match kind {
+        LineKind::Del => (palette.deleted_bg, palette.deleted),
+        _ => (palette.added_bg, palette.added),
+    };
+    blend(bg, accent, 0.5)
+}
+
+/// Split `body` into the maximal segments that share one syntax colour and one
+/// emphasis state, cutting at every span and emphasis boundary. Each segment is
+/// (byte range, colour, is-emphasised).
+fn body_sections(
+    body: &str,
+    spans: &[highlight::Span],
+    base_color: egui::Color32,
+    emphasis: &[std::ops::Range<usize>],
+) -> Vec<(std::ops::Range<usize>, egui::Color32, bool)> {
+    let len = body.len();
+    let mut cuts = vec![0usize, len];
+    for (_, r) in spans {
+        cuts.push(r.start.min(len));
+        cuts.push(r.end.min(len));
+    }
+    for r in emphasis {
+        cuts.push(r.start.min(len));
+        cuts.push(r.end.min(len));
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut out = Vec::new();
+    for w in cuts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if a >= b {
+            continue;
+        }
+        let color = spans
+            .iter()
+            .find(|(_, r)| r.start <= a && a < r.end)
+            .map(|(c, _)| *c)
+            .unwrap_or(base_color);
+        let emph = emphasis.iter().any(|r| r.start <= a && a < r.end);
+        out.push((a..b, color, emph));
+    }
+    out
+}
+
+/// Append a diff line's body to `job`. `emph_bg = None` is the fast path (syntax
+/// spans, or a single base colour); `Some(bg)` splits the body at span/emphasis
+/// boundaries and paints the changed runs with `bg` (word-diff).
+fn append_body(
+    job: &mut egui::text::LayoutJob,
+    font_id: &egui::FontId,
+    body: &str,
+    spans: &[highlight::Span],
+    base_color: egui::Color32,
+    emphasis: &[std::ops::Range<usize>],
+    emph_bg: Option<egui::Color32>,
+) {
+    use egui::text::TextFormat;
+    let fmt = |color, background| TextFormat {
+        font_id: font_id.clone(),
+        color,
+        background,
+        ..Default::default()
+    };
+    match emph_bg {
+        Some(bg) => {
+            for (range, color, emph) in body_sections(body, spans, base_color, emphasis) {
+                if let Some(text) = body.get(range) {
+                    let background = if emph { bg } else { egui::Color32::TRANSPARENT };
+                    job.append(text, 0.0, fmt(color, background));
+                }
+            }
+        }
+        None if spans.is_empty() => {
+            job.append(body, 0.0, fmt(base_color, egui::Color32::TRANSPARENT));
+        }
+        None => {
+            for (color, range) in spans {
+                if let Some(text) = body.get(range.start..range.end) {
+                    job.append(text, 0.0, fmt(*color, egui::Color32::TRANSPARENT));
+                }
+            }
+        }
+    }
+}
+
 fn diff_row_job(
     line: &DiffLine,
     palette: &highlight::DiffPalette,
     font_id: egui::FontId,
+    word_diff: bool,
 ) -> (egui::text::LayoutJob, Option<egui::Color32>) {
     use egui::text::{LayoutJob, TextFormat};
     let mut job = LayoutJob::default();
-    let mut push = |text: &str, color: egui::Color32| {
-        job.append(
-            text,
-            0.0,
-            TextFormat {
-                font_id: font_id.clone(),
-                color,
-                ..Default::default()
-            },
-        );
-    };
-
     if line.kind.is_code() {
         let (glyph, glyph_color) = match line.kind {
             LineKind::Add => ("+", palette.added),
             LineKind::Del => ("-", palette.deleted),
             _ => (" ", palette.marker),
         };
-        push(glyph, glyph_color);
-        // None (not highlighted) and Some(empty) (blank line) both render plain.
-        // Spans hold byte ranges into `body`, so slice rather than copy.
-        let body = line.body();
+        job.append(
+            glyph,
+            0.0,
+            TextFormat {
+                font_id: font_id.clone(),
+                color: glyph_color,
+                ..Default::default()
+            },
+        );
+        // Spans hold byte ranges into `body`; a None/empty span set renders plain.
         let spans = line.spans.as_deref().unwrap_or(&[]);
-        if spans.is_empty() {
-            push(body, palette.foreground);
-        } else {
-            for (color, range) in spans {
-                if let Some(text) = body.get(range.start..range.end) {
-                    push(text, *color);
-                }
-            }
-        }
+        let emph_bg =
+            (word_diff && !line.emphasis.is_empty()).then(|| emphasis_bg(line.kind, palette));
+        append_body(
+            &mut job,
+            &font_id,
+            line.body(),
+            spans,
+            palette.foreground,
+            &line.emphasis,
+            emph_bg,
+        );
         let row_bg = match line.kind {
             LineKind::Add => Some(palette.added_bg),
             LineKind::Del => Some(palette.deleted_bg),
@@ -1674,9 +1905,56 @@ fn diff_row_job(
     } else {
         // Non-code lines (hunk/file header/meta/stat) take one flat colour,
         // shared with the syntax-off render via `kind_color`.
-        push(&line.text, kind_color(line.kind, palette));
+        job.append(
+            &line.text,
+            0.0,
+            TextFormat {
+                font_id: font_id.clone(),
+                color: kind_color(line.kind, palette),
+                ..Default::default()
+            },
+        );
         (job, None)
     }
+}
+
+/// Build the syntax-off (flat) row job, applying word-diff emphasis backgrounds
+/// when `word_diff` is on. Without emphasis it's a single-colour single line.
+fn flat_row_job(
+    line: &DiffLine,
+    palette: &highlight::DiffPalette,
+    font_id: &egui::FontId,
+    word_diff: bool,
+) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let color = kind_color(line.kind, palette);
+    if !(word_diff && line.kind.is_code() && !line.emphasis.is_empty()) {
+        return LayoutJob::simple_singleline(line.text.clone(), font_id.clone(), color);
+    }
+    let mut job = LayoutJob::default();
+    let body = line.body();
+    let marker_len = line.text.len() - body.len();
+    if marker_len > 0 {
+        job.append(
+            &line.text[..marker_len],
+            0.0,
+            TextFormat {
+                font_id: font_id.clone(),
+                color,
+                ..Default::default()
+            },
+        );
+    }
+    append_body(
+        &mut job,
+        font_id,
+        body,
+        &[],
+        color,
+        &line.emphasis,
+        Some(emphasis_bg(line.kind, palette)),
+    );
+    job
 }
 
 /// Compute the set of commit indices to emphasize for `start_idx`.
@@ -1962,6 +2240,7 @@ struct GitkApp {
     file_list_width: f32,             // persisted file-list sidebar width (see App::save)
     diff_context: u32,                // diff context lines (persisted)
     diff_ignore_ws: bool,             // ignore all whitespace in diffs (persisted)
+    word_diff: bool,                  // highlight changed words within +/- lines (persisted)
     show_stats: bool,                 // show the diffstat block (config [diff].show_stats)
     diff_toolbar_rect: Option<egui::Rect>, // last shown hover-toolbar bounds (flicker guard)
     fonts: Fonts, // resolved, clamped font settings; call .font_id(role) for a FontId
@@ -2160,6 +2439,10 @@ impl GitkApp {
             .storage
             .and_then(|s| eframe::get_value(s, "diff_ignore_ws"))
             .unwrap_or(false);
+        let word_diff: bool = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, "word_diff"))
+            .unwrap_or(false);
         let diff_settings = DiffSettings {
             context: diff_context,
             ignore_ws: diff_ignore_ws,
@@ -2308,6 +2591,7 @@ impl GitkApp {
             file_list_width,
             diff_context,
             diff_ignore_ws,
+            word_diff,
             show_stats,
             diff_toolbar_rect: None,
             fonts,
@@ -2664,6 +2948,7 @@ impl eframe::App for GitkApp {
         eframe::set_value(storage, "file_list_width", &self.file_list_width);
         eframe::set_value(storage, "diff_context", &self.diff_context);
         eframe::set_value(storage, "diff_ignore_ws", &self.diff_ignore_ws);
+        eframe::set_value(storage, "word_diff", &self.word_diff);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -3414,6 +3699,9 @@ impl eframe::App for GitkApp {
                                     {
                                         diff_opts_changed = true;
                                     }
+                                    // Word-diff only changes the render (emphasis is
+                                    // precomputed), so no diff reload — toggling is instant.
+                                    ui.checkbox(&mut self.word_diff, "Word diff");
                                 });
                             });
                         });
@@ -3575,6 +3863,7 @@ impl eframe::App for GitkApp {
                             let lines = &self.diff_lines;
                             let files = &self.diff_files;
                             let priority = self.highlight_priority.as_ref();
+                            let word_diff = self.word_diff;
                             show_virtualized_diff(
                                 ui,
                                 &font_id,
@@ -3603,7 +3892,7 @@ impl eframe::App for GitkApp {
                                 },
                                 |i| {
                                     let (job, row_bg) =
-                                        diff_row_job(&lines[i], palette, font_id.clone());
+                                        diff_row_job(&lines[i], palette, font_id.clone(), word_diff);
                                     (job, row_bg, palette.foreground)
                                 },
                             );
@@ -3614,6 +3903,7 @@ impl eframe::App for GitkApp {
                             let font_id = self.fonts.font_id(Role::Diff);
                             let lines = &self.diff_lines;
                             let palette = &self.diff_palette;
+                            let word_diff = self.word_diff;
                             show_virtualized_diff(
                                 ui,
                                 &font_id,
@@ -3623,11 +3913,7 @@ impl eframe::App for GitkApp {
                                 |_rows| {},
                                 |i| {
                                     let color = kind_color(lines[i].kind, palette);
-                                    let job = egui::text::LayoutJob::simple_singleline(
-                                        lines[i].text.clone(),
-                                        font_id.clone(),
-                                        color,
-                                    );
+                                    let job = flat_row_job(&lines[i], palette, &font_id, word_diff);
                                     (job, None, color)
                                 },
                             );
@@ -4609,7 +4895,7 @@ mod tests {
         let palette = hl.palette().clone();
         let fid = egui::FontId::monospace(13.0);
         let bg =
-            |text: &str, kind| diff_row_job(&DiffLine::new(text, kind), &palette, fid.clone()).1;
+            |text: &str, kind| diff_row_job(&DiffLine::new(text, kind), &palette, fid.clone(), false).1;
         assert_eq!(bg("+x", LineKind::Add), Some(palette.added_bg));
         assert_eq!(bg("-x", LineKind::Del), Some(palette.deleted_bg));
         assert_eq!(bg("x", LineKind::Context), None);
@@ -5212,5 +5498,83 @@ mod tests {
         assert_eq!(create.follow_path.as_deref(), Some("old.txt"));
         let edit = rows.iter().find(|c| c.summary == "edit new").unwrap();
         assert_eq!(edit.follow_path.as_deref(), Some("new.txt"));
+    }
+
+    #[test]
+    fn word_emphasis_marks_only_changed_tokens() {
+        let pick = |body: &str, ranges: &[std::ops::Range<usize>]| -> Vec<String> {
+            ranges.iter().map(|r| body[r.clone()].to_string()).collect()
+        };
+        // One token differs; the shared tokens (let, =, foo, (), ;) stay plain.
+        let (del, add) = line_emphasis("let x = foo();", "let y = foo();");
+        assert_eq!(pick("let x = foo();", &del), vec!["x".to_string()]);
+        assert_eq!(pick("let y = foo();", &add), vec!["y".to_string()]);
+        // `_` is a word char, so a whole identifier is one token.
+        let (del, _) = line_emphasis("a.full_name", "a.display_name");
+        assert_eq!(pick("a.full_name", &del), vec!["full_name".to_string()]);
+    }
+
+    #[test]
+    fn word_emphasis_pairs_equal_blocks_only() {
+        // Equal-count block (1 del, 1 add): both lines get emphasis.
+        let mut lines = vec![
+            DiffLine::new("-let a = old();", LineKind::Del),
+            DiffLine::new("+let a = new();", LineKind::Add),
+        ];
+        compute_word_emphasis(&mut lines);
+        assert!(!lines[0].emphasis.is_empty());
+        assert!(!lines[1].emphasis.is_empty());
+
+        // Unequal block (1 del, 2 add): skipped entirely.
+        let mut lines = vec![
+            DiffLine::new("-x", LineKind::Del),
+            DiffLine::new("+y", LineKind::Add),
+            DiffLine::new("+z", LineKind::Add),
+        ];
+        compute_word_emphasis(&mut lines);
+        assert!(lines.iter().all(|l| l.emphasis.is_empty()));
+    }
+
+    #[test]
+    fn word_emphasis_skips_overlong_lines() {
+        // A very long edited-in-place line must not be word-diffed — the O(tokens²)
+        // LCS table would explode (minified JS / one-line JSON).
+        let del = format!("-{}", "a ".repeat(MAX_WORD_DIFF_LINE));
+        let add = format!("+{}", "b ".repeat(MAX_WORD_DIFF_LINE));
+        let mut lines = vec![
+            DiffLine::new(&del, LineKind::Del),
+            DiffLine::new(&add, LineKind::Add),
+        ];
+        compute_word_emphasis(&mut lines);
+        assert!(lines[0].emphasis.is_empty());
+        assert!(lines[1].emphasis.is_empty());
+    }
+
+    #[test]
+    fn body_sections_tile_a_multibyte_body() {
+        // Multibyte body with a syntax-span boundary and an emphasis boundary that
+        // don't coincide: the segments must tile the whole body exactly, on char
+        // boundaries (slicing would panic otherwise) — guarding against dropped
+        // text under word-diff on non-ASCII lines.
+        let body = "café = naïve";
+        let mid = "café".len(); // a char boundary partway through
+        let nv = body.find("naïve").unwrap();
+        let spans: Vec<highlight::Span> = vec![
+            (egui::Color32::RED, 0..mid),
+            (egui::Color32::BLUE, mid..body.len()),
+        ];
+        let emphasis: Vec<std::ops::Range<usize>> =
+            std::iter::once(nv..body.len()).collect();
+        let segs = body_sections(body, &spans, egui::Color32::WHITE, &emphasis);
+        // Segments reconstruct the body byte-for-byte (no gaps, no overlaps).
+        let rebuilt: String = segs.iter().map(|(r, _, _)| &body[r.clone()]).collect();
+        assert_eq!(rebuilt, body);
+        // The emphasised segments cover exactly the changed word.
+        let emph: String = segs
+            .iter()
+            .filter(|(_, _, e)| *e)
+            .map(|(r, _, _)| &body[r.clone()])
+            .collect();
+        assert_eq!(emph, "naïve");
     }
 }
