@@ -56,12 +56,12 @@ enum RefKind {
 
 /// Sentinel OID for the "uncommitted changes" virtual entry.
 fn oid_uncommitted() -> git2::Oid {
-    git2::Oid::from_bytes(&[0xFF; 20]).unwrap()
+    git2::Oid::from_bytes(&[0xFF; 20]).expect("a 20-byte array is always a valid SHA-1 oid")
 }
 
 /// Sentinel OID for the "staged changes" virtual entry.
 fn oid_staged() -> git2::Oid {
-    git2::Oid::from_bytes(&[0xFE; 20]).unwrap()
+    git2::Oid::from_bytes(&[0xFE; 20]).expect("a 20-byte array is always a valid SHA-1 oid")
 }
 
 /// Total cached diff lines before the LRU starts evicting. ~50–100 MB at this
@@ -802,11 +802,10 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, path
             .and_then(|p| p.to_str())
             .unwrap_or("");
 
-        if current_file_idx.is_none()
-            || files
-                .get(current_file_idx.unwrap())
-                .is_none_or(|f| f.path != delta_path)
-        {
+        let on_current_file = current_file_idx
+            .and_then(|i| files.get(i))
+            .is_some_and(|f| f.path == delta_path);
+        if !on_current_file {
             current_file_idx = files.iter().position(|f| f.path == delta_path);
             if let Some(fi) = current_file_idx {
                 files[fi].diff_line_idx = Some(lines.len());
@@ -942,11 +941,10 @@ fn diff_to_data(diff: &git2::Diff, title: &str, show_stats: bool) -> DiffData {
             .and_then(|p| p.to_str())
             .unwrap_or("");
 
-        if current_file_idx.is_none()
-            || files
-                .get(current_file_idx.unwrap())
-                .is_none_or(|f| f.path != delta_path)
-        {
+        let on_current_file = current_file_idx
+            .and_then(|i| files.get(i))
+            .is_some_and(|f| f.path == delta_path);
+        if !on_current_file {
             current_file_idx = files.iter().position(|f| f.path == delta_path);
             if let Some(fi) = current_file_idx {
                 files[fi].diff_line_idx = Some(lines.len());
@@ -1627,13 +1625,17 @@ fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
             matching_cols[0]
         };
 
-        let node_color = pipes[node_col].unwrap().1;
+        // node_col was just assigned a pipe (or matched an existing one), so this
+        // is always Some; fall back to colour 0 rather than panic if it ever isn't.
+        let node_color = pipes[node_col].map_or(0, |p| p.1);
 
         // Extra lanes that also pointed to this commit — they converge here.
         let mut converge_lines: Vec<(usize, usize, usize)> = Vec::new();
         if matching_cols.len() > 1 {
             for &col in &matching_cols[1..] {
-                let color = pipes[col].unwrap().1;
+                // A matching column holds this commit's pipe, so this is always
+                // Some; fall back to the node's colour rather than panic if not.
+                let color = pipes[col].map_or(node_color, |p| p.1);
                 converge_lines.push((col, node_col, color));
                 pipes[col] = None;
             }
@@ -2559,12 +2561,9 @@ impl eframe::App for GitkApp {
                         // blob is loaded once, not twice; a new Arc leaves any
                         // in-flight worker holding the old one valid. Either way
                         // surface a bad-slug warning, regardless of syntax mode.
-                        let dp_warn = if self.highlighter.is_some() {
-                            let (new_hl, w) = self
-                                .highlighter
-                                .as_ref()
-                                .unwrap()
-                                .with_theme(&self.theme_slug, self.diff_bg);
+                        let dp_warn = if let Some(old_hl) = self.highlighter.take() {
+                            let (new_hl, w) =
+                                old_hl.with_theme(&self.theme_slug, self.diff_bg);
                             self.diff_palette = new_hl.palette().clone();
                             self.highlighter = Some(Arc::new(new_hl));
                             w
