@@ -592,7 +592,11 @@ struct FileEntry {
     path: String,
     additions: usize,
     deletions: usize,
-    diff_line_idx: usize, // line index in diff_lines where this file's diff starts
+    /// `Some(n)`: this file's patch starts at `diff_lines[n]`. `None`: the file
+    /// has no patch body. Defensive — in practice git2 emits at least a header
+    /// line for every delta (binary and mode-only changes included), so a listed
+    /// file always gets a start; nothing relies on `None` actually occurring.
+    diff_line_idx: Option<usize>,
 }
 
 struct DiffData {
@@ -673,7 +677,7 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, path
                 path,
                 additions: 0,
                 deletions: 0,
-                diff_line_idx: 0,
+                diff_line_idx: None,
             });
         }
     }
@@ -728,7 +732,7 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, path
         {
             current_file_idx = files.iter().position(|f| f.path == delta_path);
             if let Some(fi) = current_file_idx {
-                files[fi].diff_line_idx = lines.len();
+                files[fi].diff_line_idx = Some(lines.len());
             }
         }
 
@@ -840,7 +844,7 @@ fn diff_to_data(diff: &git2::Diff, title: &str) -> DiffData {
                 path,
                 additions: 0,
                 deletions: 0,
-                diff_line_idx: 0,
+                diff_line_idx: None,
             });
         }
     }
@@ -872,7 +876,7 @@ fn diff_to_data(diff: &git2::Diff, title: &str) -> DiffData {
         {
             current_file_idx = files.iter().position(|f| f.path == delta_path);
             if let Some(fi) = current_file_idx {
-                files[fi].diff_line_idx = lines.len();
+                files[fi].diff_line_idx = Some(lines.len());
             }
         }
 
@@ -925,21 +929,19 @@ fn diff_to_data(diff: &git2::Diff, title: &str) -> DiffData {
 
 /// Each file's `(file index, start, end)` line range, ordered by start. File
 /// boundaries come from the structured `files` list (clean paths), not the
-/// `--- /+++` display lines. No-patch files (`diff_line_idx == 0`, the header
-/// precedes every real file) are skipped; `end` is clamped to `total_lines`.
+/// `--- /+++` display lines. Files with no patch body (`diff_line_idx` is `None`)
+/// are skipped; `end` is clamped to `total_lines`.
 fn file_line_ranges(files: &[FileEntry], total_lines: usize) -> Vec<(usize, usize, usize)> {
-    let mut sorted: Vec<usize> = (0..files.len())
-        .filter(|&i| files[i].diff_line_idx != 0)
+    // (file index, patch start line) for every file that has a patch body.
+    let mut sorted: Vec<(usize, usize)> = (0..files.len())
+        .filter_map(|i| files[i].diff_line_idx.map(|start| (i, start)))
         .collect();
-    sorted.sort_by_key(|&i| files[i].diff_line_idx);
+    sorted.sort_by_key(|&(_, start)| start);
     sorted
         .iter()
         .enumerate()
-        .map(|(k, &i)| {
-            let start = files[i].diff_line_idx;
-            let end = sorted
-                .get(k + 1)
-                .map_or(total_lines, |&j| files[j].diff_line_idx);
+        .map(|(k, &(i, start))| {
+            let end = sorted.get(k + 1).map_or(total_lines, |&(_, s)| s);
             (i, start.min(total_lines), end.min(total_lines))
         })
         .collect()
@@ -952,7 +954,7 @@ fn file_index_at_line(files: &[FileEntry], line: usize) -> usize {
         .iter()
         .enumerate()
         .rev()
-        .find(|(_, f)| f.diff_line_idx != 0 && f.diff_line_idx <= line)
+        .find(|(_, f)| f.diff_line_idx.is_some_and(|idx| idx <= line))
         .map_or(0, |(i, _)| i)
 }
 
@@ -2833,8 +2835,10 @@ impl eframe::App for GitkApp {
                                             );
                                         }
 
-                                        if resp.clicked() {
-                                            self.diff_scroll_to = Some(line_idx);
+                                        if resp.clicked()
+                                            && let Some(idx) = line_idx
+                                        {
+                                            self.diff_scroll_to = Some(idx);
                                         }
                                         if resp.hovered() {
                                             resp.show_tooltip_text(&file.path);
@@ -4087,7 +4091,7 @@ mod tests {
             path: "x.rs".to_string(),
             additions: 1,
             deletions: 1,
-            diff_line_idx: 1, // file's diff starts at the "diff --git" line
+            diff_line_idx: Some(1), // file's diff starts at the "diff --git" line
         }];
 
         highlight_diff(&mut lines, &files, &hl);
@@ -4221,14 +4225,14 @@ mod tests {
 
     #[test]
     fn file_ranges_and_index_lookup() {
-        let f = |path: &str, idx| FileEntry {
+        let f = |path: &str, idx: Option<usize>| FileEntry {
             path: path.to_string(),
             additions: 0,
             deletions: 0,
             diff_line_idx: idx,
         };
-        // File "a" at line 2, a no-patch file (idx 0, skipped), file "b" at 5.
-        let files = vec![f("a", 2), f("bin", 0), f("b", 5)];
+        // File "a" at line 2, a no-patch file (None, skipped), file "b" at 5.
+        let files = vec![f("a", Some(2)), f("bin", None), f("b", Some(5))];
 
         // Ranges: ordered by start, no-patch skipped, end = next start / total.
         assert_eq!(file_line_ranges(&files, 9), vec![(0, 2, 5), (2, 5, 9)]);
@@ -4244,14 +4248,14 @@ mod tests {
 
     #[test]
     fn unsorted_files_and_clamping() {
-        let f = |idx| FileEntry {
+        let f = |idx: Option<usize>| FileEntry {
             path: "x".to_string(),
             additions: 0,
             deletions: 0,
             diff_line_idx: idx,
         };
         // Input out of order: ranges must still come out start-ordered.
-        let files = vec![f(5), f(2)];
+        let files = vec![f(Some(5)), f(Some(2))];
         assert_eq!(file_line_ranges(&files, 9), vec![(1, 2, 5), (0, 5, 9)]);
         // total_lines below a start clamps both ends to total.
         assert_eq!(file_line_ranges(&files, 3), vec![(1, 2, 3), (0, 3, 3)]);
@@ -4316,10 +4320,10 @@ mod tests {
     }
 
     #[test]
-    fn highlight_diff_skips_no_patch_file_at_index_zero() {
-        // A binary/no-patch FileEntry has diff_line_idx == 0 (never set by the
-        // diff printer). It must NOT cause the commit header at index 0 to be
-        // tokenized as code.
+    fn highlight_diff_skips_no_patch_file() {
+        // A FileEntry with no patch body has diff_line_idx == None. It must NOT
+        // cause the commit header at index 0 to be tokenized as code. (In practice
+        // git2 positions every delta, so None is a defensive case.)
         let (hl, _) = Highlighter::new(
             "catppuccin-mocha",
             DiffBg::Fixed {
@@ -4336,13 +4340,13 @@ mod tests {
                 path: "bin.dat".to_string(),
                 additions: 0,
                 deletions: 0,
-                diff_line_idx: 0, // no-patch file — sentinel value
+                diff_line_idx: None, // no patch body
             },
             FileEntry {
                 path: "foo.rs".to_string(),
                 additions: 1,
                 deletions: 0,
-                diff_line_idx: 1, // real file starts here
+                diff_line_idx: Some(1), // real file starts here
             },
         ];
 
@@ -4414,7 +4418,7 @@ mod tests {
             path: "x.rs".to_string(),
             additions: 1,
             deletions: 0,
-            diff_line_idx: 2, // file's range starts at index 2
+            diff_line_idx: Some(2), // file's range starts at index 2
         }];
         // The blank Context header line (index 1) is None but outside any file
         // range, so the diff still counts as fully highlighted. This is the bug
@@ -4452,13 +4456,13 @@ mod tests {
                 path: "a.rs".to_string(),
                 additions: 2,
                 deletions: 0,
-                diff_line_idx: 1,
+                diff_line_idx: Some(1),
             },
             FileEntry {
                 path: "b.rs".to_string(),
                 additions: 2,
                 deletions: 0,
-                diff_line_idx: 3,
+                diff_line_idx: Some(3),
             },
         ];
 
