@@ -97,6 +97,7 @@ struct DiffCacheKey {
     ignore_ws: bool,
     theme: String,
     enabled: bool,
+    show_stats: bool,
 }
 
 /// Real commits are cacheable; the virtual uncommitted/staged entries are not
@@ -674,11 +675,14 @@ impl DiffData {
     }
 }
 
-/// Diff rendering options controlled from the toolbar.
+/// Diff rendering options. `context`/`ignore_ws` shape the git diff itself (via
+/// `diff_opts`); `show_stats` is a config-driven presentation flag (whether the
+/// diffstat block is emitted) and is NOT read by `diff_opts`.
 #[derive(Clone, Copy)]
 struct DiffSettings {
     context: u32,
     ignore_ws: bool,
+    show_stats: bool,
 }
 
 fn diff_opts(settings: DiffSettings) -> DiffOptions {
@@ -765,15 +769,19 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, path
     }
     lines.push(DiffLine::new("", LineKind::Context));
 
-    // Stats
-    if let Ok(stats) = diff.stats()
-        && let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80)
-    {
-        for l in s.as_str().unwrap_or("").lines() {
-            lines.push(DiffLine::new(l, LineKind::Stat));
+    // Stats — the diffstat block (per-file list + summary) plus its trailing
+    // blank, suppressed when show_stats is off. The blank above (after the commit
+    // message) stays, so the message flows straight into the patch.
+    if settings.show_stats {
+        if let Ok(stats) = diff.stats()
+            && let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80)
+        {
+            for l in s.as_str().unwrap_or("").lines() {
+                lines.push(DiffLine::new(l, LineKind::Stat));
+            }
         }
+        lines.push(DiffLine::new("", LineKind::Context));
     }
-    lines.push(DiffLine::new("", LineKind::Context));
 
     // Patch — track which file we're in
     let mut current_file_idx: Option<usize> = None;
@@ -855,7 +863,7 @@ fn get_working_tree_diff(repo: &Repository, settings: DiffSettings, paths: &[Str
             return DiffData::empty();
         }
     };
-    diff_to_data(&diff, "Uncommitted changes (working tree)")
+    diff_to_data(&diff, "Uncommitted changes (working tree)", settings.show_stats)
 }
 
 /// Generate diff for staged changes (index vs HEAD).
@@ -874,11 +882,11 @@ fn get_staged_diff(repo: &Repository, settings: DiffSettings, paths: &[String]) 
             return DiffData::empty();
         }
     };
-    diff_to_data(&diff, "Staged changes (index)")
+    diff_to_data(&diff, "Staged changes (index)", settings.show_stats)
 }
 
 /// Convert a git2::Diff into our DiffData format.
-fn diff_to_data(diff: &git2::Diff, title: &str) -> DiffData {
+fn diff_to_data(diff: &git2::Diff, title: &str, show_stats: bool) -> DiffData {
     let mut lines = Vec::new();
     let mut files = Vec::new();
 
@@ -904,15 +912,17 @@ fn diff_to_data(diff: &git2::Diff, title: &str) -> DiffData {
         }
     }
 
-    // Stats
-    if let Ok(stats) = diff.stats()
-        && let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80)
-    {
-        for l in s.as_str().unwrap_or("").lines() {
-            lines.push(DiffLine::new(l, LineKind::Stat));
+    // Stats — suppressed when show_stats is off (see get_diff_data).
+    if show_stats {
+        if let Ok(stats) = diff.stats()
+            && let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80)
+        {
+            for l in s.as_str().unwrap_or("").lines() {
+                lines.push(DiffLine::new(l, LineKind::Stat));
+            }
         }
+        lines.push(DiffLine::new("", LineKind::Context));
     }
-    lines.push(DiffLine::new("", LineKind::Context));
 
     // Patch
     let mut current_file_idx: Option<usize> = None;
@@ -1405,6 +1415,7 @@ fn prefetch_worker(
         let settings = DiffSettings {
             context: key.context,
             ignore_ws: key.ignore_ws,
+            show_stats: key.show_stats,
         };
         let t = std::time::Instant::now();
         log::debug!("prefetch: start {}", key.oid);
@@ -1799,6 +1810,7 @@ struct GitkApp {
     file_list_width: f32,             // persisted file-list sidebar width (see App::save)
     diff_context: u32,                // diff context lines (persisted)
     diff_ignore_ws: bool,             // ignore all whitespace in diffs (persisted)
+    show_stats: bool,                 // show the diffstat block (config [diff].show_stats)
     diff_toolbar_rect: Option<egui::Rect>, // last shown hover-toolbar bounds (flicker guard)
     fonts: Fonts, // resolved, clamped font settings; call .font_id(role) for a FontId
     config_path: Option<std::path::PathBuf>, // ~/.config/gitkay/config.toml (for live reload)
@@ -1912,6 +1924,7 @@ impl GitkApp {
             })
             .unwrap_or_default();
         let syntax_enabled = cfg.syntax.enabled.unwrap_or(true);
+        let show_stats = cfg.diff.show_stats.unwrap_or(true);
         let theme_slug = cfg
             .syntax
             .theme
@@ -1992,6 +2005,7 @@ impl GitkApp {
         let diff_settings = DiffSettings {
             context: diff_context,
             ignore_ws: diff_ignore_ws,
+            show_stats,
         };
 
         // Auto-select first commit and load its diff
@@ -2136,6 +2150,7 @@ impl GitkApp {
             file_list_width,
             diff_context,
             diff_ignore_ws,
+            show_stats,
             diff_toolbar_rect: None,
             fonts,
             config_path,
@@ -2202,6 +2217,7 @@ impl GitkApp {
         DiffSettings {
             context: self.diff_context,
             ignore_ws: self.diff_ignore_ws,
+            show_stats: self.show_stats,
         }
     }
 
@@ -2212,6 +2228,7 @@ impl GitkApp {
             ignore_ws: self.diff_ignore_ws,
             theme: self.theme_slug.clone(),
             enabled: self.syntax_enabled,
+            show_stats: self.show_stats,
         }
     }
 
@@ -4552,6 +4569,7 @@ mod tests {
             ignore_ws: false,
             theme: theme.to_string(),
             enabled,
+            show_stats: true,
         };
         let mut c: DiffCache<DiffCacheKey, u32> = DiffCache::new(100);
         c.insert(key("dark", true), 1, 1);
@@ -4715,13 +4733,48 @@ mod tests {
         assert!(!got.contains(&"touch-b".to_string()));
 
         // Diff of c3 is scoped to a.txt: its file list is exactly [a.txt].
-        let data = get_diff_data(&repo, c3, DiffSettings { context: 3, ignore_ws: false }, &s.paths);
+        let data = get_diff_data(&repo, c3, DiffSettings { context: 3, ignore_ws: false, show_stats: true }, &s.paths);
         let files: Vec<&str> = data.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(files, vec!["a.txt"]);
 
         // Empty path filter ⇒ unfiltered (sanity).
         s.paths.clear();
         assert!(summaries(&load_commits(&repo, 100, &s)).contains(&"touch-b".to_string()));
+    }
+
+    #[test]
+    fn show_stats_false_hides_the_diffstat_block() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.txt", "1\n", "base");
+        let c2 = commit_file(&repo, "a.txt", "1\n2\n", "grow-a");
+
+        let on = get_diff_data(
+            &repo,
+            c2,
+            DiffSettings { context: 3, ignore_ws: false, show_stats: true },
+            &[],
+        );
+        assert!(
+            on.lines.iter().any(|l| l.kind == LineKind::Stat),
+            "show_stats=true must include the diffstat block"
+        );
+
+        let off = get_diff_data(
+            &repo,
+            c2,
+            DiffSettings { context: 3, ignore_ws: false, show_stats: false },
+            &[],
+        );
+        assert!(
+            !off.lines.iter().any(|l| l.kind == LineKind::Stat),
+            "show_stats=false must omit the diffstat block"
+        );
+
+        // The patch itself is unaffected: same files, same add/del line counts.
+        let count = |d: &DiffData, k: LineKind| d.lines.iter().filter(|l| l.kind == k).count();
+        assert_eq!(off.files.len(), on.files.len());
+        assert_eq!(count(&off, LineKind::Add), count(&on, LineKind::Add));
+        assert_eq!(count(&off, LineKind::Del), count(&on, LineKind::Del));
     }
 
     #[test]
