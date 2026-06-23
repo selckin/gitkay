@@ -343,21 +343,29 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
 
     let mut commits = Vec::new();
 
+    // The worktree (uncommitted) and index (staged) rows are changes relative to
+    // HEAD — your current state — so they only belong in a view that shows the
+    // checked-out branch: the default current-branch view, or `--all` (where the
+    // current branch is still in view). Viewing a specific branch/rev, e.g.
+    // `gitkay foobar`, is "a different branch than checked out" and hides them.
+    let show_local = scope.all || scope.revs.is_empty();
+
     // Staged = index vs HEAD tree. Scoped to the active `-- <path>` filter, so a
     // staged change outside the path doesn't add a virtual row on its own lane.
-    let has_staged = head_oid
-        .and_then(|head| repo.find_commit(head).ok())
-        .and_then(|head_commit| head_commit.tree().ok())
-        .and_then(|head_tree| {
-            let mut opts = DiffOptions::new();
-            apply_pathspec(&mut opts, &scope.paths);
-            repo.diff_tree_to_index(Some(&head_tree), None, Some(&mut opts))
-                .ok()
-        })
-        .is_some_and(|diff| diff.deltas().len() > 0);
+    let has_staged = show_local
+        && head_oid
+            .and_then(|head| repo.find_commit(head).ok())
+            .and_then(|head_commit| head_commit.tree().ok())
+            .and_then(|head_tree| {
+                let mut opts = DiffOptions::new();
+                apply_pathspec(&mut opts, &scope.paths);
+                repo.diff_tree_to_index(Some(&head_tree), None, Some(&mut opts))
+                    .ok()
+            })
+            .is_some_and(|diff| diff.deltas().len() > 0);
 
     // Uncommitted = workdir vs index, scoped to the same path filter.
-    let has_uncommitted = {
+    let has_uncommitted = show_local && {
         let mut opts = DiffOptions::new();
         apply_pathspec(&mut opts, &scope.paths);
         repo.diff_index_to_workdir(None, Some(&mut opts))
@@ -4847,6 +4855,37 @@ mod tests {
         );
         // No filter: the row shows.
         assert!(has_uncommitted_row(Vec::new()));
+    }
+
+    #[test]
+    fn worktree_index_rows_hidden_when_viewing_a_different_branch() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.txt", "1", "a-1");
+        // A second branch to view explicitly, plus an uncommitted change on disk.
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("foobar", &head, false).unwrap();
+        std::fs::write(repo.workdir().unwrap().join("a.txt"), "dirty").unwrap();
+
+        let has_worktree_row = |scope: cli::Scope| {
+            load_commits(&repo, 100, &scope)
+                .iter()
+                .any(|c| c.oid == oid_uncommitted())
+        };
+        let scope = |all: bool, revs: &[&str]| cli::Scope {
+            all,
+            revs: revs.iter().map(|s| s.to_string()).collect(),
+            paths: Vec::new(),
+        };
+
+        // Default (current-branch) view shows your local state.
+        assert!(has_worktree_row(scope(false, &[])));
+        // Explicitly viewing a different branch hides it.
+        assert!(
+            !has_worktree_row(scope(false, &["foobar"])),
+            "worktree row must not show when viewing a branch other than HEAD"
+        );
+        // `--all` still shows it — the checked-out branch is in view.
+        assert!(has_worktree_row(scope(true, &[])));
     }
 
     #[test]
