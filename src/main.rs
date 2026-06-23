@@ -2586,6 +2586,17 @@ impl eframe::App for GitkApp {
                         // queued spans are dropped, not applied for a frame.
                         self.invalidate_diff_highlight();
                     }
+                    // show_stats changes the diff LINES (not just their colours),
+                    // so it needs a full rebuild, not a re-highlight. Update the
+                    // field first so the rebuild keys/builds under the new value;
+                    // the new cache key misses and rebuilds, stale entries evict.
+                    let new_show_stats = cfg.diff.show_stats.unwrap_or(true);
+                    if new_show_stats != self.show_stats {
+                        self.show_stats = new_show_stats;
+                        if let Ok(repo) = Repository::discover(&self.repo_path) {
+                            self.load_selected_diff(&repo);
+                        }
+                    }
                     self.config_error_toast = warned.then(std::time::Instant::now);
                 }
                 Err(e) => {
