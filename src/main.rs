@@ -3514,11 +3514,13 @@ fn main() -> eframe::Result {
             .with_inner_size([1200.0, 800.0])
             .with_app_id("gitkay")
             .with_title(&title),
-        // Persist the egui layout (the diff splitter) but NOT native window
-        // geometry. eframe's window size round-trip is unstable on Wayland
-        // (fractional scaling + client-side decorations) and makes the window
-        // grow on every restart; the window opens at the size set above instead.
-        persist_window: false,
+        // Persist the egui layout (the diff splitter) AND the native window
+        // size/position. This round-trip used to be unstable on Wayland
+        // (fractional scaling + client-side decorations grew the window on every
+        // restart) so it was disabled; that no longer reproduces, so it's back
+        // on. The size above is just the first-run fallback until geometry is
+        // saved.
+        persist_window: true,
         ..Default::default()
     };
 
