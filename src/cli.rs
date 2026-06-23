@@ -3,10 +3,12 @@
 //! repo. Grammar: `gitkay [-C <dir>] [--all] [<rev>...] [-- <path>...]`.
 
 /// The resolved command-line scope.
+#[derive(Default)]
 pub struct Scope {
     pub all: bool,
     pub revs: Vec<String>,
     pub paths: Vec<String>,
+    pub reflog: bool, // --reflog: show the ref's reflog instead of its history
 }
 
 /// Flags + raw positional tokens, before rev/path classification.
@@ -14,6 +16,7 @@ pub struct Scope {
 pub struct RawArgs {
     pub repo_dir: Option<String>,
     pub all: bool,
+    pub reflog: bool,      // --reflog: show the reflog instead of history
     pub help: bool,        // -h / --help: print usage and exit
     pub version: bool,     // -V / --version: print version and exit
     pub pre: Vec<String>,  // positional tokens before `--`
@@ -34,6 +37,7 @@ pub enum RevTokenKind {
 pub fn parse_flags(args: impl Iterator<Item = String>) -> Result<RawArgs, String> {
     let mut repo_dir = None;
     let mut all = false;
+    let mut reflog = false;
     let mut pre = Vec::new();
     let mut post = Vec::new();
     let mut after_dashdash = false;
@@ -52,6 +56,8 @@ pub fn parse_flags(args: impl Iterator<Item = String>) -> Result<RawArgs, String
             return Ok(RawArgs { version: true, ..Default::default() });
         } else if arg == "--all" {
             all = true;
+        } else if arg == "--reflog" {
+            reflog = true;
         } else if arg == "-C" {
             repo_dir = Some(iter.next().ok_or("-C requires a directory argument")?);
         } else if let Some(dir) = arg.strip_prefix("-C") {
@@ -62,7 +68,7 @@ pub fn parse_flags(args: impl Iterator<Item = String>) -> Result<RawArgs, String
             pre.push(arg);
         }
     }
-    Ok(RawArgs { repo_dir, all, pre, post, ..Default::default() })
+    Ok(RawArgs { repo_dir, all, reflog, pre, post, ..Default::default() })
 }
 
 /// Split positional tokens into revs and paths. Revs come first; the first token
@@ -183,6 +189,19 @@ mod tests {
         let r = parse_flags(v(&["--", "--help"]).into_iter()).unwrap();
         assert!(!r.help);
         assert_eq!(r.post, v(&["--help"]));
+    }
+
+    #[test]
+    fn parse_flags_reflog() {
+        let r = parse_flags(v(&["--reflog"]).into_iter()).unwrap();
+        assert!(r.reflog);
+        assert!(r.pre.is_empty());
+        // A ref after --reflog stays a positional, classified as a rev downstream.
+        let r = parse_flags(v(&["--reflog", "main"]).into_iter()).unwrap();
+        assert!(r.reflog);
+        assert_eq!(r.pre, v(&["main"]));
+        // Not set without the flag.
+        assert!(!parse_flags(v(&["main"]).into_iter()).unwrap().reflog);
     }
 
     #[test]

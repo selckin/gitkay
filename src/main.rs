@@ -52,6 +52,7 @@ enum RefKind {
     Branch,
     Remote,
     Tag,
+    Reflog, // the @{n} selector chip in reflog view
 }
 
 /// Sentinel OID for the "uncommitted changes" virtual entry.
@@ -147,6 +148,12 @@ fn token_to_pathspec(token: &str, prefix: &str, workdir: &std::path::Path) -> St
 /// The parenthetical scope shown in the window title, e.g. `--all`, `main`,
 /// `a..b -- src`. Empty when the default (current branch, no path filter) is active.
 fn scope_title_suffix(scope: &cli::Scope) -> String {
+    if scope.reflog {
+        return match scope.revs.first() {
+            Some(r) => format!("reflog {r}"),
+            None => "reflog".to_string(),
+        };
+    }
     let mut head: Vec<String> = Vec::new();
     if scope.all {
         head.push("--all".to_string());
@@ -169,10 +176,12 @@ fn print_help() {
 
 USAGE:
     gitkay [-C <dir>] [--all] [<rev>...] [-- <path>...]
+    gitkay [-C <dir>] --reflog [<ref>]
 
 OPTIONS:
     -C <dir>        Run as if started in <dir>
     --all           Show all refs (branches, remotes, tags), not just the current branch
+    --reflog        Show <ref>'s reflog (default HEAD) instead of its history
     -h, --help      Print this help and exit
     -V, --version   Print version and exit
 
@@ -495,6 +504,63 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
         commits.extend(kept);
     }
     commits
+}
+
+/// Load the commit list for the active scope: the reflog when `--reflog` is set,
+/// otherwise the normal history walk.
+fn load_history(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitInfo> {
+    if scope.reflog {
+        load_reflog(repo, max, scope)
+    } else {
+        load_commits(repo, max, scope)
+    }
+}
+
+/// Build the commit list from a ref's reflog (newest first, i.e. `@{0}` first).
+/// Each entry becomes a flat row carrying no parents — so the graph collapses to a
+/// plain column — showing the reflog message, the commit it pointed to, and an
+/// `@{n}` selector chip. `--all` and path filters don't apply in this mode.
+fn load_reflog(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitInfo> {
+    let refname = scope.revs.first().map(String::as_str).unwrap_or("HEAD");
+    // git2's reflog() wants a canonical ref name; resolve a shorthand like `main`.
+    let canonical = if refname == "HEAD" {
+        "HEAD".to_string()
+    } else {
+        match repo
+            .resolve_reference_from_short_name(refname)
+            .ok()
+            .and_then(|r| r.name().map(str::to_string).ok())
+        {
+            Some(name) => name,
+            None => {
+                // Don't fall through silently to a guaranteed-empty reflog read —
+                // a typo'd ref is otherwise indistinguishable from an empty reflog.
+                log::warn!("gitkay: --reflog: unknown ref {refname:?}");
+                refname.to_string()
+            }
+        }
+    };
+    let reflog = match repo.reflog(&canonical) {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("gitkay: cannot read reflog for {canonical:?}: {e}");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for i in 0..reflog.len().min(max) {
+        let Some(entry) = reflog.get(i) else { continue };
+        let committer = entry.committer();
+        out.push(CommitInfo {
+            oid: entry.id_new(),
+            summary: entry.message().ok().flatten().unwrap_or("").to_string(),
+            author: committer.name().unwrap_or("").to_string(),
+            time: committer.when().seconds(),
+            parents: Vec::new(),
+            refs: vec![(format!("{refname}@{{{i}}}"), RefKind::Reflog)],
+        });
+    }
+    out
 }
 
 fn build_ref_map(
@@ -1989,11 +2055,17 @@ impl GitkApp {
 
         let repo = Repository::discover(&repo_path)
             .map_err(|e| format!("not a git repository: {repo_path}: {e}"))?;
-        let commits = load_commits(&repo, 200, &scope);
-        // A path filter that matches nothing yields a silently empty graph; say so
-        // once at startup. Paths are matched repo-root-relative (a path given from
-        // a subdirectory won't match — a known limitation).
-        if !scope.paths.is_empty() && !commits.iter().any(|c| is_real_commit(c.oid)) {
+        let commits = load_history(&repo, 200, &scope);
+        // An empty view (bad path filter, or an unknown/empty reflog ref) is
+        // otherwise a silent blank window; say so once at startup. Paths are matched
+        // repo-root-relative (a path given from a subdirectory won't match — a known
+        // limitation).
+        if scope.reflog && commits.is_empty() {
+            log::warn!(
+                "--reflog: no entries for {} (unknown ref or empty reflog)",
+                scope.revs.first().map(String::as_str).unwrap_or("HEAD")
+            );
+        } else if !scope.paths.is_empty() && !commits.iter().any(|c| is_real_commit(c.oid)) {
             log::warn!(
                 "no commits match path filter {:?} (paths are repo-root-relative)",
                 scope.paths
@@ -2215,6 +2287,12 @@ impl GitkApp {
 
     fn set_selected(&mut self, idx: usize) {
         self.selected = Some(idx);
+        // Reflog entries are parentless, so branch-ancestry highlighting would dim
+        // every other row whenever one is selected — skip it in reflog mode.
+        if self.scope.reflog {
+            self.branch_highlight.clear();
+            return;
+        }
         let highlight = compute_branch_highlight(&self.commits, idx);
         self.branch_highlight = if highlight.len() < self.commits.len() {
             highlight
@@ -2448,7 +2526,7 @@ impl GitkApp {
             .and_then(|sel| self.commits.get(sel))
             .map(|commit| commit.oid);
 
-        self.commits = load_commits(repo, count, &self.scope);
+        self.commits = load_history(repo, count, &self.scope);
         self.graph_rows = layout_graph(&self.commits);
         self.all_loaded = self.commits.len() < count;
         self.refresh_search_matches();
@@ -2810,15 +2888,22 @@ impl eframe::App for GitkApp {
             .default_size(saved_commit_h)
             .show_inside(ui, |ui| {
                 let num_commits = self.commits.len();
-                let graph_width = (self
-                    .graph_rows
-                    .iter()
-                    .map(|r| r.num_cols)
-                    .max()
-                    .unwrap_or(1)
-                    .min(max_graph_cols) as f32)
-                    * col_width
-                    + 8.0;
+                // Reflog rows are parentless, so the graph is just a column of
+                // disconnected dots — drop it and reclaim the width for the text.
+                let reflog_mode = self.scope.reflog;
+                let graph_width = if reflog_mode {
+                    4.0
+                } else {
+                    (self
+                        .graph_rows
+                        .iter()
+                        .map(|r| r.num_cols)
+                        .max()
+                        .unwrap_or(1)
+                        .min(max_graph_cols) as f32)
+                        * col_width
+                        + 8.0
+                };
 
                 let panel_height = ui.available_height();
                 let graph_scroll_to = self.graph_scroll_to.take();
@@ -2940,83 +3025,85 @@ impl eframe::App for GitkApp {
                                 );
                             }
 
-                            let gx = |col: usize| -> f32 {
-                                top_left.x + col as f32 * col_width + col_width / 2.0
-                            };
+                            if !reflog_mode {
+                                let gx = |col: usize| -> f32 {
+                                    top_left.x + col as f32 * col_width + col_width / 2.0
+                                };
 
-                            // ── Graph ──
-                            for &(from, to, color_col) in &gr.lines {
-                                let c = graph_color(color_col).linear_multiply(if from == to {
-                                    0.5
-                                } else {
-                                    0.7
-                                });
-                                let stroke = egui::Stroke::new(2.0, c);
-                                let x_top = gx(from);
-                                let x_bot = gx(to);
+                                // ── Graph ──
+                                for &(from, to, color_col) in &gr.lines {
+                                    let c = graph_color(color_col).linear_multiply(if from == to {
+                                        0.5
+                                    } else {
+                                        0.7
+                                    });
+                                    let stroke = egui::Stroke::new(2.0, c);
+                                    let x_top = gx(from);
+                                    let x_bot = gx(to);
 
-                                // Check if this line passes through the node
-                                let touches_node = from == gr.node_col || to == gr.node_col;
+                                    // Check if this line passes through the node
+                                    let touches_node = from == gr.node_col || to == gr.node_col;
 
-                                // Check if this node has an incoming line from above
-                                let has_incoming = idx > 0
-                                    && self.graph_rows[idx - 1]
-                                        .lines
-                                        .iter()
-                                        .any(|&(_, to, _)| to == gr.node_col);
+                                    // Check if this node has an incoming line from above
+                                    let has_incoming = idx > 0
+                                        && self.graph_rows[idx - 1]
+                                            .lines
+                                            .iter()
+                                            .any(|&(_, to, _)| to == gr.node_col);
 
-                                if !touches_node {
-                                    // Straight or diagonal, doesn't touch the node
-                                    painter.line_segment(
-                                        [egui::pos2(x_top, y_top), egui::pos2(x_bot, y_bottom)],
-                                        stroke,
-                                    );
-                                } else if from == to && from == gr.node_col {
-                                    // Node's own lane continuation: split around dot
-                                    if has_incoming {
+                                    if !touches_node {
+                                        // Straight or diagonal, doesn't touch the node
+                                        painter.line_segment(
+                                            [egui::pos2(x_top, y_top), egui::pos2(x_bot, y_bottom)],
+                                            stroke,
+                                        );
+                                    } else if from == to && from == gr.node_col {
+                                        // Node's own lane continuation: split around dot
+                                        if has_incoming {
+                                            painter.line_segment(
+                                                [
+                                                    egui::pos2(x_top, y_top),
+                                                    egui::pos2(x_top, y_center - dot_radius - 1.0),
+                                                ],
+                                                stroke,
+                                            );
+                                        }
+                                        painter.line_segment(
+                                            [
+                                                egui::pos2(x_bot, y_center + dot_radius + 1.0),
+                                                egui::pos2(x_bot, y_bottom),
+                                            ],
+                                            stroke,
+                                        );
+                                    } else if from == gr.node_col {
+                                        // Outgoing from node: dot center → target column bottom
+                                        painter.line_segment(
+                                            [
+                                                egui::pos2(gx(gr.node_col), y_center),
+                                                egui::pos2(x_bot, y_bottom),
+                                            ],
+                                            stroke,
+                                        );
+                                    } else if to == gr.node_col {
+                                        // Incoming to node: source column top → dot center
                                         painter.line_segment(
                                             [
                                                 egui::pos2(x_top, y_top),
-                                                egui::pos2(x_top, y_center - dot_radius - 1.0),
+                                                egui::pos2(gx(gr.node_col), y_center),
                                             ],
                                             stroke,
                                         );
                                     }
-                                    painter.line_segment(
-                                        [
-                                            egui::pos2(x_bot, y_center + dot_radius + 1.0),
-                                            egui::pos2(x_bot, y_bottom),
-                                        ],
-                                        stroke,
-                                    );
-                                } else if from == gr.node_col {
-                                    // Outgoing from node: dot center → target column bottom
-                                    painter.line_segment(
-                                        [
-                                            egui::pos2(gx(gr.node_col), y_center),
-                                            egui::pos2(x_bot, y_bottom),
-                                        ],
-                                        stroke,
-                                    );
-                                } else if to == gr.node_col {
-                                    // Incoming to node: source column top → dot center
-                                    painter.line_segment(
-                                        [
-                                            egui::pos2(x_top, y_top),
-                                            egui::pos2(gx(gr.node_col), y_center),
-                                        ],
-                                        stroke,
-                                    );
                                 }
+
+                                // Commit dot
+                                painter.circle_filled(
+                                    egui::pos2(gx(gr.node_col), y_center),
+                                    dot_radius,
+                                    graph_color(gr.node_color),
+                                );
+
                             }
-
-                            // Commit dot
-                            painter.circle_filled(
-                                egui::pos2(gx(gr.node_col), y_center),
-                                dot_radius,
-                                graph_color(gr.node_color),
-                            );
-
                             // ── Text ──
                             let text_x = top_left.x + graph_width;
                             let mut cursor_x = text_x;
@@ -3026,6 +3113,7 @@ impl eframe::App for GitkApp {
                                 let (bg, fg) = match kind {
                                     RefKind::Head => (egui::Color32::from_rgb(80, 40, 50), RED),
                                     RefKind::Tag => (egui::Color32::from_rgb(60, 55, 30), YELLOW),
+                                    RefKind::Reflog => (SURFACE0, SUBTEXT),
                                     RefKind::Branch | RefKind::Remote => {
                                         // Unique color per branch/remote name
                                         let color = ref_color(ref_name);
@@ -3143,7 +3231,7 @@ impl eframe::App for GitkApp {
                             && last_row + 50 >= num_commits
                             && let Ok(repo) = Repository::discover(&self.repo_path)
                         {
-                            let more = load_commits(&repo, self.commits.len() + 500, &self.scope);
+                            let more = load_history(&repo, self.commits.len() + 500, &self.scope);
                             self.all_loaded = more.len() <= self.commits.len();
                             self.commits = more;
                             self.graph_rows = layout_graph(&self.commits);
@@ -3534,7 +3622,7 @@ fn main() -> eframe::Result {
             .collect(),
         None => raw_paths, // bare repo: no worktree to anchor paths against
     };
-    let scope = cli::Scope { all: raw.all, revs, paths };
+    let scope = cli::Scope { all: raw.all, revs, paths, reflog: raw.reflog };
 
     // Build the window title from the repo we already discovered, before dropping
     // it — re-discovering here and unwrapping would panic on a TOCTOU removal.
@@ -4703,6 +4791,7 @@ mod tests {
             all,
             revs: revs.iter().map(|s| s.to_string()).collect(),
             paths: Vec::new(),
+            reflog: false,
         }
     }
 
@@ -4749,7 +4838,12 @@ mod tests {
         commit_file(&repo, "b.txt", "1", "touch-b");
         let c3 = commit_file(&repo, "a.txt", "2", "touch-a-again");
 
-        let mut s = cli::Scope { all: false, revs: Vec::new(), paths: vec!["a.txt".to_string()] };
+        let mut s = cli::Scope {
+            all: false,
+            revs: Vec::new(),
+            paths: vec!["a.txt".to_string()],
+            reflog: false,
+        };
         // Commit graph: only commits touching a.txt.
         let got = summaries(&load_commits(&repo, 100, &s));
         assert_eq!(got, vec!["touch-a-again".to_string(), "touch-a".to_string()]);
@@ -4810,7 +4904,12 @@ mod tests {
         commit_file(&repo, "b.txt", "1", "b-only"); // dropped by the a.txt filter
         let c3 = commit_file(&repo, "a.txt", "2", "a-2");
 
-        let s = cli::Scope { all: false, revs: Vec::new(), paths: vec!["a.txt".to_string()] };
+        let s = cli::Scope {
+            all: false,
+            revs: Vec::new(),
+            paths: vec!["a.txt".to_string()],
+            reflog: false,
+        };
         let got = load_commits(&repo, 100, &s);
         let real: Vec<&CommitInfo> = got.iter().filter(|c| is_real_commit(c.oid)).collect();
 
@@ -4836,7 +4935,7 @@ mod tests {
 
         let has_uncommitted_row =
             |paths: Vec<String>| -> bool {
-                let s = cli::Scope { all: false, revs: Vec::new(), paths };
+                let s = cli::Scope { all: false, revs: Vec::new(), paths, reflog: false };
                 load_commits(&repo, 100, &s)
                     .iter()
                     .any(|c| c.oid == oid_uncommitted())
@@ -4874,6 +4973,7 @@ mod tests {
             all,
             revs: revs.iter().map(|s| s.to_string()).collect(),
             paths: Vec::new(),
+            reflog: false,
         };
 
         // Default (current-branch) view shows your local state.
@@ -4917,6 +5017,7 @@ mod tests {
             all,
             revs: revs.iter().map(|x| x.to_string()).collect(),
             paths: paths.iter().map(|x| x.to_string()).collect(),
+            reflog: false,
         };
         assert_eq!(scope_title_suffix(&s(false, &[], &[])), "");
         assert_eq!(scope_title_suffix(&s(true, &[], &[])), "--all");
@@ -4938,5 +5039,22 @@ mod tests {
         let s = scope(false, &[&format!("{c2}..{c3}")]);
         let got = summaries(&load_commits(&repo, 100, &s));
         assert_eq!(got, vec!["c3".to_string()]);
+    }
+
+    #[test]
+    fn reflog_lists_head_movements_newest_first() {
+        let (_d, repo) = temp_repo();
+        let c1 = commit_file(&repo, "a.txt", "1", "first");
+        let c2 = commit_file(&repo, "a.txt", "2", "second");
+        let scope = cli::Scope { reflog: true, ..Default::default() };
+        let rows = load_reflog(&repo, 100, &scope);
+        assert!(rows.len() >= 2, "expected >=2 reflog rows, got {}", rows.len());
+        // Newest first: HEAD@{0} is the latest commit.
+        assert_eq!(rows[0].oid, c2);
+        assert_eq!(rows[1].oid, c1);
+        // No parents (flat, no lanes) and an @{n} selector chip.
+        assert!(rows[0].parents.is_empty());
+        assert_eq!(rows[0].refs[0].0, "HEAD@{0}");
+        assert!(matches!(rows[0].refs[0].1, RefKind::Reflog));
     }
 }
