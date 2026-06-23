@@ -9,8 +9,8 @@ keywords = ["git", "history", "viewer", "wayland", "egui"]
 categories = ["development-tools", "visualization"]
 
 [dependencies]
-eframe = { version = "0.31", features = ["persistence"] }
-egui = "0.31"
+eframe = { version = "0.34", features = ["persistence"] }
+egui = "0.34"
 git2 = "0.19"
 chrono = "0.4"
 arboard = "3"
