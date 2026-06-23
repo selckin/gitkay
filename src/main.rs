@@ -4573,20 +4573,21 @@ mod tests {
     }
 
     #[test]
-    fn diff_cache_key_includes_theme_and_enabled() {
-        let key = |theme: &str, enabled: bool| DiffCacheKey {
+    fn diff_cache_key_includes_theme_enabled_and_show_stats() {
+        let key = |theme: &str, enabled: bool, show_stats: bool| DiffCacheKey {
             oid: git2::Oid::zero(),
             context: 3,
             ignore_ws: false,
             theme: theme.to_string(),
             enabled,
-            show_stats: true,
+            show_stats,
         };
         let mut c: DiffCache<DiffCacheKey, u32> = DiffCache::new(100);
-        c.insert(key("dark", true), 1, 1);
-        assert_eq!(c.remove(&key("light", true)), None, "different theme ⇒ miss");
-        assert_eq!(c.remove(&key("dark", false)), None, "different enabled ⇒ miss");
-        assert_eq!(c.remove(&key("dark", true)), Some(1), "same key ⇒ hit");
+        c.insert(key("dark", true, true), 1, 1);
+        assert_eq!(c.remove(&key("light", true, true)), None, "different theme ⇒ miss");
+        assert_eq!(c.remove(&key("dark", false, true)), None, "different enabled ⇒ miss");
+        assert_eq!(c.remove(&key("dark", true, false)), None, "different show_stats ⇒ miss");
+        assert_eq!(c.remove(&key("dark", true, true)), Some(1), "same key ⇒ hit");
     }
 
     #[test]
