@@ -2064,6 +2064,7 @@ fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
 
         // node_col was just assigned a pipe (or matched an existing one), so this
         // is always Some; fall back to colour 0 rather than panic if it ever isn't.
+        debug_assert!(pipes[node_col].is_some(), "node column {node_col} has no pipe");
         let node_color = pipes[node_col].map_or(0, |p| p.1);
 
         // Extra lanes that also pointed to this commit — they converge here.
@@ -2072,6 +2073,7 @@ fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
             for &col in &matching_cols[1..] {
                 // A matching column holds this commit's pipe, so this is always
                 // Some; fall back to the node's colour rather than panic if not.
+                debug_assert!(pipes[col].is_some(), "matching column {col} has no pipe");
                 let color = pipes[col].map_or(node_color, |p| p.1);
                 converge_lines.push((col, node_col, color));
                 pipes[col] = None;
@@ -2916,16 +2918,26 @@ impl GitkApp {
             .selected
             .and_then(|sel| self.commits.get(sel))
             .map(|commit| commit.oid);
+        let previous_index = self.selected;
 
         self.commits = load_history(repo, count, &self.scope);
         self.graph_rows = layout_graph(&self.commits);
         self.all_loaded = self.commits.len() < count;
         self.refresh_search_matches();
 
-        let target_oid = preferred_oid.or(previous_oid);
-        self.selected = target_oid
-            .and_then(|oid| self.commits.iter().position(|c| c.oid == oid))
-            .or_else(|| (!self.commits.is_empty()).then_some(0));
+        // Reflog entries routinely share oids (reset-and-back, amends), so restoring
+        // selection by oid would snap to the first match (the wrong @{n}); keep the
+        // position instead. An explicit target (preferred_oid) still wins.
+        self.selected = if self.scope.reflog && preferred_oid.is_none() {
+            previous_index
+                .filter(|&i| i < self.commits.len())
+                .or_else(|| (!self.commits.is_empty()).then_some(0))
+        } else {
+            preferred_oid
+                .or(previous_oid)
+                .and_then(|oid| self.commits.iter().position(|c| c.oid == oid))
+                .or_else(|| (!self.commits.is_empty()).then_some(0))
+        };
 
         if let Some(sel) = self.selected {
             self.set_selected(sel);
@@ -3623,8 +3635,12 @@ impl eframe::App for GitkApp {
                             && last_row + 50 >= num_commits
                             && let Ok(repo) = Repository::discover(&self.repo_path)
                         {
-                            let more = load_history(&repo, self.commits.len() + 500, &self.scope);
-                            self.all_loaded = more.len() <= self.commits.len();
+                            let requested = self.commits.len() + 500;
+                            let more = load_history(&repo, requested, &self.scope);
+                            // Fewer than we asked for ⇒ the source is exhausted. (The
+                            // old `more.len() <= prev_len` check never fired for a
+                            // reflog that grew, forcing one redundant rebuild.)
+                            self.all_loaded = more.len() < requested;
                             self.commits = more;
                             self.graph_rows = layout_graph(&self.commits);
                         }
