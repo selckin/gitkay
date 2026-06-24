@@ -2943,14 +2943,6 @@ impl GitkApp {
         }
     }
 
-    fn refresh_for_selection(&mut self, repo: &Repository, preferred_oid: git2::Oid) {
-        self.reload_commits(repo, Some(preferred_oid));
-        self.load_selected_diff(repo);
-        // Center the target (used for clicks, search jumps): the destination may
-        // be far from the current view.
-        self.graph_scroll_to = self.selected.map(|i| (i, Some(egui::Align::Center)));
-    }
-
     /// Select an already-loaded commit at `idx`, load its diff, and reset the diff
     /// view to the top — no history reload / graph relayout (that's only needed to
     /// jump to a not-yet-loaded commit). The caller sets `graph_scroll_to` itself
@@ -3233,12 +3225,12 @@ impl eframe::App for GitkApp {
                     if resp.changed() {
                         self.search_cursor = 0;
                         self.refresh_search_matches();
-                        // Jump to first match
-                        if let Some(&idx) = self.search_matches.first()
-                            && let Ok(repo) = Repository::discover(&self.repo_path)
-                        {
-                            let oid = self.commits[idx].oid;
-                            self.refresh_for_selection(&repo, oid);
+                        // Jump to the first match. It's already a valid index into the
+                        // current list (just built), so select it directly + center —
+                        // no full reload/relayout (refresh_for_selection) needed.
+                        if let Some(&idx) = self.search_matches.first() {
+                            self.select_loaded(idx);
+                            self.graph_scroll_to = Some((idx, Some(egui::Align::Center)));
                         }
                     }
                     // Enter cycles through matches
@@ -3247,10 +3239,8 @@ impl eframe::App for GitkApp {
                             self.search_cursor =
                                 (self.search_cursor + 1) % self.search_matches.len();
                             let idx = self.search_matches[self.search_cursor];
-                            if let Ok(repo) = Repository::discover(&self.repo_path) {
-                                let oid = self.commits[idx].oid;
-                                self.refresh_for_selection(&repo, oid);
-                            }
+                            self.select_loaded(idx);
+                            self.graph_scroll_to = Some((idx, Some(egui::Align::Center)));
                         }
                         resp.request_focus();
                     }
