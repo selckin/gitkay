@@ -2193,6 +2193,31 @@ fn max_line_chars(lines: &[DiffLine]) -> usize {
         .unwrap_or(0)
 }
 
+/// The file paths a config-file event must match, and the directories to watch for
+/// them. Always the config path + its parent dir; when `canonical` (the symlink-
+/// resolved path) is given and differs, also the target + its parent — editing the
+/// real file (e.g. in a dotfiles dir, a *different* directory than the link) modifies
+/// an inode the link's own parent dir never sees, so its dir must be watched too.
+/// Pure (no filesystem access) so the path logic is unit-testable. Dirs are deduped.
+fn config_watch_targets(
+    path: &std::path::Path,
+    canonical: Option<std::path::PathBuf>,
+) -> (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>) {
+    let mut files = vec![path.to_path_buf()];
+    if let Some(c) = canonical
+        && c != path
+    {
+        files.push(c);
+    }
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    for parent in files.iter().filter_map(|f| f.parent()) {
+        if !dirs.iter().any(|d| d == parent) {
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    (files, dirs)
+}
+
 /// Build a notify watcher whose callback sets `flag` and requests a repaint for
 /// events matching `keep`. Returns None (logged) if the watcher can't be created;
 /// per-event OS watch errors are silently dropped.
@@ -2295,25 +2320,33 @@ impl GitkApp {
         }
         cc.egui_ctx.set_fonts(font_defs);
 
-        // Watch the config file for live reload. Watch the *parent dir*
+        // Watch the config file for live reload. Watch the *parent dir(s)*
         // (non-recursive) so edits via atomic rename (temp file + rename, as
         // many editors do) are still seen, then filter events to the file.
         // Note: an atomic rename shows up as a Create (not Modify) event,
         // which is why both EventKind::Create and EventKind::Modify are matched.
+        // If the config path is a symlink, config_watch_targets adds the resolved
+        // target's dir too, so editing the real file (e.g. in a dotfiles repo) fires.
         let needs_config_reload = Arc::new(AtomicBool::new(false));
         let config_watcher = config_path.as_ref().and_then(|cfg_file| {
-            let parent = cfg_file.parent()?.to_path_buf();
-            let cfg_file = cfg_file.clone();
+            let canonical = std::fs::canonicalize(cfg_file).ok();
+            let (files, dirs) = config_watch_targets(cfg_file, canonical);
             let mut w = make_watcher(&cc.egui_ctx, needs_config_reload.clone(), move |event| {
                 matches!(
                     event.kind,
                     notify::EventKind::Create(_) | notify::EventKind::Modify(_)
-                ) && event.paths.iter().any(|p| p == &cfg_file)
+                ) && event.paths.iter().any(|p| files.contains(p))
             })?;
-            w.watch(&parent, RecursiveMode::NonRecursive)
-                .map_err(|e| log::warn!("config watcher: {e}"))
-                .ok()?;
-            Some(w)
+            // Watch every target dir; succeed if at least one took. (A symlinked
+            // config has two; a regular file has one.)
+            let mut watched_any = false;
+            for dir in &dirs {
+                match w.watch(dir, RecursiveMode::NonRecursive) {
+                    Ok(()) => watched_any = true,
+                    Err(e) => log::warn!("config watcher: cannot watch {dir:?}: {e}"),
+                }
+            }
+            watched_any.then_some(w)
         });
 
         if config_path.is_some() && config_watcher.is_none() {
@@ -4703,6 +4736,41 @@ mod tests {
             }
         );
         assert_eq!(warns.len(), 1);
+    }
+
+    #[test]
+    fn config_watch_targets_plain_and_symlinked() {
+        use std::path::{Path, PathBuf};
+        let link = Path::new("/home/u/.config/gitkay/config.toml");
+
+        // Plain file (no canonical): just the path + its parent dir.
+        let (files, dirs) = config_watch_targets(link, None);
+        assert_eq!(files, vec![link.to_path_buf()]);
+        assert_eq!(dirs, vec![PathBuf::from("/home/u/.config/gitkay")]);
+
+        // canonicalize returned the same path (not a symlink): no duplicates.
+        let (files, dirs) = config_watch_targets(link, Some(link.to_path_buf()));
+        assert_eq!(files.len(), 1);
+        assert_eq!(dirs.len(), 1);
+
+        // Symlink into a different dir (the dotfiles case): both files matched,
+        // both dirs watched — the target's dir is what catches a real-file edit.
+        let target = PathBuf::from("/home/u/dotfiles/gitkay/config.toml");
+        let (files, dirs) = config_watch_targets(link, Some(target.clone()));
+        assert_eq!(files, vec![link.to_path_buf(), target]);
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/home/u/.config/gitkay"),
+                PathBuf::from("/home/u/dotfiles/gitkay"),
+            ]
+        );
+
+        // Symlink to a sibling in the SAME dir: the parent dir is deduped to one.
+        let sibling = PathBuf::from("/home/u/.config/gitkay/config.real.toml");
+        let (files, dirs) = config_watch_targets(link, Some(sibling));
+        assert_eq!(files.len(), 2);
+        assert_eq!(dirs, vec![PathBuf::from("/home/u/.config/gitkay")]);
     }
 
     #[test]
