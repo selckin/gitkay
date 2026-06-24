@@ -1799,112 +1799,76 @@ fn append_body(
     }
 }
 
-/// Build the LayoutJob for one diff row plus its optional background tint.
-/// Code lines get a synthesized +/-/space gutter (drawn from `kind`, so context
-/// and changed lines share one column) then their token spans (with word-diff
-/// emphasis when on); structural lines render whole in one palette colour.
+/// Build the LayoutJob for one diff row plus its optional background tint. With
+/// `syntax` on, code lines render their token spans over the theme foreground, an
+/// accent +/-/space gutter (synthesized from `kind`, so context and changed lines
+/// share one column), and an add/del row tint. With `syntax` off the whole line
+/// takes one flat `kind_color`, the literal +/- marker is kept verbatim, and there
+/// is no row tint. Word-diff emphasis backgrounds apply either way — blended from
+/// the row tint when syntax-on, from the pane background when off. Structural
+/// (non-code) lines render whole in one palette colour in both modes.
 fn diff_row_job(
     line: &DiffLine,
     palette: &highlight::DiffPalette,
-    font_id: egui::FontId,
+    font_id: &egui::FontId,
     word_diff: bool,
+    syntax: bool,
 ) -> (egui::text::LayoutJob, Option<egui::Color32>) {
     use egui::text::{LayoutJob, TextFormat};
+    let fmt = |color| TextFormat {
+        font_id: font_id.clone(),
+        color,
+        ..Default::default()
+    };
     let mut job = LayoutJob::default();
-    if line.kind.is_code() {
+
+    // Non-code lines (hunk/file header/meta/stat) take one flat colour in both modes.
+    if !line.kind.is_code() {
+        job.append(&line.text, 0.0, fmt(kind_color(line.kind, palette)));
+        return (job, None);
+    }
+
+    // Gutter — the +/-/space diff marker.
+    if syntax {
+        // Synthesize from `kind` so context lines get a space and share the +/-
+        // column; drawn in the accent colour.
         let (glyph, glyph_color) = match line.kind {
             LineKind::Add => ("+", palette.added),
             LineKind::Del => ("-", palette.deleted),
             _ => (" ", palette.marker),
         };
-        job.append(
-            glyph,
-            0.0,
-            TextFormat {
-                font_id: font_id.clone(),
-                color: glyph_color,
-                ..Default::default()
-            },
-        );
-        // Spans hold byte ranges into `body`; a None/empty span set renders plain.
-        let spans = line.spans.as_deref().unwrap_or(&[]);
-        let emph_bg = (word_diff && !line.emphasis.is_empty()).then(|| {
-            // The patch sits on the row's own add/del tint here.
-            let tint = match line.kind {
-                LineKind::Del => palette.deleted_bg,
-                _ => palette.added_bg,
-            };
-            emphasis_bg(line.kind, palette, tint)
-        });
-        append_body(
-            &mut job,
-            &font_id,
-            line.body(),
-            spans,
-            palette.foreground,
-            &line.emphasis,
-            emph_bg,
-        );
-        let row_bg = match line.kind {
-            LineKind::Add => Some(palette.added_bg),
-            LineKind::Del => Some(palette.deleted_bg),
-            _ => None,
-        };
-        (job, row_bg)
+        job.append(glyph, 0.0, fmt(glyph_color));
     } else {
-        // Non-code lines (hunk/file header/meta/stat) take one flat colour,
-        // shared with the syntax-off render via `kind_color`.
-        job.append(
-            &line.text,
-            0.0,
-            TextFormat {
-                font_id: font_id.clone(),
-                color: kind_color(line.kind, palette),
-                ..Default::default()
-            },
-        );
-        (job, None)
+        // Keep the literal marker bytes (only Add/Del carry one) in the flat colour.
+        let marker_len = line.text.len() - line.body().len();
+        if marker_len > 0 {
+            job.append(&line.text[..marker_len], 0.0, fmt(kind_color(line.kind, palette)));
+        }
     }
-}
 
-/// Build the syntax-off (flat) row job, applying word-diff emphasis backgrounds
-/// when `word_diff` is on. Without emphasis it's a single-colour single line.
-fn flat_row_job(
-    line: &DiffLine,
-    palette: &highlight::DiffPalette,
-    font_id: &egui::FontId,
-    word_diff: bool,
-) -> egui::text::LayoutJob {
-    use egui::text::{LayoutJob, TextFormat};
-    let color = kind_color(line.kind, palette);
-    if !(word_diff && line.kind.is_code() && !line.emphasis.is_empty()) {
-        return LayoutJob::simple_singleline(line.text.clone(), font_id.clone(), color);
-    }
-    let mut job = LayoutJob::default();
-    let body = line.body();
-    let marker_len = line.text.len() - body.len();
-    if marker_len > 0 {
-        job.append(
-            &line.text[..marker_len],
-            0.0,
-            TextFormat {
-                font_id: font_id.clone(),
-                color,
-                ..Default::default()
-            },
-        );
-    }
-    append_body(
-        &mut job,
-        font_id,
-        body,
-        &[],
-        color,
-        &line.emphasis,
-        // Syntax-off draws no row tint, so the patch sits on the pane background.
-        Some(emphasis_bg(line.kind, palette, palette.background)),
-    );
-    job
+    // Body — syntax spans over the theme foreground (syntax-on) or one flat colour
+    // with no spans (syntax-off). Word-diff emphasis paints changed runs over the
+    // right backdrop: the row's own add/del tint when syntax-on, else the pane bg.
+    let (base_color, spans, backdrop): (_, &[highlight::Span], _) = if syntax {
+        let tint = match line.kind {
+            LineKind::Del => palette.deleted_bg,
+            _ => palette.added_bg,
+        };
+        // Spans hold byte ranges into body(); a None/empty span set renders plain.
+        (palette.foreground, line.spans.as_deref().unwrap_or(&[]), tint)
+    } else {
+        (kind_color(line.kind, palette), &[], palette.background)
+    };
+    let emph_bg = (word_diff && !line.emphasis.is_empty())
+        .then(|| emphasis_bg(line.kind, palette, backdrop));
+    append_body(&mut job, font_id, line.body(), spans, base_color, &line.emphasis, emph_bg);
+
+    let row_bg = match line.kind {
+        LineKind::Add if syntax => Some(palette.added_bg),
+        LineKind::Del if syntax => Some(palette.deleted_bg),
+        _ => None,
+    };
+    (job, row_bg)
 }
 
 /// Compute the set of commit indices to emphasize for `start_idx`.
@@ -3846,7 +3810,7 @@ impl eframe::App for GitkApp {
                                 },
                                 |i| {
                                     let (job, row_bg) =
-                                        diff_row_job(&lines[i], palette, font_id.clone(), word_diff);
+                                        diff_row_job(&lines[i], palette, &font_id, word_diff, true);
                                     (job, row_bg, palette.foreground)
                                 },
                             );
@@ -3866,9 +3830,13 @@ impl eframe::App for GitkApp {
                                 scroll_target,
                                 |_rows| {},
                                 |i| {
-                                    let color = kind_color(lines[i].kind, palette);
-                                    let job = flat_row_job(&lines[i], palette, &font_id, word_diff);
-                                    (job, None, color)
+                                    let (job, _) =
+                                        diff_row_job(&lines[i], palette, &font_id, word_diff, false);
+                                    // The fallback colour is only used for sections left
+                                    // at Color32::PLACEHOLDER; diff_row_job always sets an
+                                    // explicit colour, so it's never consulted — pass the
+                                    // same constant as the syntax-on path.
+                                    (job, None, palette.foreground)
                                 },
                             );
                         }
@@ -4842,8 +4810,9 @@ mod tests {
         );
         let palette = hl.palette().clone();
         let fid = egui::FontId::monospace(13.0);
-        let bg =
-            |text: &str, kind| diff_row_job(&DiffLine::new(text, kind), &palette, fid.clone(), false).1;
+        let bg = |text: &str, kind| {
+            diff_row_job(&DiffLine::new(text, kind), &palette, &fid, false, true).1
+        };
         assert_eq!(bg("+x", LineKind::Add), Some(palette.added_bg));
         assert_eq!(bg("-x", LineKind::Del), Some(palette.deleted_bg));
         assert_eq!(bg("x", LineKind::Context), None);
