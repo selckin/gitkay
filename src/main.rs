@@ -2316,6 +2316,7 @@ struct GitkApp {
     diff_ignore_ws: bool,             // ignore all whitespace in diffs (persisted)
     word_diff: bool,                  // highlight changed words within +/- lines (persisted)
     show_stats: bool,                 // show the diffstat block (config [diff].show_stats)
+    file_full_path: bool,             // show full repo-relative path in file list (config [diff].file_full_path)
     diff_toolbar_rect: Option<egui::Rect>, // last shown hover-toolbar bounds (flicker guard)
     fonts: Fonts, // resolved, clamped font settings; call .font_id(role) for a FontId
     config_path: Option<std::path::PathBuf>, // ~/.config/gitkay/config.toml (for live reload)
@@ -2456,6 +2457,7 @@ impl GitkApp {
             .unwrap_or_default();
         let syntax_enabled = cfg.diff.syntax;
         let show_stats = cfg.diff.show_stats;
+        let file_full_path = cfg.diff.file_full_path;
         let theme_slug = cfg
             .diff
             .theme
@@ -2716,6 +2718,7 @@ impl GitkApp {
             diff_ignore_ws,
             word_diff,
             show_stats,
+            file_full_path,
             diff_toolbar_rect: None,
             fonts,
             config_path,
@@ -3284,6 +3287,9 @@ impl eframe::App for GitkApp {
                             self.load_selected_diff(&repo);
                         }
                     }
+                    // Render-only: full-path display doesn't change diff data, so no
+                    // rebuild — the next repaint just draws under the new value.
+                    self.file_full_path = cfg.diff.file_full_path;
                     self.config_error_toast = warned.then(std::time::Instant::now);
                 }
                 Err(e) => {
@@ -4012,8 +4018,6 @@ impl eframe::App for GitkApp {
                                     let top = self.diff_top_line.load(Ordering::Relaxed);
                                     let current_file = file_index_at_line_opt(&self.diff_files, top);
                                     for (fi, file) in self.diff_files.iter().enumerate() {
-                                        let short_path =
-                                            file.path.rsplit('/').next().unwrap_or(&file.path);
                                         let line_idx = file.diff_line_idx;
 
                                         let (rect, resp) = ui.allocate_exact_size(
@@ -4035,52 +4039,115 @@ impl eframe::App for GitkApp {
                                             );
                                         }
 
-                                        let mut x = rect.min.x + 4.0;
+                                        let left = rect.min.x + 4.0;
+                                        let right = rect.max.x - 4.0;
                                         let cy = rect.center().y;
 
-                                        // File name first
                                         let name_color = if resp.hovered() {
                                             egui::Color32::from_rgb(220, 224, 252)
                                         } else {
                                             TEXT
                                         };
-                                        let ng = ui.painter().layout_no_wrap(
-                                            short_path.to_string(),
-                                            self.fonts.font_id(Role::FileList),
-                                            name_color,
-                                        );
-                                        ui.painter().galley(
-                                            egui::pos2(x, cy - 7.0),
-                                            ng.clone(),
-                                            name_color,
-                                        );
-                                        x += ng.size().x + 6.0;
+                                        let name_font = self.fonts.font_id(Role::FileList);
 
-                                        // Then stats
+                                        // Stat galleys (+adds / -dels). Absent for files
+                                        // with no line changes (binary/mode/pure rename).
+                                        let stats_font = self.fonts.file_stats_font_id();
+                                        let stat_gap = 3.0;
+                                        let mut stat_galleys: Vec<(
+                                            std::sync::Arc<egui::Galley>,
+                                            egui::Color32,
+                                        )> = Vec::new();
                                         if file.additions > 0 {
-                                            let g = ui.painter().layout_no_wrap(
-                                                format!("+{}", file.additions),
-                                                self.fonts.file_stats_font_id(),
+                                            stat_galleys.push((
+                                                ui.painter().layout_no_wrap(
+                                                    format!("+{}", file.additions),
+                                                    stats_font.clone(),
+                                                    GREEN,
+                                                ),
                                                 GREEN,
-                                            );
-                                            ui.painter().galley(
-                                                egui::pos2(x, cy - 6.0),
-                                                g.clone(),
-                                                GREEN,
-                                            );
-                                            x += g.size().x + 3.0;
+                                            ));
                                         }
                                         if file.deletions > 0 {
-                                            let g = ui.painter().layout_no_wrap(
-                                                format!("-{}", file.deletions),
-                                                self.fonts.file_stats_font_id(),
+                                            stat_galleys.push((
+                                                ui.painter().layout_no_wrap(
+                                                    format!("-{}", file.deletions),
+                                                    stats_font.clone(),
+                                                    RED,
+                                                ),
                                                 RED,
+                                            ));
+                                        }
+                                        let stats_w: f32 = stat_galleys
+                                            .iter()
+                                            .map(|(g, _)| g.size().x)
+                                            .sum::<f32>()
+                                            + stat_gap
+                                                * stat_galleys.len().saturating_sub(1) as f32;
+
+                                        if self.file_full_path {
+                                            // Right-align stats; left-elide the full path
+                                            // into the width that remains.
+                                            let pad =
+                                                if stat_galleys.is_empty() { 0.0 } else { 6.0 };
+                                            let path_max =
+                                                (right - left - stats_w - pad).max(0.0);
+                                            let label = left_elide(&file.path, path_max, |s| {
+                                                ui.painter()
+                                                    .layout_no_wrap(
+                                                        s.to_string(),
+                                                        name_font.clone(),
+                                                        name_color,
+                                                    )
+                                                    .size()
+                                                    .x
+                                            });
+                                            let ng = ui.painter().layout_no_wrap(
+                                                label,
+                                                name_font.clone(),
+                                                name_color,
                                             );
                                             ui.painter().galley(
-                                                egui::pos2(x, cy - 6.0),
-                                                g.clone(),
-                                                RED,
+                                                egui::pos2(left, cy - 7.0),
+                                                ng,
+                                                name_color,
                                             );
+                                            let mut sx = right - stats_w;
+                                            for (g, color) in &stat_galleys {
+                                                let w = g.size().x;
+                                                ui.painter().galley(
+                                                    egui::pos2(sx, cy - 6.0),
+                                                    g.clone(),
+                                                    *color,
+                                                );
+                                                sx += w + stat_gap;
+                                            }
+                                        } else {
+                                            // Basename, stats inline after it (original).
+                                            let short_path = file
+                                                .path
+                                                .rsplit('/')
+                                                .next()
+                                                .unwrap_or(&file.path);
+                                            let ng = ui.painter().layout_no_wrap(
+                                                short_path.to_string(),
+                                                name_font.clone(),
+                                                name_color,
+                                            );
+                                            ui.painter().galley(
+                                                egui::pos2(left, cy - 7.0),
+                                                ng.clone(),
+                                                name_color,
+                                            );
+                                            let mut x = left + ng.size().x + 6.0;
+                                            for (g, color) in &stat_galleys {
+                                                ui.painter().galley(
+                                                    egui::pos2(x, cy - 6.0),
+                                                    g.clone(),
+                                                    *color,
+                                                );
+                                                x += g.size().x + stat_gap;
+                                            }
                                         }
 
                                         if resp.clicked()
