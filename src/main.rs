@@ -929,11 +929,20 @@ struct DiffView {
     last_top_anchor: Option<usize>,
 }
 
+/// Empty rows kept below the content (diff view and file list) for breathing room, so
+/// the last line/file never sits flush against the bottom edge.
+const BOTTOM_PAD_ROWS: usize = 2;
+
+/// Height of one file-list row, in points. The file list allocates each entry at this
+/// height and sizes its bottom breathing-room padding from it, so both must agree.
+const FILE_ROW_H: f32 = 18.0;
+
 /// Bottom-padding rows for the diff so the deepest file (`last_top_anchor`, its start
 /// line) can scroll to the top of a `viewport_rows`-tall viewport: only the rows that
-/// file leaves short of a screenful, so a last file that already fills the viewport
-/// gets none (no dead scroll space). `None` ⇒ no files ⇒ no padding. Pure (no egui),
-/// so the off-by-one-prone arithmetic is unit-testable.
+/// file leaves short of a screenful, so a last file that already fills the viewport gets
+/// none from this function. (The caller then floors the result at `BOTTOM_PAD_ROWS` for
+/// breathing room, so the rendered padding is never actually zero.) `None` ⇒ no files ⇒
+/// no padding. Pure (no egui), so the off-by-one-prone arithmetic is unit-testable.
 fn diff_pad_rows(n_lines: usize, last_top_anchor: Option<usize>, viewport_rows: usize) -> usize {
     last_top_anchor.map_or(0, |anchor| {
         viewport_rows.saturating_sub(n_lines.saturating_sub(anchor))
@@ -955,7 +964,10 @@ fn show_virtualized_diff(
     // up the final screenful, so the last files can never sit at the top (nor be
     // highlighted in the file list, which tracks the top line). See diff_pad_rows.
     let viewport_rows = (ui.available_height() / row_h).ceil() as usize;
-    let total_rows = n_lines + diff_pad_rows(n_lines, last_top_anchor, viewport_rows);
+    // At least BOTTOM_PAD_ROWS empty rows of breathing room, even when the last file
+    // already fills the viewport (diff_pad_rows would be 0).
+    let pad = diff_pad_rows(n_lines, last_top_anchor, viewport_rows).max(BOTTOM_PAD_ROWS);
+    let total_rows = n_lines + pad;
     let mut scroll = egui::ScrollArea::both()
         .id_salt("diff_scroll")
         .auto_shrink([false, false])
@@ -3871,7 +3883,7 @@ impl eframe::App for GitkApp {
                                         let line_idx = file.diff_line_idx;
 
                                         let (rect, resp) = ui.allocate_exact_size(
-                                            egui::vec2(ui.available_width(), 18.0),
+                                            egui::vec2(ui.available_width(), FILE_ROW_H),
                                             egui::Sense::click(),
                                         );
 
@@ -3946,6 +3958,9 @@ impl eframe::App for GitkApp {
                                             resp.show_tooltip_text(&file.path);
                                         }
                                     }
+                                    // Breathing room so the last file isn't flush
+                                    // against the bottom edge.
+                                    ui.add_space(BOTTOM_PAD_ROWS as f32 * FILE_ROW_H);
                                 });
                         });
                     // Only persist the width on an actual resize-drag, not when
