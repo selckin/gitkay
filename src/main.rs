@@ -11,7 +11,7 @@ mod cli;
 mod config;
 mod diff_cache;
 mod highlight;
-use config::{Fonts, Role};
+use config::{FileListLayout, Fonts, Role};
 use diff_cache::DiffCache;
 use highlight::{DiffBg, HighlightLines, Highlighter};
 
@@ -190,6 +190,120 @@ fn left_elide(path: &str, max_width: f32, measure: impl Fn(&str) -> f32) -> Stri
         "…".to_string()
     } else {
         cand(best)
+    }
+}
+
+/// Like `left_elide` but keeps the START of `s` and drops the tail with a
+/// trailing "…". For labels (basenames) whose distinguishing part is the front,
+/// where dropping the leading chars would hide what tells two files apart.
+fn right_elide(s: &str, max_width: f32, measure: impl Fn(&str) -> f32) -> String {
+    if measure(s) <= max_width {
+        return s.to_string();
+    }
+    // Byte offset where each char starts, so a kept prefix slices on a char boundary.
+    let offsets: Vec<usize> = s.char_indices().map(|(i, _)| i).collect();
+    let n = offsets.len();
+    // Candidate keeping the first `k` chars (1..=n-1): s[..offsets[k]] + "…".
+    let cand = |k: usize| format!("{}…", &s[..offsets[k]]);
+    let mut best = 0usize;
+    let (mut lo, mut hi) = (1usize, n.saturating_sub(1));
+    while lo <= hi {
+        let mid = (lo + hi) / 2; // lo >= 1 => mid >= 1, so `mid - 1` never underflows
+        if measure(&cand(mid)) <= max_width {
+            best = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    if best == 0 {
+        "…".to_string()
+    } else {
+        cand(best)
+    }
+}
+
+/// One rendered row of the file-list sidebar.
+enum FileListRow {
+    /// A directory header (grouped layout only); the full dir path with trailing `/`.
+    Header(String),
+    /// A file row. `idx` indexes `diff_files`; `label` is what to draw.
+    File {
+        idx: usize,
+        label: String,
+        indented: bool,
+    },
+}
+
+/// Split a path into (directory-with-trailing-slash, basename). The directory is
+/// "" for a root-level file. Slices only at an ASCII `/`, so multibyte-safe.
+fn split_dir(path: &str) -> (&str, &str) {
+    match path.rfind('/') {
+        Some(i) => (&path[..=i], &path[i + 1..]),
+        None => ("", path),
+    }
+}
+
+/// Turn the diff's file paths into render rows for the given layout.
+/// `Name`/`Full` are flat (diff order); `Grouped` groups files by directory —
+/// one header per directory (alphabetical, parents before children), basenames
+/// indented underneath, with root-level files listed last without a header.
+fn build_file_rows(paths: &[&str], layout: FileListLayout) -> Vec<FileListRow> {
+    match layout {
+        FileListLayout::Name => paths
+            .iter()
+            .enumerate()
+            .map(|(idx, p)| FileListRow::File {
+                idx,
+                label: split_dir(p).1.to_string(),
+                indented: false,
+            })
+            .collect(),
+        FileListLayout::Full => paths
+            .iter()
+            .enumerate()
+            .map(|(idx, p)| FileListRow::File {
+                idx,
+                label: p.to_string(),
+                indented: false,
+            })
+            .collect(),
+        FileListLayout::Grouped => {
+            // Group file indices by directory so each directory gets exactly one
+            // header. (Sorting by full path alone would let a subdirectory's paths
+            // interleave a parent's files and re-emit the header.) BTreeMap keys
+            // sort directories alphabetically, parents before children; root files
+            // ("") are split out and emitted last, headerless.
+            let mut by_dir: std::collections::BTreeMap<&str, Vec<usize>> =
+                std::collections::BTreeMap::new();
+            for (idx, p) in paths.iter().enumerate() {
+                by_dir.entry(split_dir(p).0).or_default().push(idx);
+            }
+            let root = by_dir.remove("");
+            let mut rows = Vec::with_capacity(paths.len() + by_dir.len());
+            for (dir, mut idxs) in by_dir {
+                idxs.sort_by(|&a, &b| split_dir(paths[a]).1.cmp(split_dir(paths[b]).1));
+                rows.push(FileListRow::Header(dir.to_string()));
+                for idx in idxs {
+                    rows.push(FileListRow::File {
+                        idx,
+                        label: split_dir(paths[idx]).1.to_string(),
+                        indented: true,
+                    });
+                }
+            }
+            if let Some(mut idxs) = root {
+                idxs.sort_by(|&a, &b| paths[a].cmp(paths[b]));
+                for idx in idxs {
+                    rows.push(FileListRow::File {
+                        idx,
+                        label: split_dir(paths[idx]).1.to_string(),
+                        indented: false,
+                    });
+                }
+            }
+            rows
+        }
     }
 }
 
@@ -999,6 +1113,12 @@ const BOTTOM_PAD_ROWS: usize = 2;
 /// Height of one file-list row, in points. The file list allocates each entry at this
 /// height and sizes its bottom breathing-room padding from it, so both must agree.
 const FILE_ROW_H: f32 = 18.0;
+/// Indent of a file row under its directory header in the grouped file list.
+const FILE_INDENT: f32 = 12.0;
+
+/// Minimum width of the file-list sidebar; also the floor for its max width so a
+/// narrow window can't let the sidebar starve the diff strip.
+const FILE_LIST_MIN_W: f32 = 140.0;
 
 /// Bottom-padding rows for the diff so the deepest file (`last_top_anchor`, its start
 /// line) can scroll to the top of a `viewport_rows`-tall viewport: only the rows that
@@ -2295,6 +2415,7 @@ struct GitkApp {
     selected: Option<usize>,
     diff_lines: Vec<DiffLine>,
     diff_files: Vec<FileEntry>,
+    file_rows: Vec<FileListRow>, // cached file-list rows; rebuilt when diff_files or file_list changes
     diff_scroll_to: Option<usize>,
     diff_top_line: Arc<AtomicUsize>, // first visible diff line (set each frame in on_visible) — for page-by-file nav
     diff_visible_rows: Arc<AtomicUsize>, // visible diff rows (set each frame in on_visible) — for Space page-scroll
@@ -2316,7 +2437,7 @@ struct GitkApp {
     diff_ignore_ws: bool,             // ignore all whitespace in diffs (persisted)
     word_diff: bool,                  // highlight changed words within +/- lines (persisted)
     show_stats: bool,                 // show the diffstat block (config [diff].show_stats)
-    file_full_path: bool,             // show full repo-relative path in file list (config [diff].file_full_path)
+    file_list: FileListLayout,        // file-list sidebar layout (config [diff].file_list)
     diff_toolbar_rect: Option<egui::Rect>, // last shown hover-toolbar bounds (flicker guard)
     fonts: Fonts, // resolved, clamped font settings; call .font_id(role) for a FontId
     config_path: Option<std::path::PathBuf>, // ~/.config/gitkay/config.toml (for live reload)
@@ -2457,7 +2578,7 @@ impl GitkApp {
             .unwrap_or_default();
         let syntax_enabled = cfg.diff.syntax;
         let show_stats = cfg.diff.show_stats;
-        let file_full_path = cfg.diff.file_full_path;
+        let file_list = cfg.diff.file_list;
         let theme_slug = cfg
             .diff
             .theme
@@ -2691,12 +2812,18 @@ impl GitkApp {
             None
         };
 
+        let file_rows = build_file_rows(
+            &diff_files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            file_list,
+        );
+
         Ok(Self {
             commits,
             graph_rows,
             selected: Some(0),
             diff_lines,
             diff_files,
+            file_rows,
             diff_scroll_to: None,
             diff_top_line: Arc::new(AtomicUsize::new(0)),
             diff_visible_rows: Arc::new(AtomicUsize::new(1)),
@@ -2718,7 +2845,7 @@ impl GitkApp {
             diff_ignore_ws,
             word_diff,
             show_stats,
-            file_full_path,
+            file_list,
             diff_toolbar_rect: None,
             fonts,
             config_path,
@@ -2903,6 +3030,7 @@ impl GitkApp {
             self.diff_files.clear();
             self.current_diff_key = None;
         }
+        self.rebuild_file_rows();
         self.diff_max_chars = max_line_chars(&self.diff_lines);
         self.invalidate_diff_highlight();
     }
@@ -3150,6 +3278,138 @@ impl GitkApp {
         }
         self.diff_scroll_to = Some(0); // new commit → reset diff view to top
     }
+
+    /// Recompute the cached file-list rows. Call after `diff_files` or
+    /// `file_list` changes — the rows are otherwise static between commit
+    /// selections, and the sidebar isn't virtualized, so the draw loop reads this
+    /// cache instead of rebuilding (and re-sorting) every frame.
+    fn rebuild_file_rows(&mut self) {
+        let paths: Vec<&str> = self.diff_files.iter().map(|f| f.path.as_str()).collect();
+        self.file_rows = build_file_rows(&paths, self.file_list);
+    }
+
+    /// One non-interactive directory-header row in the grouped file list.
+    fn draw_dir_header(&self, ui: &mut egui::Ui, dir: &str) {
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), FILE_ROW_H),
+            egui::Sense::hover(),
+        );
+        let left = rect.min.x + 4.0;
+        let right = rect.max.x - 4.0;
+        let cy = rect.center().y;
+        let font = self.fonts.font_id(Role::FileList);
+        let label = left_elide(dir, (right - left).max(0.0), |s| {
+            ui.painter()
+                .layout_no_wrap(s.to_string(), font.clone(), SUBTEXT)
+                .size()
+                .x
+        });
+        let g = ui.painter().layout_no_wrap(label, font.clone(), SUBTEXT);
+        ui.painter().galley(egui::pos2(left, cy - 7.0), g, SUBTEXT);
+    }
+
+    /// One file row: `label` at `indent`, with right-aligned `+/-` stats,
+    /// current-file accent, hover highlight, and full-path tooltip. The label is
+    /// elided to fit the space before the stats — from the front (`elide_left`,
+    /// for full paths, keeping the filename) or from the back (basenames, keeping
+    /// the name's start). Returns the diff line to scroll to if the row was
+    /// clicked, so the caller (not this `&self` method) does the scroll write.
+    fn draw_file_row(
+        &self,
+        ui: &mut egui::Ui,
+        idx: usize,
+        label: &str,
+        indent: f32,
+        elide_left: bool,
+        current_file: Option<usize>,
+    ) -> Option<usize> {
+        let additions = self.diff_files[idx].additions;
+        let deletions = self.diff_files[idx].deletions;
+        let line_idx = self.diff_files[idx].diff_line_idx;
+
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), FILE_ROW_H),
+            egui::Sense::click(),
+        );
+
+        if current_file == Some(idx) {
+            ui.painter().rect_filled(rect, 2.0, select_accent());
+        } else if resp.hovered() {
+            ui.painter().rect_filled(
+                rect,
+                2.0,
+                egui::Color32::from_rgba_unmultiplied(203, 166, 247, 20),
+            );
+        }
+
+        let left = rect.min.x + 4.0 + indent;
+        let right = rect.max.x - 4.0;
+        let cy = rect.center().y;
+
+        let name_color = if resp.hovered() {
+            egui::Color32::from_rgb(220, 224, 252)
+        } else {
+            TEXT
+        };
+        let name_font = self.fonts.font_id(Role::FileList);
+
+        // Stats (+adds / -dels), right-aligned. Two optionals instead of a Vec to
+        // avoid a per-row heap allocation (this list isn't virtualized).
+        let stats_font = self.fonts.file_stats_font_id();
+        let stat_gap = 3.0;
+        let add_galley = (additions > 0).then(|| {
+            ui.painter()
+                .layout_no_wrap(format!("+{additions}"), stats_font.clone(), GREEN)
+        });
+        let del_galley = (deletions > 0).then(|| {
+            ui.painter()
+                .layout_no_wrap(format!("-{deletions}"), stats_font.clone(), RED)
+        });
+        let add_w = add_galley.as_ref().map_or(0.0, |g| g.size().x);
+        let del_w = del_galley.as_ref().map_or(0.0, |g| g.size().x);
+        let inner_gap = if add_galley.is_some() && del_galley.is_some() {
+            stat_gap
+        } else {
+            0.0
+        };
+        let stats_w = add_w + del_w + inner_gap;
+        let pad = if add_galley.is_some() || del_galley.is_some() {
+            6.0
+        } else {
+            0.0
+        };
+
+        // Label, elided into the width left of the stats.
+        let label_max = (right - left - stats_w - pad).max(0.0);
+        let measure = |s: &str| {
+            ui.painter()
+                .layout_no_wrap(s.to_string(), name_font.clone(), name_color)
+                .size()
+                .x
+        };
+        let elided = if elide_left {
+            left_elide(label, label_max, measure)
+        } else {
+            right_elide(label, label_max, measure)
+        };
+        let g = ui.painter().layout_no_wrap(elided, name_font.clone(), name_color);
+        ui.painter().galley(egui::pos2(left, cy - 7.0), g, name_color);
+
+        // Stats flush-right.
+        let mut sx = right - stats_w;
+        if let Some(g) = add_galley {
+            ui.painter().galley(egui::pos2(sx, cy - 6.0), g, GREEN);
+            sx += add_w + stat_gap;
+        }
+        if let Some(g) = del_galley {
+            ui.painter().galley(egui::pos2(sx, cy - 6.0), g, RED);
+        }
+
+        if resp.hovered() {
+            resp.show_tooltip_text(&self.diff_files[idx].path);
+        }
+        if resp.clicked() { line_idx } else { None }
+    }
 }
 
 impl eframe::App for GitkApp {
@@ -3287,9 +3547,12 @@ impl eframe::App for GitkApp {
                             self.load_selected_diff(&repo);
                         }
                     }
-                    // Render-only: full-path display doesn't change diff data, so no
-                    // rebuild — the next repaint just draws under the new value.
-                    self.file_full_path = cfg.diff.file_full_path;
+                    // Render-only: the file-list layout doesn't change diff data, so
+                    // no diff rebuild — just recompute the cached rows when it changes.
+                    if self.file_list != cfg.diff.file_list {
+                        self.file_list = cfg.diff.file_list;
+                        self.rebuild_file_rows();
+                    }
                     self.config_error_toast = warned.then(std::time::Instant::now);
                 }
                 Err(e) => {
@@ -3996,15 +4259,15 @@ impl eframe::App for GitkApp {
                 if !self.diff_files.is_empty() {
                     let saved_w = self.file_list_width;
                     // Let the sidebar grow with the window — up to all but a readable
-                    // ~300px strip for the diff — so full paths have room on wide
-                    // screens, while never dropping below the old 400px cap on narrow
-                    // ones. `ui` here still spans the whole diff region (the diff's
-                    // central panel is carved out after this right panel).
-                    let max_w = (ui.available_width() - 300.0).max(400.0);
+                    // ~300px strip for the diff — so paths have room on wide screens.
+                    // Floor at the panel min (not 400) so the diff keeps its strip on
+                    // narrow windows too. `ui` here still spans the whole diff region
+                    // (the diff's central panel is carved out after this right panel).
+                    let max_w = (ui.available_width() - 300.0).max(FILE_LIST_MIN_W);
                     let file_panel = egui::Panel::right("file_list_panel")
                         .resizable(true)
                         .default_size(saved_w)
-                        .min_size(140.0)
+                        .min_size(FILE_LIST_MIN_W)
                         .max_size(max_w)
                         .frame(egui::Frame::NONE)
                         .show_inside(ui, |ui| {
@@ -4022,148 +4285,40 @@ impl eframe::App for GitkApp {
                                     // with the same accent the commit list uses for the
                                     // selected row, so the list tracks the diff view.
                                     let top = self.diff_top_line.load(Ordering::Relaxed);
-                                    let current_file = file_index_at_line_opt(&self.diff_files, top);
-                                    for (fi, file) in self.diff_files.iter().enumerate() {
-                                        let line_idx = file.diff_line_idx;
-
-                                        let (rect, resp) = ui.allocate_exact_size(
-                                            egui::vec2(ui.available_width(), FILE_ROW_H),
-                                            egui::Sense::click(),
-                                        );
-
-                                        // Current-file accent (same as the commit-list
-                                        // selection); hover highlight for the rest.
-                                        if current_file == Some(fi) {
-                                            ui.painter().rect_filled(rect, 2.0, select_accent());
-                                        } else if resp.hovered() {
-                                            ui.painter().rect_filled(
-                                                rect,
-                                                2.0,
-                                                egui::Color32::from_rgba_unmultiplied(
-                                                    203, 166, 247, 20,
-                                                ),
-                                            );
-                                        }
-
-                                        let left = rect.min.x + 4.0;
-                                        let right = rect.max.x - 4.0;
-                                        let cy = rect.center().y;
-
-                                        let name_color = if resp.hovered() {
-                                            egui::Color32::from_rgb(220, 224, 252)
-                                        } else {
-                                            TEXT
-                                        };
-                                        let name_font = self.fonts.font_id(Role::FileList);
-
-                                        // Stat galleys (+adds / -dels). Absent for files
-                                        // with no line changes (binary/mode/pure rename).
-                                        let stats_font = self.fonts.file_stats_font_id();
-                                        let stat_gap = 3.0;
-                                        let mut stat_galleys: Vec<(
-                                            std::sync::Arc<egui::Galley>,
-                                            egui::Color32,
-                                        )> = Vec::new();
-                                        if file.additions > 0 {
-                                            stat_galleys.push((
-                                                ui.painter().layout_no_wrap(
-                                                    format!("+{}", file.additions),
-                                                    stats_font.clone(),
-                                                    GREEN,
-                                                ),
-                                                GREEN,
-                                            ));
-                                        }
-                                        if file.deletions > 0 {
-                                            stat_galleys.push((
-                                                ui.painter().layout_no_wrap(
-                                                    format!("-{}", file.deletions),
-                                                    stats_font.clone(),
-                                                    RED,
-                                                ),
-                                                RED,
-                                            ));
-                                        }
-                                        let stats_w: f32 = stat_galleys
-                                            .iter()
-                                            .map(|(g, _)| g.size().x)
-                                            .sum::<f32>()
-                                            + stat_gap
-                                                * stat_galleys.len().saturating_sub(1) as f32;
-
-                                        if self.file_full_path {
-                                            // Right-align stats; left-elide the full path
-                                            // into the width that remains.
-                                            let pad =
-                                                if stat_galleys.is_empty() { 0.0 } else { 6.0 };
-                                            let path_max =
-                                                (right - left - stats_w - pad).max(0.0);
-                                            let label = left_elide(&file.path, path_max, |s| {
-                                                ui.painter()
-                                                    .layout_no_wrap(
-                                                        s.to_string(),
-                                                        name_font.clone(),
-                                                        name_color,
-                                                    )
-                                                    .size()
-                                                    .x
-                                            });
-                                            let ng = ui.painter().layout_no_wrap(
+                                    let current_file =
+                                        file_index_at_line_opt(&self.diff_files, top);
+                                    // Full mode draws full paths (elide from the front,
+                                    // keeping the filename); grouped/name draw basenames
+                                    // (elide from the back, keeping the name's start).
+                                    let elide_left = self.file_list == FileListLayout::Full;
+                                    let mut scroll_to: Option<usize> = None;
+                                    for row in &self.file_rows {
+                                        match row {
+                                            FileListRow::Header(dir) => {
+                                                self.draw_dir_header(ui, dir)
+                                            }
+                                            FileListRow::File {
+                                                idx,
                                                 label,
-                                                name_font.clone(),
-                                                name_color,
-                                            );
-                                            ui.painter().galley(
-                                                egui::pos2(left, cy - 7.0),
-                                                ng,
-                                                name_color,
-                                            );
-                                            let mut sx = right - stats_w;
-                                            for (g, color) in &stat_galleys {
-                                                let w = g.size().x;
-                                                ui.painter().galley(
-                                                    egui::pos2(sx, cy - 6.0),
-                                                    g.clone(),
-                                                    *color,
-                                                );
-                                                sx += w + stat_gap;
-                                            }
-                                        } else {
-                                            // Basename, stats inline after it (original).
-                                            let short_path = file
-                                                .path
-                                                .rsplit('/')
-                                                .next()
-                                                .unwrap_or(&file.path);
-                                            let ng = ui.painter().layout_no_wrap(
-                                                short_path.to_string(),
-                                                name_font.clone(),
-                                                name_color,
-                                            );
-                                            ui.painter().galley(
-                                                egui::pos2(left, cy - 7.0),
-                                                ng.clone(),
-                                                name_color,
-                                            );
-                                            let mut x = left + ng.size().x + 6.0;
-                                            for (g, color) in &stat_galleys {
-                                                ui.painter().galley(
-                                                    egui::pos2(x, cy - 6.0),
-                                                    g.clone(),
-                                                    *color,
-                                                );
-                                                x += g.size().x + stat_gap;
+                                                indented,
+                                            } => {
+                                                let indent =
+                                                    if *indented { FILE_INDENT } else { 0.0 };
+                                                if let Some(li) = self.draw_file_row(
+                                                    ui,
+                                                    *idx,
+                                                    label,
+                                                    indent,
+                                                    elide_left,
+                                                    current_file,
+                                                ) {
+                                                    scroll_to = Some(li);
+                                                }
                                             }
                                         }
-
-                                        if resp.clicked()
-                                            && let Some(idx) = line_idx
-                                        {
-                                            self.diff_scroll_to = Some(idx);
-                                        }
-                                        if resp.hovered() {
-                                            resp.show_tooltip_text(&file.path);
-                                        }
+                                    }
+                                    if let Some(li) = scroll_to {
+                                        self.diff_scroll_to = Some(li);
                                     }
                                     // Breathing room so the last file isn't flush
                                     // against the bottom edge.
@@ -6162,6 +6317,98 @@ mod tests {
     }
 
     #[test]
+    fn build_file_rows_name_mode_is_flat_basenames() {
+        let paths = ["src/a.rs", "b.rs"];
+        let rows = build_file_rows(&paths, FileListLayout::Name);
+        let desc: Vec<String> = rows.iter().map(row_desc).collect();
+        assert_eq!(desc, vec!["F:0:a.rs:false", "F:1:b.rs:false"]);
+    }
+
+    #[test]
+    fn build_file_rows_full_mode_is_flat_full_paths() {
+        let paths = ["src/a.rs", "b.rs"];
+        let rows = build_file_rows(&paths, FileListLayout::Full);
+        let desc: Vec<String> = rows.iter().map(row_desc).collect();
+        assert_eq!(desc, vec!["F:0:src/a.rs:false", "F:1:b.rs:false"]);
+    }
+
+    #[test]
+    fn build_file_rows_grouped_sorts_and_headers() {
+        // Diff order is unsorted; grouped groups by directory (alphabetical,
+        // parents before children) with root files last.
+        let paths = [
+            "src/main/java/com/acme/Foo.java", // 0
+            "src/main/java/com/acme/Bar.java", // 1
+            "src/test/java/com/acme/FooTest.java", // 2
+            "docs/guide.md", // 3
+            "README.md", // 4
+        ];
+        let rows = build_file_rows(&paths, FileListLayout::Grouped);
+        let desc: Vec<String> = rows.iter().map(row_desc).collect();
+        assert_eq!(
+            desc,
+            vec![
+                "H:docs/",
+                "F:3:guide.md:true",
+                "H:src/main/java/com/acme/",
+                "F:1:Bar.java:true",    // Bar sorts before Foo
+                "F:0:Foo.java:true",
+                "H:src/test/java/com/acme/",
+                "F:2:FooTest.java:true",
+                "F:4:README.md:false",  // root, no header, last
+            ]
+        );
+    }
+
+    #[test]
+    fn build_file_rows_grouped_dir_with_subdir_emits_one_header() {
+        // A directory with both direct files and a subdirectory must emit its
+        // header exactly once with all its direct files under it — sorting by full
+        // path alone would interleave the subdir between b.rs and d.rs and re-emit
+        // the "a/" header.
+        let paths = ["a/b.rs", "a/c/x.rs", "a/d.rs"];
+        let rows = build_file_rows(&paths, FileListLayout::Grouped);
+        let desc: Vec<String> = rows.iter().map(row_desc).collect();
+        assert_eq!(
+            desc,
+            vec![
+                "H:a/",
+                "F:0:b.rs:true",
+                "F:2:d.rs:true",
+                "H:a/c/",
+                "F:1:x.rs:true",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_file_rows_grouped_root_only_has_no_headers() {
+        let paths = ["b.txt", "a.txt"];
+        let rows = build_file_rows(&paths, FileListLayout::Grouped);
+        let desc: Vec<String> = rows.iter().map(row_desc).collect();
+        // Sorted: a.txt (idx 1) then b.txt (idx 0); no headers.
+        assert_eq!(desc, vec!["F:1:a.txt:false", "F:0:b.txt:false"]);
+    }
+
+    #[test]
+    fn build_file_rows_grouped_multibyte_dir() {
+        let paths = ["α/β.rs", "α/γ.rs"];
+        let rows = build_file_rows(&paths, FileListLayout::Grouped);
+        assert!(matches!(&rows[0], FileListRow::Header(d) if d == "α/"));
+        assert_eq!(rows.len(), 3); // header + 2 files
+    }
+
+    /// Compact one row to a string for assertions.
+    fn row_desc(r: &FileListRow) -> String {
+        match r {
+            FileListRow::Header(d) => format!("H:{d}"),
+            FileListRow::File { idx, label, indented } => {
+                format!("F:{idx}:{label}:{indented}")
+            }
+        }
+    }
+
+    #[test]
     fn left_elide_keeps_short_path() {
         assert_eq!(left_elide("a/b/c", 10.0, char_count), "a/b/c");
     }
@@ -6186,5 +6433,33 @@ mod tests {
         let out = left_elide("αβ/γδ/εζ.rs", 5.0, char_count);
         assert!(out.starts_with('…'));
         assert!(char_count(&out) <= 5.0);
+    }
+
+    #[test]
+    fn right_elide_keeps_short_name() {
+        assert_eq!(right_elide("file.rs", 10.0, char_count), "file.rs");
+    }
+
+    #[test]
+    fn right_elide_truncates_from_back() {
+        // "VeryLongName.tsx" is 16 chars; budget 6 keeps the first 5 + "…",
+        // preserving the distinguishing START of the name.
+        let out = right_elide("VeryLongName.tsx", 6.0, char_count);
+        assert_eq!(out, "VeryL…");
+        assert!(out.ends_with('…'));
+        assert!(char_count(&out) <= 6.0);
+    }
+
+    #[test]
+    fn right_elide_degenerate_returns_ellipsis() {
+        assert_eq!(right_elide("abc", 0.5, char_count), "…");
+    }
+
+    #[test]
+    fn right_elide_multibyte_no_panic() {
+        // Multibyte chars must be trimmed on char boundaries, never mid-byte.
+        let out = right_elide("αβγδε.rs", 4.0, char_count);
+        assert!(out.ends_with('…'));
+        assert!(char_count(&out) <= 4.0);
     }
 }

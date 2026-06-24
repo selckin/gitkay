@@ -111,6 +111,19 @@ pub struct BandsSection {
     pub(crate) deleted: Option<String>,
 }
 
+/// File-list sidebar layout (`[diff] file_list`).
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FileListLayout {
+    /// Group files under directory headers, basenames indented underneath.
+    #[default]
+    Grouped,
+    /// Flat list, each row the full repo-relative path.
+    Full,
+    /// Flat list, basenames only.
+    Name,
+}
+
 /// `[diff]` — diff-pane rendering options.
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -121,9 +134,9 @@ pub struct DiffSection {
     /// Show the diffstat block (per-file change list + summary) between the commit
     /// message and the patch. The file-list sidebar is independent and always shown.
     pub(crate) show_stats: bool,
-    /// Show each changed file's full repo-relative path in the file-list sidebar
-    /// instead of just its basename. Long paths are left-truncated with a leading "…".
-    pub(crate) file_full_path: bool,
+    /// File-list sidebar layout: grouped under directory headers, flat full
+    /// paths, or flat basenames.
+    pub(crate) file_list: FileListLayout,
     /// Highlight theme slug (see `default_template()` for valid slugs). None ⇒ default.
     pub(crate) theme: Option<String>,
     pub(crate) bands: BandsSection,
@@ -134,7 +147,7 @@ impl Default for DiffSection {
         Self {
             syntax: true,
             show_stats: true,
-            file_full_path: true,
+            file_list: FileListLayout::Grouped,
             theme: None,
             bands: BandsSection::default(),
         }
@@ -271,9 +284,10 @@ fn default_template() -> String {
          # commit message and the patch. false = hide it; the file-list sidebar\n\
          # still lists every changed file.\n\
          # show_stats = true\n\
-         # Show each changed file's full repo-relative path in the file-list\n\
-         # sidebar instead of just its name. Long paths are left-truncated.\n\
-         # file_full_path = true\n\
+         # File-list sidebar layout. \"grouped\" (default) groups files under\n\
+         # directory headers with basenames indented; \"full\" shows each file's\n\
+         # full repo-relative path; \"name\" shows just basenames.\n\
+         # file_list = \"grouped\"\n\
          # Syntax-highlight diffs. false = the original flat per-role coloring.\n\
          # syntax = true\n\
          # Diff syntax-highlighting theme. Any of:\n\
@@ -591,9 +605,18 @@ mod tests {
     }
 
     #[test]
-    fn diff_file_full_path_parses_off() {
-        let cfg: Config = toml::from_str("[diff]\nfile_full_path = false\n").unwrap();
-        assert!(!cfg.diff.file_full_path);
+    fn diff_file_list_parses_each_value() {
+        let g: Config = toml::from_str("[diff]\nfile_list = \"grouped\"\n").unwrap();
+        assert_eq!(g.diff.file_list, FileListLayout::Grouped);
+        let f: Config = toml::from_str("[diff]\nfile_list = \"full\"\n").unwrap();
+        assert_eq!(f.diff.file_list, FileListLayout::Full);
+        let n: Config = toml::from_str("[diff]\nfile_list = \"name\"\n").unwrap();
+        assert_eq!(n.diff.file_list, FileListLayout::Name);
+    }
+
+    #[test]
+    fn diff_file_list_invalid_is_a_parse_error() {
+        assert!(toml::from_str::<Config>("[diff]\nfile_list = \"tree\"\n").is_err());
     }
 
     #[test]
@@ -602,7 +625,7 @@ mod tests {
         assert_eq!(cfg.diff.theme, None);
         assert!(cfg.diff.syntax); // default on
         assert!(cfg.diff.show_stats); // default on
-        assert!(cfg.diff.file_full_path); // default on
+        assert_eq!(cfg.diff.file_list, FileListLayout::Grouped); // default
         assert_eq!(cfg.diff.bands.source, BandSource::Fixed);
         assert_eq!(cfg.diff.bands.added, None);
     }
