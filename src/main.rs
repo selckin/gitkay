@@ -2851,6 +2851,22 @@ impl GitkApp {
         let previous_index = self.selected;
 
         self.commits = load_history(repo, count, &self.scope);
+        self.resync_commits(count, preferred_oid, previous_oid, previous_index);
+    }
+
+    /// Rebuild everything derived from a freshly-(re)assigned `self.commits`: the
+    /// graph layout, the `all_loaded` flag (vs the requested `count`), search
+    /// matches, and the restored selection + branch highlight. Selection re-anchors
+    /// to `preferred_oid`, else the previously-selected commit (by oid for normal
+    /// history; by index for reflog, where oids repeat), else row 0. Shared by the
+    /// full reload and the lazy-load tail-extension so both stay in sync.
+    fn resync_commits(
+        &mut self,
+        count: usize,
+        preferred_oid: Option<git2::Oid>,
+        previous_oid: Option<git2::Oid>,
+        previous_index: Option<usize>,
+    ) {
         self.graph_rows = layout_graph(&self.commits);
         self.all_loaded = self.commits.len() < count;
         self.refresh_search_matches();
@@ -3555,19 +3571,24 @@ impl eframe::App for GitkApp {
                             ui.allocate_space(egui::vec2(0.0, remaining));
                         }
 
-                        // Lazy load: when near the bottom, load more commits
+                        // Lazy load: when near the bottom, load more commits. Route
+                        // through resync_commits (same as a full reload) so search
+                        // matches, the selection, and branch highlight track the new
+                        // list — the load is normally a superset, but virtual rows /
+                        // ref changes can shift or shrink it, so the indices must be
+                        // re-anchored rather than carried over blindly.
                         if !self.all_loaded
                             && last_row + 50 >= num_commits
                             && let Ok(repo) = Repository::discover(&self.repo_path)
                         {
+                            let previous_oid =
+                                self.selected.and_then(|i| self.commits.get(i)).map(|c| c.oid);
+                            let previous_index = self.selected;
                             let requested = self.commits.len() + 500;
-                            let more = load_history(&repo, requested, &self.scope);
-                            // Fewer than we asked for ⇒ the source is exhausted. (The
-                            // old `more.len() <= prev_len` check never fired for a
-                            // reflog that grew, forcing one redundant rebuild.)
-                            self.all_loaded = more.len() < requested;
-                            self.commits = more;
-                            self.graph_rows = layout_graph(&self.commits);
+                            self.commits = load_history(&repo, requested, &self.scope);
+                            // all_loaded is set inside resync (commits.len() < requested):
+                            // fewer than asked ⇒ source exhausted.
+                            self.resync_commits(requested, None, previous_oid, previous_index);
                         }
                     });
             });
