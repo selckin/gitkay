@@ -1286,6 +1286,20 @@ fn file_index_at_line(files: &[FileEntry], line: usize) -> usize {
         .map_or(0, |(i, _)| i)
 }
 
+/// The diff line to scroll to for a page-by-file step, given `top` (the first visible
+/// line): when `down`, the next file's start strictly below `top`; otherwise the
+/// nearest file start strictly above `top` (so paging up from inside a file lands on
+/// its own header first, then the previous file's). None when there's no file in that
+/// direction. File starts come from `file_line_ranges` (sorted, body-bearing files).
+fn next_file_line(files: &[FileEntry], total_lines: usize, top: usize, down: bool) -> Option<usize> {
+    let starts = file_line_ranges(files, total_lines).into_iter().map(|(_, s, _)| s);
+    if down {
+        starts.filter(|&s| s > top).min()
+    } else {
+        starts.filter(|&s| s < top).max()
+    }
+}
+
 /// Tokenize lines `[start, end)` into `(line index, spans)` updates, advancing
 /// the per-file highlight `state`. Structural lines are skipped.
 fn tokenize_range(
@@ -2163,6 +2177,8 @@ struct GitkApp {
     diff_lines: Vec<DiffLine>,
     diff_files: Vec<FileEntry>,
     diff_scroll_to: Option<usize>,
+    diff_top_line: Arc<AtomicUsize>, // first visible diff line (set each frame in on_visible) — for page-by-file nav
+    diff_paged_to: Option<usize>, // last line a PageUp/Down stepped to (the bottom can clamp the scroll short of it)
     graph_scroll_to: Option<(usize, Option<egui::Align>)>, // (commit index, alignment) to scroll to in graph view
     repo_path: String,
     scope: cli::Scope, // CLI ref/path scope, set once at startup
@@ -2560,6 +2576,8 @@ impl GitkApp {
             diff_lines,
             diff_files,
             diff_scroll_to: None,
+            diff_top_line: Arc::new(AtomicUsize::new(0)),
+            diff_paged_to: None,
             graph_scroll_to: None,
             repo_path,
             scope,
@@ -2677,6 +2695,14 @@ impl GitkApp {
     }
 
     fn load_selected_diff(&mut self, repo: &Repository) {
+        // A new diff invalidates the page-by-file nav state: drop any stale scroll
+        // target a same-frame PageUp/Down queued against the outgoing diff, and reset
+        // the recorded top / paged cursor so the next page step starts from the top of
+        // the new diff. (Callers that want a specific scroll set diff_scroll_to after.)
+        self.diff_scroll_to = None;
+        self.diff_top_line.store(0, Ordering::Relaxed);
+        self.diff_paged_to = None;
+
         // Stash the outgoing diff under its stored key (a move, not a clone) so a
         // later revisit restores it — content and spans — instantly. Only set
         // for real commits, so virtual diffs are never cached.
@@ -3215,6 +3241,37 @@ impl eframe::App for GitkApp {
                     self.select_loaded(new);
                     self.graph_scroll_to = Some((new, None));
                 }
+            }
+        }
+
+        // PageDown / PageUp: jump to the next / previous file in the diff. Handled
+        // even while the search field is focused — a single-line field has no use for
+        // these keys. Skipped when a commit switch already queued a scroll reset this
+        // frame (diff_scroll_to set), so the new commit's diff still opens at the top.
+        let page_delta: isize = ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown) {
+                1
+            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp) {
+                -1
+            } else {
+                0
+            }
+        });
+        if page_delta != 0 && self.diff_scroll_to.is_none() {
+            let down = page_delta > 0;
+            let top = self.diff_top_line.load(Ordering::Relaxed);
+            // Paging down to a near-end file clamps the scroll short of its start (no
+            // content below to fill the viewport), leaving the recorded top below it;
+            // step from the line we actually paged to so the final files stay
+            // reachable. Only for down — paging up never clamps, so it follows the live
+            // top (and honours a manual scroll).
+            let from = match self.diff_paged_to {
+                Some(p) if down && top <= p => p,
+                _ => top,
+            };
+            if let Some(line) = next_file_line(&self.diff_files, self.diff_lines.len(), from, down) {
+                self.diff_scroll_to = Some(line);
+                self.diff_paged_to = Some(line);
             }
         }
 
@@ -3845,6 +3902,9 @@ impl eframe::App for GitkApp {
                                             && let Some(idx) = line_idx
                                         {
                                             self.diff_scroll_to = Some(idx);
+                                            // Anchor page-by-file nav to the clicked
+                                            // file (and survive a near-bottom clamp).
+                                            self.diff_paged_to = Some(idx);
                                         }
                                         if resp.hovered() {
                                             resp.show_tooltip_text(&file.path);
@@ -3901,6 +3961,7 @@ impl eframe::App for GitkApp {
                             let files = &self.diff_files;
                             let priority = self.highlight_priority.as_ref();
                             let word_diff = self.word_diff;
+                            let diff_top = Arc::clone(&self.diff_top_line);
                             show_virtualized_diff(
                                 ui,
                                 &font_id,
@@ -3908,6 +3969,7 @@ impl eframe::App for GitkApp {
                                 self.diff_max_chars,
                                 scroll_target,
                                 |rows| {
+                                    diff_top.store(rows.start, Ordering::Relaxed);
                                     // Tell the background worker which files are on
                                     // screen so it tokenizes those first, plus the
                                     // file range one viewport (in rows) above/below
@@ -3941,13 +4003,16 @@ impl eframe::App for GitkApp {
                             let lines = &self.diff_lines;
                             let palette = &self.diff_palette;
                             let word_diff = self.word_diff;
+                            let diff_top = Arc::clone(&self.diff_top_line);
                             show_virtualized_diff(
                                 ui,
                                 &font_id,
                                 lines.len(),
                                 self.diff_max_chars,
                                 scroll_target,
-                                |_rows| {},
+                                |rows| {
+                                    diff_top.store(rows.start, Ordering::Relaxed);
+                                },
                                 |i| {
                                     let (job, _) =
                                         diff_row_job(&lines[i], palette, &font_id, word_diff, false);
@@ -4896,6 +4961,34 @@ mod tests {
         assert_eq!(file_index_at_line(&files, 5), 2); // first line of "b"
         assert_eq!(file_index_at_line(&files, 8), 2); // inside "b"
         assert_eq!(file_index_at_line(&files, 999), 2); // past the last file → last file
+    }
+
+    #[test]
+    fn next_file_line_steps_between_files() {
+        let f = |idx: Option<usize>| FileEntry {
+            path: "x".to_string(),
+            additions: 0,
+            deletions: 0,
+            diff_line_idx: idx,
+        };
+        // File starts at lines 2 and 5 (a no-patch file in between is skipped).
+        let files = vec![f(Some(2)), f(None), f(Some(5))];
+        let down = |top| next_file_line(&files, 9, top, true);
+        let up = |top| next_file_line(&files, 9, top, false);
+
+        // Down → the next file start strictly below `top`.
+        assert_eq!(down(0), Some(2)); // header → first file
+        assert_eq!(down(2), Some(5)); // at A's top → B
+        assert_eq!(down(3), Some(5)); // inside A → B
+        assert_eq!(down(5), None); // at/inside the last file → nothing below
+        assert_eq!(down(7), None);
+
+        // Up → the nearest file start strictly above `top`.
+        assert_eq!(up(0), None); // header → nothing above
+        assert_eq!(up(2), None); // at A's top → nothing above
+        assert_eq!(up(3), Some(2)); // inside A → A's top
+        assert_eq!(up(5), Some(2)); // at B's top → previous file A
+        assert_eq!(up(7), Some(5)); // inside B → B's top
     }
 
     #[test]
