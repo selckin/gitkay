@@ -46,7 +46,7 @@
 
 ### Diff Viewer
 - True syntax-highlighted diffs (syntect): language-aware token colors over the chosen theme's background, with green/red row tints and a +/- gutter for additions/deletions
-- Selectable color theme via `[syntax] theme` in the config (any of 29 bundled themes — a curated allowlist; default Catppuccin Mocha), applied live on save; or turn highlighting off for the original flat per-line coloring
+- Selectable color theme via `[diff] theme` in the config (any of 29 bundled themes — a curated allowlist; default Catppuccin Mocha), applied live on save; or turn highlighting off for the original flat per-line coloring
 - File list sidebar with per-file `+/-` stats
 - Click a file to jump to its diff section
 - Commit header with author, date, full message
@@ -164,19 +164,37 @@ gitkay runs with no configuration. To customise it, edit
 `~/.config/gitkay/config.toml` — a fully-commented template with every default is
 written on first run. Changes apply live on save; no restart needed.
 
-**Fonts** (`[fonts]`, `[sizes]`, `[families]`): set a monospace and a proportional
-font family (by installed name, resolved from installed system fonts, or by explicit
-file path) and a size plus family for each text role: `diff`, `commit_summary`,
-`commit_meta`, `refs`, `file_list`, and `ui`.
+Unknown keys are reported as an error (rather than silently ignored), so typos
+surface immediately.
 
-**Diff syntax highlighting** (`[syntax]`):
+**Fonts** (`[fonts]`): define the two font sources — `monospace` and `proportional`
+— by installed family name (resolved from system fonts) or by explicit
+`monospace_path` / `proportional_path`. Leave unset to use the bundled fonts.
+
+**Text** (`[text]`): each role gets a `{ size, font }`, where `font` is
+`"monospace"` or `"proportional"`. Omit either key to keep that role's default.
+Roles: `diff`, `commit_summary`, `commit_meta`, `refs`, `file_list`, `ui`.
+
+```toml
+[text]
+diff = { size = 13, font = "monospace" }
+commit_summary = { size = 14, font = "proportional" }
+```
+
+**Diff** (`[diff]`):
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `enabled` | `true` | `false` restores the original flat per-line coloring (no theme, no highlighter) |
+| `show_stats` | `true` | `false` hides the diffstat block (the file-list sidebar still lists every file) |
+| `syntax` | `true` | `false` restores the original flat per-role coloring (no theme, no highlighter) |
 | `theme` | `"catppuccin-mocha"` | one of 29 bundled themes (e.g. `dracula`, `nord`, `gruvbox-dark`, `github`, `solarized-light`); unknown values warn and fall back |
-| `diff_background` | `"fixed"` | `"fixed"` uses the band colors below; `"theme"` derives add/remove backgrounds from the active theme |
-| `added_background` / `deleted_background` | built-in dark/light | explicit `"#rrggbb"` band colors for `"fixed"` mode |
+
+**Diff bands** (`[diff.bands]`) — the add/remove row tints on syntax-on diffs:
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `source` | `"fixed"` | `"fixed"` uses the colors below; `"theme"` derives them from the active theme |
+| `added` / `deleted` | built-in dark/light | explicit `"#rrggbb"` band colors for `"fixed"` mode |
 
 ## License
 

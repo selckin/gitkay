@@ -6,7 +6,7 @@ Native Wayland git history viewer — gitk, but okay. Built with Rust + egui.
 
 ```sh
 cargo build --release
-cargo test                # 106 tests (44 main + 32 config + 17 highlight + 7 cli + 6 diff-cache)
+cargo test                # 126 tests (57 main + 36 config + 17 highlight + 10 cli + 6 diff-cache)
 cp target/release/gitkay ~/.local/bin/
 ```
 
@@ -17,8 +17,8 @@ Rust deps of note: `fontdb` (system-font name → file lookup), `dirs` (XDG path
 
 ## Architecture
 
-App at `src/main.rs` (~4800 lines) plus extracted modules: `src/config.rs`
-(font/size + `[syntax]` config: TOML parsing, fontdb resolution + cache,
+App at `src/main.rs` (~5600 lines) plus extracted modules: `src/config.rs`
+(`[fonts]`/`[text]`/`[diff]` config: TOML parsing, fontdb resolution + cache,
 role→FontId map), `src/highlight.rs` (syntect highlighter, theme/palette
 resolution, per-line tokenization), `src/diff_cache.rs` (line-budget LRU cache),
 and `src/cli.rs` (pure argv parser, rev-vs-path classification). `main.rs` has
@@ -50,7 +50,7 @@ three sections:
 
 ## Tests
 
-106 tests total (per-file breakdown under Build / Test above). The graph-layout
+126 tests total (per-file breakdown under Build / Test above). The graph-layout
 tests listed below live in `main.rs` and all use fake OIDs via `oid(n)` — no real
 git repo needed; the `config`, `highlight`, `cli`, and `diff_cache` modules each
 carry their own `#[cfg(test)]` suite (TOML parsing + clamping, theme/palette

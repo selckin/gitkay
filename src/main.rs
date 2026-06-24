@@ -1672,25 +1672,22 @@ fn prefetch_worker(job: PrefetchJob) {
     }
 }
 
-/// Resolve the `[syntax]` diff-background config into a `DiffBg`, plus any
-/// warnings (bad mode or unparseable hex — each falls back to a default). The
-/// caller surfaces the warnings (stderr + the in-UI toast).
-fn resolve_diff_bg(s: &config::SyntaxSection) -> (DiffBg, Vec<String>) {
+/// Resolve the `[diff.bands]` config into a `DiffBg`, plus any warnings (unparseable
+/// hex falls back to a default). The `source` is a typed enum, so an invalid value is
+/// already a parse error — no mode warning to emit here. The caller surfaces the
+/// warnings (stderr + the in-UI toast).
+fn resolve_diff_bg(bands: &config::BandsSection) -> (DiffBg, Vec<String>) {
     let mut warnings = Vec::new();
-    // Validate any explicitly-set band hex up front so a malformed value is never
-    // silently swallowed — even in "theme" mode, where the parsed colours are then
-    // unused (the bands come from the theme).
-    let added = parse_bg_hex("added_background", s.added_background.as_deref(), &mut warnings);
-    let deleted = parse_bg_hex("deleted_background", s.deleted_background.as_deref(), &mut warnings);
+    // Validate any explicitly-set band hex even in Theme mode (where the parsed
+    // colours are unused), so a malformed value is never silently swallowed.
+    let added = parse_bg_hex("added", bands.added.as_deref(), &mut warnings);
+    let deleted = parse_bg_hex("deleted", bands.deleted.as_deref(), &mut warnings);
 
-    match s.diff_background.as_deref().unwrap_or("fixed") {
-        "theme" => (DiffBg::Theme, warnings),
-        "fixed" => (DiffBg::Fixed { added, deleted }, warnings),
-        other => {
-            warnings.push(format!("unknown syntax.diff_background {other:?}; using \"fixed\""));
-            (DiffBg::Fixed { added, deleted }, warnings)
-        }
-    }
+    let bg = match bands.source {
+        config::BandSource::Theme => DiffBg::Theme,
+        config::BandSource::Fixed => DiffBg::Fixed { added, deleted },
+    };
+    (bg, warnings)
 }
 
 /// Parse an optional `"#rrggbb"` background color, pushing a warning if it is
@@ -1699,7 +1696,7 @@ fn parse_bg_hex(label: &str, v: Option<&str>, warnings: &mut Vec<String>) -> Opt
     let h = v?;
     let c = highlight::parse_hex(h);
     if c.is_none() {
-        warnings.push(format!("invalid syntax.{label} color {h:?}; using default"));
+        warnings.push(format!("invalid diff.bands.{label} color {h:?}; using default"));
     }
     c
 }
@@ -2270,14 +2267,14 @@ impl GitkApp {
                 }
             })
             .unwrap_or_default();
-        let syntax_enabled = cfg.syntax.enabled.unwrap_or(true);
-        let show_stats = cfg.diff.show_stats.unwrap_or(true);
+        let syntax_enabled = cfg.diff.syntax;
+        let show_stats = cfg.diff.show_stats;
         let theme_slug = cfg
-            .syntax
+            .diff
             .theme
             .clone()
             .unwrap_or_else(|| highlight::DEFAULT_THEME_SLUG.to_string());
-        let (diff_bg, diff_bg_warnings) = resolve_diff_bg(&cfg.syntax);
+        let (diff_bg, diff_bg_warnings) = resolve_diff_bg(&cfg.diff.bands);
         for w in &diff_bg_warnings {
             log::warn!("{w}");
             startup_issue = true;
@@ -2918,13 +2915,13 @@ impl eframe::App for GitkApp {
                     let (defs, fonts, warns) = config::build_fonts(&cfg);
                     ctx.set_fonts(defs);
                     self.fonts = fonts;
-                    let new_enabled = cfg.syntax.enabled.unwrap_or(true);
+                    let new_enabled = cfg.diff.syntax;
                     let new_slug = cfg
-                        .syntax
+                        .diff
                         .theme
                         .clone()
                         .unwrap_or_else(|| highlight::DEFAULT_THEME_SLUG.to_string());
-                    let (new_diff_bg, diff_bg_warnings) = resolve_diff_bg(&cfg.syntax);
+                    let (new_diff_bg, diff_bg_warnings) = resolve_diff_bg(&cfg.diff.bands);
                     // Surface font + diff-background warnings (stderr now, toast
                     // below) so config typos aren't silent on a headless desktop.
                     let mut warned = !warns.is_empty();
@@ -2995,7 +2992,7 @@ impl eframe::App for GitkApp {
                     // so it needs a full rebuild, not a re-highlight. Update the
                     // field first so the rebuild keys/builds under the new value;
                     // the new cache key misses and rebuilds, stale entries evict.
-                    let new_show_stats = cfg.diff.show_stats.unwrap_or(true);
+                    let new_show_stats = cfg.diff.show_stats;
                     if new_show_stats != self.show_stats {
                         self.show_stats = new_show_stats;
                         if let Ok(repo) = Repository::discover(&self.repo_path) {
@@ -4638,13 +4635,13 @@ mod tests {
 
     #[test]
     fn resolve_diff_bg_theme_mode_still_validates_band_hex() {
-        use config::SyntaxSection;
+        use config::{BandSource, BandsSection};
         // In theme mode the band colours come from the theme and are ignored, but
         // a malformed value is still a config error and must be surfaced (the
         // function's doc promises a warning on unparseable hex).
-        let (bg, warns) = resolve_diff_bg(&SyntaxSection {
-            diff_background: Some("theme".to_string()),
-            added_background: Some("nothex".to_string()),
+        let (bg, warns) = resolve_diff_bg(&BandsSection {
+            source: BandSource::Theme,
+            added: Some("nothex".to_string()),
             ..Default::default()
         });
         assert_eq!(bg, DiffBg::Theme);
@@ -4657,9 +4654,9 @@ mod tests {
 
     #[test]
     fn resolve_diff_bg_interprets_config() {
-        use config::SyntaxSection;
-        // Absent / default → fixed mode, no explicit colors, no warnings.
-        let (bg, warns) = resolve_diff_bg(&SyntaxSection::default());
+        use config::{BandSource, BandsSection};
+        // Default → fixed mode, no explicit colors, no warnings.
+        let (bg, warns) = resolve_diff_bg(&BandsSection::default());
         assert_eq!(
             bg,
             DiffBg::Fixed {
@@ -4669,20 +4666,19 @@ mod tests {
         );
         assert!(warns.is_empty());
 
-        // "theme" mode.
-        let (bg, warns) = resolve_diff_bg(&SyntaxSection {
-            diff_background: Some("theme".to_string()),
+        // Theme mode.
+        let (bg, warns) = resolve_diff_bg(&BandsSection {
+            source: BandSource::Theme,
             ..Default::default()
         });
         assert_eq!(bg, DiffBg::Theme);
         assert!(warns.is_empty());
 
         // Explicit valid hex in fixed mode.
-        let (bg, warns) = resolve_diff_bg(&SyntaxSection {
-            diff_background: Some("fixed".to_string()),
-            added_background: Some("#0a300a".to_string()),
-            deleted_background: Some("#400c0e".to_string()),
-            ..Default::default()
+        let (bg, warns) = resolve_diff_bg(&BandsSection {
+            source: BandSource::Fixed,
+            added: Some("#0a300a".to_string()),
+            deleted: Some("#400c0e".to_string()),
         });
         assert_eq!(
             bg,
@@ -4693,23 +4689,10 @@ mod tests {
         );
         assert!(warns.is_empty());
 
-        // Unknown mode → fixed fallback + one warning.
-        let (bg, warns) = resolve_diff_bg(&SyntaxSection {
-            diff_background: Some("teme".to_string()),
-            ..Default::default()
-        });
-        assert_eq!(
-            bg,
-            DiffBg::Fixed {
-                added: None,
-                deleted: None
-            }
-        );
-        assert_eq!(warns.len(), 1);
-
-        // Invalid hex → ignored (None) + one warning.
-        let (bg, warns) = resolve_diff_bg(&SyntaxSection {
-            added_background: Some("nothex".to_string()),
+        // Invalid hex → ignored (None) + one warning. (An invalid `source` can't
+        // reach here — it's a parse error; see config::invalid_band_source_*.)
+        let (bg, warns) = resolve_diff_bg(&BandsSection {
+            added: Some("nothex".to_string()),
             ..Default::default()
         });
         assert_eq!(

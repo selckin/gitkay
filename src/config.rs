@@ -29,8 +29,11 @@ pub enum Family {
     Proportional,
 }
 
+/// The two font sources every text role draws from: `[fonts] monospace = "..."`.
+/// A named family resolves from system fonts; a `*_path` is an explicit file that
+/// skips the name lookup.
 #[derive(Deserialize, Clone, Debug, PartialEq, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct FontsSection {
     pub(crate) monospace: Option<String>,
     pub(crate) proportional: Option<String>,
@@ -38,76 +41,107 @@ pub struct FontsSection {
     pub(crate) proportional_path: Option<String>,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq)]
-#[serde(default)]
-pub struct SizesSection {
-    pub(crate) diff: f32,
-    pub(crate) commit_summary: f32,
-    pub(crate) commit_meta: f32,
-    pub(crate) refs: f32,
-    pub(crate) file_list: f32,
-    pub(crate) ui: f32,
+/// One text role's overrides: `{ size = .., font = .. }`. Each unset field falls
+/// back to that role's built-in default (see `role_default`), so e.g.
+/// `commit_meta = { font = "proportional" }` keeps commit_meta's own default size.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct TextStyle {
+    pub(crate) size: Option<f32>,
+    pub(crate) font: Option<Family>,
 }
 
-impl Default for SizesSection {
+/// Per-role text styling: `[text]` with one `<role> = { size, font }` entry each.
+#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct TextSection {
+    pub(crate) diff: TextStyle,
+    pub(crate) commit_summary: TextStyle,
+    pub(crate) commit_meta: TextStyle,
+    pub(crate) refs: TextStyle,
+    pub(crate) file_list: TextStyle,
+    pub(crate) ui: TextStyle,
+}
+
+impl TextSection {
+    fn style(&self, role: Role) -> &TextStyle {
+        match role {
+            Role::Diff => &self.diff,
+            Role::CommitSummary => &self.commit_summary,
+            Role::CommitMeta => &self.commit_meta,
+            Role::Refs => &self.refs,
+            Role::FileList => &self.file_list,
+            Role::Ui => &self.ui,
+        }
+    }
+}
+
+/// Built-in (size, family) for each role, before any `[text]` override.
+fn role_default(role: Role) -> (f32, Family) {
+    match role {
+        Role::Diff => (13.0, Family::Monospace),
+        Role::CommitSummary => (13.0, Family::Monospace),
+        Role::CommitMeta => (12.0, Family::Monospace),
+        Role::Refs => (11.0, Family::Monospace),
+        Role::FileList => (12.0, Family::Monospace),
+        Role::Ui => (13.0, Family::Monospace),
+    }
+}
+
+/// Where add/remove row bands get their colour. A typed enum (like `Family`), so an
+/// invalid value is a parse error rather than a runtime warning.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BandSource {
+    /// gitkay's fixed dark/light bands (see `added`/`deleted`).
+    #[default]
+    Fixed,
+    /// Derive add/remove backgrounds from the active theme's own diff colours.
+    Theme,
+}
+
+/// `[diff.bands]` — add/remove row band colours for syntax-on diffs.
+#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct BandsSection {
+    pub(crate) source: BandSource,
+    /// Explicit `"#rrggbb"` band colours for `Fixed` mode; unset ⇒ built-in dark
+    /// (or light, on light themes) defaults.
+    pub(crate) added: Option<String>,
+    pub(crate) deleted: Option<String>,
+}
+
+/// `[diff]` — diff-pane rendering options.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiffSection {
+    /// Syntax-highlight diffs. `false` ⇒ the original flat per-role colouring (no
+    /// theme, no highlighter).
+    pub(crate) syntax: bool,
+    /// Show the diffstat block (per-file change list + summary) between the commit
+    /// message and the patch. The file-list sidebar is independent and always shown.
+    pub(crate) show_stats: bool,
+    /// Highlight theme slug (see `default_template()` for valid slugs). None ⇒ default.
+    pub(crate) theme: Option<String>,
+    pub(crate) bands: BandsSection,
+}
+
+impl Default for DiffSection {
     fn default() -> Self {
         Self {
-            diff: 13.0,
-            commit_summary: 13.0,
-            commit_meta: 12.0,
-            refs: 11.0,
-            file_list: 12.0,
-            ui: 13.0,
+            syntax: true,
+            show_stats: true,
+            theme: None,
+            bands: BandsSection::default(),
         }
     }
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq, Default)]
-#[serde(default)]
-pub struct FamiliesSection {
-    pub(crate) diff: Family,
-    pub(crate) commit_summary: Family,
-    pub(crate) commit_meta: Family,
-    pub(crate) refs: Family,
-    pub(crate) file_list: Family,
-    pub(crate) ui: Family,
-}
-
-#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
-#[serde(default)]
-pub struct SyntaxSection {
-    /// Syntax-highlight diffs. `None`/`true` ⇒ syntect highlighting; `false` ⇒
-    /// the original flat per-line role coloring (no theme, no highlighter).
-    pub(crate) enabled: Option<bool>,
-    /// Theme slug (see the `[syntax]` section in `default_template()` for valid slugs).
-    /// None ⇒ default theme.
-    pub(crate) theme: Option<String>,
-    /// Add/remove row band source: `"fixed"` (default) ⇒ gitkay's dark/light
-    /// bands (see `added_background`/`deleted_background`); `"theme"` ⇒ derive
-    /// from the active theme's own diff colors.
-    pub(crate) diff_background: Option<String>,
-    /// Explicit add/remove band colors as `"#rrggbb"`, used in `"fixed"` mode.
-    /// Unset ⇒ built-in dark (or light, on light themes) defaults.
-    pub(crate) added_background: Option<String>,
-    pub(crate) deleted_background: Option<String>,
-}
-
-#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
-#[serde(default)]
-pub struct DiffSection {
-    /// Show the diffstat block (per-file change list + summary) between the
-    /// commit message and the patch. `None`/`true` ⇒ shown; `false` ⇒ hidden.
-    /// The file-list sidebar is independent and always shown.
-    pub(crate) show_stats: Option<bool>,
-}
-
-#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub(crate) fonts: FontsSection,
-    pub(crate) sizes: SizesSection,
-    pub(crate) families: FamiliesSection,
-    pub(crate) syntax: SyntaxSection,
+    pub(crate) text: TextSection,
     pub(crate) diff: DiffSection,
 }
 
@@ -130,46 +164,64 @@ fn egui_family(f: Family) -> egui::FontFamily {
     }
 }
 
-/// Resolved, clamped font settings ready to hand to egui per role.
+/// One role's resolved size + family: config override applied over `role_default`,
+/// size NaN-guarded and clamped to [MIN_SIZE, MAX_SIZE].
+#[derive(Clone, Copy)]
+struct ResolvedStyle {
+    size: f32,
+    family: Family,
+}
+
+/// Resolved, clamped per-role font settings ready to hand to egui.
 pub struct Fonts {
-    sizes: SizesSection, // clamped to [MIN_SIZE, MAX_SIZE] at construction
-    families: FamiliesSection,
+    diff: ResolvedStyle,
+    commit_summary: ResolvedStyle,
+    commit_meta: ResolvedStyle,
+    refs: ResolvedStyle,
+    file_list: ResolvedStyle,
+    ui: ResolvedStyle,
 }
 
 impl Fonts {
     pub fn from_config(cfg: &Config) -> Fonts {
-        let d = SizesSection::default();
-        let clamp =
-            |v: f32, default: f32| (if v.is_nan() { default } else { v }).clamp(MIN_SIZE, MAX_SIZE);
+        let resolve = |role: Role| -> ResolvedStyle {
+            let (def_size, def_family) = role_default(role);
+            let style = cfg.text.style(role);
+            let size = style.size.unwrap_or(def_size);
+            let size = (if size.is_nan() { def_size } else { size }).clamp(MIN_SIZE, MAX_SIZE);
+            ResolvedStyle { size, family: style.font.unwrap_or(def_family) }
+        };
         Fonts {
-            sizes: SizesSection {
-                diff: clamp(cfg.sizes.diff, d.diff),
-                commit_summary: clamp(cfg.sizes.commit_summary, d.commit_summary),
-                commit_meta: clamp(cfg.sizes.commit_meta, d.commit_meta),
-                refs: clamp(cfg.sizes.refs, d.refs),
-                file_list: clamp(cfg.sizes.file_list, d.file_list),
-                ui: clamp(cfg.sizes.ui, d.ui),
-            },
-            families: cfg.families.clone(),
+            diff: resolve(Role::Diff),
+            commit_summary: resolve(Role::CommitSummary),
+            commit_meta: resolve(Role::CommitMeta),
+            refs: resolve(Role::Refs),
+            file_list: resolve(Role::FileList),
+            ui: resolve(Role::Ui),
+        }
+    }
+
+    fn style(&self, role: Role) -> ResolvedStyle {
+        match role {
+            Role::Diff => self.diff,
+            Role::CommitSummary => self.commit_summary,
+            Role::CommitMeta => self.commit_meta,
+            Role::Refs => self.refs,
+            Role::FileList => self.file_list,
+            Role::Ui => self.ui,
         }
     }
 
     pub fn font_id(&self, role: Role) -> egui::FontId {
-        let (size, family) = match role {
-            Role::Diff => (self.sizes.diff, self.families.diff),
-            Role::CommitSummary => (self.sizes.commit_summary, self.families.commit_summary),
-            Role::CommitMeta => (self.sizes.commit_meta, self.families.commit_meta),
-            Role::Refs => (self.sizes.refs, self.families.refs),
-            Role::FileList => (self.sizes.file_list, self.families.file_list),
-            Role::Ui => (self.sizes.ui, self.families.ui),
-        };
-        egui::FontId::new(size, egui_family(family))
+        let s = self.style(role);
+        egui::FontId::new(s.size, egui_family(s.family))
     }
 
     /// File-list +/- stats: same family as the file list, two px smaller.
     pub fn file_stats_font_id(&self) -> egui::FontId {
-        let size = (self.sizes.file_list - 2.0).max(MIN_SIZE);
-        egui::FontId::new(size, egui_family(self.families.file_list))
+        let s = self.file_list;
+        let size = (s.size - 2.0).max(MIN_SIZE);
+        egui::FontId::new(size, egui_family(s.family))
     }
 }
 
@@ -183,67 +235,60 @@ fn cache_path() -> Option<PathBuf> {
 
 /// A fully-commented config showing every default. Written on first run.
 fn default_template() -> String {
-    let s = SizesSection::default();
+    let sz = |role: Role| role_default(role).0;
     format!(
-        "# gitkay font configuration — ~/.config/gitkay/config.toml\n\
+        "# gitkay configuration — ~/.config/gitkay/config.toml\n\
          # This file is optional. Every line below is commented out and shows its\n\
          # default value. Uncomment and edit to override. Changes apply live on save.\n\
+         # Unknown keys are reported as an error rather than silently ignored.\n\
          \n\
          [fonts]\n\
-         # Named families: resolved from installed system fonts; the resolved\n\
-         # path is cached in ~/.cache/gitkay/fonts.toml across restarts.\n\
-         # Leave unset to use gitkay's bundled fonts.\n\
+         # The two font sources every text role draws from. Named families resolve\n\
+         # from installed system fonts (the resolved path is cached in\n\
+         # ~/.cache/gitkay/fonts.toml); leave unset to use gitkay's bundled fonts.\n\
          # monospace = \"JetBrains Mono\"\n\
          # proportional = \"Inter\"\n\
          # Explicit file paths skip the named-family lookup and cache entirely:\n\
          # monospace_path = \"/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf\"\n\
          # proportional_path = \"/usr/share/fonts/TTF/Inter-Regular.ttf\"\n\
          \n\
-         [sizes]\n\
-         # diff = {diff}\n\
-         # commit_summary = {commit_summary}\n\
-         # commit_meta = {commit_meta}   # date / SHA / author\n\
-         # refs = {refs}\n\
-         # file_list = {file_list}     # filenames; +/- stats render 2px smaller\n\
-         # ui = {ui}            # search bar + diff toolbar\n\
+         [text]\n\
+         # Each text role's size (px) and font (\"monospace\" or \"proportional\").\n\
+         # Omit either key in a role to keep that role's default.\n\
+         # diff           = {{ size = {diff}, font = \"monospace\" }}\n\
+         # commit_summary = {{ size = {commit_summary}, font = \"monospace\" }}\n\
+         # commit_meta    = {{ size = {commit_meta}, font = \"monospace\" }}   # date / SHA / author\n\
+         # refs           = {{ size = {refs}, font = \"monospace\" }}\n\
+         # file_list      = {{ size = {file_list}, font = \"monospace\" }}   # +/- stats render 2px smaller\n\
+         # ui             = {{ size = {ui}, font = \"monospace\" }}   # search bar + diff toolbar\n\
          \n\
-         [families]\n\
-         # Which family each role uses: \"monospace\" or \"proportional\".\n\
-         # diff = \"monospace\"\n\
-         # commit_summary = \"monospace\"\n\
-         # commit_meta = \"monospace\"\n\
-         # refs = \"monospace\"\n\
-         # file_list = \"monospace\"\n\
-         # ui = \"monospace\"\n\
-         \n\
-         [syntax]\n\
-         # Syntax-highlight diffs. false = the original flat per-line coloring.\n\
-         # enabled = true\n\
+         [diff]\n\
+         # Show the diffstat block (per-file change list + summary) between the\n\
+         # commit message and the patch. false = hide it; the file-list sidebar\n\
+         # still lists every changed file.\n\
+         # show_stats = true\n\
+         # Syntax-highlight diffs. false = the original flat per-role coloring.\n\
+         # syntax = true\n\
          # Diff syntax-highlighting theme. Any of:\n\
          # catppuccin-mocha (default), catppuccin-macchiato, catppuccin-frappe,\n\
          # catppuccin-latte, dracula, nord, gruvbox-dark, gruvbox-light, github,\n\
          # solarized-dark, solarized-light, one-half-dark, two-dark, zenburn,\n\
          # monokai-extended, sublime-snazzy, dark-neon, and more (see docs).\n\
          # theme = \"catppuccin-mocha\"\n\
-         # Add/remove row band source: \"fixed\" (default) = the colors below\n\
-         # (dark by default, light pastels on light themes); \"theme\" = derive\n\
-         # from the active theme's own diff colors.\n\
-         # diff_background = \"fixed\"\n\
-         # Exact band colors for \"fixed\" mode, as \"#rrggbb\". Unset = defaults.\n\
-         # added_background = \"#0a300a\"\n\
-         # deleted_background = \"#400c0e\"\n\
          \n\
-         [diff]\n\
-         # Show the diffstat block (per-file change list + summary) between the\n\
-         # commit message and the patch. false = hide it; the file-list sidebar\n\
-         # still lists every changed file.\n\
-         # show_stats = true\n",
-        diff = s.diff,
-        commit_summary = s.commit_summary,
-        commit_meta = s.commit_meta,
-        refs = s.refs,
-        file_list = s.file_list,
-        ui = s.ui,
+         [diff.bands]\n\
+         # Add/remove row band colours (syntax-on diffs). source \"fixed\" (default)\n\
+         # uses the colours below (dark, or light pastels on light themes); \"theme\"\n\
+         # derives them from the active theme's own diff colours.\n\
+         # source = \"fixed\"\n\
+         # added = \"#0a300a\"\n\
+         # deleted = \"#400c0e\"\n",
+        diff = sz(Role::Diff),
+        commit_summary = sz(Role::CommitSummary),
+        commit_meta = sz(Role::CommitMeta),
+        refs = sz(Role::Refs),
+        file_list = sz(Role::FileList),
+        ui = sz(Role::Ui),
     )
 }
 
@@ -439,26 +484,29 @@ mod tests {
 
     #[test]
     fn empty_config_is_all_defaults() {
+        // Parsed text styles are unset (None) — per-role defaults live in
+        // `role_default`, applied at resolution (see default_font_ids_match_*).
         let cfg: Config = toml::from_str("").unwrap();
-        assert_eq!(cfg.sizes.diff, 13.0);
-        assert_eq!(cfg.sizes.commit_meta, 12.0);
-        assert_eq!(cfg.sizes.refs, 11.0);
-        assert_eq!(cfg.families.diff, Family::Monospace);
+        assert_eq!(cfg.text.diff, TextStyle::default());
+        assert_eq!(cfg.text.commit_meta.size, None);
+        assert_eq!(cfg.text.diff.font, None);
         assert_eq!(cfg.fonts.monospace, None);
     }
 
     #[test]
-    fn partial_sizes_override_only_named_keys() {
-        let cfg: Config = toml::from_str("[sizes]\ndiff = 20\n").unwrap();
-        assert_eq!(cfg.sizes.diff, 20.0);
-        assert_eq!(cfg.sizes.ui, 13.0); // untouched -> default
+    fn partial_text_override_only_named_keys() {
+        // A role table fills only the keys it lists; the rest stay None (default).
+        let cfg: Config = toml::from_str("[text]\ndiff = { size = 20 }\n").unwrap();
+        assert_eq!(cfg.text.diff.size, Some(20.0));
+        assert_eq!(cfg.text.diff.font, None); // untouched key in the same role
+        assert_eq!(cfg.text.ui.size, None); // untouched role
     }
 
     #[test]
     fn family_string_parses() {
-        let cfg: Config = toml::from_str("[families]\ndiff = \"proportional\"\n").unwrap();
-        assert_eq!(cfg.families.diff, Family::Proportional);
-        assert_eq!(cfg.families.ui, Family::Monospace);
+        let cfg: Config = toml::from_str("[text]\ndiff = { font = \"proportional\" }\n").unwrap();
+        assert_eq!(cfg.text.diff.font, Some(Family::Proportional));
+        assert_eq!(cfg.text.ui.font, None);
     }
 
     #[test]
@@ -486,7 +534,7 @@ mod tests {
     #[test]
     fn proportional_role_uses_proportional_family() {
         let mut cfg = Config::default();
-        cfg.families.commit_summary = Family::Proportional;
+        cfg.text.commit_summary.font = Some(Family::Proportional);
         let fonts = Fonts::from_config(&cfg);
         assert_eq!(
             fonts.font_id(Role::CommitSummary).family,
@@ -495,10 +543,21 @@ mod tests {
     }
 
     #[test]
+    fn unset_font_keeps_role_default_family() {
+        // Overriding only the size must not change the role's default family.
+        let mut cfg = Config::default();
+        cfg.text.commit_summary.size = Some(20.0);
+        let fonts = Fonts::from_config(&cfg);
+        let id = fonts.font_id(Role::CommitSummary);
+        assert_eq!(id.size, 20.0);
+        assert_eq!(id.family, egui::FontFamily::Monospace);
+    }
+
+    #[test]
     fn sizes_are_clamped() {
         let mut cfg = Config::default();
-        cfg.sizes.diff = 1000.0;
-        cfg.sizes.refs = 0.5;
+        cfg.text.diff.size = Some(1000.0);
+        cfg.text.refs.size = Some(0.5);
         let fonts = Fonts::from_config(&cfg);
         assert_eq!(fonts.font_id(Role::Diff).size, 64.0);
         assert_eq!(fonts.font_id(Role::Refs).size, 4.0);
@@ -519,41 +578,45 @@ mod tests {
     }
 
     #[test]
-    fn syntax_theme_parses() {
-        let cfg: Config = toml::from_str("[syntax]\ntheme = \"dracula\"\n").unwrap();
-        assert_eq!(cfg.syntax.theme.as_deref(), Some("dracula"));
+    fn diff_theme_parses() {
+        let cfg: Config = toml::from_str("[diff]\ntheme = \"dracula\"\n").unwrap();
+        assert_eq!(cfg.diff.theme.as_deref(), Some("dracula"));
     }
 
     #[test]
-    fn missing_syntax_section_is_none() {
+    fn missing_diff_section_uses_defaults() {
         let cfg: Config = toml::from_str("").unwrap();
-        assert_eq!(cfg.syntax.theme, None);
-        assert_eq!(cfg.syntax.enabled, None);
-        assert_eq!(cfg.syntax.diff_background, None);
-        assert_eq!(cfg.syntax.added_background, None);
+        assert_eq!(cfg.diff.theme, None);
+        assert!(cfg.diff.syntax); // default on
+        assert!(cfg.diff.show_stats); // default on
+        assert_eq!(cfg.diff.bands.source, BandSource::Fixed);
+        assert_eq!(cfg.diff.bands.added, None);
     }
 
     #[test]
-    fn syntax_options_parse() {
+    fn diff_options_parse() {
         let cfg: Config = toml::from_str(
-            "[syntax]\nenabled = false\ndiff_background = \"theme\"\nadded_background = \"#0a300a\"\n",
+            "[diff]\nsyntax = false\nshow_stats = false\n[diff.bands]\nsource = \"theme\"\nadded = \"#0a300a\"\n",
         )
         .unwrap();
-        assert_eq!(cfg.syntax.enabled, Some(false));
-        assert_eq!(cfg.syntax.diff_background.as_deref(), Some("theme"));
-        assert_eq!(cfg.syntax.added_background.as_deref(), Some("#0a300a"));
+        assert!(!cfg.diff.syntax);
+        assert!(!cfg.diff.show_stats);
+        assert_eq!(cfg.diff.bands.source, BandSource::Theme);
+        assert_eq!(cfg.diff.bands.added.as_deref(), Some("#0a300a"));
     }
 
     #[test]
-    fn diff_show_stats_parses() {
-        let cfg: Config = toml::from_str("[diff]\nshow_stats = false\n").unwrap();
-        assert_eq!(cfg.diff.show_stats, Some(false));
+    fn invalid_band_source_is_a_parse_error() {
+        assert!(toml::from_str::<Config>("[diff.bands]\nsource = \"teme\"\n").is_err());
     }
 
     #[test]
-    fn missing_diff_section_is_none() {
-        let cfg: Config = toml::from_str("").unwrap();
-        assert_eq!(cfg.diff.show_stats, None);
+    fn unknown_key_is_a_parse_error() {
+        // deny_unknown_fields surfaces typos instead of silently dropping them.
+        assert!(toml::from_str::<Config>("[text]\ndiff = { size = 20, weight = 700 }\n").is_err());
+        assert!(toml::from_str::<Config>("[diff]\nshow_statz = false\n").is_err());
+        // A whole old-style section is now a loud error, not a silent no-op.
+        assert!(toml::from_str::<Config>("[sizes]\ndiff = 20\n").is_err());
     }
 
     #[test]
@@ -564,19 +627,22 @@ mod tests {
     }
 
     #[test]
-    fn template_mentions_syntax_theme() {
+    fn template_mentions_diff_theme_and_bands() {
         let t = default_template();
-        assert!(t.contains("[syntax]"));
+        assert!(t.contains("[diff]"));
         assert!(t.contains("theme ="));
+        assert!(t.contains("[diff.bands]"));
+        assert!(t.contains("syntax ="));
     }
 
     #[test]
     fn template_documents_real_default_values() {
         let t = default_template();
-        assert!(t.contains("# diff = 13"));
-        assert!(t.contains("# commit_meta = 12"));
-        assert!(t.contains("# refs = 11"));
-        assert!(t.contains("# ui = 13"));
+        // Per-role sizes appear inside the `{ size = N, font = ... }` inline tables.
+        assert!(t.contains("size = 13"));
+        assert!(t.contains("size = 12"));
+        assert!(t.contains("size = 11"));
+        assert!(t.contains("font = \"monospace\""));
     }
 
     #[test]
@@ -691,7 +757,7 @@ mod tests {
     #[test]
     fn nan_size_falls_back_to_default() {
         let mut cfg = Config::default();
-        cfg.sizes.diff = f32::NAN;
+        cfg.text.diff.size = Some(f32::NAN);
         let fonts = Fonts::from_config(&cfg);
         assert!(fonts.font_id(Role::Diff).size.is_finite());
         assert_eq!(fonts.font_id(Role::Diff).size, 13.0);
@@ -700,8 +766,8 @@ mod tests {
     #[test]
     fn inf_size_clamps_to_bounds() {
         let mut cfg = Config::default();
-        cfg.sizes.diff = f32::INFINITY;
-        cfg.sizes.ui = f32::NEG_INFINITY;
+        cfg.text.diff.size = Some(f32::INFINITY);
+        cfg.text.ui.size = Some(f32::NEG_INFINITY);
         let fonts = Fonts::from_config(&cfg);
         assert_eq!(fonts.font_id(Role::Diff).size, 64.0);
         assert_eq!(fonts.font_id(Role::Ui).size, 4.0);
@@ -710,7 +776,7 @@ mod tests {
     #[test]
     fn file_stats_floored_at_min_size() {
         let mut cfg = Config::default();
-        cfg.sizes.file_list = 4.0; // already MIN_SIZE
+        cfg.text.file_list.size = Some(4.0); // already MIN_SIZE
         let fonts = Fonts::from_config(&cfg);
         assert_eq!(fonts.file_stats_font_id().size, 4.0); // 4-2=2, floored to 4
     }
@@ -719,12 +785,16 @@ mod tests {
     fn every_role_maps_to_its_size_and_family() {
         let mut cfg = Config::default();
         // make families distinguishable: set all to proportional
-        cfg.families.diff = Family::Proportional;
-        cfg.families.commit_summary = Family::Proportional;
-        cfg.families.commit_meta = Family::Proportional;
-        cfg.families.refs = Family::Proportional;
-        cfg.families.file_list = Family::Proportional;
-        cfg.families.ui = Family::Proportional;
+        for style in [
+            &mut cfg.text.diff,
+            &mut cfg.text.commit_summary,
+            &mut cfg.text.commit_meta,
+            &mut cfg.text.refs,
+            &mut cfg.text.file_list,
+            &mut cfg.text.ui,
+        ] {
+            style.font = Some(Family::Proportional);
+        }
         let f = Fonts::from_config(&cfg);
         for (role, size) in [
             (Role::Diff, 13.0),
@@ -771,7 +841,7 @@ mod tests {
 
     #[test]
     fn invalid_family_string_is_a_parse_error() {
-        assert!(toml::from_str::<Config>("[families]\ndiff = \"bold\"\n").is_err());
+        assert!(toml::from_str::<Config>("[text]\ndiff = { font = \"bold\" }\n").is_err());
     }
 
     #[test]
