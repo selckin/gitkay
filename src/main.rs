@@ -3995,11 +3995,17 @@ impl eframe::App for GitkApp {
                 let mut divider: Option<egui::Rect> = None;
                 if !self.diff_files.is_empty() {
                     let saved_w = self.file_list_width;
+                    // Let the sidebar grow with the window — up to all but a readable
+                    // ~300px strip for the diff — so full paths have room on wide
+                    // screens, while never dropping below the old 400px cap on narrow
+                    // ones. `ui` here still spans the whole diff region (the diff's
+                    // central panel is carved out after this right panel).
+                    let max_w = (ui.available_width() - 300.0).max(400.0);
                     let file_panel = egui::Panel::right("file_list_panel")
                         .resizable(true)
                         .default_size(saved_w)
                         .min_size(140.0)
-                        .max_size(400.0)
+                        .max_size(max_w)
                         .frame(egui::Frame::NONE)
                         .show_inside(ui, |ui| {
                             ui.label(
