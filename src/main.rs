@@ -159,6 +159,40 @@ fn normalize_rel(path: &str) -> String {
     out.join("/")
 }
 
+/// Fit `path` into `max_width` for left-aligned display. Returns `path` unchanged
+/// when it already fits; otherwise the longest trailing suffix that fits when
+/// prefixed with `…` (so the filename + nearest dirs stay visible), or `…` alone
+/// when even one char won't fit. `measure` returns a string's rendered width and
+/// must be monotonic in suffix length. Pure (no egui), so it is unit-testable.
+fn left_elide(path: &str, max_width: f32, measure: impl Fn(&str) -> f32) -> String {
+    if measure(path) <= max_width {
+        return path.to_string();
+    }
+    // Byte offset where each char starts, so a kept suffix slices on a char boundary.
+    let offsets: Vec<usize> = path.char_indices().map(|(i, _)| i).collect();
+    let n = offsets.len();
+    // Candidate for keeping the last `k` chars (1..=n-1): "…" + path[offsets[n-k]..].
+    let cand = |k: usize| format!("…{}", &path[offsets[n - k]..]);
+    // Largest k whose candidate fits. fits() is monotonic (more chars => wider),
+    // so binary-search instead of trimming one char at a time.
+    let mut best = 0usize;
+    let (mut lo, mut hi) = (1usize, n.saturating_sub(1));
+    while lo <= hi {
+        let mid = (lo + hi) / 2; // lo >= 1 => mid >= 1, so `mid - 1` never underflows
+        if measure(&cand(mid)) <= max_width {
+            best = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    if best == 0 {
+        "…".to_string()
+    } else {
+        cand(best)
+    }
+}
+
 /// Translate a user-supplied path token into a repo-root-relative pathspec. `prefix`
 /// is the run directory's location inside the repo (e.g. "src" when started in
 /// `<repo>/src`). Relative tokens are joined onto `prefix`; absolute tokens are made
@@ -6047,5 +6081,37 @@ mod tests {
         assert_eq!(rename_source(&repo, &c(edit), "new.txt"), None);
         // A path that wasn't renamed → None.
         assert_eq!(rename_source(&repo, &c(renamed), "unrelated.txt"), None);
+    }
+
+    /// Synthetic width: one unit per char (including the "…", which is one char).
+    fn char_count(s: &str) -> f32 {
+        s.chars().count() as f32
+    }
+
+    #[test]
+    fn left_elide_keeps_short_path() {
+        assert_eq!(left_elide("a/b/c", 10.0, char_count), "a/b/c");
+    }
+
+    #[test]
+    fn left_elide_truncates_from_front() {
+        // "aaaa/bbbb/cccc" is 14 chars; budget 6 fits "…" + the last 5 chars.
+        let out = left_elide("aaaa/bbbb/cccc", 6.0, char_count);
+        assert_eq!(out, "…/cccc");
+        assert!(out.starts_with('…'));
+        assert!(char_count(&out) <= 6.0);
+    }
+
+    #[test]
+    fn left_elide_degenerate_returns_ellipsis() {
+        assert_eq!(left_elide("abc", 0.5, char_count), "…");
+    }
+
+    #[test]
+    fn left_elide_multibyte_no_panic() {
+        // Multibyte chars must be trimmed on char boundaries, never mid-byte.
+        let out = left_elide("αβ/γδ/εζ.rs", 5.0, char_count);
+        assert!(out.starts_with('…'));
+        assert!(char_count(&out) <= 5.0);
     }
 }
