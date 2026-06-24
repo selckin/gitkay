@@ -230,8 +230,9 @@ fn prefetch_targets(
     out
 }
 
+/// The virtual uncommitted/staged entries — exactly the complement of a real commit.
 fn is_virtual_oid(oid: git2::Oid) -> bool {
-    oid == oid_uncommitted() || oid == oid_staged()
+    !is_real_commit(oid)
 }
 
 /// Apply one `<rev>` token to the revwalk: `^X` hides, `A..B` hides A + pushes B,
@@ -1005,6 +1006,16 @@ fn diff_opts(settings: DiffSettings) -> DiffOptions {
     opts
 }
 
+/// Format a commit timestamp (Unix seconds) as `YYYY-MM-DD HH:MM`, with seconds when
+/// asked, or "" if the timestamp is out of range. (A valid time never formats empty,
+/// so callers can treat "" as "no date".)
+fn format_commit_time(secs: i64, with_seconds: bool) -> String {
+    let fmt = if with_seconds { "%Y-%m-%d %H:%M:%S" } else { "%Y-%m-%d %H:%M" };
+    chrono::DateTime::from_timestamp(secs, 0)
+        .map(|dt| dt.format(fmt).to_string())
+        .unwrap_or_default()
+}
+
 fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, paths: &[String]) -> DiffData {
     // Handle virtual entries
     if oid == oid_uncommitted() {
@@ -1040,27 +1051,8 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, path
         }
     };
 
-    // Collect file stats
-    let mut files = Vec::new();
-    for i in 0..diff.deltas().len() {
-        if let Some(delta) = diff.get_delta(i) {
-            let path = delta
-                .new_file()
-                .path()
-                .or_else(|| delta.old_file().path())
-                .and_then(|p| p.to_str())
-                .unwrap_or("")
-                .to_string();
-            files.push(FileEntry {
-                path,
-                additions: 0,
-                deletions: 0,
-                diff_line_idx: None,
-            });
-        }
-    }
-
     let mut lines = Vec::new();
+    let mut files = Vec::new();
 
     // Header
     lines.push(DiffLine::new(&format!("commit {oid}"), LineKind::Meta));
@@ -1068,11 +1060,9 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, path
         &format!("Author: {}", commit.author()),
         LineKind::Meta,
     ));
-    if let Some(dt) = chrono::DateTime::from_timestamp(commit.time().seconds(), 0) {
-        lines.push(DiffLine::new(
-            &format!("Date:   {}", dt.format("%Y-%m-%d %H:%M:%S")),
-            LineKind::Meta,
-        ));
+    let date = format_commit_time(commit.time().seconds(), true);
+    if !date.is_empty() {
+        lines.push(DiffLine::new(&format!("Date:   {date}"), LineKind::Meta));
     }
     lines.push(DiffLine::new("", LineKind::Context));
     if let Ok(msg) = commit.message() {
@@ -1080,12 +1070,50 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, path
             lines.push(DiffLine::new(&format!("    {l}"), LineKind::Meta));
         }
     }
+    // The blank above (after the commit message) stays, so the message flows
+    // straight into the diffstat/patch produced below.
     lines.push(DiffLine::new("", LineKind::Context));
 
+    append_diff_body(&mut lines, &mut files, &diff, settings.show_stats);
+    DiffData::new(lines, files)
+}
+
+/// The display path for a diff delta — the new side, falling back to the old side
+/// (deletions/renames), or "" if neither is valid UTF-8.
+fn delta_path<'a>(delta: &git2::DiffDelta<'a>) -> &'a str {
+    delta
+        .new_file()
+        .path()
+        .or_else(|| delta.old_file().path())
+        .and_then(|p| p.to_str())
+        .unwrap_or("")
+}
+
+/// Append a git2 diff (per-file stats, the optional diffstat block, then the patch
+/// body) onto an already-started `lines`/`files` pair. The caller pushes whatever
+/// header lines it wants first; everything from here on is identical for a commit
+/// diff and a working-tree/index diff.
+fn append_diff_body(
+    lines: &mut Vec<DiffLine>,
+    files: &mut Vec<FileEntry>,
+    diff: &git2::Diff,
+    show_stats: bool,
+) {
+    // Collect file stats
+    for i in 0..diff.deltas().len() {
+        if let Some(delta) = diff.get_delta(i) {
+            files.push(FileEntry {
+                path: delta_path(&delta).to_string(),
+                additions: 0,
+                deletions: 0,
+                diff_line_idx: None,
+            });
+        }
+    }
+
     // Stats — the diffstat block (per-file list + summary) plus its trailing
-    // blank, suppressed when show_stats is off. The blank above (after the commit
-    // message) stays, so the message flows straight into the patch.
-    if settings.show_stats {
+    // blank, suppressed when show_stats is off.
+    if show_stats {
         if let Ok(stats) = diff.stats()
             && let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80)
         {
@@ -1100,18 +1128,12 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, path
     let mut current_file_idx: Option<usize> = None;
     diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
         // Detect file boundary
-        let delta_path = delta
-            .new_file()
-            .path()
-            .or_else(|| delta.old_file().path())
-            .and_then(|p| p.to_str())
-            .unwrap_or("");
-
+        let path = delta_path(&delta);
         let on_current_file = current_file_idx
             .and_then(|i| files.get(i))
-            .is_some_and(|f| f.path == delta_path);
+            .is_some_and(|f| f.path == path);
         if !on_current_file {
-            current_file_idx = files.iter().position(|f| f.path == delta_path);
+            current_file_idx = files.iter().position(|f| f.path == path);
             if let Some(fi) = current_file_idx {
                 files[fi].diff_line_idx = Some(lines.len());
             }
@@ -1160,8 +1182,6 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, path
         true
     })
     .unwrap_or_else(|e| log::warn!("gitkay: error rendering diff patch: {e}"));
-
-    DiffData::new(lines, files)
 }
 
 /// Generate diff for uncommitted working tree changes (workdir vs index).
@@ -1197,7 +1217,7 @@ fn get_staged_diff(repo: &Repository, settings: DiffSettings, paths: &[String]) 
     diff_to_data(&diff, "Staged changes (index)", settings.show_stats)
 }
 
-/// Convert a git2::Diff into our DiffData format.
+/// Convert a git2::Diff into our DiffData format, under a single title line.
 fn diff_to_data(diff: &git2::Diff, title: &str, show_stats: bool) -> DiffData {
     let mut lines = Vec::new();
     let mut files = Vec::new();
@@ -1205,101 +1225,7 @@ fn diff_to_data(diff: &git2::Diff, title: &str, show_stats: bool) -> DiffData {
     lines.push(DiffLine::new(title, LineKind::Meta));
     lines.push(DiffLine::new("", LineKind::Context));
 
-    // Collect file stats
-    for i in 0..diff.deltas().len() {
-        if let Some(delta) = diff.get_delta(i) {
-            let path = delta
-                .new_file()
-                .path()
-                .or_else(|| delta.old_file().path())
-                .and_then(|p| p.to_str())
-                .unwrap_or("")
-                .to_string();
-            files.push(FileEntry {
-                path,
-                additions: 0,
-                deletions: 0,
-                diff_line_idx: None,
-            });
-        }
-    }
-
-    // Stats — suppressed when show_stats is off (see get_diff_data).
-    if show_stats {
-        if let Ok(stats) = diff.stats()
-            && let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80)
-        {
-            for l in s.as_str().unwrap_or("").lines() {
-                lines.push(DiffLine::new(l, LineKind::Stat));
-            }
-        }
-        lines.push(DiffLine::new("", LineKind::Context));
-    }
-
-    // Patch
-    let mut current_file_idx: Option<usize> = None;
-    diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
-        let delta_path = delta
-            .new_file()
-            .path()
-            .or_else(|| delta.old_file().path())
-            .and_then(|p| p.to_str())
-            .unwrap_or("");
-
-        let on_current_file = current_file_idx
-            .and_then(|i| files.get(i))
-            .is_some_and(|f| f.path == delta_path);
-        if !on_current_file {
-            current_file_idx = files.iter().position(|f| f.path == delta_path);
-            if let Some(fi) = current_file_idx {
-                files[fi].diff_line_idx = Some(lines.len());
-            }
-        }
-
-        let kind = match line.origin() {
-            '+' => {
-                if let Some(fi) = current_file_idx {
-                    files[fi].additions += 1;
-                }
-                LineKind::Add
-            }
-            '-' => {
-                if let Some(fi) = current_file_idx {
-                    files[fi].deletions += 1;
-                }
-                LineKind::Del
-            }
-            'H' | 'F' => LineKind::Hunk,
-            _ => {
-                let content = std::str::from_utf8(line.content()).unwrap_or("");
-                if content.starts_with("diff ") || content.starts_with("index ") {
-                    LineKind::FileMeta
-                } else if content.starts_with("--- ") || content.starts_with("+++ ") {
-                    LineKind::FileName
-                } else if content.starts_with("@@") {
-                    LineKind::Hunk
-                } else {
-                    LineKind::Context
-                }
-            }
-        };
-        let prefix = match line.origin() {
-            '+' => "+",
-            '-' => "-",
-            _ => "",
-        };
-        let content = std::str::from_utf8(line.content()).unwrap_or("");
-        // git2 delivers a multi-line file header (origin FILE_HDR) as ONE line
-        // with embedded newlines; split it so every DiffLine is exactly one
-        // visual line — the row-virtualized render allocates a fixed row height
-        // per line, so a multi-line entry would draw over the lines below it.
-        for piece in content.trim_end_matches('\n').split('\n') {
-            lines.push(DiffLine::new(&format!("{prefix}{piece}"), kind));
-        }
-        true
-    })
-    .unwrap_or_else(|e| log::warn!("gitkay: error rendering diff patch: {e}"));
-
+    append_diff_body(&mut lines, &mut files, diff, show_stats);
     DiffData::new(lines, files)
 }
 
@@ -1693,20 +1619,25 @@ fn prewarm_highlighter(
     );
 }
 
-/// Background prefetch: for each neighbour `DiffCacheKey`, compute its diff and
-/// fully highlight it, sending the finished `(key, DiffData)` back for the UI to
-/// cache. Bails as soon as a newer dispatch supersedes it (`epoch`). Pure
-/// optimization — any failure just warms fewer neighbours.
-#[allow(clippy::too_many_arguments)]
-fn prefetch_worker(
+/// Everything the background prefetch worker owns for one dispatch.
+struct PrefetchJob {
     repo_path: String,
-    jobs: Vec<(DiffCacheKey, Vec<String>)>,
+    /// Each neighbour to warm: its cache key plus the pathspec to diff it under.
+    targets: Vec<(DiffCacheKey, Vec<String>)>,
     hl: Arc<Highlighter>,
+    /// This dispatch's epoch; the worker bails once `current_epoch` moves past it.
     epoch: u64,
     current_epoch: Arc<AtomicU64>,
     tx: mpsc::Sender<(DiffCacheKey, DiffData)>,
     ctx: egui::Context,
-) {
+}
+
+/// Background prefetch: for each neighbour `DiffCacheKey`, compute its diff and
+/// fully highlight it, sending the finished `(key, DiffData)` back for the UI to
+/// cache. Bails as soon as a newer dispatch supersedes it (`epoch`). Pure
+/// optimization — any failure just warms fewer neighbours.
+fn prefetch_worker(job: PrefetchJob) {
+    let PrefetchJob { repo_path, targets, hl, epoch, current_epoch, tx, ctx } = job;
     // Superseded before we even ran — don't open the repo.
     if epoch != current_epoch.load(Ordering::Relaxed) {
         return;
@@ -1718,7 +1649,7 @@ fn prefetch_worker(
             return;
         }
     };
-    for (key, paths) in jobs {
+    for (key, paths) in targets {
         if epoch != current_epoch.load(Ordering::Relaxed) {
             return; // user moved on
         }
@@ -1746,31 +1677,20 @@ fn prefetch_worker(
 /// caller surfaces the warnings (stderr + the in-UI toast).
 fn resolve_diff_bg(s: &config::SyntaxSection) -> (DiffBg, Vec<String>) {
     let mut warnings = Vec::new();
-    let mode = s.diff_background.as_deref().unwrap_or("fixed");
-    if mode == "theme" {
-        // The bands come from the theme here, so the parsed colours are unused —
-        // but still validate any explicitly set band hex so a malformed value
-        // isn't silently swallowed.
-        parse_bg_hex("added_background", s.added_background.as_deref(), &mut warnings);
-        parse_bg_hex("deleted_background", s.deleted_background.as_deref(), &mut warnings);
-        return (DiffBg::Theme, warnings);
+    // Validate any explicitly-set band hex up front so a malformed value is never
+    // silently swallowed — even in "theme" mode, where the parsed colours are then
+    // unused (the bands come from the theme).
+    let added = parse_bg_hex("added_background", s.added_background.as_deref(), &mut warnings);
+    let deleted = parse_bg_hex("deleted_background", s.deleted_background.as_deref(), &mut warnings);
+
+    match s.diff_background.as_deref().unwrap_or("fixed") {
+        "theme" => (DiffBg::Theme, warnings),
+        "fixed" => (DiffBg::Fixed { added, deleted }, warnings),
+        other => {
+            warnings.push(format!("unknown syntax.diff_background {other:?}; using \"fixed\""));
+            (DiffBg::Fixed { added, deleted }, warnings)
+        }
     }
-    if mode != "fixed" {
-        warnings.push(format!(
-            "unknown syntax.diff_background {mode:?}; using \"fixed\""
-        ));
-    }
-    let added = parse_bg_hex(
-        "added_background",
-        s.added_background.as_deref(),
-        &mut warnings,
-    );
-    let deleted = parse_bg_hex(
-        "deleted_background",
-        s.deleted_background.as_deref(),
-        &mut warnings,
-    );
-    (DiffBg::Fixed { added, deleted }, warnings)
 }
 
 /// Parse an optional `"#rrggbb"` background color, pushing a warning if it is
@@ -2042,6 +1962,18 @@ struct GraphRow {
     num_cols: usize,
 }
 
+/// Place `slot` in the first empty pipe (reusing a freed lane) or append a new one,
+/// returning its column.
+fn alloc_lane(pipes: &mut Vec<Option<(git2::Oid, usize)>>, slot: (git2::Oid, usize)) -> usize {
+    if let Some(pos) = pipes.iter().position(|p| p.is_none()) {
+        pipes[pos] = Some(slot);
+        pos
+    } else {
+        pipes.push(Some(slot));
+        pipes.len() - 1
+    }
+}
+
 fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
     // Each pipe tracks (oid, color_index). None = empty slot.
     let mut pipes: Vec<Option<(git2::Oid, usize)>> = Vec::new();
@@ -2064,13 +1996,7 @@ fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
             // New commit — find an empty slot or append
             let color = next_color;
             next_color += 1;
-            if let Some(pos) = pipes.iter().position(|p| p.is_none()) {
-                pipes[pos] = Some((commit.oid, color));
-                pos
-            } else {
-                pipes.push(Some((commit.oid, color)));
-                pipes.len() - 1
-            }
+            alloc_lane(&mut pipes, (commit.oid, color))
         } else {
             matching_cols[0]
         };
@@ -2138,13 +2064,7 @@ fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
                 } else {
                     let color = next_color;
                     next_color += 1;
-                    let col = if let Some(pos) = pipes.iter().position(|p| p.is_none()) {
-                        pipes[pos] = Some((*parent_oid, color));
-                        pos
-                    } else {
-                        pipes.push(Some((*parent_oid, color)));
-                        pipes.len() - 1
-                    };
+                    let col = alloc_lane(&mut pipes, (*parent_oid, color));
                     lines.push((node_col, col, color));
                     new_lanes.push(col);
                 }
@@ -2904,17 +2824,20 @@ impl GitkApp {
             return;
         }
         let epoch = self.prefetch_epoch.fetch_add(1, Ordering::Relaxed) + 1;
-        let repo_path = self.repo_path.clone();
-        let current_epoch = Arc::clone(&self.prefetch_epoch);
-        let tx = self.prefetch_tx.clone();
-        let ctx = ctx.clone();
         log::debug!("prefetch: dispatched {} around commit #{sel}", jobs.len());
+        let job = PrefetchJob {
+            repo_path: self.repo_path.clone(),
+            targets: jobs,
+            hl,
+            epoch,
+            current_epoch: Arc::clone(&self.prefetch_epoch),
+            tx: self.prefetch_tx.clone(),
+            ctx: ctx.clone(),
+        };
         if std::thread::Builder::new()
             .name("gitkay-prefetch".to_string())
             .spawn(move || {
-                let work = std::panic::AssertUnwindSafe(move || {
-                    prefetch_worker(repo_path, jobs, hl, epoch, current_epoch, tx, ctx)
-                });
+                let work = std::panic::AssertUnwindSafe(move || prefetch_worker(job));
                 if std::panic::catch_unwind(work).is_err() {
                     log::warn!("prefetch thread panicked");
                 }
@@ -2965,6 +2888,18 @@ impl GitkApp {
         // Center the target (used for clicks, search jumps): the destination may
         // be far from the current view.
         self.graph_scroll_to = self.selected.map(|i| (i, Some(egui::Align::Center)));
+    }
+
+    /// Select an already-loaded commit at `idx`, load its diff, and reset the diff
+    /// view to the top — no history reload / graph relayout (that's only needed to
+    /// jump to a not-yet-loaded commit). The caller sets `graph_scroll_to` itself
+    /// when it also needs to bring the row into view.
+    fn select_loaded(&mut self, idx: usize) {
+        self.set_selected(idx);
+        if let Ok(repo) = Repository::discover(&self.repo_path) {
+            self.load_selected_diff(&repo);
+        }
+        self.diff_scroll_to = Some(0); // new commit → reset diff view to top
     }
 }
 
@@ -3199,11 +3134,7 @@ impl eframe::App for GitkApp {
                     // Cycle to the match without reloading the whole history: the
                     // match index is already valid for the current commit list.
                     let idx = self.search_matches[self.search_cursor];
-                    self.set_selected(idx);
-                    if let Ok(repo) = Repository::discover(&self.repo_path) {
-                        self.load_selected_diff(&repo);
-                    }
-                    self.diff_scroll_to = Some(0); // new commit → reset diff view to top
+                    self.select_loaded(idx);
                     self.graph_scroll_to = Some((idx, Some(egui::Align::Center)));
                 }
             } else if !self.commits.is_empty() {
@@ -3213,11 +3144,7 @@ impl eframe::App for GitkApp {
                     None => 0,
                 };
                 if Some(new) != self.selected {
-                    self.set_selected(new);
-                    if let Ok(repo) = Repository::discover(&self.repo_path) {
-                        self.load_selected_diff(&repo);
-                    }
-                    self.diff_scroll_to = Some(0); // new commit → reset diff view to top
+                    self.select_loaded(new);
                     self.graph_scroll_to = Some((new, None));
                 }
             }
@@ -3370,16 +3297,9 @@ impl eframe::App for GitkApp {
                                         .text(&sha);
                                 }
                                 self.copied_toast = Some(std::time::Instant::now());
-                                // The clicked commit is already loaded at clicked_idx
-                                // — select it and load its diff, exactly like arrow-key
-                                // nav. No commit-list reload / graph relayout (that's
-                                // only needed to jump to a not-yet-loaded commit, e.g.
-                                // a search hit), which was blocking the UI on click.
-                                self.set_selected(clicked_idx);
-                                if let Ok(repo) = Repository::discover(&self.repo_path) {
-                                    self.load_selected_diff(&repo);
-                                }
-                                self.diff_scroll_to = Some(0); // reset diff view to top
+                                // The clicked commit is already loaded at clicked_idx —
+                                // select it and load its diff, exactly like arrow-key nav.
+                                self.select_loaded(clicked_idx);
                             }
                         }
 
@@ -3557,9 +3477,7 @@ impl eframe::App for GitkApp {
 
                             // Author + date (right-aligned) — compute first to know where summary must stop
                             let right_x = row_rect.max.x;
-                            let date_str = chrono::DateTime::from_timestamp(commit.time, 0)
-                                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                                .unwrap_or_default();
+                            let date_str = format_commit_time(commit.time, false);
                             let date_font = self.fonts.font_id(Role::CommitMeta);
                             let date_galley =
                                 painter.layout_no_wrap(date_str, date_font.clone(), SUBTEXT);
