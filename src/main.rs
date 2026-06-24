@@ -42,6 +42,7 @@ struct CommitInfo {
     summary: String,
     author: String,
     time: i64,
+    tz_offset_min: i32, // the commit's recorded UTC offset, so its time shows like git log
     parents: Vec<git2::Oid>,
     refs: Vec<(String, RefKind)>,
     follow_path: Option<String>, // in --follow mode, the file's name at this commit
@@ -444,6 +445,7 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
             summary: "Uncommitted changes".to_string(),
             author: String::new(),
             time: chrono::Utc::now().timestamp(),
+            tz_offset_min: local_tz_offset_min(),
             parents: if has_staged {
                 vec![oid_staged()]
             } else {
@@ -459,6 +461,7 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
             summary: "Staged changes".to_string(),
             author: String::new(),
             time: chrono::Utc::now().timestamp(),
+            tz_offset_min: local_tz_offset_min(),
             parents: head_oid.into_iter().collect(),
             refs: vec![("index".to_string(), RefKind::Tag)],
             follow_path: None,
@@ -495,6 +498,7 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
         summary: commit.summary().ok().flatten().unwrap_or("").to_string(),
         author: commit.author().name().unwrap_or("").to_string(),
         time: commit.time().seconds(),
+        tz_offset_min: commit.time().offset_minutes(),
         parents,
         refs: ref_map.get(&oid).cloned().unwrap_or_default(),
         follow_path: None,
@@ -649,6 +653,7 @@ fn load_reflog(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitI
             summary: entry.message().ok().flatten().unwrap_or("").to_string(),
             author: committer.name().unwrap_or("").to_string(),
             time: committer.when().seconds(),
+            tz_offset_min: committer.when().offset_minutes(),
             parents: Vec::new(),
             refs: vec![(format!("{refname}@{{{i}}}"), RefKind::Reflog)],
             follow_path: None,
@@ -1006,14 +1011,24 @@ fn diff_opts(settings: DiffSettings) -> DiffOptions {
     opts
 }
 
-/// Format a commit timestamp (Unix seconds) as `YYYY-MM-DD HH:MM`, with seconds when
-/// asked, or "" if the timestamp is out of range. (A valid time never formats empty,
-/// so callers can treat "" as "no date".)
-fn format_commit_time(secs: i64, with_seconds: bool) -> String {
+/// Format a commit timestamp (Unix seconds) in its own recorded UTC offset
+/// (`tz_offset_min`) as `YYYY-MM-DD HH:MM`, with seconds when asked — matching what
+/// `git log` shows. Returns "" if the timestamp or offset is out of range. (A valid
+/// time never formats empty, so callers can treat "" as "no date".)
+fn format_commit_time(secs: i64, tz_offset_min: i32, with_seconds: bool) -> String {
     let fmt = if with_seconds { "%Y-%m-%d %H:%M:%S" } else { "%Y-%m-%d %H:%M" };
-    chrono::DateTime::from_timestamp(secs, 0)
-        .map(|dt| dt.format(fmt).to_string())
-        .unwrap_or_default()
+    match (
+        chrono::DateTime::from_timestamp(secs, 0),
+        chrono::FixedOffset::east_opt(tz_offset_min * 60),
+    ) {
+        (Some(dt), Some(off)) => dt.with_timezone(&off).format(fmt).to_string(),
+        _ => String::new(),
+    }
+}
+
+/// The viewer's current UTC offset in minutes, for the "now"-stamped virtual rows.
+fn local_tz_offset_min() -> i32 {
+    chrono::Local::now().offset().local_minus_utc() / 60
 }
 
 fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, paths: &[String]) -> DiffData {
@@ -1060,7 +1075,8 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, path
         &format!("Author: {}", commit.author()),
         LineKind::Meta,
     ));
-    let date = format_commit_time(commit.time().seconds(), true);
+    let t = commit.time();
+    let date = format_commit_time(t.seconds(), t.offset_minutes(), true);
     if !date.is_empty() {
         lines.push(DiffLine::new(&format!("Date:   {date}"), LineKind::Meta));
     }
@@ -3499,7 +3515,8 @@ impl eframe::App for GitkApp {
 
                             // Author + date (right-aligned) — compute first to know where summary must stop
                             let right_x = row_rect.max.x;
-                            let date_str = format_commit_time(commit.time, false);
+                            let date_str =
+                                format_commit_time(commit.time, commit.tz_offset_min, false);
                             let date_font = self.fonts.font_id(Role::CommitMeta);
                             let date_galley =
                                 painter.layout_no_wrap(date_str, date_font.clone(), SUBTEXT);
@@ -4066,6 +4083,7 @@ mod tests {
             summary: format!("Commit {id}"),
             author: "test".into(),
             time: 0,
+            tz_offset_min: 0,
             parents: parents.iter().map(|p| oid(*p)).collect(),
             refs: vec![],
             follow_path: None,
@@ -4804,6 +4822,18 @@ mod tests {
         let (files, dirs) = config_watch_targets(link, Some(sibling));
         assert_eq!(files.len(), 2);
         assert_eq!(dirs, vec![PathBuf::from("/home/u/.config/gitkay")]);
+    }
+
+    #[test]
+    fn format_commit_time_applies_recorded_offset() {
+        let secs = 1_609_459_200; // 2021-01-01 00:00:00 UTC
+        assert_eq!(format_commit_time(secs, 0, true), "2021-01-01 00:00:00");
+        // +120 min (UTC+2): 02:00 the same day.
+        assert_eq!(format_commit_time(secs, 120, false), "2021-01-01 02:00");
+        // -300 min (UTC-5): 19:00 the *previous* day — the offset shifts the date.
+        assert_eq!(format_commit_time(secs, -300, false), "2020-12-31 19:00");
+        // Out-of-range offset → "" (treated as "no date" by callers).
+        assert_eq!(format_commit_time(secs, 100_000, false), "");
     }
 
     #[test]
@@ -5586,6 +5616,7 @@ mod tests {
             summary: String::new(),
             author: String::new(),
             time: 0,
+            tz_offset_min: 0,
             parents: Vec::new(),
             refs: Vec::new(),
             follow_path: fp.map(String::from),
