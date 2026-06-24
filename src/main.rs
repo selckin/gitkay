@@ -3418,13 +3418,16 @@ impl eframe::App for GitkApp {
                                     0.0,
                                     egui::Color32::from_rgba_unmultiplied(203, 166, 247, 40),
                                 );
-                            } else if is_search_match {
-                                // Yellow accent bar on the left edge
+                            }
+                            // Yellow accent bar on the left edge — independent of the
+                            // selection fill (drawn on top of it), so the selected
+                            // commit still shows it when it's also a search match.
+                            if is_search_match {
                                 let bar = egui::Rect::from_min_size(
                                     row_rect.min,
                                     egui::vec2(3.0, row_rect.height()),
                                 );
-                                painter.rect_filled(bar, 0.0, egui::Color32::from_rgb(249, 226, 175));
+                                painter.rect_filled(bar, 0.0, YELLOW);
                             }
                             if self.selected != Some(idx)
                                 && response.hover_pos().is_some_and(|p| row_rect.contains(p))
