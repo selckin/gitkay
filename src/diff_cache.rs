@@ -60,6 +60,21 @@ impl<K: Clone + Eq + Hash, V> DiffCache<K, V> {
         self.entries.contains_key(key)
     }
 
+    /// Drop every entry whose key fails `keep`, subtracting the freed weight. Used to
+    /// purge stale content-keyed entries that share a sentinel oid but no longer
+    /// reflect the working tree, so only the current version stays cached.
+    pub fn retain_keys(&mut self, mut keep: impl FnMut(&K) -> bool) {
+        let mut freed = 0usize;
+        self.entries.retain(|k, e| {
+            let keep_it = keep(k);
+            if !keep_it {
+                freed += e.weight;
+            }
+            keep_it
+        });
+        self.total -= freed;
+    }
+
     /// Insert (or overwrite) an entry of the given weight, then evict the
     /// least-recently-used entries until `total <= budget` — but always keep at
     /// least one entry, so a single value larger than the budget is still cached
@@ -160,6 +175,25 @@ mod tests {
         assert!(!c.contains(&1), "key 1 was LRU; contains() must not have refreshed it");
         assert!(c.contains(&2));
         assert!(c.contains(&3));
+    }
+
+    #[test]
+    fn retain_keys_drops_matches_and_subtracts_weight() {
+        let mut c: DiffCache<u32, u32> = DiffCache::new(100);
+        c.insert(10, 1, 15); // stale — to be purged
+        c.insert(11, 2, 25); // kept
+        c.insert(20, 3, 10); // kept
+        // Drop only the entries failing the predicate (here: key 10).
+        c.retain_keys(|&k| k != 10);
+        assert_eq!(c.remove(&10), None, "stale entry dropped");
+        assert_eq!(c.remove(&11), Some(2), "unrelated entry kept");
+        assert_eq!(c.remove(&20), Some(3), "current entry kept");
+        // total was decremented by the dropped weight: re-inserting up to budget must
+        // not evict the survivors.
+        c.insert(11, 2, 25);
+        c.insert(20, 3, 10);
+        c.insert(30, 4, 65); // 25 + 10 + 65 = 100 ⇒ fits exactly, nothing evicted
+        assert!(c.contains(&11) && c.contains(&20) && c.contains(&30));
     }
 
     #[test]

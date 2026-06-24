@@ -94,7 +94,10 @@ const PREFETCH_MARGIN: usize = 8;
 const RELOAD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Everything a cached diff's content + spans depend on. `diff_bg` is excluded
-/// (it's a render-time tint, not baked into spans).
+/// (it's a render-time tint, not baked into spans). `content` is 0 for real commits
+/// (the immutable oid already pins the content) and a hash of the generated diff text
+/// for the virtual uncommitted/staged entries — whose content tracks the working tree,
+/// so the same sentinel oid must not serve a stale highlighted diff.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct DiffCacheKey {
     oid: git2::Oid,
@@ -103,12 +106,36 @@ struct DiffCacheKey {
     theme: String,
     enabled: bool,
     show_stats: bool,
+    content: u64,
 }
 
-/// Real commits are cacheable; the virtual uncommitted/staged entries are not
-/// (their content tracks the working tree, so a fixed pseudo-oid would go stale).
+/// A real commit (keyed in the diff cache by its immutable oid) vs the virtual
+/// uncommitted/staged entries (whose content tracks the working tree, so they're
+/// keyed by a content hash instead — see `DiffCacheKey::content`).
 fn is_real_commit(oid: git2::Oid) -> bool {
     oid != oid_uncommitted() && oid != oid_staged()
+}
+
+/// A content fingerprint of a generated diff — the text and kind of every line, with
+/// the line count mixed in. Keys the cache for the virtual entries so re-selecting an
+/// unchanged working tree reuses the highlighting, but an edit (different text) misses
+/// and re-tokenizes. Kind matters because highlighting runs on `body()`, which strips
+/// the leading `+`/`-` marker for Add/Del lines — so two diffs with byte-identical text
+/// but a flipped kind tokenize differently and must not share a fingerprint.
+///
+/// A 64-bit collision (two different diffs, one hash) would serve the wrong cached diff,
+/// but at ~1/2^64 per edit — self-healing on the next edit, and capped at one entry per
+/// sentinel oid (see `load_selected_diff`'s `retain_keys`) so collisions can't pile up —
+/// it's an accepted risk, not worth a wider hash or a full content compare on every hit.
+fn hash_diff_content(data: &DiffData) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    data.lines.len().hash(&mut h);
+    for line in &data.lines {
+        line.text.hash(&mut h);
+        (line.kind as u8).hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Lexically normalize a `/`-separated relative path: drop `.` and empty segments,
@@ -2495,19 +2522,20 @@ impl GitkApp {
         // Auto-select first commit and load its diff
         let (diff_lines, diff_files, current_diff_key) = if let Some(first) = commits.first() {
             let data = get_diff_data(&repo, first.oid, diff_settings, &scope.paths);
-            // Key the startup diff so navigating away stashes it into the cache (real
-            // commits only — virtual rows aren't cacheable). Without this, the most-
-            // visited commit (HEAD at row 0) is recomputed + re-highlighted on every
-            // return instead of restored instantly.
-            let key = is_real_commit(first.oid).then(|| DiffCacheKey {
+            // Key the startup diff so navigating away stashes it into the cache, and
+            // returning (e.g. to HEAD at row 0, the most-visited commit) restores it
+            // instantly instead of recomputing + re-highlighting. A virtual entry is
+            // content-addressed (see load_selected_diff); a real commit by its oid.
+            let key = DiffCacheKey {
                 oid: first.oid,
                 context: diff_context,
                 ignore_ws: diff_ignore_ws,
                 theme: theme_slug.clone(),
                 enabled: syntax_enabled,
                 show_stats,
-            });
-            (data.lines, data.files, key)
+                content: if is_real_commit(first.oid) { 0 } else { hash_diff_content(&data) },
+            };
+            (data.lines, data.files, Some(key))
         } else {
             (Vec::new(), Vec::new(), None)
         };
@@ -2736,6 +2764,9 @@ impl GitkApp {
         diff_paths_for(&self.scope, &self.commits, oid)
     }
 
+    /// The cache key for a real commit (its immutable oid pins the content). The
+    /// virtual entries set `content` to a per-diff hash on top of this (see
+    /// `load_selected_diff`).
     fn diff_cache_key(&self, oid: git2::Oid) -> DiffCacheKey {
         DiffCacheKey {
             oid,
@@ -2744,6 +2775,7 @@ impl GitkApp {
             theme: self.theme_slug.clone(),
             enabled: self.syntax_enabled,
             show_stats: self.show_stats,
+            content: 0,
         }
     }
 
@@ -2756,42 +2788,74 @@ impl GitkApp {
         self.diff_top_line.store(0, Ordering::Relaxed);
 
         // Stash the outgoing diff under its stored key (a move, not a clone) so a
-        // later revisit restores it — content and spans — instantly. Only set
-        // for real commits, so virtual diffs are never cached.
+        // later revisit restores it — content and spans — instantly. Real commits are
+        // keyed by their immutable oid; the virtual uncommitted/staged entries by a
+        // content hash (see load_selected_diff below), so they're cached too.
         if let Some(key) = self.current_diff_key.take() {
             let data = DiffData {
                 lines: std::mem::take(&mut self.diff_lines),
                 files: std::mem::take(&mut self.diff_files),
             };
             let weight = data.lines.len();
+            // A virtual entry is content-keyed, so each working-tree edit produces a
+            // fresh hash and the previous content would linger under the same sentinel
+            // oid as unreachable dead weight. Only the current working-tree version is
+            // ever reachable, so drop any stale same-oid entry before re-inserting.
+            if !is_real_commit(key.oid) {
+                let oid = key.oid;
+                self.diff_cache.retain_keys(|k| k.oid != oid);
+            }
             self.diff_cache.insert(key, data, weight);
         }
 
         if let Some(sel) = self.selected.filter(|&s| s < self.commits.len()) {
             let oid = self.commits[sel].oid;
             log::debug!("select: commit {oid} (#{sel})");
-            let key = is_real_commit(oid).then(|| self.diff_cache_key(oid));
-            let data = match key.as_ref().and_then(|k| self.diff_cache.remove(k)) {
-                Some(data) => {
-                    log::debug!("perf: diff cache hit ({} lines) for {oid}", data.lines.len());
-                    data
-                }
-                None => {
-                    let t = std::time::Instant::now();
-                    let diff_paths = self.diff_paths_for_oid(oid);
-                    let data = get_diff_data(repo, oid, self.diff_settings(), &diff_paths);
-                    log::debug!(
-                        "perf: get_diff_data {:?} ({} lines, {} files) for {oid}",
-                        t.elapsed(),
-                        data.lines.len(),
-                        data.files.len()
-                    );
-                    data
-                }
+            let (key, data) = if is_real_commit(oid) {
+                // Real commit: oid-keyed, generated only on a cache miss.
+                let key = self.diff_cache_key(oid);
+                let data = match self.diff_cache.remove(&key) {
+                    Some(data) => {
+                        log::debug!("perf: diff cache hit ({} lines) for {oid}", data.lines.len());
+                        data
+                    }
+                    None => {
+                        // Resolve the pathspec only on a miss: a cache hit must do no
+                        // work, and under --follow diff_paths_for is an O(commits) scan.
+                        let t = std::time::Instant::now();
+                        let diff_paths = self.diff_paths_for_oid(oid);
+                        let data = get_diff_data(repo, oid, self.diff_settings(), &diff_paths);
+                        log::debug!(
+                            "perf: get_diff_data {:?} ({} lines, {} files) for {oid}",
+                            t.elapsed(),
+                            data.lines.len(),
+                            data.files.len()
+                        );
+                        data
+                    }
+                };
+                (key, data)
+            } else {
+                // Virtual (uncommitted/staged): the content tracks the working tree, so
+                // always regenerate (cheap) and key by a content hash — an unchanged
+                // tree hits the cache and reuses the highlighting; an edit misses and
+                // re-tokenizes, so a stale highlight is never shown.
+                let diff_paths = self.diff_paths_for_oid(oid);
+                let fresh = get_diff_data(repo, oid, self.diff_settings(), &diff_paths);
+                let mut key = self.diff_cache_key(oid);
+                key.content = hash_diff_content(&fresh);
+                let data = match self.diff_cache.remove(&key) {
+                    Some(data) => {
+                        log::debug!("perf: virtual diff cache hit ({} lines)", data.lines.len());
+                        data
+                    }
+                    None => fresh,
+                };
+                (key, data)
             };
             self.diff_lines = data.lines;
             self.diff_files = data.files;
-            self.current_diff_key = key;
+            self.current_diff_key = Some(key);
         } else {
             self.diff_lines.clear();
             self.diff_files.clear();
@@ -5307,21 +5371,52 @@ mod tests {
     }
 
     #[test]
-    fn diff_cache_key_includes_theme_enabled_and_show_stats() {
-        let key = |theme: &str, enabled: bool, show_stats: bool| DiffCacheKey {
+    fn diff_cache_key_includes_theme_enabled_show_stats_and_content() {
+        let key = |theme: &str, enabled: bool, show_stats: bool, content: u64| DiffCacheKey {
             oid: git2::Oid::ZERO_SHA1,
             context: 3,
             ignore_ws: false,
             theme: theme.to_string(),
             enabled,
             show_stats,
+            content,
         };
         let mut c: DiffCache<DiffCacheKey, u32> = DiffCache::new(100);
-        c.insert(key("dark", true, true), 1, 1);
-        assert_eq!(c.remove(&key("light", true, true)), None, "different theme ⇒ miss");
-        assert_eq!(c.remove(&key("dark", false, true)), None, "different enabled ⇒ miss");
-        assert_eq!(c.remove(&key("dark", true, false)), None, "different show_stats ⇒ miss");
-        assert_eq!(c.remove(&key("dark", true, true)), Some(1), "same key ⇒ hit");
+        c.insert(key("dark", true, true, 0), 1, 1);
+        assert_eq!(c.remove(&key("light", true, true, 0)), None, "different theme ⇒ miss");
+        assert_eq!(c.remove(&key("dark", false, true, 0)), None, "different enabled ⇒ miss");
+        assert_eq!(c.remove(&key("dark", true, false, 0)), None, "different show_stats ⇒ miss");
+        // content distinguishes virtual diffs whose working-tree content changed.
+        assert_eq!(c.remove(&key("dark", true, true, 7)), None, "different content ⇒ miss");
+        assert_eq!(c.remove(&key("dark", true, true, 0)), Some(1), "same key ⇒ hit");
+    }
+
+    #[test]
+    fn hash_diff_content_tracks_text_changes() {
+        let mk = |texts: &[&str]| DiffData {
+            lines: texts.iter().map(|t| DiffLine::new(t, LineKind::Add)).collect(),
+            files: Vec::new(),
+        };
+        let a = mk(&["fn main() {}", "let x = 1;"]);
+        assert_eq!(hash_diff_content(&a), hash_diff_content(&mk(&["fn main() {}", "let x = 1;"])));
+        assert_ne!(hash_diff_content(&a), hash_diff_content(&mk(&["fn main() {}", "let x = 2;"])));
+        assert_ne!(hash_diff_content(&a), hash_diff_content(&mk(&["fn main() {}"]))); // length differs
+    }
+
+    #[test]
+    fn hash_diff_content_tracks_line_kind() {
+        // Same text, different kind: body() strips the +/- marker per kind, so these
+        // tokenize differently and must hash differently (else a cached virtual diff
+        // would be highlighted from the wrong bodies).
+        let one = |text: &str, kind| DiffData {
+            lines: vec![DiffLine::new(text, kind)],
+            files: Vec::new(),
+        };
+        assert_ne!(
+            hash_diff_content(&one("+foo", LineKind::Add)),
+            hash_diff_content(&one("+foo", LineKind::Context)),
+            "identical text but different kind ⇒ different fingerprint"
+        );
     }
 
     #[test]
