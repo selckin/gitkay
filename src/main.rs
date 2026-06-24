@@ -402,6 +402,13 @@ fn rewrite_parents(
     out
 }
 
+/// Number of real (non-virtual) commits in a loaded list. `max`/`count` budgets
+/// these, so the 0-2 virtual uncommitted/staged rows never shrink the window or
+/// skew the `all_loaded` check.
+fn real_commit_count(commits: &[CommitInfo]) -> usize {
+    commits.iter().filter(|c| is_real_commit(c.oid)).count()
+}
+
 fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitInfo> {
     let ref_map = build_ref_map(repo);
     let head_oid = repo.head().ok().and_then(|h| h.target());
@@ -505,6 +512,10 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
     };
 
     let mut seen = HashSet::new();
+    // Virtual uncommitted/staged rows are already pushed; `max` budgets real commits
+    // (matching the path-filter branch's `kept.len() >= max`), so the window doesn't
+    // shrink by the virtual count.
+    let virtual_count = commits.len();
     if scope.paths.is_empty() {
         for oid in revwalk.flatten() {
             if !seen.insert(oid) {
@@ -512,7 +523,7 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
             }
             if let Ok(commit) = repo.find_commit(oid) {
                 commits.push(build_info(oid, &commit, commit.parent_ids().collect()));
-                if commits.len() >= max {
+                if commits.len() - virtual_count >= max {
                     break;
                 }
             }
@@ -522,7 +533,6 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
         // surviving commit's parents to its nearest surviving ancestor — git's history
         // simplification. Without the rewrite the graph can't connect kept commits
         // across the dropped ones, so every commit lands on its own lane.
-        let virtual_count = commits.len(); // uncommitted/staged entries already pushed
         // 1. Walk newest→oldest, recording every commit's parents; keep the ones that
         //    touch the path until we have `max` of them.
         let mut walked: Vec<(git2::Oid, Vec<git2::Oid>)> = Vec::new();
@@ -2437,7 +2447,7 @@ impl GitkApp {
         } else {
             (Vec::new(), Vec::new(), None)
         };
-        let all_loaded = commits.len() < 200;
+        let all_loaded = real_commit_count(&commits) < 200;
 
         // Watch .git directory for changes (refs, HEAD, index)
         let needs_reload = Arc::new(AtomicBool::new(false));
@@ -2894,7 +2904,7 @@ impl GitkApp {
     }
 
     fn reload_commits(&mut self, repo: &Repository, preferred_oid: Option<git2::Oid>) {
-        let count = self.commits.len().max(200);
+        let count = real_commit_count(&self.commits).max(200);
         let previous_oid = self
             .selected
             .and_then(|sel| self.commits.get(sel))
@@ -2919,7 +2929,9 @@ impl GitkApp {
         previous_index: Option<usize>,
     ) {
         self.graph_rows = layout_graph(&self.commits);
-        self.all_loaded = self.commits.len() < count;
+        // `count` budgets real commits; compare against the real count so the virtual
+        // rows don't make a fully-loaded history read as "more available".
+        self.all_loaded = real_commit_count(&self.commits) < count;
         self.refresh_search_matches();
 
         // Reflog entries routinely share oids (reset-and-back, amends), so restoring
@@ -3635,7 +3647,7 @@ impl eframe::App for GitkApp {
                             let previous_oid =
                                 self.selected.and_then(|i| self.commits.get(i)).map(|c| c.oid);
                             let previous_index = self.selected;
-                            let requested = self.commits.len() + 500;
+                            let requested = real_commit_count(&self.commits) + 500;
                             self.commits = load_history(&repo, requested, &self.scope);
                             // all_loaded is set inside resync (commits.len() < requested):
                             // fewer than asked ⇒ source exhausted.
