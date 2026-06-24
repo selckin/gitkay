@@ -6,7 +6,7 @@ Native Wayland git history viewer — gitk, but okay. Built with Rust + egui.
 
 ```sh
 cargo build --release
-cargo test                # 126 tests (57 main + 36 config + 17 highlight + 10 cli + 6 diff-cache)
+cargo test                # 149 tests (main + config + highlight + cli + diff-cache modules)
 cp target/release/gitkay ~/.local/bin/
 ```
 
@@ -17,7 +17,7 @@ Rust deps of note: `fontdb` (system-font name → file lookup), `dirs` (XDG path
 
 ## Architecture
 
-App at `src/main.rs` (~5600 lines) plus extracted modules: `src/config.rs`
+App at `src/main.rs` (~6500 lines) plus extracted modules: `src/config.rs`
 (`[fonts]`/`[text]`/`[diff]` config: TOML parsing, fontdb resolution + cache,
 role→FontId map), `src/highlight.rs` (syntect highlighter, theme/palette
 resolution, per-line tokenization), `src/diff_cache.rs` (line-budget LRU cache),
@@ -50,7 +50,7 @@ three sections:
 
 ## Tests
 
-126 tests total (per-file breakdown under Build / Test above). The graph-layout
+149 tests total (split across the main/config/highlight/cli/diff-cache modules). The graph-layout
 tests listed below live in `main.rs` and all use fake OIDs via `oid(n)` — no real
 git repo needed; the `config`, `highlight`, `cli`, and `diff_cache` modules each
 carry their own `#[cfg(test)]` suite (TOML parsing + clamping, theme/palette
@@ -83,4 +83,4 @@ resolution, rev-vs-path classification, LRU eviction).
 - `collect_refs` per commit is O(commits × refs) → precompute ref map once
 - Working-tree edits do not touch `.git`; refresh commits/diff on selection changes to keep virtual staged/uncommitted entries current without a recursive worktree watcher
 - Branch highlighting walks first-parent children upward, but all parents downward, so merge commits keep merged history highlighted
-- File-list sidebar is not row-virtualized — every changed file lays out each frame; `left_elide` (left-truncation for `[diff] file_full_path`) measures the full path once and binary-searches the suffix only when it overflows, so the per-row cost stays low
+- File-list sidebar is not row-virtualized — every row lays out each frame. `build_file_rows` (pure) turns paths into header/file rows per `[diff] file_list` (`grouped` sorts by full path, one header per directory); `left_elide` left-truncates labels, measuring the full string once and binary-searching only when it overflows
