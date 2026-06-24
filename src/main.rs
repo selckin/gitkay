@@ -2801,7 +2801,15 @@ impl GitkApp {
         // coloured rather than staying plain forever.
         if std::thread::Builder::new()
             .name("gitkay-highlight".to_string())
-            .spawn(move || highlight_worker(job))
+            .spawn(move || {
+                // Contain a syntect panic to this one diff (as the prefetch worker
+                // does): without this a bad grammar/line would kill the highlight
+                // thread and leave every later diff plain for the rest of the session.
+                let work = std::panic::AssertUnwindSafe(move || highlight_worker(job));
+                if std::panic::catch_unwind(work).is_err() {
+                    log::warn!("highlight thread panicked");
+                }
+            })
             .is_err()
         {
             log::warn!("highlight thread spawn failed; highlighting on the UI thread");
