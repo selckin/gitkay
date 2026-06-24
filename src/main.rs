@@ -941,9 +941,11 @@ fn kind_color(kind: LineKind, palette: &highlight::DiffPalette) -> egui::Color32
 
 /// Render `n_lines` rows of the diff with row virtualization — only the visible
 /// rows get a LayoutJob (diffs can be tens of thousands of lines, all uniform
-/// single-line height). `on_visible` receives the visible row range (the themed
-/// path uses it to tell the highlight worker which files are on screen; the flat
-/// path passes a no-op). `build_row` produces each row's job, an optional
+/// single-line height). `on_visible` receives the visible (real) row range and the
+/// full viewport height in rows — the range tells the highlight worker which files are
+/// on screen (the flat path ignores it), the height drives the Space page-scroll and is
+/// the true screenful even when bottom-padding rows clamp the real range short.
+/// `build_row` produces each row's job, an optional
 /// background tint, and the galley fallback colour. Shared by both render paths
 /// so the scroll/offset/width scaffold lives in one place.
 /// Layout inputs for `show_virtualized_diff`: total rows, the widest line (sizes the
@@ -980,7 +982,7 @@ fn show_virtualized_diff(
     ui: &mut egui::Ui,
     font_id: &egui::FontId,
     view: DiffView,
-    mut on_visible: impl FnMut(std::ops::Range<usize>),
+    mut on_visible: impl FnMut(std::ops::Range<usize>, usize),
     mut build_row: impl FnMut(usize) -> (egui::text::LayoutJob, Option<egui::Color32>, egui::Color32),
 ) {
     let DiffView { n_lines, content_chars, scroll_target, last_top_anchor } = view;
@@ -1011,9 +1013,10 @@ fn show_virtualized_diff(
     let content_w = (content_chars as f32 + 1.0) * char_w;
     scroll.show_rows(ui, row_h, total_rows, |ui, rows| {
         ui.set_min_width(content_w);
-        // Report only real lines — the padding rows below aren't part of the diff.
+        // Report only real lines — the padding rows below aren't part of the diff —
+        // plus the true viewport height (the real range clamps short over padding).
         let real = rows.start.min(n_lines.saturating_sub(1))..rows.end.min(n_lines);
-        on_visible(real);
+        on_visible(real, viewport_rows);
         for i in rows {
             if i >= n_lines {
                 // Padding row: reserve the height, draw nothing.
@@ -2260,6 +2263,7 @@ struct GitkApp {
     diff_files: Vec<FileEntry>,
     diff_scroll_to: Option<usize>,
     diff_top_line: Arc<AtomicUsize>, // first visible diff line (set each frame in on_visible) — for page-by-file nav
+    diff_visible_rows: Arc<AtomicUsize>, // visible diff rows (set each frame in on_visible) — for Space page-scroll
     graph_scroll_to: Option<(usize, Option<egui::Align>)>, // (commit index, alignment) to scroll to in graph view
     repo_path: String,
     scope: cli::Scope, // CLI ref/path scope, set once at startup
@@ -2659,6 +2663,7 @@ impl GitkApp {
             diff_files,
             diff_scroll_to: None,
             diff_top_line: Arc::new(AtomicUsize::new(0)),
+            diff_visible_rows: Arc::new(AtomicUsize::new(1)),
             graph_scroll_to: None,
             repo_path,
             scope,
@@ -3308,14 +3313,16 @@ impl eframe::App for GitkApp {
 
         let search_id = egui::Id::new("search_field");
 
-        // Any printable keypress when search bar is not focused → focus it.
-        // The TextEdit will pick up the pending Text event once it has focus.
+        // Any printable keypress when search bar is not focused → focus it. The literal
+        // Space is the one exception: it's the diff page-scroll key, so it must not open
+        // search (you'd never start a search with a leading space anyway). Only ' ' is
+        // excluded — other whitespace (Tab, NBSP, …) still focuses and types normally.
         let mut search_has_focus = ctx.memory(|m| m.has_focus(search_id));
         if !search_has_focus {
             let has_text_event = ctx.input(|i| {
                 i.events
                     .iter()
-                    .any(|e| matches!(e, egui::Event::Text(t) if !t.is_empty()))
+                    .any(|e| matches!(e, egui::Event::Text(t) if !t.is_empty() && t.as_str() != " "))
             });
             if has_text_event {
                 ctx.memory_mut(|m| m.request_focus(search_id));
@@ -3383,6 +3390,35 @@ impl eframe::App for GitkApp {
             {
                 self.diff_scroll_to = Some(line);
             }
+        }
+
+        // Space / Shift+Space: scroll the diff down / up by ~a page. Only when no
+        // widget has keyboard focus, so it doesn't steal Space from the search field
+        // or a toolbar checkbox (where Space types / toggles).
+        let space_dir: isize = if ctx.memory(|m| m.focused().is_none()) {
+            ctx.input_mut(|i| {
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::Space) {
+                    1
+                } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::Space) {
+                    -1
+                } else {
+                    0
+                }
+            })
+        } else {
+            0
+        };
+        if space_dir != 0 && self.diff_scroll_to.is_none() && !self.diff_lines.is_empty() {
+            let top = self.diff_top_line.load(Ordering::Relaxed);
+            // Half a viewport per press — enough to advance, little enough to keep
+            // context (a full page scrolls away almost everything you were reading).
+            let page = (self.diff_visible_rows.load(Ordering::Relaxed) / 2).max(1);
+            let new_top = if space_dir > 0 {
+                (top + page).min(self.diff_lines.len())
+            } else {
+                top.saturating_sub(page)
+            };
+            self.diff_scroll_to = Some(new_top);
         }
 
         // ── Top panel: search bar ──
@@ -4086,12 +4122,14 @@ impl eframe::App for GitkApp {
                             let priority = self.highlight_priority.as_ref();
                             let word_diff = self.word_diff;
                             let diff_top = Arc::clone(&self.diff_top_line);
+                            let diff_visible = Arc::clone(&self.diff_visible_rows);
                             show_virtualized_diff(
                                 ui,
                                 &font_id,
                                 diff_view,
-                                |rows| {
+                                |rows, viewport_rows| {
                                     diff_top.store(rows.start, Ordering::Relaxed);
+                                    diff_visible.store(viewport_rows, Ordering::Relaxed);
                                     // Tell the background worker which files are on
                                     // screen so it tokenizes those first, plus the
                                     // file range one viewport (in rows) above/below
@@ -4126,12 +4164,14 @@ impl eframe::App for GitkApp {
                             let palette = &self.diff_palette;
                             let word_diff = self.word_diff;
                             let diff_top = Arc::clone(&self.diff_top_line);
+                            let diff_visible = Arc::clone(&self.diff_visible_rows);
                             show_virtualized_diff(
                                 ui,
                                 &font_id,
                                 diff_view,
-                                |rows| {
+                                |rows, viewport_rows| {
                                     diff_top.store(rows.start, Ordering::Relaxed);
+                                    diff_visible.store(viewport_rows, Ordering::Relaxed);
                                 },
                                 |i| {
                                     let (job, _) =
