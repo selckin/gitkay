@@ -3104,10 +3104,14 @@ impl eframe::App for GitkApp {
         }
         self.ensure_diff_highlighted(&ctx);
 
-        // Apply prefetched neighbour diffs into the cache — skip one that became
-        // the live diff in the meantime (load_selected_diff owns that key).
+        // Apply prefetched neighbour diffs into the cache. Skip one that became the
+        // live diff in the meantime (load_selected_diff owns that key), and drop one
+        // whose settings no longer match the current ones: a prefetch dispatched under
+        // an old context/theme/etc finishes with a key pinning those old settings, so
+        // it could never be hit again and would only bloat the LRU. (Settings unchanged
+        // but selection moved still matches — those neighbour diffs stay useful.)
         while let Ok((key, data)) = self.prefetch_rx.try_recv() {
-            if self.current_diff_key.as_ref() != Some(&key) {
+            if key == self.diff_cache_key(key.oid) && self.current_diff_key.as_ref() != Some(&key) {
                 let weight = data.lines.len();
                 self.diff_cache.insert(key, data, weight);
             }
