@@ -47,7 +47,7 @@
 ### Diff Viewer
 - True syntax-highlighted diffs (syntect): language-aware token colors over the chosen theme's background, with green/red row tints and a +/- gutter for additions/deletions
 - Selectable color theme via `[diff] theme` in the config (any of 29 bundled themes — a curated allowlist; default Catppuccin Mocha), applied live on save; or turn highlighting off for the original flat per-line coloring
-- File list sidebar with per-file `+/-` stats
+- File list sidebar with per-file `+/-` stats and the full file path (toggle via `[diff] file_full_path`)
 - Click a file to jump to its diff section
 - Commit header with author, date, full message
 
@@ -186,6 +186,7 @@ commit_summary = { size = 14, font = "proportional" }
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `show_stats` | `true` | `false` hides the diffstat block (the file-list sidebar still lists every file) |
+| `file_full_path` | `true` | `false` shows just the basename; `true` shows the full repo-relative path (long paths left-truncated, complete path on hover) |
 | `syntax` | `true` | `false` restores the original flat per-role coloring (no theme, no highlighter) |
 | `theme` | `"catppuccin-mocha"` | one of 29 bundled themes (e.g. `dracula`, `nord`, `gruvbox-dark`, `github`, `solarized-light`); unknown values warn and fall back |
 
