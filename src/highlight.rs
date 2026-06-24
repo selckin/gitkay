@@ -132,7 +132,8 @@ pub fn luminance(c: egui::Color32) -> f32 {
     (0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32) / 255.0
 }
 
-fn blend(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+/// Linear blend of two opaque colours (`t` toward `b`).
+pub(crate) fn blend(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
     let m = |x: u8, y: u8| (x as f32 * (1.0 - t) + y as f32 * t).round() as u8;
     egui::Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
 }
