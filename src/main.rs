@@ -1784,14 +1784,20 @@ fn parse_bg_hex(label: &str, v: Option<&str>, warnings: &mut Vec<String>) -> Opt
     c
 }
 
-/// Word-diff highlight colour for a changed run on a `kind` line: a brighter patch
-/// than the row tint, blending the row background toward the diff accent colour.
-fn emphasis_bg(kind: LineKind, palette: &highlight::DiffPalette) -> egui::Color32 {
-    let (bg, accent) = match kind {
-        LineKind::Del => (palette.deleted_bg, palette.deleted),
-        _ => (palette.added_bg, palette.added),
+/// Word-diff highlight colour for a changed run on a `kind` line: `backdrop` pushed
+/// halfway toward the diff accent colour, so the patch is a brighter version of
+/// whatever is actually behind it. The caller passes the row tint (syntax-on, where
+/// the row is tinted) or the pane background (syntax-off, where it isn't).
+fn emphasis_bg(
+    kind: LineKind,
+    palette: &highlight::DiffPalette,
+    backdrop: egui::Color32,
+) -> egui::Color32 {
+    let accent = match kind {
+        LineKind::Del => palette.deleted,
+        _ => palette.added,
     };
-    highlight::blend(bg, accent, 0.5)
+    highlight::blend(backdrop, accent, 0.5)
 }
 
 /// Split `body` into the maximal segments that share one syntax colour and one
@@ -1902,8 +1908,14 @@ fn diff_row_job(
         );
         // Spans hold byte ranges into `body`; a None/empty span set renders plain.
         let spans = line.spans.as_deref().unwrap_or(&[]);
-        let emph_bg =
-            (word_diff && !line.emphasis.is_empty()).then(|| emphasis_bg(line.kind, palette));
+        let emph_bg = (word_diff && !line.emphasis.is_empty()).then(|| {
+            // The patch sits on the row's own add/del tint here.
+            let tint = match line.kind {
+                LineKind::Del => palette.deleted_bg,
+                _ => palette.added_bg,
+            };
+            emphasis_bg(line.kind, palette, tint)
+        });
         append_body(
             &mut job,
             &font_id,
@@ -1969,7 +1981,8 @@ fn flat_row_job(
         &[],
         color,
         &line.emphasis,
-        Some(emphasis_bg(line.kind, palette)),
+        // Syntax-off draws no row tint, so the patch sits on the pane background.
+        Some(emphasis_bg(line.kind, palette, palette.background)),
     );
     job
 }
