@@ -582,6 +582,22 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
     commits
 }
 
+/// Pathspec to scope a commit's diff to. In --follow mode it's the file's name *at
+/// that commit* (a pre-rename commit resolves under its old name); otherwise the
+/// global path filter. Pure (no `GitkApp`) so it's unit-testable.
+fn diff_paths_for(scope: &cli::Scope, commits: &[CommitInfo], oid: git2::Oid) -> Vec<String> {
+    if scope.follow {
+        commits
+            .iter()
+            .find(|c| c.oid == oid)
+            .and_then(|c| c.follow_path.clone())
+            .map(|p| vec![p])
+            .unwrap_or_else(|| scope.paths.clone())
+    } else {
+        scope.paths.clone()
+    }
+}
+
 /// Load the commit list for the active scope: the reflog when `--reflog` is set,
 /// otherwise the normal history walk.
 fn load_history(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitInfo> {
@@ -739,9 +755,10 @@ fn word_tokens(s: &str) -> Vec<(std::ops::Range<usize>, &str)> {
     out
 }
 
-/// Indices of the tokens in `a` and `b` that are NOT in a longest common
-/// subsequence (by text) — the changed tokens on each side. O(n·m), fine for one
-/// short line.
+/// The token positions in `a` and `b` that a longest-common-subsequence alignment
+/// (by text) leaves unmatched — the changed tokens on each side. (A token whose
+/// text also appears elsewhere can still be marked changed; it's the *position*
+/// that's unaligned, not the value.) O(n·m), fine for one short line.
 fn changed_tokens(a: &[&str], b: &[&str]) -> (Vec<usize>, Vec<usize>) {
     let (n, m) = (a.len(), b.len());
     // dp[i][j] = LCS length of a[i..] and b[j..].
@@ -953,6 +970,14 @@ struct DiffData {
 }
 
 impl DiffData {
+    /// Finalize a diff builder's output: store the lines + files, computing the
+    /// word-diff emphasis once. The single place every builder produces a DiffData,
+    /// so no source can forget the emphasis pass.
+    fn new(mut lines: Vec<DiffLine>, files: Vec<FileEntry>) -> Self {
+        compute_word_emphasis(&mut lines);
+        DiffData { lines, files }
+    }
+
     /// An empty diff — returned when a git2 operation fails (the error is logged
     /// at the call site before returning this).
     fn empty() -> Self {
@@ -1136,8 +1161,7 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, path
     })
     .unwrap_or_else(|e| log::warn!("gitkay: error rendering diff patch: {e}"));
 
-    compute_word_emphasis(&mut lines);
-    DiffData { lines, files }
+    DiffData::new(lines, files)
 }
 
 /// Generate diff for uncommitted working tree changes (workdir vs index).
@@ -1276,8 +1300,7 @@ fn diff_to_data(diff: &git2::Diff, title: &str, show_stats: bool) -> DiffData {
     })
     .unwrap_or_else(|e| log::warn!("gitkay: error rendering diff patch: {e}"));
 
-    compute_word_emphasis(&mut lines);
-    DiffData { lines, files }
+    DiffData::new(lines, files)
 }
 
 /// Each file's `(file index, start, end)` line range, ordered by start. File
@@ -1761,16 +1784,6 @@ fn parse_bg_hex(label: &str, v: Option<&str>, warnings: &mut Vec<String>) -> Opt
     c
 }
 
-/// Build the LayoutJob for one diff row plus its optional background tint.
-/// Code lines get a synthesized +/-/space gutter (drawn from `kind`, so context
-/// and changed lines share one column) then their token spans; structural lines
-/// render whole in one palette color.
-/// Linear blend of two opaque colours (`t` toward `b`).
-fn blend(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
-    let m = |x: u8, y: u8| (x as f32 * (1.0 - t) + y as f32 * t).round() as u8;
-    egui::Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
-}
-
 /// Word-diff highlight colour for a changed run on a `kind` line: a brighter patch
 /// than the row tint, blending the row background toward the diff accent colour.
 fn emphasis_bg(kind: LineKind, palette: &highlight::DiffPalette) -> egui::Color32 {
@@ -1778,7 +1791,7 @@ fn emphasis_bg(kind: LineKind, palette: &highlight::DiffPalette) -> egui::Color3
         LineKind::Del => (palette.deleted_bg, palette.deleted),
         _ => (palette.added_bg, palette.added),
     };
-    blend(bg, accent, 0.5)
+    highlight::blend(bg, accent, 0.5)
 }
 
 /// Split `body` into the maximal segments that share one syntax colour and one
@@ -1860,6 +1873,10 @@ fn append_body(
     }
 }
 
+/// Build the LayoutJob for one diff row plus its optional background tint.
+/// Code lines get a synthesized +/-/space gutter (drawn from `kind`, so context
+/// and changed lines share one column) then their token spans (with word-diff
+/// emphasis when on); structural lines render whole in one palette colour.
 fn diff_row_job(
     line: &DiffLine,
     palette: &highlight::DiffPalette,
@@ -2669,21 +2686,11 @@ impl GitkApp {
         }
     }
 
-    /// Pathspec to scope a commit's diff to. In --follow mode this is the file's
-    /// name *at that commit* (so a pre-rename commit resolves under its old name);
-    /// otherwise the global path filter. The one place every diff entry point —
-    /// the selected diff and the prefetch worker — resolves the path.
+    /// Pathspec to scope a commit's diff to (delegates to the pure `diff_paths_for`).
+    /// Both diff entry points — the selected diff and the prefetch worker — call this,
+    /// so neither can drift from the --follow path resolution.
     fn diff_paths_for_oid(&self, oid: git2::Oid) -> Vec<String> {
-        if self.scope.follow {
-            self.commits
-                .iter()
-                .find(|c| c.oid == oid)
-                .and_then(|c| c.follow_path.clone())
-                .map(|p| vec![p])
-                .unwrap_or_else(|| self.scope.paths.clone())
-        } else {
-            self.scope.paths.clone()
-        }
+        diff_paths_for(&self.scope, &self.commits, oid)
     }
 
     fn diff_cache_key(&self, oid: git2::Oid) -> DiffCacheKey {
@@ -4008,16 +4015,10 @@ fn main() -> eframe::Result {
             .collect(),
         None => raw_paths, // bare repo: no worktree to anchor paths against
     };
-    // --follow tracks exactly one path across renames (like git); reject misuse.
-    if raw.follow {
-        if raw.reflog {
-            eprintln!("gitkay: --follow and --reflog cannot be combined");
-            std::process::exit(2);
-        }
-        if paths.len() != 1 {
-            eprintln!("gitkay: --follow requires exactly one path");
-            std::process::exit(2);
-        }
+    // Reject flag/positional misuse (--follow needs exactly one path, etc.).
+    if let Err(e) = cli::validate(raw.reflog, raw.follow, revs.len(), paths.len()) {
+        eprintln!("gitkay: {e}");
+        std::process::exit(2);
     }
     let scope = cli::Scope { all: raw.all, revs, paths, reflog: raw.reflog, follow: raw.follow };
 
@@ -5576,5 +5577,90 @@ mod tests {
             .map(|(r, _, _)| &body[r.clone()])
             .collect();
         assert_eq!(emph, "naïve");
+    }
+
+    #[test]
+    fn diff_paths_for_follows_per_commit_name() {
+        let mk = |o: git2::Oid, fp: Option<&str>| CommitInfo {
+            oid: o,
+            summary: String::new(),
+            author: String::new(),
+            time: 0,
+            parents: Vec::new(),
+            refs: Vec::new(),
+            follow_path: fp.map(String::from),
+        };
+        let commits = vec![mk(oid(2), Some("new.txt")), mk(oid(1), Some("old.txt"))];
+        let follow = cli::Scope {
+            follow: true,
+            paths: vec!["new.txt".to_string()],
+            ..Default::default()
+        };
+        // Each commit's diff follows the file's name at that commit.
+        assert_eq!(diff_paths_for(&follow, &commits, oid(1)), vec!["old.txt".to_string()]);
+        assert_eq!(diff_paths_for(&follow, &commits, oid(2)), vec!["new.txt".to_string()]);
+        // Unknown oid (or no follow_path) falls back to the global path.
+        assert_eq!(diff_paths_for(&follow, &commits, oid(9)), vec!["new.txt".to_string()]);
+        // Non-follow mode always uses the global path filter.
+        let plain = cli::Scope { paths: vec!["x".to_string()], ..Default::default() };
+        assert_eq!(diff_paths_for(&plain, &commits, oid(1)), vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn changed_tokens_edge_cases() {
+        assert_eq!(changed_tokens(&["a", "b"], &["a", "b"]), (vec![], vec![])); // identical
+        assert_eq!(changed_tokens(&["a", "c"], &["a", "b", "c"]), (vec![], vec![1])); // insert
+        assert_eq!(changed_tokens(&["a", "b", "c"], &["a", "c"]), (vec![1], vec![])); // delete
+        assert_eq!(changed_tokens(&[], &["a"]), (vec![], vec![0])); // empty → all inserted
+        assert_eq!(changed_tokens(&["a"], &[]), (vec![0], vec![])); // all deleted
+        assert_eq!(changed_tokens(&[], &[]), (vec![], vec![])); // both empty
+    }
+
+    #[test]
+    fn merge_token_ranges_merges_only_contiguous() {
+        let toks: Vec<(std::ops::Range<usize>, &str)> =
+            vec![(0..1, "a"), (1..2, "b"), (2..3, "c"), (3..4, "d")];
+        assert_eq!(merge_token_ranges(&toks, &[0, 1]), vec![0..2]); // adjacent → merged
+        assert_eq!(merge_token_ranges(&toks, &[0, 2]), vec![0..1, 2..3]); // gap → separate
+        assert!(merge_token_ranges(&toks, &[]).is_empty());
+    }
+
+    #[test]
+    fn reflog_resolves_a_named_branch() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.txt", "1", "on master");
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature", &head, false).unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        let c2 = commit_file(&repo, "a.txt", "2", "on feature");
+        // A shorthand ref name resolves to its reflog (the named-ref branch).
+        let scope = cli::Scope {
+            reflog: true,
+            revs: vec!["feature".to_string()],
+            ..Default::default()
+        };
+        let rows = load_reflog(&repo, 100, &scope);
+        assert!(!rows.is_empty(), "named-ref reflog should resolve and list entries");
+        assert_eq!(rows[0].oid, c2);
+        assert_eq!(rows[0].refs[0].0, "feature@{0}");
+    }
+
+    #[test]
+    fn rename_source_and_file_added() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "old.txt", "x\ny\nz\n", "create");
+        let wd = repo.workdir().unwrap().to_path_buf();
+        std::fs::rename(wd.join("old.txt"), wd.join("new.txt")).unwrap();
+        let renamed = commit_rename(&repo, "old.txt", "new.txt", "rename");
+        let edit = commit_file(&repo, "new.txt", "x\nY\nz\n", "edit");
+        let c = |o| repo.find_commit(o).unwrap();
+        // The rename commit adds new.txt (renamed from old.txt).
+        assert!(file_added(&c(renamed), "new.txt"));
+        assert_eq!(rename_source(&repo, &c(renamed), "new.txt").as_deref(), Some("old.txt"));
+        // The edit commit did NOT add new.txt (it already existed) → no rename.
+        assert!(!file_added(&c(edit), "new.txt"));
+        assert_eq!(rename_source(&repo, &c(edit), "new.txt"), None);
+        // A path that wasn't renamed → None.
+        assert_eq!(rename_source(&repo, &c(renamed), "unrelated.txt"), None);
     }
 }

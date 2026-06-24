@@ -118,6 +118,22 @@ pub fn classify(
     Ok((revs, paths))
 }
 
+/// Validate the flag/positional combination. Pure (no repo, no process exit) so
+/// the rules are unit-testable; the caller maps `Err` to a usage message + exit.
+/// `n_revs`/`n_paths` are the counts after classification.
+pub fn validate(reflog: bool, follow: bool, n_revs: usize, n_paths: usize) -> Result<(), String> {
+    if follow && reflog {
+        return Err("--follow and --reflog cannot be combined".to_string());
+    }
+    if follow && n_paths != 1 {
+        return Err("--follow requires exactly one path".to_string());
+    }
+    if reflog && (n_paths > 0 || n_revs > 1) {
+        return Err("--reflog takes at most one ref and no paths".to_string());
+    }
+    Ok(())
+}
+
 /// Classify a `<rev>` token's shape (`...` is checked before `..`).
 pub fn rev_token_kind(tok: &str) -> RevTokenKind {
     if let Some(rest) = tok.strip_prefix('^') {
@@ -215,6 +231,20 @@ mod tests {
         assert!(r.follow);
         assert_eq!(r.pre, v(&["src/foo.rs"]));
         assert!(!parse_flags(v(&["src/foo.rs"]).into_iter()).unwrap().follow);
+    }
+
+    #[test]
+    fn validate_flag_combinations() {
+        // validate(reflog, follow, n_revs, n_paths)
+        assert!(validate(false, false, 1, 2).is_ok()); // ordinary scope
+        assert!(validate(false, true, 0, 1).is_ok()); // --follow one path
+        assert!(validate(false, true, 0, 0).is_err()); // --follow needs a path
+        assert!(validate(false, true, 0, 2).is_err()); // --follow rejects two paths
+        assert!(validate(true, true, 0, 1).is_err()); // can't combine
+        assert!(validate(true, false, 0, 0).is_ok()); // --reflog HEAD
+        assert!(validate(true, false, 1, 0).is_ok()); // --reflog <ref>
+        assert!(validate(true, false, 2, 0).is_err()); // --reflog rejects two refs
+        assert!(validate(true, false, 1, 1).is_err()); // --reflog rejects a path
     }
 
     #[test]
