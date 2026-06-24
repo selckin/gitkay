@@ -2419,11 +2419,23 @@ impl GitkApp {
         };
 
         // Auto-select first commit and load its diff
-        let (diff_lines, diff_files) = if let Some(first) = commits.first() {
+        let (diff_lines, diff_files, current_diff_key) = if let Some(first) = commits.first() {
             let data = get_diff_data(&repo, first.oid, diff_settings, &scope.paths);
-            (data.lines, data.files)
+            // Key the startup diff so navigating away stashes it into the cache (real
+            // commits only — virtual rows aren't cacheable). Without this, the most-
+            // visited commit (HEAD at row 0) is recomputed + re-highlighted on every
+            // return instead of restored instantly.
+            let key = is_real_commit(first.oid).then(|| DiffCacheKey {
+                oid: first.oid,
+                context: diff_context,
+                ignore_ws: diff_ignore_ws,
+                theme: theme_slug.clone(),
+                enabled: syntax_enabled,
+                show_stats,
+            });
+            (data.lines, data.files, key)
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), None)
         };
         let all_loaded = commits.len() < 200;
 
@@ -2580,7 +2592,7 @@ impl GitkApp {
             highlight_rx,
             highlight_priority: None,
             diff_cache: DiffCache::new(DIFF_CACHE_LINE_BUDGET),
-            current_diff_key: None,
+            current_diff_key,
             prewarm_rx,
             prefetch_tx,
             prefetch_rx,
