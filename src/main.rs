@@ -919,17 +919,43 @@ fn kind_color(kind: LineKind, palette: &highlight::DiffPalette) -> egui::Color32
 /// path passes a no-op). `build_row` produces each row's job, an optional
 /// background tint, and the galley fallback colour. Shared by both render paths
 /// so the scroll/offset/width scaffold lives in one place.
-fn show_virtualized_diff(
-    ui: &mut egui::Ui,
-    font_id: &egui::FontId,
+/// Layout inputs for `show_virtualized_diff`: total rows, the widest line (sizes the
+/// horizontal scroll), an optional forced scroll line, and the deepest file start the
+/// bottom padding must let reach the top (`None` ⇒ no files ⇒ no padding).
+struct DiffView {
     n_lines: usize,
     content_chars: usize,
     scroll_target: Option<usize>,
+    last_top_anchor: Option<usize>,
+}
+
+/// Bottom-padding rows for the diff so the deepest file (`last_top_anchor`, its start
+/// line) can scroll to the top of a `viewport_rows`-tall viewport: only the rows that
+/// file leaves short of a screenful, so a last file that already fills the viewport
+/// gets none (no dead scroll space). `None` ⇒ no files ⇒ no padding. Pure (no egui),
+/// so the off-by-one-prone arithmetic is unit-testable.
+fn diff_pad_rows(n_lines: usize, last_top_anchor: Option<usize>, viewport_rows: usize) -> usize {
+    last_top_anchor.map_or(0, |anchor| {
+        viewport_rows.saturating_sub(n_lines.saturating_sub(anchor))
+    })
+}
+
+fn show_virtualized_diff(
+    ui: &mut egui::Ui,
+    font_id: &egui::FontId,
+    view: DiffView,
     mut on_visible: impl FnMut(std::ops::Range<usize>),
     mut build_row: impl FnMut(usize) -> (egui::text::LayoutJob, Option<egui::Color32>, egui::Color32),
 ) {
+    let DiffView { n_lines, content_chars, scroll_target, last_top_anchor } = view;
     let row_h = ui.fonts_mut(|f| f.row_height(font_id));
     ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+    // Bottom padding: empty rows below the diff so the deepest file's start can scroll
+    // to the top of the viewport — without it the scroll clamps a near-end line partway
+    // up the final screenful, so the last files can never sit at the top (nor be
+    // highlighted in the file list, which tracks the top line). See diff_pad_rows.
+    let viewport_rows = (ui.available_height() / row_h).ceil() as usize;
+    let total_rows = n_lines + diff_pad_rows(n_lines, last_top_anchor, viewport_rows);
     let mut scroll = egui::ScrollArea::both()
         .id_salt("diff_scroll")
         .auto_shrink([false, false])
@@ -944,10 +970,17 @@ fn show_virtualized_diff(
     // off-screen line is wide. Monospace assumption.
     let char_w = ui.fonts_mut(|f| f.glyph_width(font_id, ' '));
     let content_w = (content_chars as f32 + 1.0) * char_w;
-    scroll.show_rows(ui, row_h, n_lines, |ui, rows| {
+    scroll.show_rows(ui, row_h, total_rows, |ui, rows| {
         ui.set_min_width(content_w);
-        on_visible(rows.clone());
+        // Report only real lines — the padding rows below aren't part of the diff.
+        let real = rows.start.min(n_lines.saturating_sub(1))..rows.end.min(n_lines);
+        on_visible(real);
         for i in rows {
+            if i >= n_lines {
+                // Padding row: reserve the height, draw nothing.
+                ui.allocate_exact_size(egui::vec2(content_w, row_h), egui::Sense::hover());
+                continue;
+            }
             let (job, row_bg, fallback) = build_row(i);
             let galley = ui.fonts_mut(|f| f.layout_job(job));
             let width = ui.available_width().max(galley.size().x);
@@ -1275,15 +1308,18 @@ fn file_line_ranges(files: &[FileEntry], total_lines: usize) -> Vec<(usize, usiz
         .collect()
 }
 
-/// Index of the file whose patch region contains `line` (the last file starting
-/// at or before it), or 0 when `line` is in the pre-file header region.
-fn file_index_at_line(files: &[FileEntry], line: usize) -> usize {
+/// Index of the file whose patch region contains `line` (the last file starting at or
+/// before it), or `None` when `line` is in the pre-file header region.
+fn file_index_at_line_opt(files: &[FileEntry], line: usize) -> Option<usize> {
     files
         .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, f)| f.diff_line_idx.is_some_and(|idx| idx <= line))
-        .map_or(0, |(i, _)| i)
+        .rposition(|f| f.diff_line_idx.is_some_and(|idx| idx <= line))
+}
+
+/// Like `file_index_at_line_opt` but defaults to 0 (the first file) in the header
+/// region — for callers that always want a file index.
+fn file_index_at_line(files: &[FileEntry], line: usize) -> usize {
+    file_index_at_line_opt(files, line).unwrap_or(0)
 }
 
 /// The diff line to scroll to for a page-by-file step, given `top` (the first visible
@@ -2168,6 +2204,13 @@ const GREEN: egui::Color32 = egui::Color32::from_rgb(166, 227, 161);
 const RED: egui::Color32 = egui::Color32::from_rgb(243, 139, 168);
 const YELLOW: egui::Color32 = egui::Color32::from_rgb(249, 226, 175);
 
+/// Mauve selection accent (translucent) — the fill behind the selected commit row and
+/// the current file in the file list, so the two stay in sync. A fn (not a const)
+/// because `from_rgba_unmultiplied` is gamma-correct and not const-constructible.
+fn select_accent() -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(203, 166, 247, 40)
+}
+
 // ── App state ────────────────────────────────────────────────────────────
 
 struct GitkApp {
@@ -2178,7 +2221,6 @@ struct GitkApp {
     diff_files: Vec<FileEntry>,
     diff_scroll_to: Option<usize>,
     diff_top_line: Arc<AtomicUsize>, // first visible diff line (set each frame in on_visible) — for page-by-file nav
-    diff_paged_to: Option<usize>, // last line a PageUp/Down stepped to (the bottom can clamp the scroll short of it)
     graph_scroll_to: Option<(usize, Option<egui::Align>)>, // (commit index, alignment) to scroll to in graph view
     repo_path: String,
     scope: cli::Scope, // CLI ref/path scope, set once at startup
@@ -2577,7 +2619,6 @@ impl GitkApp {
             diff_files,
             diff_scroll_to: None,
             diff_top_line: Arc::new(AtomicUsize::new(0)),
-            diff_paged_to: None,
             graph_scroll_to: None,
             repo_path,
             scope,
@@ -2697,11 +2738,10 @@ impl GitkApp {
     fn load_selected_diff(&mut self, repo: &Repository) {
         // A new diff invalidates the page-by-file nav state: drop any stale scroll
         // target a same-frame PageUp/Down queued against the outgoing diff, and reset
-        // the recorded top / paged cursor so the next page step starts from the top of
-        // the new diff. (Callers that want a specific scroll set diff_scroll_to after.)
+        // the recorded top so the next page step starts from the top of the new diff.
+        // (Callers that want a specific scroll set diff_scroll_to after.)
         self.diff_scroll_to = None;
         self.diff_top_line.store(0, Ordering::Relaxed);
-        self.diff_paged_to = None;
 
         // Stash the outgoing diff under its stored key (a move, not a clone) so a
         // later revisit restores it — content and spans — instantly. Only set
@@ -3258,20 +3298,14 @@ impl eframe::App for GitkApp {
             }
         });
         if page_delta != 0 && self.diff_scroll_to.is_none() {
-            let down = page_delta > 0;
+            // Step from the live top: the diff's bottom padding lets any file scroll to
+            // the top, so `top` always reflects a reachable position (no clamp to work
+            // around) and a manual scroll is honoured.
             let top = self.diff_top_line.load(Ordering::Relaxed);
-            // Paging down to a near-end file clamps the scroll short of its start (no
-            // content below to fill the viewport), leaving the recorded top below it;
-            // step from the line we actually paged to so the final files stay
-            // reachable. Only for down — paging up never clamps, so it follows the live
-            // top (and honours a manual scroll).
-            let from = match self.diff_paged_to {
-                Some(p) if down && top <= p => p,
-                _ => top,
-            };
-            if let Some(line) = next_file_line(&self.diff_files, self.diff_lines.len(), from, down) {
+            if let Some(line) =
+                next_file_line(&self.diff_files, self.diff_lines.len(), top, page_delta > 0)
+            {
                 self.diff_scroll_to = Some(line);
-                self.diff_paged_to = Some(line);
             }
         }
 
@@ -3470,11 +3504,7 @@ impl eframe::App for GitkApp {
                             }
 
                             if self.selected == Some(idx) {
-                                painter.rect_filled(
-                                    row_rect,
-                                    0.0,
-                                    egui::Color32::from_rgba_unmultiplied(203, 166, 247, 40),
-                                );
+                                painter.rect_filled(row_rect, 0.0, select_accent());
                             }
                             // Yellow accent bar on the left edge — independent of the
                             // selection fill (drawn on top of it), so the selected
@@ -3829,7 +3859,13 @@ impl eframe::App for GitkApp {
                             egui::ScrollArea::vertical()
                                 .id_salt("file_list")
                                 .show(ui, |ui| {
-                                    for file in &self.diff_files {
+                                    // The file the diff is scrolled into (None while
+                                    // still in the commit header) — highlighted below
+                                    // with the same accent the commit list uses for the
+                                    // selected row, so the list tracks the diff view.
+                                    let top = self.diff_top_line.load(Ordering::Relaxed);
+                                    let current_file = file_index_at_line_opt(&self.diff_files, top);
+                                    for (fi, file) in self.diff_files.iter().enumerate() {
                                         let short_path =
                                             file.path.rsplit('/').next().unwrap_or(&file.path);
                                         let line_idx = file.diff_line_idx;
@@ -3839,8 +3875,11 @@ impl eframe::App for GitkApp {
                                             egui::Sense::click(),
                                         );
 
-                                        // Hover highlight
-                                        if resp.hovered() {
+                                        // Current-file accent (same as the commit-list
+                                        // selection); hover highlight for the rest.
+                                        if current_file == Some(fi) {
+                                            ui.painter().rect_filled(rect, 2.0, select_accent());
+                                        } else if resp.hovered() {
                                             ui.painter().rect_filled(
                                                 rect,
                                                 2.0,
@@ -3902,9 +3941,6 @@ impl eframe::App for GitkApp {
                                             && let Some(idx) = line_idx
                                         {
                                             self.diff_scroll_to = Some(idx);
-                                            // Anchor page-by-file nav to the clicked
-                                            // file (and survive a near-bottom clamp).
-                                            self.diff_paged_to = Some(idx);
                                         }
                                         if resp.hovered() {
                                             resp.show_tooltip_text(&file.path);
@@ -3952,7 +3988,16 @@ impl eframe::App for GitkApp {
                     .frame(frame)
                     .show_inside(ui, |ui| {
                         ui.style_mut().override_font_id = Some(self.fonts.font_id(Role::Diff));
-                        let scroll_target = self.diff_scroll_to.take();
+                        // Layout inputs are identical for both render branches (only the
+                        // closures differ), so build the DiffView once. last_top_anchor
+                        // is the deepest file start, which the bottom padding lets reach
+                        // the top (None ⇒ no files).
+                        let diff_view = DiffView {
+                            n_lines: self.diff_lines.len(),
+                            content_chars: self.diff_max_chars,
+                            scroll_target: self.diff_scroll_to.take(),
+                            last_top_anchor: self.diff_files.iter().filter_map(|f| f.diff_line_idx).max(),
+                        };
                         if let Some(palette) = &palette {
                             // Themed render: row colours come from the theme's token
                             // spans plus an add/del background tint.
@@ -3965,9 +4010,7 @@ impl eframe::App for GitkApp {
                             show_virtualized_diff(
                                 ui,
                                 &font_id,
-                                lines.len(),
-                                self.diff_max_chars,
-                                scroll_target,
+                                diff_view,
                                 |rows| {
                                     diff_top.store(rows.start, Ordering::Relaxed);
                                     // Tell the background worker which files are on
@@ -4007,9 +4050,7 @@ impl eframe::App for GitkApp {
                             show_virtualized_diff(
                                 ui,
                                 &font_id,
-                                lines.len(),
-                                self.diff_max_chars,
-                                scroll_target,
+                                diff_view,
                                 |rows| {
                                     diff_top.store(rows.start, Ordering::Relaxed);
                                 },
@@ -4961,6 +5002,24 @@ mod tests {
         assert_eq!(file_index_at_line(&files, 5), 2); // first line of "b"
         assert_eq!(file_index_at_line(&files, 8), 2); // inside "b"
         assert_eq!(file_index_at_line(&files, 999), 2); // past the last file → last file
+
+        // The _opt variant distinguishes the header region (no current file) from 0.
+        assert_eq!(file_index_at_line_opt(&files, 0), None); // header → no file
+        assert_eq!(file_index_at_line_opt(&files, 3), Some(0)); // inside "a"
+        assert_eq!(file_index_at_line_opt(&files, 8), Some(2)); // inside "b"
+    }
+
+    #[test]
+    fn diff_pad_rows_sizes_to_the_last_file() {
+        // No files → no padding.
+        assert_eq!(diff_pad_rows(100, None, 30), 0);
+        // Last file already fills (or exactly fills) the viewport → no padding.
+        assert_eq!(diff_pad_rows(100, Some(50), 30), 0); // 50 lines below ≥ 30
+        assert_eq!(diff_pad_rows(100, Some(70), 30), 0); // exactly 30 below
+        // Small last file → pad just enough for its start to reach the top.
+        assert_eq!(diff_pad_rows(100, Some(90), 30), 20); // 10 below, need 30
+        // One-line last file at the very end → almost a full screenful.
+        assert_eq!(diff_pad_rows(100, Some(99), 30), 29); // 1 below, need 30
     }
 
     #[test]
