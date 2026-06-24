@@ -80,10 +80,12 @@ const MAX_WARM_LANGS: usize = 12;
 /// pathologically deep trees (real repos nest far shallower). Deeper subtrees are
 /// skipped — the entry cap already bounds total work.
 const MAX_TREE_DEPTH: usize = 64;
-/// Prefetch: commits below the current selection to warm into the cache.
-const PREFETCH_BELOW: usize = 4;
-/// Prefetch: commits above the current selection to warm (closest-first).
-const PREFETCH_ABOVE: usize = 2;
+/// Prefetch: hard cap on commits warmed into the cache per dispatch, so a very tall
+/// commit list doesn't queue a huge number of diff builds. Closest-to-selected win.
+const PREFETCH_MAX: usize = 24;
+/// Prefetch: rows warmed beyond each visible edge, so arrow-key navigation off a
+/// view edge (the next Up/Down target is just off-screen) still hits a warm cache.
+const PREFETCH_MARGIN: usize = 8;
 
 /// Debounce window for watcher-triggered reloads: a burst of `.git` writes
 /// (rebase, fetch) coalesces into one reload after it settles, instead of a
@@ -202,33 +204,24 @@ fn print_version() {
     println!("gitkay {}", env!("CARGO_PKG_VERSION"));
 }
 
-/// The real-commit oids to prefetch around `selected`: up to `below` commits
-/// below (indices `selected+1 ..`), then up to `above` commits above
-/// (closest-first: `selected-1`, `selected-2`, …). Clamped to the slice bounds;
-/// virtual (uncommitted/staged) entries are excluded. Pure — fed the commit oids.
+/// The real-commit oids to prefetch: every row in `view` (a row range, clamped to the
+/// list via `get`) except the selected one and the virtual uncommitted/staged entries,
+/// ordered by distance from `selected` so the most likely next navigation targets warm
+/// first (on a tie the row *below* — larger index, i.e. scrolling down — wins), capped
+/// at `max`. Pure — fed the loaded commit list.
 fn prefetch_targets(
-    oids: &[git2::Oid],
+    commits: &[CommitInfo],
     selected: usize,
-    below: usize,
-    above: usize,
+    view: std::ops::Range<usize>,
+    max: usize,
 ) -> Vec<git2::Oid> {
-    let mut out = Vec::new();
-    for i in (selected + 1)..=(selected + below) {
-        if let Some(&oid) = oids.get(i)
-            && is_real_commit(oid)
-        {
-            out.push(oid);
-        }
-    }
-    for d in 1..=above {
-        if let Some(i) = selected.checked_sub(d)
-            && let Some(&oid) = oids.get(i)
-            && is_real_commit(oid)
-        {
-            out.push(oid);
-        }
-    }
-    out
+    let mut idxs: Vec<usize> = view
+        .filter(|&i| i != selected)
+        .filter(|&i| commits.get(i).is_some_and(|c| is_real_commit(c.oid)))
+        .collect();
+    // Closest to the selection first; tie → the row below (larger index) first.
+    idxs.sort_by_key(|&i| (i.abs_diff(selected), i < selected));
+    idxs.into_iter().take(max).map(|i| commits[i].oid).collect()
 }
 
 /// The virtual uncommitted/staged entries — exactly the complement of a real commit.
@@ -2213,6 +2206,7 @@ struct GitkApp {
     prefetch_epoch: Arc<AtomicU64>, // bumped per dispatch; supersedes older prefetch workers
     prefetched_gen: u64,            // diff_generation we last dispatched prefetch for
     last_highlight_check_gen: u64,  // diff_generation we last ran diff_fully_highlighted for
+    commit_view_range: std::ops::Range<usize>, // visible commit-list rows (set each frame)
 }
 
 /// Widest diff line in characters — used to size the horizontal scroll content
@@ -2609,6 +2603,10 @@ impl GitkApp {
             prefetch_epoch: Arc::new(AtomicU64::new(0)),
             prefetched_gen: 0,
             last_highlight_check_gen: 0,
+            // A generous first-frame estimate so a diff that settles before the
+            // commit panel has rendered once still warms the top commits; the panel
+            // overwrites this with the exact visible range every frame.
+            commit_view_range: 0..64,
         })
     }
 
@@ -2848,10 +2846,10 @@ impl GitkApp {
         }
     }
 
-    /// Spawn a background prefetch of the cacheable neighbours of the current
-    /// selection (4 below, 2 above), skipping any already cached or currently
-    /// live. Best-effort: only when a highlighter exists and a real commit is
-    /// selected.
+    /// Spawn a background prefetch of the cacheable commits in (and just past) the
+    /// visible window — closest-to-selected first, capped at `PREFETCH_MAX` — skipping
+    /// any already cached or currently live. Best-effort: only when a highlighter
+    /// exists and a real commit is selected.
     fn dispatch_prefetch(&self, ctx: &egui::Context) {
         let Some(sel) = self.selected else {
             log::debug!("prefetch: skip — no commit selected");
@@ -2861,13 +2859,15 @@ impl GitkApp {
             log::debug!("prefetch: skip — highlighter not ready");
             return;
         };
-        let oids: Vec<git2::Oid> = self.commits.iter().map(|c| c.oid).collect();
-        // Each target carries its own pathspec, so --follow prefetches a pre-rename
-        // commit under its old name (not the global path) — matching the single diff
-        // path that load_selected_diff would use, so the oid-keyed cache can't be
-        // poisoned by a wrong-path prefetch.
+        // The visible rows plus a margin past each edge, so an arrow-key step off the
+        // edge still lands on a warm diff. Each target carries its own pathspec, so
+        // --follow prefetches a pre-rename commit under its old name (not the global
+        // path) — matching the single diff path load_selected_diff would use, so the
+        // oid-keyed cache can't be poisoned by a wrong-path prefetch.
+        let view = self.commit_view_range.start.saturating_sub(PREFETCH_MARGIN)
+            ..self.commit_view_range.end + PREFETCH_MARGIN;
         let jobs: Vec<(DiffCacheKey, Vec<String>)> =
-            prefetch_targets(&oids, sel, PREFETCH_BELOW, PREFETCH_ABOVE)
+            prefetch_targets(&self.commits, sel, view, PREFETCH_MAX)
                 .into_iter()
                 .map(|oid| (self.diff_cache_key(oid), self.diff_paths_for_oid(oid)))
                 .filter(|(k, _)| {
@@ -2875,11 +2875,11 @@ impl GitkApp {
                 })
                 .collect();
         if jobs.is_empty() {
-            log::debug!("prefetch: skip — neighbours of commit #{sel} already cached (or none)");
+            log::debug!("prefetch: skip — visible commits already cached (or none)");
             return;
         }
         let epoch = self.prefetch_epoch.fetch_add(1, Ordering::Relaxed) + 1;
-        log::debug!("prefetch: dispatched {} around commit #{sel}", jobs.len());
+        log::debug!("prefetch: dispatched {} visible around commit #{sel}", jobs.len());
         let job = PrefetchJob {
             repo_path: self.repo_path.clone(),
             targets: jobs,
@@ -3140,9 +3140,8 @@ impl eframe::App for GitkApp {
                 self.diff_cache.insert(key, data, weight);
             }
         }
-        // Once the current diff is fully coloured, warm the neighbours (once per
-        // settled diff, tracked via diff_generation which is stable after a diff
-        // settles). Syntax-enabled only.
+        // Once the current diff is fully coloured, warm the visible commit window
+        // (closest-to-selected first), once per settled diff. Syntax-enabled only.
         if self.syntax_enabled {
             let current_gen = self.diff_generation.load(Ordering::Relaxed);
             // diff_fully_highlighted is O(lines); it can only flip to true when new
@@ -3336,6 +3335,9 @@ impl eframe::App for GitkApp {
                         let visible_rows = (panel_height / row_height).ceil() as usize + 2;
                         let last_row = (first_row + visible_rows).min(num_commits);
                         let row_range = first_row..last_row;
+                        // Remember the visible rows so the prefetcher can warm them
+                        // (read next frame, before this panel renders again).
+                        self.commit_view_range = row_range.clone();
 
                         // Pre-spacer
                         if first_row > 0 {
@@ -5197,29 +5199,42 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prefetch_targets_below_first_then_above_closest_first() {
-        let real = |n: u8| git2::Oid::from_bytes(&[n; 20]).unwrap();
-        // indices: 0=uncommitted, 1=staged (virtual), 2..=8 real
-        let oids = vec![
-            oid_uncommitted(),
-            oid_staged(),
-            real(2), real(3), real(4), real(5), real(6), real(7), real(8),
-        ];
-        // selected = 5 (real(5)); below 4 → indices 6,7,8 (9 is out of range);
-        // above 2 → indices 4,3 (closest-first).
-        assert_eq!(
-            prefetch_targets(&oids, 5, 4, 2),
-            vec![real(6), real(7), real(8), real(4), real(3)]
-        );
+    /// A bare CommitInfo carrying only an oid, for prefetch-target tests.
+    fn ci(oid: git2::Oid) -> CommitInfo {
+        CommitInfo {
+            oid,
+            summary: String::new(),
+            author: String::new(),
+            time: 0,
+            tz_offset_min: 0,
+            parents: Vec::new(),
+            refs: Vec::new(),
+            follow_path: None,
+        }
     }
 
     #[test]
-    fn prefetch_targets_excludes_virtual_entries() {
+    fn prefetch_targets_closest_first_below_wins_ties() {
         let real = |n: u8| git2::Oid::from_bytes(&[n; 20]).unwrap();
-        let oids = vec![oid_uncommitted(), oid_staged(), real(2), real(3), real(4)];
-        // selected = 2 (first real); below 4 → 3,4; above 2 → indices 1,0 = virtual → excluded.
-        assert_eq!(prefetch_targets(&oids, 2, 4, 2), vec![real(3), real(4)]);
+        let commits: Vec<CommitInfo> = (0..9).map(|n| ci(real(n))).collect();
+        // selected = 4, whole list visible. Ordered by |i-4|; on a tie the row below
+        // (larger index) first: 5,3, 6,2, 7,1, 8,0. Capped at 4.
+        assert_eq!(
+            prefetch_targets(&commits, 4, 0..9, 4),
+            vec![real(5), real(3), real(6), real(2)]
+        );
+        // Only the rows in `view` are eligible — a narrow window excludes the rest.
+        assert_eq!(prefetch_targets(&commits, 4, 3..6, 10), vec![real(5), real(3)]);
+    }
+
+    #[test]
+    fn prefetch_targets_excludes_virtual_and_caps() {
+        let real = |n: u8| git2::Oid::from_bytes(&[n; 20]).unwrap();
+        let mut commits = vec![ci(oid_uncommitted()), ci(oid_staged())];
+        commits.extend((2..7).map(|n| ci(real(n)))); // indices 2..=6
+        // selected = 2 (first real), whole list visible. Virtual rows 0,1 excluded;
+        // candidates 3,4,5,6 by distance; capped at 2.
+        assert_eq!(prefetch_targets(&commits, 2, 0..7, 2), vec![real(3), real(4)]);
     }
 
     fn temp_repo() -> (tempfile::TempDir, git2::Repository) {
