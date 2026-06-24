@@ -83,3 +83,4 @@ resolution, rev-vs-path classification, LRU eviction).
 - `collect_refs` per commit is O(commits × refs) → precompute ref map once
 - Working-tree edits do not touch `.git`; refresh commits/diff on selection changes to keep virtual staged/uncommitted entries current without a recursive worktree watcher
 - Branch highlighting walks first-parent children upward, but all parents downward, so merge commits keep merged history highlighted
+- File-list sidebar is not row-virtualized — every changed file lays out each frame; `left_elide` (left-truncation for `[diff] file_full_path`) measures the full path once and binary-searches the suffix only when it overflows, so the per-row cost stays low
