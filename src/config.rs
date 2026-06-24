@@ -121,6 +121,9 @@ pub struct DiffSection {
     /// Show the diffstat block (per-file change list + summary) between the commit
     /// message and the patch. The file-list sidebar is independent and always shown.
     pub(crate) show_stats: bool,
+    /// Show each changed file's full repo-relative path in the file-list sidebar
+    /// instead of just its basename. Long paths are left-truncated with a leading "…".
+    pub(crate) file_full_path: bool,
     /// Highlight theme slug (see `default_template()` for valid slugs). None ⇒ default.
     pub(crate) theme: Option<String>,
     pub(crate) bands: BandsSection,
@@ -131,6 +134,7 @@ impl Default for DiffSection {
         Self {
             syntax: true,
             show_stats: true,
+            file_full_path: true,
             theme: None,
             bands: BandsSection::default(),
         }
@@ -267,6 +271,9 @@ fn default_template() -> String {
          # commit message and the patch. false = hide it; the file-list sidebar\n\
          # still lists every changed file.\n\
          # show_stats = true\n\
+         # Show each changed file's full repo-relative path in the file-list\n\
+         # sidebar instead of just its name. Long paths are left-truncated.\n\
+         # file_full_path = true\n\
          # Syntax-highlight diffs. false = the original flat per-role coloring.\n\
          # syntax = true\n\
          # Diff syntax-highlighting theme. Any of:\n\
@@ -584,11 +591,18 @@ mod tests {
     }
 
     #[test]
+    fn diff_file_full_path_parses_off() {
+        let cfg: Config = toml::from_str("[diff]\nfile_full_path = false\n").unwrap();
+        assert!(!cfg.diff.file_full_path);
+    }
+
+    #[test]
     fn missing_diff_section_uses_defaults() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.diff.theme, None);
         assert!(cfg.diff.syntax); // default on
         assert!(cfg.diff.show_stats); // default on
+        assert!(cfg.diff.file_full_path); // default on
         assert_eq!(cfg.diff.bands.source, BandSource::Fixed);
         assert_eq!(cfg.diff.bands.added, None);
     }
