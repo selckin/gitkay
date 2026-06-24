@@ -138,37 +138,37 @@ pub(crate) fn blend(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32
     egui::Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
 }
 
-/// First scope the theme actually defines (color differs from the default
-/// foreground), else None.
-fn scope_color(
+/// First scope in `scopes` for which `pick` (the foreground or background) differs
+/// from `default` — i.e. the theme actually defines that attribute — mapped to egui,
+/// else None. `scope_color`/`scope_bg` are the two thin specializations.
+fn scope_attr(
     hl: &SynHighlighter,
-    default_fg: SynColor,
+    default: SynColor,
     scopes: &[&str],
+    pick: impl Fn(&syntect::highlighting::Style) -> SynColor,
 ) -> Option<egui::Color32> {
     for s in scopes {
         if let Ok(scope) = Scope::new(s) {
-            let style = hl.style_for_stack(&[scope]);
-            if style.foreground != default_fg {
-                return Some(syn_to_egui(style.foreground));
+            let c = pick(&hl.style_for_stack(&[scope]));
+            if c != default {
+                return Some(syn_to_egui(c));
             }
         }
     }
     None
 }
 
+/// First scope the theme actually defines a foreground for (differs from the
+/// default foreground), else None.
+fn scope_color(hl: &SynHighlighter, default_fg: SynColor, scopes: &[&str]) -> Option<egui::Color32> {
+    scope_attr(hl, default_fg, scopes, |s| s.foreground)
+}
+
 /// First scope whose *background* the theme actually defines (differs from the
 /// theme's default background), else None. Used to honour a theme's own
 /// diff-line backgrounds when fixed diff colors are turned off.
 fn scope_bg(hl: &SynHighlighter, default_bg: SynColor, scopes: &[&str]) -> Option<egui::Color32> {
-    for s in scopes {
-        if let Ok(scope) = Scope::new(s) {
-            let style = hl.style_for_stack(&[scope]);
-            if style.background != default_bg {
-                return Some(syn_to_egui(style.background));
-            }
-        }
-    }
-    None
+    scope_attr(hl, default_bg, scopes, |s| s.background)
 }
 
 impl DiffPalette {
