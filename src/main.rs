@@ -1078,15 +1078,16 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, path
     DiffData::new(lines, files)
 }
 
-/// The display path for a diff delta — the new side, falling back to the old side
-/// (deletions/renames), or "" if neither is valid UTF-8.
-fn delta_path<'a>(delta: &git2::DiffDelta<'a>) -> &'a str {
+/// The path for a diff delta as raw bytes — the new side, falling back to the old
+/// side (deletions/renames), or empty if neither is set. Bytes (not a lossy `&str`)
+/// so file identity survives non-UTF-8 names: `String::from_utf8_lossy` would map two
+/// distinct non-UTF-8 paths to the same display string and collide them.
+fn delta_path_bytes<'a>(delta: &git2::DiffDelta<'a>) -> &'a [u8] {
     delta
         .new_file()
-        .path()
-        .or_else(|| delta.old_file().path())
-        .and_then(|p| p.to_str())
-        .unwrap_or("")
+        .path_bytes()
+        .or_else(|| delta.old_file().path_bytes())
+        .unwrap_or(b"")
 }
 
 /// Append a git2 diff (per-file stats, the optional diffstat block, then the patch
@@ -1099,15 +1100,20 @@ fn append_diff_body(
     diff: &git2::Diff,
     show_stats: bool,
 ) {
-    // Collect file stats
+    // Collect file stats. `byte_paths` mirrors `files` and is the identity key for
+    // matching patch lines back to their file below — `files[i].path` is a lossy
+    // display string, so two non-UTF-8 names could share one and collide.
+    let mut byte_paths: Vec<Vec<u8>> = Vec::new();
     for i in 0..diff.deltas().len() {
         if let Some(delta) = diff.get_delta(i) {
+            let bytes = delta_path_bytes(&delta);
             files.push(FileEntry {
-                path: delta_path(&delta).to_string(),
+                path: String::from_utf8_lossy(bytes).into_owned(),
                 additions: 0,
                 deletions: 0,
                 diff_line_idx: None,
             });
+            byte_paths.push(bytes.to_vec());
         }
     }
 
@@ -1124,16 +1130,17 @@ fn append_diff_body(
         lines.push(DiffLine::new("", LineKind::Context));
     }
 
-    // Patch — track which file we're in
+    // Patch — track which file we're in (by byte path, so non-UTF-8 names don't
+    // collide; see byte_paths above).
     let mut current_file_idx: Option<usize> = None;
     diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
         // Detect file boundary
-        let path = delta_path(&delta);
+        let path = delta_path_bytes(&delta);
         let on_current_file = current_file_idx
-            .and_then(|i| files.get(i))
-            .is_some_and(|f| f.path == path);
+            .and_then(|i| byte_paths.get(i))
+            .is_some_and(|p| p.as_slice() == path);
         if !on_current_file {
-            current_file_idx = files.iter().position(|f| f.path == path);
+            current_file_idx = byte_paths.iter().position(|p| p.as_slice() == path);
             if let Some(fi) = current_file_idx {
                 files[fi].diff_line_idx = Some(lines.len());
             }
