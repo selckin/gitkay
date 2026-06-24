@@ -2785,6 +2785,14 @@ impl GitkApp {
             self.highlight_priority = None;
             return;
         }
+        // Cache hit: a diff restored from the cache (or warmed by prefetch) already
+        // carries its spans, so there's nothing to tokenize. Skip before the
+        // multi-MB clone of diff_lines/diff_files + a worker that would scan every
+        // line and colour nothing — paid on every revisit of a cached commit.
+        if diff_fully_highlighted(&self.diff_lines, &self.diff_files) {
+            self.highlight_priority = None;
+            return;
+        }
         log::debug!(
             "perf: async highlight spawned ({} lines)",
             self.diff_lines.len()
