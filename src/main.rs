@@ -3270,7 +3270,12 @@ impl eframe::App for GitkApp {
 
                         // Spacer before visible rows
                         let scroll_offset = ui.clip_rect().min.y - ui.cursor().min.y;
-                        let first_row = (scroll_offset / row_height).floor().max(0.0) as usize;
+                        // Clamp to num_commits: if the list shrank below the retained
+                        // scroll position (a reload to fewer rows before egui re-clamps
+                        // the offset), an unclamped first_row > num_commits would make
+                        // last_row < first_row and underflow the unsigned subtraction.
+                        let first_row =
+                            ((scroll_offset / row_height).floor().max(0.0) as usize).min(num_commits);
                         let visible_rows = (panel_height / row_height).ceil() as usize + 2;
                         let last_row = (first_row + visible_rows).min(num_commits);
                         let row_range = first_row..last_row;
@@ -3280,7 +3285,7 @@ impl eframe::App for GitkApp {
                             ui.allocate_space(egui::vec2(0.0, first_row as f32 * row_height));
                         }
 
-                        let rows_height = (last_row - first_row) as f32 * row_height;
+                        let rows_height = last_row.saturating_sub(first_row) as f32 * row_height;
                         let (response, painter) = ui.allocate_painter(
                             egui::vec2(ui.available_width(), rows_height),
                             egui::Sense::click(),
