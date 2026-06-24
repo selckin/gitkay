@@ -142,6 +142,8 @@ gitkay /path/to/repo
 | **Enter** / **↑** / **↓** in search | Cycle through matches, graph scrolls to match |
 | **Click** file in sidebar | Jump to file's diff section |
 | **Hover** file in sidebar | Full path tooltip |
+| **PageUp / PageDown** | Jump to the previous / next file in the diff |
+| **Space / Shift+Space** | Scroll the diff down / up by half a page |
 
 ## Architecture
 
