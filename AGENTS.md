@@ -39,13 +39,18 @@ parts run off the window-creation critical path:
   synchronously (never worse than inline). The walk is cold-IO-bound, not algorithmic —
   warmed it's ~1ms; the cost is first-touch index/worktree stats, so the fix is to overlap
   it, not to "optimise" the (already minimal) walk.
-- **Font prefetch** — `main()` spawns a `gitkay-fonts` thread running `build_fonts` (it
-  re-reads config — cheap) so fontdb's system-font scan (~150ms, only when a font is
-  configured *by name* and not yet path-cached in `~/.cache/gitkay/fonts.toml`) overlaps
-  window init. `GitkApp::new` receives the `FontDefinitions` over a channel and does only
-  the Context-bound `set_fonts`; on a disconnected channel it builds inline. A named font
-  fontdb can't resolve is **not** cached, so it re-scans every launch — `resolve_font_path`
-  warns (default level) so the misconfig is visible rather than a silent permanent tax.
+- **Font prefetch + deferred swap** — `main()` spawns a `gitkay-fonts` thread running
+  `build_fonts` (it re-reads config — cheap) so fontdb's system-font scan overlaps window
+  init. The scan only runs when a font is configured *by name* and not yet path-cached in
+  `~/.cache/gitkay/fonts.toml`; it is ~150ms warm-ish but up to ~1.5s on a **cold** cache
+  (6000+ faces). `GitkApp::new` never blocks on it: it builds the cheap role map
+  (`Fonts::from_config`) directly and `try_recv`s the `FontDefinitions` — warm it's already
+  waiting so `set_fonts` runs at startup; cold it's deferred (`pending_fonts`), the window
+  paints in egui's default fonts, and `ui()` polls + applies the configured fonts the moment
+  the scan lands (the off-thread builder has no Context handle to wake the UI). `set_fonts`
+  always runs on the creator/main thread. A named font fontdb can't resolve is **not**
+  cached, so it re-scans every launch — `resolve_font_path` warns (default level) so the
+  misconfig is visible rather than a silent permanent tax.
 - **Deferred first diff** (`StartupDiff` state machine) — `GitkApp::new` does *not* compute
   the startup diff (window creation blocks until the creator returns). It auto-selects
   commit 0 with an empty diff pane; `ui()` paints the graph on the first frame, then calls

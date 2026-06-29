@@ -2479,6 +2479,10 @@ struct GitkApp {
     file_list: FileListLayout,        // file-list sidebar layout (config [diff].file_list)
     diff_toolbar_rect: Option<egui::Rect>, // last shown hover-toolbar bounds (flicker guard)
     fonts: Fonts, // resolved, clamped font settings; call .font_id(role) for a FontId
+    // Deferred FontDefinitions from the off-thread build: Some until applied. Set when a
+    // cold fontdb scan outlives window-init, so the window paints in default fonts and
+    // swaps to the configured ones once the scan lands (polled in ui()). None once applied.
+    pending_fonts: Option<mpsc::Receiver<(egui::FontDefinitions, Fonts, Vec<String>)>>,
     config_path: Option<std::path::PathBuf>, // ~/.config/gitkay/config.toml (for live reload)
     needs_config_reload: Arc<AtomicBool>, // set by the config-file watcher
     _config_watcher: Option<RecommendedWatcher>, // watches the config's parent dir so atomic-rename saves are caught
@@ -2644,20 +2648,33 @@ impl GitkApp {
         }
         log::debug!("perf: startup: read + parse config {:?}", t_cfg.elapsed());
 
-        // Receive the font set built off-thread (started in main(), overlapped with
-        // window init — fontdb's system scan is the cost when a font is named but not
-        // cached). recv() blocks only if it hasn't finished; on a disconnected channel
-        // (prefetch failed) build inline. set_fonts must stay here — it needs the
-        // egui Context, which only exists on this (the main/creator) thread.
-        let t_fonts = std::time::Instant::now();
-        let (font_defs, fonts, font_warnings) = font_rx
-            .recv()
-            .unwrap_or_else(|_| config::build_fonts(&cfg));
-        log::debug!("perf: startup: fonts ready (new() waited {:?})", t_fonts.elapsed());
-        if !font_warnings.is_empty() {
-            startup_issue = true;
-        }
-        cc.egui_ctx.set_fonts(font_defs);
+        // Fonts: never block the window on the font scan. The role map (sizes/families)
+        // is cheap and comes straight from config; the heavy FontDefinitions (fontdb's
+        // system scan — up to ~1.5s on a COLD font cache) is built off-thread. Warm
+        // (cached) it's already waiting, so try_recv succeeds and set_fonts runs at
+        // startup with no flash. Cold, it isn't ready: defer it (pending_fonts) so the
+        // window paints in egui's default fonts now and swaps once the scan lands (ui()).
+        // set_fonts must run on this (the creator/main) thread — it needs the Context.
+        let fonts = Fonts::from_config(&cfg);
+        let pending_fonts = match font_rx.try_recv() {
+            Ok((font_defs, _fonts, font_warnings)) => {
+                startup_issue |= !font_warnings.is_empty();
+                cc.egui_ctx.set_fonts(font_defs);
+                log::debug!("perf: startup: fonts applied at startup (warm cache)");
+                None
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                log::debug!("perf: startup: fonts not ready (cold scan); window paints with defaults");
+                Some(font_rx)
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // Prefetch thread failed to spawn — build inline (blocking, rare).
+                let (font_defs, _fonts, font_warnings) = config::build_fonts(&cfg);
+                startup_issue |= !font_warnings.is_empty();
+                cc.egui_ctx.set_fonts(font_defs);
+                None
+            }
+        };
 
         // Watch the config file for live reload. Watch the *parent dir(s)*
         // (non-recursive) so edits via atomic rename (temp file + rename, as
@@ -2908,6 +2925,7 @@ impl GitkApp {
             file_list,
             diff_toolbar_rect: None,
             fonts,
+            pending_fonts,
             config_path,
             needs_config_reload,
             _config_watcher: config_watcher,
@@ -3510,6 +3528,26 @@ impl eframe::App for GitkApp {
                 log::debug!("perf: startup: deferred first diff loaded {:?}", t.elapsed());
             }
             StartupDiff::Done => {}
+        }
+
+        // Apply deferred fonts once a cold fontdb scan finishes (it outlived window
+        // init). Until they land, keep waking at a modest cadence so the swap happens
+        // promptly — the off-thread builder has no Context handle to wake us itself.
+        if let Some(rx) = &self.pending_fonts {
+            match rx.try_recv() {
+                Ok((font_defs, _fonts, warnings)) => {
+                    ctx.set_fonts(font_defs);
+                    if !warnings.is_empty() {
+                        self.config_error_toast = Some(std::time::Instant::now());
+                    }
+                    self.pending_fonts = None;
+                    log::debug!("perf: startup: deferred fonts applied");
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(33));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.pending_fonts = None, // builder died; keep defaults
+            }
         }
 
         // Auto-reload when git refs change, debounced: a new .git event (re)arms
