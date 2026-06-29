@@ -7,6 +7,7 @@ Native Wayland git history viewer — gitk, but okay. Built with Rust + egui.
 ```sh
 cargo build --release
 cargo test                # 149 tests (main + config + highlight + cli + diff-cache modules)
+cargo clippy -- -D warnings  # CI gate — any warning fails CI
 cp target/release/gitkay ~/.local/bin/
 ```
 
