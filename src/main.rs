@@ -578,7 +578,13 @@ fn real_commit_count(commits: &[CommitInfo]) -> usize {
 }
 
 fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitInfo> {
+    let t = std::time::Instant::now();
     let ref_map = build_ref_map(repo);
+    log::debug!(
+        "perf: load_commits: build_ref_map ({} oids) {:?}",
+        ref_map.len(),
+        t.elapsed()
+    );
     let head_oid = repo.head().ok().and_then(|h| h.target());
 
     let mut commits = Vec::new();
@@ -592,6 +598,7 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
 
     // Staged = index vs HEAD tree. Scoped to the active `-- <path>` filter, so a
     // staged change outside the path doesn't add a virtual row on its own lane.
+    let t = std::time::Instant::now();
     let has_staged = show_local
         && head_oid
             .and_then(|head| repo.find_commit(head).ok())
@@ -603,8 +610,13 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
                     .ok()
             })
             .is_some_and(|diff| diff.deltas().len() > 0);
+    log::debug!(
+        "perf: load_commits: staged probe (diff_tree_to_index) -> {has_staged} {:?}",
+        t.elapsed()
+    );
 
     // Uncommitted = workdir vs index, scoped to the same path filter.
+    let t = std::time::Instant::now();
     let has_uncommitted = show_local && {
         let mut opts = DiffOptions::new();
         apply_pathspec(&mut opts, &scope.paths);
@@ -612,6 +624,10 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
             .ok()
             .is_some_and(|diff| diff.deltas().len() > 0)
     };
+    log::debug!(
+        "perf: load_commits: uncommitted probe (diff_index_to_workdir) -> {has_uncommitted} {:?}",
+        t.elapsed()
+    );
 
     // Add virtual entries at the top
     if has_uncommitted {
@@ -644,6 +660,7 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
     }
 
     // Load real commits
+    let t = std::time::Instant::now();
     let mut revwalk = match repo.revwalk() {
         Ok(r) => r,
         Err(_) => return commits,
@@ -762,6 +779,11 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
         }
         commits.extend(kept);
     }
+    log::debug!(
+        "perf: load_commits: revwalk + build ({} real commits, sort=TIME|TOPOLOGICAL) {:?}",
+        commits.len() - virtual_count,
+        t.elapsed()
+    );
     commits
 }
 
@@ -2409,10 +2431,27 @@ fn select_accent() -> egui::Color32 {
 
 // ── App state ────────────────────────────────────────────────────────────
 
+/// Drives the one-time deferral of the startup diff. `GitkApp::new` runs during
+/// window creation (eframe doesn't paint until the creator returns), so computing
+/// the first diff there blocks the window from appearing on a potentially slow,
+/// I/O-bound `get_diff_data` (the working-tree entry stats files; a large diff
+/// tokenizes). Instead the graph paints on the first frame and the diff loads on
+/// the next one.
+enum StartupDiff {
+    /// First frame not yet painted: show an empty diff pane, then request a repaint.
+    NeedsPaint,
+    /// First frame painted: load the selected commit's diff now (this frame).
+    NeedsLoad,
+    /// Loaded (or nothing to load) — steady state.
+    Done,
+}
+
 struct GitkApp {
     commits: Vec<CommitInfo>,
     graph_rows: Vec<GraphRow>,
     selected: Option<usize>,
+    startup_diff: StartupDiff, // one-time: defer the first diff off the window-creation path
+
     diff_lines: Vec<DiffLine>,
     diff_files: Vec<FileEntry>,
     file_rows: Vec<FileListRow>, // cached file-list rows; rebuilt when diff_files or file_list changes
@@ -2545,7 +2584,10 @@ impl GitkApp {
         cc: &eframe::CreationContext<'_>,
         repo_path: String,
         scope: cli::Scope,
+        history_rx: mpsc::Receiver<Vec<CommitInfo>>,
+        font_rx: mpsc::Receiver<(egui::FontDefinitions, Fonts, Vec<String>)>,
     ) -> Result<Self, String> {
+        let startup_t0 = std::time::Instant::now();
         let mut style = (*cc.egui_ctx.global_style()).clone();
         style.visuals = egui::Visuals::dark();
         style.visuals.panel_fill = BG;
@@ -2558,6 +2600,7 @@ impl GitkApp {
         // ── Fonts & sizes config ──
         // Optional ~/.config/gitkay/config.toml. With no file (or the freshly
         // written commented template) this reproduces today's look exactly.
+        let t_cfg = std::time::Instant::now();
         let config_path = config::config_path();
         if let Some(ref p) = config_path
             && !p.exists()
@@ -2599,7 +2642,18 @@ impl GitkApp {
             log::warn!("{w}");
             startup_issue = true;
         }
-        let (font_defs, fonts, font_warnings) = config::build_fonts(&cfg);
+        log::debug!("perf: startup: read + parse config {:?}", t_cfg.elapsed());
+
+        // Receive the font set built off-thread (started in main(), overlapped with
+        // window init — fontdb's system scan is the cost when a font is named but not
+        // cached). recv() blocks only if it hasn't finished; on a disconnected channel
+        // (prefetch failed) build inline. set_fonts must stay here — it needs the
+        // egui Context, which only exists on this (the main/creator) thread.
+        let t_fonts = std::time::Instant::now();
+        let (font_defs, fonts, font_warnings) = font_rx
+            .recv()
+            .unwrap_or_else(|_| config::build_fonts(&cfg));
+        log::debug!("perf: startup: fonts ready (new() waited {:?})", t_fonts.elapsed());
         if !font_warnings.is_empty() {
             startup_issue = true;
         }
@@ -2639,9 +2693,24 @@ impl GitkApp {
             startup_issue = true;
         }
 
+        let t_discover = std::time::Instant::now();
         let repo = Repository::discover(&repo_path)
             .map_err(|e| format!("not a git repository: {repo_path}: {e}"))?;
-        let commits = load_history(&repo, 200, &scope);
+        log::debug!("perf: startup: repo discover {:?}", t_discover.elapsed());
+
+        // Receive the prefetched history (started in main(), overlapped with window
+        // init). recv() blocks only if the off-thread walk hasn't finished yet; on a
+        // disconnected channel (prefetch failed to spawn/discover) load synchronously.
+        let t_history = std::time::Instant::now();
+        let commits = match history_rx.recv() {
+            Ok(c) => c,
+            Err(_) => load_history(&repo, 200, &scope),
+        };
+        log::debug!(
+            "perf: startup: history ready ({} rows, new() waited {:?})",
+            commits.len(),
+            t_history.elapsed()
+        );
         // An empty view (bad path filter, or an unknown/empty reflog ref) is
         // otherwise a silent blank window; say so once at startup. Paths are matched
         // repo-root-relative (a path given from a subdirectory won't match — a known
@@ -2657,10 +2726,13 @@ impl GitkApp {
                 scope.paths
             );
         }
+        let t_layout = std::time::Instant::now();
         let graph_rows = layout_graph(&commits);
+        log::debug!("perf: startup: layout_graph {:?}", t_layout.elapsed());
 
-        // Restore persisted diff options before the first diff is generated, so
-        // the startup diff honours them.
+        // Restore persisted diff options. The first commit is auto-selected, but its
+        // diff is generated lazily on the first update() frame (see StartupDiff) — not
+        // here — so window creation isn't blocked on a potentially slow get_diff_data.
         let diff_context: u32 = cc
             .storage
             .and_then(|s| eframe::get_value(s, "diff_context"))
@@ -2674,31 +2746,17 @@ impl GitkApp {
             .storage
             .and_then(|s| eframe::get_value(s, "word_diff"))
             .unwrap_or(false);
-        let diff_settings = DiffSettings {
-            context: diff_context,
-            ignore_ws: diff_ignore_ws,
-            show_stats,
-        };
 
-        // Auto-select first commit and load its diff
-        let (diff_lines, diff_files, current_diff_key) = if let Some(first) = commits.first() {
-            let data = get_diff_data(&repo, first.oid, diff_settings, &scope.paths);
-            // Key the startup diff so navigating away stashes it into the cache, and
-            // returning (e.g. to HEAD at row 0, the most-visited commit) restores it
-            // instantly instead of recomputing + re-highlighting. A virtual entry is
-            // content-addressed (see load_selected_diff); a real commit by its oid.
-            let key = DiffCacheKey {
-                oid: first.oid,
-                context: diff_context,
-                ignore_ws: diff_ignore_ws,
-                theme: theme_slug.clone(),
-                enabled: syntax_enabled,
-                show_stats,
-                content: if is_real_commit(first.oid) { 0 } else { hash_diff_content(&data) },
-            };
-            (data.lines, data.files, Some(key))
+        // The startup diff is deferred to the first frame: empty here, filled by
+        // load_selected_diff on the StartupDiff::NeedsLoad pass. With no commits
+        // there's nothing to load, so go straight to Done.
+        let diff_lines: Vec<DiffLine> = Vec::new();
+        let diff_files: Vec<FileEntry> = Vec::new();
+        let current_diff_key: Option<DiffCacheKey> = None;
+        let startup_diff = if commits.is_empty() {
+            StartupDiff::Done
         } else {
-            (Vec::new(), Vec::new(), None)
+            StartupDiff::NeedsPaint
         };
         let all_loaded = real_commit_count(&commits) < 200;
 
@@ -2817,10 +2875,12 @@ impl GitkApp {
             file_list,
         );
 
+        log::debug!("perf: startup: GitkApp::new total {:?}", startup_t0.elapsed());
         Ok(Self {
             commits,
             graph_rows,
             selected: Some(0),
+            startup_diff,
             diff_lines,
             diff_files,
             file_rows,
@@ -2858,7 +2918,7 @@ impl GitkApp {
             theme_slug,
             diff_bg,
             diff_palette,
-            diff_needs_highlight: true, // highlight the startup diff on first frame
+            diff_needs_highlight: false, // no diff yet — the deferred startup load arms highlighting
             diff_generation: Arc::new(AtomicU64::new(0)),
             highlight_tx,
             highlight_rx,
@@ -3432,6 +3492,26 @@ impl eframe::App for GitkApp {
         // (Arc) clone of the Context so the existing ctx-based logic is unchanged,
         // while the top-level panels attach to `ui` via show_inside.
         let ctx = ui.ctx().clone();
+
+        // Deferred startup diff: paint the graph on the first frame, then compute the
+        // initial diff on the next one (load_selected_diff runs get_diff_data + arms
+        // async highlighting), so window creation isn't blocked on it. See StartupDiff.
+        match self.startup_diff {
+            StartupDiff::NeedsPaint => {
+                self.startup_diff = StartupDiff::NeedsLoad;
+                ctx.request_repaint(); // come back next frame to load the diff
+            }
+            StartupDiff::NeedsLoad => {
+                self.startup_diff = StartupDiff::Done;
+                let t = std::time::Instant::now();
+                if let Ok(repo) = Repository::discover(&self.repo_path) {
+                    self.load_selected_diff(&repo);
+                }
+                log::debug!("perf: startup: deferred first diff loaded {:?}", t.elapsed());
+            }
+            StartupDiff::Done => {}
+        }
+
         // Auto-reload when git refs change, debounced: a new .git event (re)arms
         // a timer, and the reload runs only once the writes settle. This collapses
         // the burst of ref/index churn from a rebase or fetch into a single
@@ -4463,6 +4543,7 @@ impl eframe::App for GitkApp {
 fn main() -> eframe::Result {
     // Warnings show by default; set e.g. RUST_LOG=gitkay=debug for timing logs.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    let startup_t0 = std::time::Instant::now();
 
     let raw = match cli::parse_flags(std::env::args().skip(1)) {
         Ok(r) => r,
@@ -4560,6 +4641,11 @@ fn main() -> eframe::Result {
     };
     drop(repo); // GitkApp re-discovers from repo_path
 
+    log::debug!(
+        "perf: startup: cli parse + discover + classify {:?}",
+        startup_t0.elapsed()
+    );
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
@@ -4575,6 +4661,52 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
+    // Prefetch the commit history on a background thread so its cold git I/O (index
+    // + worktree stats — ~200-330ms on a cold cache, near-instant warm) overlaps
+    // with eframe's window/GL initialisation, which runs on this thread inside
+    // run_native *before* the app creator is called. GitkApp::new receives the walk
+    // over this channel and only blocks if it hasn't finished (it usually has, since
+    // window init is the larger cost). On spawn or discover failure the sender drops,
+    // recv() returns Err, and new() loads synchronously — never worse than before.
+    let (history_tx, history_rx) = mpsc::channel();
+    {
+        let repo_path = repo_path.clone();
+        let scope = scope.clone();
+        if let Err(e) = std::thread::Builder::new()
+            .name("gitkay-history".to_string())
+            .spawn(move || {
+                if let Ok(repo) = Repository::discover(&repo_path) {
+                    let t = std::time::Instant::now();
+                    let commits = load_history(&repo, 200, &scope);
+                    log::debug!("perf: startup: history prefetch (off-thread) {:?}", t.elapsed());
+                    let _ = history_tx.send(commits);
+                }
+            })
+        {
+            log::warn!("history prefetch thread spawn failed: {e}; loading synchronously");
+        }
+    }
+
+    // Build the font set on a background thread too: fontdb's system-font scan
+    // (~150ms when a font is configured by name and not yet cached) overlaps with
+    // window/GL init. The thread re-reads config (cheap) and runs build_fonts; the
+    // main thread only does the Context-bound set_fonts. Default config names no
+    // font, so build_fonts is near-free then — this hoists no wasted work. On spawn
+    // failure the sender drops and new() builds fonts inline.
+    let (font_tx, font_rx) = mpsc::channel();
+    if let Err(e) = std::thread::Builder::new()
+        .name("gitkay-fonts".to_string())
+        .spawn(move || {
+            let cfg = config::config_path()
+                .as_ref()
+                .and_then(|p| config::read_config(p).ok())
+                .unwrap_or_default();
+            let _ = font_tx.send(config::build_fonts(&cfg));
+        })
+    {
+        log::warn!("font prefetch thread spawn failed: {e}; building fonts inline");
+    }
+
     // Stable app id "gitkay" (not the per-repo title) so Wayland compositors can
     // match window rules on app_id, and so eframe uses a stable storage dir for
     // the persisted layout regardless of which repo is open. (egui-winit 0.31
@@ -4583,9 +4715,22 @@ fn main() -> eframe::Result {
         "gitkay",
         options,
         Box::new(move |cc| {
-            GitkApp::new(cc, repo_path, scope)
-                .map(|app| Box::new(app) as Box<dyn eframe::App>)
-                .map_err(|e| e.into())
+            // run_native has already created the winit window + GL context by the
+            // time this creator runs, so the elapsed-so-far here isolates the
+            // window/GL init cost (everything between the pre-eframe work above and
+            // GitkApp::new) — typically a large, mostly-uncontrollable chunk.
+            log::debug!(
+                "perf: startup: window + GL init {:?}",
+                startup_t0.elapsed()
+            );
+            // …and this end-to-end figure covers the whole path from process start
+            // to a built app: pre-eframe work, window/GL init, and GitkApp::new.
+            let app = GitkApp::new(cc, repo_path, scope, history_rx, font_rx)?;
+            log::debug!(
+                "perf: startup: ready (process start -> app built) {:?}",
+                startup_t0.elapsed()
+            );
+            Ok(Box::new(app) as Box<dyn eframe::App>)
         }),
     )
 }
