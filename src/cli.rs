@@ -3,7 +3,7 @@
 //! repo. Grammar: `gitkay [-C <dir>] [--all] [<rev>...] [-- <path>...]`.
 
 /// The resolved command-line scope.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Scope {
     pub all: bool,
     pub revs: Vec<String>,
