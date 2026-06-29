@@ -336,13 +336,29 @@ fn resolve_font_path(
     if let Some(cached) = cache.get(name).cloned() {
         let pb = PathBuf::from(cached);
         if exists(&pb) {
+            log::debug!("build_fonts: font '{name}' resolved from cache -> {pb:?}");
             return Some(pb);
         }
         cache.remove(name); // stale entry — evict so a failed rescan doesn't leave it behind
     }
-    let found = scan(name)?;
-    cache.insert(name.to_owned(), found.to_string_lossy().into_owned());
-    Some(found)
+    match scan(name) {
+        Some(found) => {
+            log::debug!("build_fonts: font '{name}' resolved by scan -> {found:?}");
+            cache.insert(name.to_owned(), found.to_string_lossy().into_owned());
+            Some(found)
+        }
+        None => {
+            // A named font fontdb can't match: gitkay falls back to its bundled fonts,
+            // and because nothing is cached the (~150ms) system scan re-runs on EVERY
+            // launch. Surfaced at warn so a typo'd or uninstalled name is visible
+            // instead of being a silent, permanent startup tax.
+            log::warn!(
+                "font '{name}' not found by fontdb; using bundled fallback \
+                 (this re-scans every launch — install the font, set *_path, or remove it)"
+            );
+            None
+        }
+    }
 }
 
 /// Pick a font source for one family: an explicit path wins outright; otherwise
@@ -434,8 +450,17 @@ pub fn build_fonts(cfg: &Config) -> (egui::FontDefinitions, Fonts, Vec<String>) 
     let mut db: Option<fontdb::Database> = None;
     let mut scan = |name: &str| -> Option<PathBuf> {
         let db = db.get_or_insert_with(|| {
+            // The ~150ms startup cost when a font is configured by name and not yet
+            // cached: fontdb enumerates every system font face. Built lazily, once,
+            // and only when a name actually needs resolving.
+            let t = std::time::Instant::now();
             let mut d = fontdb::Database::new();
             d.load_system_fonts();
+            log::debug!(
+                "perf: build_fonts: load_system_fonts ({} faces) {:?}",
+                d.len(),
+                t.elapsed()
+            );
             d
         });
         fontdb_scan(db, name)
