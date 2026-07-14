@@ -10,7 +10,7 @@ Pitfalls" list. Read it first; this file is the quick orientation plus what CI e
 
 ```sh
 cargo build                       # debug; release: cargo build --release
-cargo test                        # 149 tests across the main/config/highlight/cli/diff_cache modules
+cargo test                        # all tests; they live in the main/config/highlight/cli/diff_cache modules
 cargo test test_pr_merge_pattern  # one test by name (substring match)
 cargo test config::               # one module's suite
 cargo clippy -- -D warnings       # CI gate: any warning fails CI — keep it clean
@@ -20,8 +20,8 @@ RUST_LOG=gitkay=debug cargo run   # run with per-phase startup/perf timing logs
 - Binary crate, not a lib: `cargo test --lib` fails — filter by test name instead.
 - System deps (Ubuntu/Debian): `libgtk-4-dev libgraphene-1.0-dev libssl-dev pkg-config cmake`
   (openSUSE: `gtk4-devel libgraphene-devel openssl-devel`).
-- CLI: `gitkay [<rev>…] [-- <path>…]` (plus `--all`, `--reflog`, `--follow <path>`); the
-  rev-vs-path classification lives in `cli.rs`.
+- CLI: `gitkay [-C <dir>] [--all] [--reflog] [--follow] [<rev>…] [-- <path>…]` — `--follow` is a
+  bare flag requiring exactly one path after `--`; the rev-vs-path classification lives in `cli.rs`.
 
 ## Architecture (big picture — see AGENTS.md for depth)
 
