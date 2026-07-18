@@ -11,6 +11,7 @@ mod cli;
 mod config;
 mod diff_cache;
 mod highlight;
+mod word_diff;
 use config::{FileListLayout, Fonts, Role};
 use diff_cache::DiffCache;
 use highlight::{DiffBg, HighlightLines, Highlighter};
@@ -173,17 +174,26 @@ fn normalize_rel(path: &str) -> String {
 /// prefixed with `…` (so the filename + nearest dirs stay visible), or `…` alone
 /// when even one char won't fit. `measure` returns a string's rendered width and
 /// must be monotonic in suffix length. Pure (no egui), so it is unit-testable.
-fn left_elide(path: &str, max_width: f32, measure: impl Fn(&str) -> f32) -> String {
-    if measure(path) <= max_width {
-        return path.to_string();
-    }
-    // Byte offset where each char starts, so a kept suffix slices on a char boundary.
-    let offsets: Vec<usize> = path.char_indices().map(|(i, _)| i).collect();
-    let n = offsets.len();
-    // Candidate for keeping the last `k` chars (1..=n-1): "…" + path[offsets[n-k]..].
-    let cand = |k: usize| format!("…{}", &path[offsets[n - k]..]);
-    // Largest k whose candidate fits. fits() is monotonic (more chars => wider),
-    // so binary-search instead of trimming one char at a time.
+/// Width in points of `s` laid out on one line in `font` — the measurement the elide
+/// helpers binary-search against. Color doesn't affect width, so any is fine.
+fn text_width(painter: &egui::Painter, s: &str, font: &egui::FontId) -> f32 {
+    painter
+        .layout_no_wrap(s.to_string(), font.clone(), egui::Color32::WHITE)
+        .size()
+        .x
+}
+
+/// Largest `k` in `1..=n-1` whose candidate (built by `cand`, which keeps `k` chars
+/// plus an ellipsis) still fits `max_width`. Candidates widen monotonically with `k`,
+/// so this binary-searches instead of trimming a char at a time; returns a bare "…"
+/// when not even one kept char fits. Shared body of `left_elide`/`right_elide`, which
+/// handle the "whole string already fits" fast path before calling.
+fn elide_bsearch(
+    n: usize,
+    max_width: f32,
+    measure: impl Fn(&str) -> f32,
+    cand: impl Fn(usize) -> String,
+) -> String {
     let mut best = 0usize;
     let (mut lo, mut hi) = (1usize, n.saturating_sub(1));
     while lo <= hi {
@@ -202,6 +212,20 @@ fn left_elide(path: &str, max_width: f32, measure: impl Fn(&str) -> f32) -> Stri
     }
 }
 
+/// Elide `path` to fit `max_width`, keeping the END and prefixing a "…".
+fn left_elide(path: &str, max_width: f32, measure: impl Fn(&str) -> f32) -> String {
+    if measure(path) <= max_width {
+        return path.to_string();
+    }
+    // Byte offset where each char starts, so a kept suffix slices on a char boundary.
+    let offsets: Vec<usize> = path.char_indices().map(|(i, _)| i).collect();
+    let n = offsets.len();
+    // Candidate for keeping the last `k` chars (1..=n-1): "…" + path[offsets[n-k]..].
+    elide_bsearch(n, max_width, &measure, |k| {
+        format!("…{}", &path[offsets[n - k]..])
+    })
+}
+
 /// Like `left_elide` but keeps the START of `s` and drops the tail with a
 /// trailing "…". For labels (basenames) whose distinguishing part is the front,
 /// where dropping the leading chars would hide what tells two files apart.
@@ -213,23 +237,7 @@ fn right_elide(s: &str, max_width: f32, measure: impl Fn(&str) -> f32) -> String
     let offsets: Vec<usize> = s.char_indices().map(|(i, _)| i).collect();
     let n = offsets.len();
     // Candidate keeping the first `k` chars (1..=n-1): s[..offsets[k]] + "…".
-    let cand = |k: usize| format!("{}…", &s[..offsets[k]]);
-    let mut best = 0usize;
-    let (mut lo, mut hi) = (1usize, n.saturating_sub(1));
-    while lo <= hi {
-        let mid = (lo + hi) / 2; // lo >= 1 => mid >= 1, so `mid - 1` never underflows
-        if measure(&cand(mid)) <= max_width {
-            best = mid;
-            lo = mid + 1;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    if best == 0 {
-        "…".to_string()
-    } else {
-        cand(best)
-    }
+    elide_bsearch(n, max_width, &measure, |k| format!("{}…", &s[..offsets[k]]))
 }
 
 /// One rendered row of the file-list sidebar.
@@ -511,11 +519,6 @@ fn prefetch_targets(
     idxs.into_iter().take(max).map(|i| commits[i].oid).collect()
 }
 
-/// The virtual uncommitted/staged entries — exactly the complement of a real commit.
-fn is_virtual_oid(oid: git2::Oid) -> bool {
-    !is_real_commit(oid)
-}
-
 /// Apply one `<rev>` token to the revwalk: `^X` hides, `A..B` hides A + pushes B,
 /// `A...B` pushes both + hides their merge-base, else pushes the single rev. Each
 /// endpoint is resolved with `revparse_single` (so `HEAD~3`, `@{u}`, tags, etc.
@@ -579,6 +582,14 @@ fn apply_pathspec(opts: &mut DiffOptions, paths: &[String]) {
     }
 }
 
+/// A `DiffOptions` scoped only by `paths`, with no context/whitespace settings — for the
+/// delta-count probes that just ask "does this diff touch the pathspec?".
+fn pathspec_opts(paths: &[String]) -> DiffOptions {
+    let mut opts = DiffOptions::new();
+    apply_pathspec(&mut opts, paths);
+    opts
+}
+
 /// Whether `commit`'s diff against its first parent (or the empty tree for a root
 /// commit) touches any of `paths`. Used for the `-- <path>` commit filter.
 fn commit_touches_paths(repo: &Repository, commit: &git2::Commit, paths: &[String]) -> bool {
@@ -590,8 +601,7 @@ fn commit_touches_paths(repo: &Repository, commit: &git2::Commit, paths: &[Strin
         }
     };
     let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
-    let mut opts = DiffOptions::new();
-    apply_pathspec(&mut opts, paths);
+    let mut opts = pathspec_opts(paths);
     match repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts)) {
         Ok(d) => d.deltas().len() > 0,
         Err(e) => {
@@ -716,8 +726,7 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
             .and_then(|head| repo.find_commit(head).ok())
             .and_then(|head_commit| head_commit.tree().ok())
             .and_then(|head_tree| {
-                let mut opts = DiffOptions::new();
-                apply_pathspec(&mut opts, &scope.paths);
+                let mut opts = pathspec_opts(&scope.paths);
                 repo.diff_tree_to_index(Some(&head_tree), None, Some(&mut opts))
                     .ok()
             })
@@ -730,8 +739,7 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
     // Uncommitted = workdir vs index, scoped to the same path filter.
     let t = std::time::Instant::now();
     let has_uncommitted = show_local && {
-        let mut opts = DiffOptions::new();
-        apply_pathspec(&mut opts, &scope.paths);
+        let mut opts = pathspec_opts(&scope.paths);
         repo.diff_index_to_workdir(None, Some(&mut opts))
             .ok()
             .is_some_and(|diff| diff.deltas().len() > 0)
@@ -1045,97 +1053,6 @@ impl DiffLine {
     }
 }
 
-/// Split `s` into word-diff tokens: maximal `[A-Za-z0-9_]` runs are single tokens,
-/// every other character is its own token (whitespace and punctuation included).
-/// Each token carries its byte range in `s` and its text.
-fn word_tokens(s: &str) -> Vec<(std::ops::Range<usize>, &str)> {
-    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
-    let mut out = Vec::new();
-    let mut chars = s.char_indices().peekable();
-    while let Some(&(start, c)) = chars.peek() {
-        if is_word(c) {
-            let mut end = start;
-            while let Some(&(i, c)) = chars.peek() {
-                if is_word(c) {
-                    end = i + c.len_utf8();
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            out.push((start..end, &s[start..end]));
-        } else {
-            let end = start + c.len_utf8();
-            chars.next();
-            out.push((start..end, &s[start..end]));
-        }
-    }
-    out
-}
-
-/// The token positions in `a` and `b` that a longest-common-subsequence alignment
-/// (by text) leaves unmatched — the changed tokens on each side. (A token whose
-/// text also appears elsewhere can still be marked changed; it's the *position*
-/// that's unaligned, not the value.) O(n·m), fine for one short line.
-fn changed_tokens(a: &[&str], b: &[&str]) -> (Vec<usize>, Vec<usize>) {
-    let (n, m) = (a.len(), b.len());
-    // dp[i][j] = LCS length of a[i..] and b[j..].
-    let mut dp = vec![vec![0u16; m + 1]; n + 1];
-    for i in (0..n).rev() {
-        for j in (0..m).rev() {
-            dp[i][j] = if a[i] == b[j] {
-                dp[i + 1][j + 1] + 1
-            } else {
-                dp[i + 1][j].max(dp[i][j + 1])
-            };
-        }
-    }
-    let (mut a_ch, mut b_ch) = (Vec::new(), Vec::new());
-    let (mut i, mut j) = (0, 0);
-    while i < n && j < m {
-        if a[i] == b[j] {
-            i += 1;
-            j += 1;
-        } else if dp[i + 1][j] >= dp[i][j + 1] {
-            a_ch.push(i);
-            i += 1;
-        } else {
-            b_ch.push(j);
-            j += 1;
-        }
-    }
-    a_ch.extend(i..n);
-    b_ch.extend(j..m);
-    (a_ch, b_ch)
-}
-
-/// Byte ranges of the given (ascending) changed token indices, merging tokens that
-/// are contiguous in the source so a changed run becomes one highlight.
-fn merge_token_ranges(
-    tokens: &[(std::ops::Range<usize>, &str)],
-    changed: &[usize],
-) -> Vec<std::ops::Range<usize>> {
-    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
-    for &idx in changed {
-        let r = tokens[idx].0.clone();
-        match out.last_mut() {
-            Some(last) if last.end == r.start => last.end = r.end,
-            _ => out.push(r),
-        }
-    }
-    out
-}
-
-/// Word-level changed ranges for a `-`/`+` line pair, in each body's coordinates.
-fn line_emphasis(del: &str, add: &str) -> (Vec<std::ops::Range<usize>>, Vec<std::ops::Range<usize>>) {
-    let dt = word_tokens(del);
-    let at = word_tokens(add);
-    let ds: Vec<&str> = dt.iter().map(|(_, s)| *s).collect();
-    let as_: Vec<&str> = at.iter().map(|(_, s)| *s).collect();
-    let (d_ch, a_ch) = changed_tokens(&ds, &as_);
-    (merge_token_ranges(&dt, &d_ch), merge_token_ranges(&at, &a_ch))
-}
-
 /// Fill in each line's word-diff `emphasis` ranges. A change block (a run of `-`
 /// lines followed by a run of `+` lines) is intra-line diffed only when the two
 /// runs have equal length, pairing them 1:1 — the common "edited in place" case.
@@ -1173,7 +1090,7 @@ fn compute_word_emphasis(lines: &mut [DiffLine]) {
                 }
                 let del_body = lines[del_start + k].body().to_string();
                 let add_body = lines[add_start + k].body().to_string();
-                let (de, ae) = line_emphasis(&del_body, &add_body);
+                let (de, ae) = word_diff::line_emphasis(&del_body, &add_body);
                 lines[del_start + k].emphasis = de;
                 lines[add_start + k].emphasis = ae;
             }
@@ -1607,18 +1524,40 @@ fn append_diff_body(
 }
 
 /// Generate diff for uncommitted working tree changes (workdir vs index).
-fn get_working_tree_diff(repo: &Repository, settings: DiffSettings, paths: &[String]) -> DiffData {
+/// Shared pipeline for the virtual (working-tree / staged) diffs: build the pathspec- and
+/// settings-scoped `DiffOptions`, run `build` to produce the git diff, coalesce
+/// renames/copies, and convert to `DiffData` under `title`. A diff error is logged (with
+/// `what`) and yields an empty `DiffData` so a transient failure never aborts the view.
+fn virtual_diff<'r>(
+    repo: &'r Repository,
+    settings: DiffSettings,
+    paths: &[String],
+    title: &str,
+    what: &str,
+    build: impl FnOnce(&'r Repository, &mut DiffOptions) -> Result<git2::Diff<'r>, git2::Error>,
+) -> DiffData {
     let mut opts = diff_opts(settings);
     apply_pathspec(&mut opts, paths);
-    let mut diff = match repo.diff_index_to_workdir(None, Some(&mut opts)) {
+    let mut diff = match build(repo, &mut opts) {
         Ok(d) => d,
         Err(e) => {
-            log::warn!("gitkay: cannot diff working tree: {e}");
+            log::warn!("gitkay: cannot diff {what}: {e}");
             return DiffData::empty();
         }
     };
     detect_similar(&mut diff, settings);
-    diff_to_data(&diff, "Uncommitted changes (working tree)", settings.show_stats)
+    diff_to_data(&diff, title, settings.show_stats)
+}
+
+fn get_working_tree_diff(repo: &Repository, settings: DiffSettings, paths: &[String]) -> DiffData {
+    virtual_diff(
+        repo,
+        settings,
+        paths,
+        "Uncommitted changes (working tree)",
+        "working tree",
+        |repo, opts| repo.diff_index_to_workdir(None, Some(opts)),
+    )
 }
 
 /// Generate diff for staged changes (index vs HEAD).
@@ -1628,17 +1567,14 @@ fn get_staged_diff(repo: &Repository, settings: DiffSettings, paths: &[String]) 
         .ok()
         .and_then(|h| h.peel_to_commit().ok())
         .and_then(|c| c.tree().ok());
-    let mut opts = diff_opts(settings);
-    apply_pathspec(&mut opts, paths);
-    let mut diff = match repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut opts)) {
-        Ok(d) => d,
-        Err(e) => {
-            log::warn!("gitkay: cannot diff staged changes: {e}");
-            return DiffData::empty();
-        }
-    };
-    detect_similar(&mut diff, settings);
-    diff_to_data(&diff, "Staged changes (index)", settings.show_stats)
+    virtual_diff(
+        repo,
+        settings,
+        paths,
+        "Staged changes (index)",
+        "staged changes",
+        |repo, opts| repo.diff_tree_to_index(head_tree.as_ref(), None, Some(opts)),
+    )
 }
 
 /// Convert a git2::Diff into our DiffData format, under a single title line.
@@ -2077,6 +2013,24 @@ struct PrefetchJob {
 /// fully highlight it, sending the finished `(key, DiffData)` back for the UI to
 /// cache. Bails as soon as a newer dispatch supersedes it (`epoch`). Pure
 /// optimization — any failure just warms fewer neighbours.
+/// Spawn a named detached thread running `f`, catching (and logging, with `panic_msg`) a
+/// panic in `f` so one bad job can't kill the thread and silently break the feature for
+/// the rest of the session. Returns the spawn result so the caller can still handle
+/// thread exhaustion (`Builder::spawn` errors rather than panicking like bare `spawn`).
+fn spawn_guarded(
+    name: &str,
+    panic_msg: &'static str,
+    f: impl FnOnce() + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err() {
+                log::warn!("{panic_msg}");
+            }
+        })
+}
+
 fn prefetch_worker(job: PrefetchJob) {
     let PrefetchJob { repo_path, targets, hl, epoch, current_epoch, tx, ctx } = job;
     // Superseded before we even ran — don't open the repo.
@@ -2595,13 +2549,19 @@ fn graph_color(col: usize) -> egui::Color32 {
     egui::Color32::from_rgb(r, g, b)
 }
 
-/// Deterministic color for an author name.
-fn author_color(name: &str) -> egui::Color32 {
+/// A deterministic palette entry for `name`: a multiplicative byte hash folded into
+/// `palette` by modulo. `mult` tunes the spread and differs per call site.
+fn hashed_color(name: &str, mult: u32, palette: &[(u8, u8, u8)]) -> egui::Color32 {
     let hash = name
         .bytes()
-        .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
-    let (r, g, b) = GRAPH_COLORS[(hash as usize) % GRAPH_COLORS.len()];
+        .fold(0u32, |acc, b| acc.wrapping_mul(mult).wrapping_add(b as u32));
+    let (r, g, b) = palette[(hash as usize) % palette.len()];
     egui::Color32::from_rgb(r, g, b)
+}
+
+/// Deterministic color for an author name.
+fn author_color(name: &str) -> egui::Color32 {
+    hashed_color(name, 31, GRAPH_COLORS)
 }
 
 /// Extended palette for ref labels — more variation than graph colors.
@@ -2622,11 +2582,7 @@ const REF_COLORS: &[(u8, u8, u8)] = &[
 
 /// Deterministic color for a ref name.
 fn ref_color(name: &str) -> egui::Color32 {
-    let hash = name
-        .bytes()
-        .fold(0u32, |acc, b| acc.wrapping_mul(37).wrapping_add(b as u32));
-    let (r, g, b) = REF_COLORS[(hash as usize) % REF_COLORS.len()];
-    egui::Color32::from_rgb(r, g, b)
+    hashed_color(name, 37, REF_COLORS)
 }
 
 const BG: egui::Color32 = egui::Color32::from_rgb(30, 30, 46);
@@ -2667,6 +2623,9 @@ enum StartupDiff {
 struct GitkApp {
     commits: Vec<CommitInfo>,
     graph_rows: Vec<GraphRow>,
+    /// Cached `max(num_cols)` over `graph_rows`, recomputed only when `graph_rows` is
+    /// rebuilt — so the per-frame graph-width sizing needn't rescan every row.
+    graph_max_cols: usize,
     selected: Option<usize>,
     startup_diff: StartupDiff, // one-time: defer the first diff off the window-creation path
 
@@ -2980,6 +2939,7 @@ impl GitkApp {
         }
         let t_layout = std::time::Instant::now();
         let graph_rows = layout_graph(&commits);
+        let graph_max_cols = graph_rows.iter().map(|r| r.num_cols).max().unwrap_or(1);
         log::debug!("perf: startup: layout_graph {:?}", t_layout.elapsed());
 
         // Restore persisted diff options. The first commit is auto-selected, but its
@@ -3098,22 +3058,14 @@ impl GitkApp {
             let ctx = cc.egui_ctx.clone();
             let repo_path_pw = repo_path.clone();
             let theme_pw = theme_slug.clone();
-            match std::thread::Builder::new()
-                .name("gitkay-prewarm".to_string())
-                // Catch a panic in the (detached) prewarm thread so it's logged
-                // rather than a silent stderr message — e.g. if warm_extension
-                // panics after the highlighter was already sent and installed.
-                .spawn(move || {
-                    let work =
-                        std::panic::AssertUnwindSafe(move || {
-                            prewarm_highlighter(repo_path_pw, theme_pw, diff_bg, tx, ctx)
-                        });
-                    if std::panic::catch_unwind(work).is_err() {
-                        log::warn!(
-                            "prewarm thread panicked; highlighting falls back to the installed or synchronous highlighter"
-                        );
-                    }
-                }) {
+            // Catch a panic in the (detached) prewarm thread so it's logged rather than a
+            // silent stderr message — e.g. if warm_extension panics after the highlighter
+            // was already sent and installed.
+            match spawn_guarded(
+                "gitkay-prewarm",
+                "prewarm thread panicked; highlighting falls back to the installed or synchronous highlighter",
+                move || prewarm_highlighter(repo_path_pw, theme_pw, diff_bg, tx, ctx),
+            ) {
                 Ok(_) => Some(rx),
                 Err(e) => {
                     log::warn!("prewarm thread spawn failed: {e}; first diff builds the highlighter synchronously");
@@ -3136,6 +3088,7 @@ impl GitkApp {
         Ok(Self {
             commits,
             graph_rows,
+            graph_max_cols,
             selected: Some(0),
             startup_diff,
             diff_lines,
@@ -3277,9 +3230,10 @@ impl GitkApp {
     /// on the UI thread; a miss (or a virtual/working-tree entry, which is content-
     /// keyed and so can't be looked up before its content is computed) computes
     /// `get_diff_data` on a worker thread and shows a placeholder until it lands —
-    /// so a large diff or rename/copy detection never freezes the window. The `repo`
-    /// arg is kept for the rare synchronous-fallback path (worker spawn failure).
-    fn load_selected_diff(&mut self, repo: &Repository) {
+    /// so a large diff or rename/copy detection never freezes the window. Takes no
+    /// repo: the common paths (cache hit, worker dispatch) don't need one, and the rare
+    /// synchronous fallback discovers it lazily — so navigation costs no `discover`.
+    fn load_selected_diff(&mut self) {
         // Already showing this exact diff (same commit + options)? Then there's nothing
         // to load. Two cases converge here: a reload/refresh of the unchanged current
         // commit (e.g. a fetch/rebase debounce), and navigating back to the on-screen
@@ -3340,7 +3294,7 @@ impl GitkApp {
         // Resolve the pathspec only here — a hit above must do no work, and under
         // --follow diff_paths_for is an O(commits) scan.
         let paths = self.diff_paths_for_oid(oid);
-        self.dispatch_diff_load(repo, oid, key, !is_real_commit(oid), paths);
+        self.dispatch_diff_load(oid, key, !is_real_commit(oid), paths);
     }
 
     /// Move the currently-displayed diff into the cache under its stored key (a move,
@@ -3416,7 +3370,6 @@ impl GitkApp {
     /// rare case).
     fn dispatch_diff_load(
         &mut self,
-        repo: &Repository,
         oid: git2::Oid,
         key: DiffCacheKey,
         is_virtual: bool,
@@ -3455,16 +3408,27 @@ impl GitkApp {
         if spawn.is_err() {
             log::warn!("diff-load thread spawn failed; loading synchronously");
             // paths/key were moved into the (dropped) closure; re-resolve them for the
-            // synchronous fallback.
-            let paths = self.diff_paths_for_oid(oid);
-            let mut key = self.diff_cache_key(oid);
-            let data = get_diff_data(repo, oid, settings, &paths);
-            // A virtual entry is content-keyed, so hash its content here (the worker does
-            // this off-thread); real commits key by oid alone.
-            if is_virtual {
-                key.content = hash_diff_content(&data);
+            // synchronous fallback. Only this rare path needs a repo handle, so discover
+            // it here rather than on every navigation.
+            match Repository::discover(&self.repo_path) {
+                Ok(repo) => {
+                    let paths = self.diff_paths_for_oid(oid);
+                    let mut key = self.diff_cache_key(oid);
+                    let data = get_diff_data(&repo, oid, settings, &paths);
+                    // A virtual entry is content-keyed, so hash its content here (the
+                    // worker does this off-thread); real commits key by oid alone.
+                    if is_virtual {
+                        key.content = hash_diff_content(&data);
+                    }
+                    self.install_preferring_cache(key, data);
+                }
+                // No repo and no worker — clear the just-armed loading state so the pane
+                // doesn't stick on the placeholder; the previous diff stays on screen.
+                Err(e) => {
+                    log::warn!("diff-load fallback: repo discover failed: {e}");
+                    self.diff_load_started_at = None;
+                }
             }
-            self.install_preferring_cache(key, data);
         }
     }
 
@@ -3483,6 +3447,16 @@ impl GitkApp {
     /// (~0.5s with the fancy-regex backend) — doing that on the UI thread froze
     /// the window on commit selection. Cheap to call every frame: a no-op once
     /// `diff_needs_highlight` is cleared.
+    /// Install a freshly built highlighter, surfacing any theme-load warning as a log line
+    /// plus a config-error toast. Shared by the prewarmed and synchronous build paths.
+    fn install_highlighter(&mut self, hl: Highlighter, warning: Option<String>) {
+        if let Some(w) = warning {
+            log::warn!("{w}");
+            self.config_error_toast = Some(std::time::Instant::now());
+        }
+        self.highlighter = Some(Arc::new(hl));
+    }
+
     fn ensure_diff_highlighted(&mut self, ctx: &egui::Context) {
         if !self.diff_needs_highlight {
             return;
@@ -3500,11 +3474,7 @@ impl GitkApp {
                 // reuses the warm SyntaxSet.
                 Some(Ok(prewarmed)) => {
                     let (hl, warning) = prewarmed.with_theme(&self.theme_slug, self.diff_bg);
-                    if let Some(w) = warning {
-                        log::warn!("{w}");
-                        self.config_error_toast = Some(std::time::Instant::now());
-                    }
-                    self.highlighter = Some(Arc::new(hl));
+                    self.install_highlighter(hl, warning);
                     self.prewarm_rx = None;
                 }
                 // Still building off-thread: render plain this frame and retry next
@@ -3518,11 +3488,7 @@ impl GitkApp {
                     let t = std::time::Instant::now();
                     let (hl, warning) = Highlighter::new(&self.theme_slug, self.diff_bg);
                     log::debug!("perf: built highlighter (sync fallback) {:?}", t.elapsed());
-                    if let Some(w) = warning {
-                        log::warn!("{w}");
-                        self.config_error_toast = Some(std::time::Instant::now());
-                    }
-                    self.highlighter = Some(Arc::new(hl));
+                    self.install_highlighter(hl, warning);
                 }
             }
         }
@@ -3572,18 +3538,13 @@ impl GitkApp {
         // `Builder::spawn` returns Err on thread exhaustion (vs `spawn`, which
         // panics). On failure, highlight synchronously so the diff still gets
         // coloured rather than staying plain forever.
-        if std::thread::Builder::new()
-            .name("gitkay-highlight".to_string())
-            .spawn(move || {
-                // Contain a syntect panic to this one diff (as the prefetch worker
-                // does): without this a bad grammar/line would kill the highlight
-                // thread and leave every later diff plain for the rest of the session.
-                let work = std::panic::AssertUnwindSafe(move || highlight_worker(job));
-                if std::panic::catch_unwind(work).is_err() {
-                    log::warn!("highlight thread panicked");
-                }
-            })
-            .is_err()
+        // Contain a syntect panic to this one diff (as the prefetch worker does): without
+        // this a bad grammar/line would kill the highlight thread and leave every later
+        // diff plain for the rest of the session.
+        if spawn_guarded("gitkay-highlight", "highlight thread panicked", move || {
+            highlight_worker(job)
+        })
+        .is_err()
         {
             log::warn!("highlight thread spawn failed; highlighting on the UI thread");
             self.highlight_priority = None;
@@ -3634,15 +3595,10 @@ impl GitkApp {
             tx: self.prefetch_tx.clone(),
             ctx: ctx.clone(),
         };
-        if std::thread::Builder::new()
-            .name("gitkay-prefetch".to_string())
-            .spawn(move || {
-                let work = std::panic::AssertUnwindSafe(move || prefetch_worker(job));
-                if std::panic::catch_unwind(work).is_err() {
-                    log::warn!("prefetch thread panicked");
-                }
-            })
-            .is_err()
+        if spawn_guarded("gitkay-prefetch", "prefetch thread panicked", move || {
+            prefetch_worker(job)
+        })
+        .is_err()
         {
             log::warn!("prefetch thread spawn failed");
         }
@@ -3674,6 +3630,7 @@ impl GitkApp {
         previous_index: Option<usize>,
     ) {
         self.graph_rows = layout_graph(&self.commits);
+        self.graph_max_cols = self.graph_rows.iter().map(|r| r.num_cols).max().unwrap_or(1);
         // `count` budgets real commits; compare against the real count so the virtual
         // rows don't make a fully-loaded history read as "more available".
         self.all_loaded = real_commit_count(&self.commits) < count;
@@ -3706,9 +3663,7 @@ impl GitkApp {
     /// when it also needs to bring the row into view.
     fn select_loaded(&mut self, idx: usize) {
         self.set_selected(idx);
-        if let Ok(repo) = Repository::discover(&self.repo_path) {
-            self.load_selected_diff(&repo);
-        }
+        self.load_selected_diff();
         self.diff_scroll_to = Some(0); // new commit → reset diff view to top
     }
 
@@ -3739,12 +3694,7 @@ impl GitkApp {
         let right = rect.max.x - 4.0;
         let cy = rect.center().y;
         let font = self.fonts.font_id(Role::FileList);
-        let measure = |s: &str| {
-            ui.painter()
-                .layout_no_wrap(s.to_string(), font.clone(), SUBTEXT)
-                .size()
-                .x
-        };
+        let measure = |s: &str| text_width(ui.painter(), s, &font);
         // `dim_len` lands on a '/' boundary, so the split is always char-safe.
         let (shared, tail) = dir.split_at(dim_len.min(dir.len()));
         let mut x = left;
@@ -3837,12 +3787,7 @@ impl GitkApp {
 
         // Label, elided into the width left of the stats.
         let label_max = (right - left - stats_w - pad).max(0.0);
-        let measure = |s: &str| {
-            ui.painter()
-                .layout_no_wrap(s.to_string(), name_font.clone(), name_color)
-                .size()
-                .x
-        };
+        let measure = |s: &str| text_width(ui.painter(), s, &name_font);
         let elided = if elide_left {
             left_elide(label, label_max, measure)
         } else {
@@ -3907,9 +3852,7 @@ impl eframe::App for GitkApp {
             StartupDiff::NeedsLoad => {
                 self.startup_diff = StartupDiff::Done;
                 let t = std::time::Instant::now();
-                if let Ok(repo) = Repository::discover(&self.repo_path) {
-                    self.load_selected_diff(&repo);
-                }
+                self.load_selected_diff();
                 log::debug!("perf: startup: deferred first diff loaded {:?}", t.elapsed());
             }
             StartupDiff::Done => {}
@@ -3948,7 +3891,7 @@ impl eframe::App for GitkApp {
                 self.reload_armed_at = None;
                 if let Ok(repo) = Repository::discover(&self.repo_path) {
                     self.reload_commits(&repo, None);
-                    self.load_selected_diff(&repo);
+                    self.load_selected_diff();
                 }
             } else {
                 // Wake up when the debounce window closes to run the reload.
@@ -4058,12 +4001,9 @@ impl eframe::App for GitkApp {
                     // Update it before any reload so the reload rebuilds the rows under
                     // the new layout in one pass; if nothing reloads, rebuild the rows
                     // here for a layout-only change.
-                    let layout_changed = self.file_list != cfg.diff.file_list;
-                    self.file_list = cfg.diff.file_list;
+                    let layout_changed = set_if_changed(&mut self.file_list, cfg.diff.file_list);
                     if reload_diff {
-                        if let Ok(repo) = Repository::discover(&self.repo_path) {
-                            self.load_selected_diff(&repo);
-                        }
+                        self.load_selected_diff();
                     } else if layout_changed {
                         self.rebuild_file_rows();
                     }
@@ -4358,15 +4298,7 @@ impl eframe::App for GitkApp {
                 let graph_width = if reflog_mode {
                     4.0
                 } else {
-                    (self
-                        .graph_rows
-                        .iter()
-                        .map(|r| r.num_cols)
-                        .max()
-                        .unwrap_or(1)
-                        .min(max_graph_cols) as f32)
-                        * col_width
-                        + 8.0
+                    (self.graph_max_cols.min(max_graph_cols) as f32) * col_width + 8.0
                 };
 
                 let panel_height = ui.available_height();
@@ -4494,6 +4426,15 @@ impl eframe::App for GitkApp {
                                     top_left.x + col as f32 * col_width + col_width / 2.0
                                 };
 
+                                // Whether this node has an incoming line from the row
+                                // above is loop-invariant — compute it once per row, not
+                                // once per graph line.
+                                let has_incoming = idx > 0
+                                    && self.graph_rows[idx - 1]
+                                        .lines
+                                        .iter()
+                                        .any(|&(_, to, _)| to == gr.node_col);
+
                                 // ── Graph ──
                                 for &(from, to, color_col) in &gr.lines {
                                     let c = graph_color(color_col).linear_multiply(if from == to {
@@ -4507,13 +4448,6 @@ impl eframe::App for GitkApp {
 
                                     // Check if this line passes through the node
                                     let touches_node = from == gr.node_col || to == gr.node_col;
-
-                                    // Check if this node has an incoming line from above
-                                    let has_incoming = idx > 0
-                                        && self.graph_rows[idx - 1]
-                                            .lines
-                                            .iter()
-                                            .any(|&(_, to, _)| to == gr.node_col);
 
                                     if !touches_node {
                                         // Straight or diagonal, doesn't touch the node
@@ -4612,10 +4546,10 @@ impl eframe::App for GitkApp {
                             let date_w = date_galley.size().x;
 
                             // Short SHA
-                            let short_sha = if is_virtual_oid(commit.oid) {
-                                String::new()
-                            } else {
+                            let short_sha = if is_real_commit(commit.oid) {
                                 format!("{:.7}", commit.oid)
+                            } else {
+                                String::new()
                             };
                             let sha_galley =
                                 painter.layout_no_wrap(short_sha, date_font.clone(), SUBTEXT);
@@ -4780,24 +4714,15 @@ impl eframe::App for GitkApp {
                                         diff_opts_changed = true;
                                     }
                                     ui.add_space(12.0);
-                                    if ui
+                                    diff_opts_changed |= ui
                                         .checkbox(&mut self.diff_ignore_ws, "Ignore whitespace")
-                                        .changed()
-                                    {
-                                        diff_opts_changed = true;
-                                    }
-                                    if ui
+                                        .changed();
+                                    diff_opts_changed |= ui
                                         .checkbox(&mut self.diff_detect_renames, "Detect renames")
-                                        .changed()
-                                    {
-                                        diff_opts_changed = true;
-                                    }
-                                    if ui
+                                        .changed();
+                                    diff_opts_changed |= ui
                                         .checkbox(&mut self.diff_detect_copies, "Detect copies")
-                                        .changed()
-                                    {
-                                        diff_opts_changed = true;
-                                    }
+                                        .changed();
                                     // Word-diff only changes the render (emphasis is
                                     // precomputed), so no diff reload — toggling is instant.
                                     ui.checkbox(&mut self.word_diff, "Word diff");
@@ -4808,8 +4733,8 @@ impl eframe::App for GitkApp {
                 } else {
                     self.diff_toolbar_rect = None;
                 }
-                if diff_opts_changed && let Ok(repo) = Repository::discover(&self.repo_path) {
-                    self.load_selected_diff(&repo);
+                if diff_opts_changed {
+                    self.load_selected_diff();
                 }
 
                 // A diff-load worker is computing the selected commit's diff. Until it
@@ -4972,77 +4897,53 @@ impl eframe::App for GitkApp {
                             },
                             last_top_anchor: self.diff_files.iter().filter_map(|f| f.diff_line_idx).max(),
                         };
-                        if let Some(palette) = &palette {
-                            // Themed render: row colours come from the theme's token
-                            // spans plus an add/del background tint.
-                            let font_id = self.fonts.font_id(Role::Diff);
-                            let lines = &self.diff_lines;
-                            let files = &self.diff_files;
-                            let priority = self.highlight_priority.as_ref();
-                            let word_diff = self.word_diff;
-                            let diff_top = Arc::clone(&self.diff_top_line);
-                            let diff_visible = Arc::clone(&self.diff_visible_rows);
-                            show_virtualized_diff(
-                                ui,
-                                &font_id,
-                                diff_view,
-                                |rows, viewport_rows| {
-                                    diff_top.store(rows.start, Ordering::Relaxed);
-                                    diff_visible.store(viewport_rows, Ordering::Relaxed);
-                                    // Tell the background worker which files are on
-                                    // screen so it tokenizes those first, plus the
-                                    // file range one viewport (in rows) above/below
-                                    // for read-ahead.
-                                    if let Some(p) = priority
-                                        && rows.start < rows.end
-                                    {
-                                        let vh = rows.end - rows.start;
-                                        let lo = file_index_at_line(files, rows.start);
-                                        let hi = file_index_at_line(files, rows.end - 1);
-                                        let page_lo =
-                                            file_index_at_line(files, rows.start.saturating_sub(vh));
-                                        let page_hi = file_index_at_line(files, rows.end - 1 + vh);
-                                        p.lo.store(lo, Ordering::Relaxed);
-                                        p.hi.store(hi, Ordering::Relaxed);
-                                        p.page_lo.store(page_lo, Ordering::Relaxed);
-                                        p.page_hi.store(page_hi, Ordering::Relaxed);
-                                    }
-                                },
-                                |i| {
-                                    let (job, row_bg) =
-                                        diff_row_job(&lines[i], palette, &font_id, word_diff, true);
-                                    (job, row_bg, palette.foreground)
-                                },
-                            );
-                        } else {
-                            // Flat per-line colouring (syntax off): one colour per
-                            // LineKind from the theme palette, no token spans, no
-                            // row tint.
-                            let font_id = self.fonts.font_id(Role::Diff);
-                            let lines = &self.diff_lines;
-                            let palette = &self.diff_palette;
-                            let word_diff = self.word_diff;
-                            let diff_top = Arc::clone(&self.diff_top_line);
-                            let diff_visible = Arc::clone(&self.diff_visible_rows);
-                            show_virtualized_diff(
-                                ui,
-                                &font_id,
-                                diff_view,
-                                |rows, viewport_rows| {
-                                    diff_top.store(rows.start, Ordering::Relaxed);
-                                    diff_visible.store(viewport_rows, Ordering::Relaxed);
-                                },
-                                |i| {
-                                    let (job, _) =
-                                        diff_row_job(&lines[i], palette, &font_id, word_diff, false);
-                                    // The fallback colour is only used for sections left
-                                    // at Color32::PLACEHOLDER; diff_row_job always sets an
-                                    // explicit colour, so it's never consulted — pass the
-                                    // same constant as the syntax-on path.
-                                    (job, None, palette.foreground)
-                                },
-                            );
-                        }
+                        // One render path for both modes. Syntax-on takes row colours from
+                        // the theme's token spans plus an add/del tint; syntax-off uses one
+                        // flat colour per LineKind with no spans and no row tint (diff_row_job
+                        // returns row_bg = None when syntax is off, so passing it through
+                        // matches the old explicit `None`). The palette is the highlighter's
+                        // when built, else the theme palette.
+                        let syntax = self.syntax_enabled;
+                        let render_palette = palette.as_ref().unwrap_or(&self.diff_palette);
+                        let font_id = self.fonts.font_id(Role::Diff);
+                        let lines = &self.diff_lines;
+                        let files = &self.diff_files;
+                        let priority = self.highlight_priority.as_ref();
+                        let word_diff = self.word_diff;
+                        let diff_top = Arc::clone(&self.diff_top_line);
+                        let diff_visible = Arc::clone(&self.diff_visible_rows);
+                        show_virtualized_diff(
+                            ui,
+                            &font_id,
+                            diff_view,
+                            |rows, viewport_rows| {
+                                diff_top.store(rows.start, Ordering::Relaxed);
+                                diff_visible.store(viewport_rows, Ordering::Relaxed);
+                                // Tell the background worker which files are on screen so it
+                                // tokenizes those first, plus one viewport (in rows)
+                                // above/below for read-ahead. No-op with syntax off — there
+                                // is no worker, so priority is None.
+                                if let Some(p) = priority
+                                    && rows.start < rows.end
+                                {
+                                    let vh = rows.end - rows.start;
+                                    let lo = file_index_at_line(files, rows.start);
+                                    let hi = file_index_at_line(files, rows.end - 1);
+                                    let page_lo =
+                                        file_index_at_line(files, rows.start.saturating_sub(vh));
+                                    let page_hi = file_index_at_line(files, rows.end - 1 + vh);
+                                    p.lo.store(lo, Ordering::Relaxed);
+                                    p.hi.store(hi, Ordering::Relaxed);
+                                    p.page_lo.store(page_lo, Ordering::Relaxed);
+                                    p.page_hi.store(page_hi, Ordering::Relaxed);
+                                }
+                            },
+                            |i| {
+                                let (job, row_bg) =
+                                    diff_row_job(&lines[i], render_palette, &font_id, word_diff, syntax);
+                                (job, row_bg, render_palette.foreground)
+                            },
+                        );
                     });
 
                 // The side panel already draws a separator at the divider that
@@ -6937,20 +6838,6 @@ mod tests {
     }
 
     #[test]
-    fn word_emphasis_marks_only_changed_tokens() {
-        let pick = |body: &str, ranges: &[std::ops::Range<usize>]| -> Vec<String> {
-            ranges.iter().map(|r| body[r.clone()].to_string()).collect()
-        };
-        // One token differs; the shared tokens (let, =, foo, (), ;) stay plain.
-        let (del, add) = line_emphasis("let x = foo();", "let y = foo();");
-        assert_eq!(pick("let x = foo();", &del), vec!["x".to_string()]);
-        assert_eq!(pick("let y = foo();", &add), vec!["y".to_string()]);
-        // `_` is a word char, so a whole identifier is one token.
-        let (del, _) = line_emphasis("a.full_name", "a.display_name");
-        assert_eq!(pick("a.full_name", &del), vec!["full_name".to_string()]);
-    }
-
-    #[test]
     fn word_emphasis_pairs_equal_blocks_only() {
         // Equal-count block (1 del, 1 add): both lines get emphasis.
         let mut lines = vec![
@@ -7040,25 +6927,6 @@ mod tests {
         // Non-follow mode always uses the global path filter.
         let plain = cli::Scope { paths: vec!["x".to_string()], ..Default::default() };
         assert_eq!(diff_paths_for(&plain, &commits, oid(1)), vec!["x".to_string()]);
-    }
-
-    #[test]
-    fn changed_tokens_edge_cases() {
-        assert_eq!(changed_tokens(&["a", "b"], &["a", "b"]), (vec![], vec![])); // identical
-        assert_eq!(changed_tokens(&["a", "c"], &["a", "b", "c"]), (vec![], vec![1])); // insert
-        assert_eq!(changed_tokens(&["a", "b", "c"], &["a", "c"]), (vec![1], vec![])); // delete
-        assert_eq!(changed_tokens(&[], &["a"]), (vec![], vec![0])); // empty → all inserted
-        assert_eq!(changed_tokens(&["a"], &[]), (vec![0], vec![])); // all deleted
-        assert_eq!(changed_tokens(&[], &[]), (vec![], vec![])); // both empty
-    }
-
-    #[test]
-    fn merge_token_ranges_merges_only_contiguous() {
-        let toks: Vec<(std::ops::Range<usize>, &str)> =
-            vec![(0..1, "a"), (1..2, "b"), (2..3, "c"), (3..4, "d")];
-        assert_eq!(merge_token_ranges(&toks, &[0, 1]), vec![0..2]); // adjacent → merged
-        assert_eq!(merge_token_ranges(&toks, &[0, 2]), vec![0..1, 2..3]); // gap → separate
-        assert!(merge_token_ranges(&toks, &[]).is_empty());
     }
 
     #[test]
