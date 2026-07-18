@@ -246,60 +246,144 @@ fn split_dir(path: &str) -> (&str, &str) {
     }
 }
 
-/// Turn the diff's file paths into render rows for the given layout.
-/// `Name`/`Full` are flat (diff order); `Grouped` groups files by directory —
-/// one header per directory (alphabetical, parents before children), basenames
-/// indented underneath, with root-level files listed last without a header.
-fn build_file_rows(paths: &[&str], layout: FileListLayout) -> Vec<FileListRow> {
+/// Byte length of the leading directory segments that `a` and `b` share, ending at a
+/// `/` — whole-segment, so `x/foo/` and `x/bar/` share `x/` (2) while `src2/` and
+/// `src/` share nothing (0). Used to dim the ancestor path a directory header repeats
+/// from the header above it. Multibyte-safe (only ASCII `/` is a boundary, and the
+/// returned length always lands on one).
+fn common_dir_prefix_len(a: &str, b: &str) -> usize {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut pfx = 0;
+    let mut i = 0;
+    while i < a.len() && i < b.len() && a[i] == b[i] {
+        if a[i] == b'/' {
+            pfx = i + 1;
+        }
+        i += 1;
+    }
+    pfx
+}
+
+/// git-style rename/copy display: the parts common to `old` and `new` are factored
+/// out at `/` boundaries, leaving the change in `{old ⇒ new}` braces. Returns
+/// `(common_dir_prefix, label)`, where `prefix + label` is the full form —
+/// `("a/b/", "{ ⇒ sub}/x.rs")` for a move into `sub/`, `("d/", "{a.txt ⇒ b.txt}")`
+/// for a same-directory rename, `("", "x ⇒ y")` when nothing is shared. `prefix`
+/// (always "" or `/`-terminated) is the directory the file groups under.
+fn rename_brace(old: &str, new: &str) -> (String, String) {
+    let (a, b) = (old.as_bytes(), new.as_bytes());
+    let (la, lb) = (a.len(), b.len());
+
+    // Common prefix, snapped to the last shared '/'.
+    let mut pfx = 0;
+    let mut i = 0;
+    while i < la && i < lb && a[i] == b[i] {
+        if a[i] == b'/' {
+            pfx = i + 1;
+        }
+        i += 1;
+    }
+
+    // Common suffix, snapped to a '/'. The floor lets the suffix reuse the slash that
+    // ends the prefix (pfx > 0 ⇒ old[pfx-1] == '/'), which produces the
+    // `dir/{ ⇒ sub}/file` form. Paths never contain a NUL byte, so 0 is a safe
+    // past-the-end sentinel that matches only itself and is never '/'.
+    let floor = pfx.saturating_sub(1);
+    let byte_at = |s: &[u8], i: usize| if i == s.len() { 0u8 } else { s[i] };
+    let mut sfx = 0;
+    let (mut ai, mut bi) = (la, lb);
+    while ai >= floor && bi >= floor && byte_at(a, ai) == byte_at(b, bi) {
+        if byte_at(a, ai) == b'/' {
+            sfx = la - ai;
+        }
+        if ai == 0 || bi == 0 {
+            break;
+        }
+        ai -= 1;
+        bi -= 1;
+    }
+
+    if pfx + sfx == 0 {
+        return (String::new(), format!("{old} ⇒ {new}"));
+    }
+    let a_mid = &old[pfx..pfx + la.saturating_sub(pfx + sfx)];
+    let b_mid = &new[pfx..pfx + lb.saturating_sub(pfx + sfx)];
+    let suffix = &old[la - sfx..];
+    (old[..pfx].to_string(), format!("{{{a_mid} ⇒ {b_mid}}}{suffix}"))
+}
+
+/// Turn the diff's files (new path + optional rename/copy source) into render rows
+/// for the given layout. `Name`/`Full` are flat (diff order); `Grouped` groups files
+/// by directory — one header per directory (alphabetical, parents before children),
+/// labels indented underneath, root-level files last without a header. A renamed or
+/// copied file is shown git-style (`rename_brace`) and grouped under the directory
+/// common to its old and new path, so the move reads clearly (`{ ⇒ admin}/File.java`
+/// under the `…/actions/` header) instead of a bare `File.java → File.java`.
+fn build_file_rows(files: &[(&str, Option<&str>)], layout: FileListLayout) -> Vec<FileListRow> {
+    // (group directory, rendered label) per file, resolved for this layout.
+    let computed: Vec<(String, String)> = files
+        .iter()
+        .map(|&(new, old)| match old.filter(|o| *o != new) {
+            Some(old) => {
+                let (prefix, brace) = rename_brace(old, new);
+                // Grouped/Name show the compact brace; Full prepends the full prefix.
+                let label = if layout == FileListLayout::Full {
+                    format!("{prefix}{brace}")
+                } else {
+                    brace
+                };
+                (prefix, label)
+            }
+            None => {
+                let (dir, base) = split_dir(new);
+                let label = if layout == FileListLayout::Full {
+                    new.to_string()
+                } else {
+                    base.to_string()
+                };
+                (dir.to_string(), label)
+            }
+        })
+        .collect();
+
     match layout {
-        FileListLayout::Name => paths
+        FileListLayout::Name | FileListLayout::Full => computed
             .iter()
             .enumerate()
-            .map(|(idx, p)| FileListRow::File {
+            .map(|(idx, (_, label))| FileListRow::File {
                 idx,
-                label: split_dir(p).1.to_string(),
-                indented: false,
-            })
-            .collect(),
-        FileListLayout::Full => paths
-            .iter()
-            .enumerate()
-            .map(|(idx, p)| FileListRow::File {
-                idx,
-                label: p.to_string(),
+                label: label.clone(),
                 indented: false,
             })
             .collect(),
         FileListLayout::Grouped => {
-            // Group file indices by directory so each directory gets exactly one
-            // header. (Sorting by full path alone would let a subdirectory's paths
-            // interleave a parent's files and re-emit the header.) BTreeMap keys
-            // sort directories alphabetically, parents before children; root files
-            // ("") are split out and emitted last, headerless.
+            // Group indices by directory so each directory gets exactly one header;
+            // BTreeMap keys sort directories alphabetically (parents before children).
+            // Root files ("") are split out and emitted last, headerless.
             let mut by_dir: std::collections::BTreeMap<&str, Vec<usize>> =
                 std::collections::BTreeMap::new();
-            for (idx, p) in paths.iter().enumerate() {
-                by_dir.entry(split_dir(p).0).or_default().push(idx);
+            for (idx, (dir, _)) in computed.iter().enumerate() {
+                by_dir.entry(dir.as_str()).or_default().push(idx);
             }
             let root = by_dir.remove("");
-            let mut rows = Vec::with_capacity(paths.len() + by_dir.len());
+            let mut rows = Vec::with_capacity(computed.len() + by_dir.len());
             for (dir, mut idxs) in by_dir {
-                idxs.sort_by(|&a, &b| split_dir(paths[a]).1.cmp(split_dir(paths[b]).1));
+                idxs.sort_by(|&a, &b| computed[a].1.cmp(&computed[b].1));
                 rows.push(FileListRow::Header(dir.to_string()));
                 for idx in idxs {
                     rows.push(FileListRow::File {
                         idx,
-                        label: split_dir(paths[idx]).1.to_string(),
+                        label: computed[idx].1.clone(),
                         indented: true,
                     });
                 }
             }
             if let Some(mut idxs) = root {
-                idxs.sort_by(|&a, &b| paths[a].cmp(paths[b]));
+                idxs.sort_by(|&a, &b| computed[a].1.cmp(&computed[b].1));
                 for idx in idxs {
                     rows.push(FileListRow::File {
                         idx,
-                        label: split_dir(paths[idx]).1.to_string(),
+                        label: computed[idx].1.clone(),
                         indented: false,
                     });
                 }
@@ -1219,10 +1303,7 @@ struct FileEntry {
     path: String,
     /// For a `Renamed`/`Copied` delta, the source path (old side) when it differs
     /// from `path`; `None` otherwise. Display-only — `path` (the new side) stays
-    /// the identity/patch-boundary key. Not yet read outside tests: the file list
-    /// doesn't render `old → new` yet (a follow-up task), so allow dead_code until
-    /// it grows a reader.
-    #[allow(dead_code)]
+    /// the identity/patch-boundary key.
     old_path: Option<String>,
     additions: usize,
     deletions: usize,
@@ -2459,6 +2540,9 @@ fn ref_color(name: &str) -> egui::Color32 {
 const BG: egui::Color32 = egui::Color32::from_rgb(30, 30, 46);
 const TEXT: egui::Color32 = egui::Color32::from_rgb(205, 214, 244);
 const SUBTEXT: egui::Color32 = egui::Color32::from_rgb(108, 112, 134);
+// Dimmer than SUBTEXT: the shared parent path in a grouped directory header, so the
+// leaf directory (drawn in SUBTEXT) stands out from the repeated ancestor path.
+const SUBTEXT_DIM: egui::Color32 = egui::Color32::from_rgb(78, 81, 99);
 const SURFACE0: egui::Color32 = egui::Color32::from_rgb(49, 50, 68);
 const GREEN: egui::Color32 = egui::Color32::from_rgb(166, 227, 161);
 const RED: egui::Color32 = egui::Color32::from_rgb(243, 139, 168);
@@ -2934,7 +3018,10 @@ impl GitkApp {
         };
 
         let file_rows = build_file_rows(
-            &diff_files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            &diff_files
+                .iter()
+                .map(|f| (f.path.as_str(), f.old_path.as_deref()))
+                .collect::<Vec<_>>(),
             file_list,
         );
 
@@ -3414,12 +3501,21 @@ impl GitkApp {
     /// selections, and the sidebar isn't virtualized, so the draw loop reads this
     /// cache instead of rebuilding (and re-sorting) every frame.
     fn rebuild_file_rows(&mut self) {
-        let paths: Vec<&str> = self.diff_files.iter().map(|f| f.path.as_str()).collect();
-        self.file_rows = build_file_rows(&paths, self.file_list);
+        let files: Vec<(&str, Option<&str>)> = self
+            .diff_files
+            .iter()
+            .map(|f| (f.path.as_str(), f.old_path.as_deref()))
+            .collect();
+        self.file_rows = build_file_rows(&files, self.file_list);
     }
 
     /// One non-interactive directory-header row in the grouped file list.
-    fn draw_dir_header(&self, ui: &mut egui::Ui, dir: &str) {
+    /// Draw one grouped directory header, breadcrumb-style. `dim_len` is the byte
+    /// length of the leading path this header shares with the header above it
+    /// (`common_dir_prefix_len`); that repeated ancestor is drawn dimmed
+    /// (`SUBTEXT_DIM`) and the distinguishing tail in `SUBTEXT`, so a deep tree reads
+    /// like an indented breadcrumb instead of a wall of repeated path.
+    fn draw_dir_header(&self, ui: &mut egui::Ui, dir: &str, dim_len: usize) {
         let (rect, _) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), FILE_ROW_H),
             egui::Sense::hover(),
@@ -3428,14 +3524,29 @@ impl GitkApp {
         let right = rect.max.x - 4.0;
         let cy = rect.center().y;
         let font = self.fonts.font_id(Role::FileList);
-        let label = left_elide(dir, (right - left).max(0.0), |s| {
+        let measure = |s: &str| {
             ui.painter()
                 .layout_no_wrap(s.to_string(), font.clone(), SUBTEXT)
                 .size()
                 .x
-        });
-        let g = ui.painter().layout_no_wrap(label, font.clone(), SUBTEXT);
-        ui.painter().galley(egui::pos2(left, cy - 7.0), g, SUBTEXT);
+        };
+        // `dim_len` lands on a '/' boundary, so the split is always char-safe.
+        let (shared, tail) = dir.split_at(dim_len.min(dir.len()));
+        let mut x = left;
+        let tail_w = measure(tail);
+        // Dim the ancestor shared with the header above; left-elide it (keeping the
+        // segments nearest the tail) so the distinguishing tail always stays visible.
+        if !shared.is_empty() && tail_w < right - left {
+            let st = left_elide(shared, right - left - tail_w, measure);
+            let sg = ui.painter().layout_no_wrap(st, font.clone(), SUBTEXT_DIM);
+            let sw = sg.size().x;
+            ui.painter().galley(egui::pos2(x, cy - 7.0), sg, SUBTEXT_DIM);
+            x += sw;
+        }
+        // Distinguishing tail at normal header brightness; left-elide if it overflows.
+        let tt = left_elide(tail, (right - x).max(0.0), measure);
+        let tg = ui.painter().layout_no_wrap(tt, font.clone(), SUBTEXT);
+        ui.painter().galley(egui::pos2(x, cy - 7.0), tg, SUBTEXT);
     }
 
     /// One file row: `label` at `indent`, with right-aligned `+/-` stats,
@@ -4491,10 +4602,17 @@ impl eframe::App for GitkApp {
                                     // (elide from the back, keeping the name's start).
                                     let elide_left = self.file_list == FileListLayout::Full;
                                     let mut scroll_to: Option<usize> = None;
+                                    // Breadcrumb dimming: each header dims the path it
+                                    // shares with the header drawn just above it.
+                                    let mut prev_header_dir: Option<&str> = None;
                                     for row in &self.file_rows {
                                         match row {
                                             FileListRow::Header(dir) => {
-                                                self.draw_dir_header(ui, dir)
+                                                let dim_len = prev_header_dir.map_or(0, |p| {
+                                                    common_dir_prefix_len(p, dir)
+                                                });
+                                                self.draw_dir_header(ui, dir, dim_len);
+                                                prev_header_dir = Some(dir);
                                             }
                                             FileListRow::File {
                                                 idx,
@@ -6705,16 +6823,16 @@ mod tests {
 
     #[test]
     fn build_file_rows_name_mode_is_flat_basenames() {
-        let paths = ["src/a.rs", "b.rs"];
-        let rows = build_file_rows(&paths, FileListLayout::Name);
+        let files = [("src/a.rs", None), ("b.rs", None)];
+        let rows = build_file_rows(&files, FileListLayout::Name);
         let desc: Vec<String> = rows.iter().map(row_desc).collect();
         assert_eq!(desc, vec!["F:0:a.rs:false", "F:1:b.rs:false"]);
     }
 
     #[test]
     fn build_file_rows_full_mode_is_flat_full_paths() {
-        let paths = ["src/a.rs", "b.rs"];
-        let rows = build_file_rows(&paths, FileListLayout::Full);
+        let files = [("src/a.rs", None), ("b.rs", None)];
+        let rows = build_file_rows(&files, FileListLayout::Full);
         let desc: Vec<String> = rows.iter().map(row_desc).collect();
         assert_eq!(desc, vec!["F:0:src/a.rs:false", "F:1:b.rs:false"]);
     }
@@ -6723,14 +6841,14 @@ mod tests {
     fn build_file_rows_grouped_sorts_and_headers() {
         // Diff order is unsorted; grouped groups by directory (alphabetical,
         // parents before children) with root files last.
-        let paths = [
-            "src/main/java/com/acme/Foo.java", // 0
-            "src/main/java/com/acme/Bar.java", // 1
-            "src/test/java/com/acme/FooTest.java", // 2
-            "docs/guide.md", // 3
-            "README.md", // 4
+        let files = [
+            ("src/main/java/com/acme/Foo.java", None), // 0
+            ("src/main/java/com/acme/Bar.java", None), // 1
+            ("src/test/java/com/acme/FooTest.java", None), // 2
+            ("docs/guide.md", None), // 3
+            ("README.md", None), // 4
         ];
-        let rows = build_file_rows(&paths, FileListLayout::Grouped);
+        let rows = build_file_rows(&files, FileListLayout::Grouped);
         let desc: Vec<String> = rows.iter().map(row_desc).collect();
         assert_eq!(
             desc,
@@ -6753,8 +6871,8 @@ mod tests {
         // header exactly once with all its direct files under it — sorting by full
         // path alone would interleave the subdir between b.rs and d.rs and re-emit
         // the "a/" header.
-        let paths = ["a/b.rs", "a/c/x.rs", "a/d.rs"];
-        let rows = build_file_rows(&paths, FileListLayout::Grouped);
+        let files = [("a/b.rs", None), ("a/c/x.rs", None), ("a/d.rs", None)];
+        let rows = build_file_rows(&files, FileListLayout::Grouped);
         let desc: Vec<String> = rows.iter().map(row_desc).collect();
         assert_eq!(
             desc,
@@ -6770,8 +6888,8 @@ mod tests {
 
     #[test]
     fn build_file_rows_grouped_root_only_has_no_headers() {
-        let paths = ["b.txt", "a.txt"];
-        let rows = build_file_rows(&paths, FileListLayout::Grouped);
+        let files = [("b.txt", None), ("a.txt", None)];
+        let rows = build_file_rows(&files, FileListLayout::Grouped);
         let desc: Vec<String> = rows.iter().map(row_desc).collect();
         // Sorted: a.txt (idx 1) then b.txt (idx 0); no headers.
         assert_eq!(desc, vec!["F:1:a.txt:false", "F:0:b.txt:false"]);
@@ -6779,10 +6897,98 @@ mod tests {
 
     #[test]
     fn build_file_rows_grouped_multibyte_dir() {
-        let paths = ["α/β.rs", "α/γ.rs"];
-        let rows = build_file_rows(&paths, FileListLayout::Grouped);
+        let files = [("α/β.rs", None), ("α/γ.rs", None)];
+        let rows = build_file_rows(&files, FileListLayout::Grouped);
         assert!(matches!(&rows[0], FileListRow::Header(d) if d == "α/"));
         assert_eq!(rows.len(), 3); // header + 2 files
+    }
+
+    #[test]
+    fn build_file_rows_renames_use_git_brace() {
+        // Moved into a subdirectory keeping its name — the case that used to render a
+        // useless "Panel.html → Panel.html". Grouped under the COMMON directory with
+        // the git `{ ⇒ admin}` brace.
+        let files = [("wm/actions/admin/Panel.html", Some("wm/actions/Panel.html"))];
+        assert_eq!(
+            build_file_rows(&files, FileListLayout::Grouped)
+                .iter()
+                .map(row_desc)
+                .collect::<Vec<_>>(),
+            vec!["H:wm/actions/", "F:0:{ ⇒ admin}/Panel.html:true"]
+        );
+        // Full prepends the common prefix; Name shows the compact brace.
+        assert_eq!(
+            build_file_rows(&files, FileListLayout::Full)
+                .iter()
+                .map(row_desc)
+                .collect::<Vec<_>>(),
+            vec!["F:0:wm/actions/{ ⇒ admin}/Panel.html:false"]
+        );
+        assert_eq!(
+            build_file_rows(&files, FileListLayout::Name)
+                .iter()
+                .map(row_desc)
+                .collect::<Vec<_>>(),
+            vec!["F:0:{ ⇒ admin}/Panel.html:false"]
+        );
+    }
+
+    #[test]
+    fn build_file_rows_renames_sibling_and_same_dir() {
+        // A sibling-directory move and a same-directory rename, grouped under their
+        // respective common directories (sorted: "d/" before "wm/").
+        let files = [
+            ("wm/baz/Bar.java", Some("wm/foo/Bar.java")), // 0: sibling move
+            ("d/New.java", Some("d/Old.java")),           // 1: rename in place
+        ];
+        assert_eq!(
+            build_file_rows(&files, FileListLayout::Grouped)
+                .iter()
+                .map(row_desc)
+                .collect::<Vec<_>>(),
+            vec![
+                "H:d/",
+                "F:1:{Old.java ⇒ New.java}:true",
+                "H:wm/",
+                "F:0:{foo ⇒ baz}/Bar.java:true",
+            ]
+        );
+    }
+
+    #[test]
+    fn common_dir_prefix_len_cases() {
+        // Sibling directories under a shared ancestor: dim the shared "x/wm/".
+        assert_eq!(common_dir_prefix_len("x/wm/actions/", "x/wm/activematch/"), 5);
+        // A child of the header above shares the whole parent.
+        assert_eq!(common_dir_prefix_len("a/", "a/b/"), 2);
+        // Nothing shared.
+        assert_eq!(common_dir_prefix_len("docs/", "src/main/"), 0);
+        // Whole-segment: "src2/" and "src/" share nothing.
+        assert_eq!(common_dir_prefix_len("src2/x/", "src/x/"), 0);
+        // Multibyte segment (α is 2 bytes); boundary is the ASCII '/'.
+        assert_eq!(common_dir_prefix_len("α/foo/", "α/bar/"), 3);
+    }
+
+    #[test]
+    fn rename_brace_cases() {
+        let s = |t: &str| t.to_string();
+        // Moved into a subdirectory (empty old-mid).
+        assert_eq!(rename_brace("a/x.c", "a/b/x.c"), (s("a/"), s("{ ⇒ b}/x.c")));
+        // Moved up out of a subdirectory (empty new-mid).
+        assert_eq!(rename_brace("a/b/x.c", "a/x.c"), (s("a/"), s("{b ⇒ }/x.c")));
+        // Sibling-directory move.
+        assert_eq!(rename_brace("p/foo/x.c", "p/baz/x.c"), (s("p/"), s("{foo ⇒ baz}/x.c")));
+        // Same-directory rename: filename parts aren't factored (suffix snaps to '/').
+        assert_eq!(rename_brace("d/Old.java", "d/New.java"), (s("d/"), s("{Old.java ⇒ New.java}")));
+        // Deep shared prefix.
+        assert_eq!(
+            rename_brace("a/b/c/foo/F.java", "a/b/c/baz/F.java"),
+            (s("a/b/c/"), s("{foo ⇒ baz}/F.java"))
+        );
+        // Nothing shared ⇒ no braces, empty prefix.
+        assert_eq!(rename_brace("x.c", "y.c"), (String::new(), s("x.c ⇒ y.c")));
+        // Multibyte directory segments.
+        assert_eq!(rename_brace("α/foo/x", "α/bar/x"), (s("α/"), s("{foo ⇒ bar}/x")));
     }
 
     /// Compact one row to a string for assertions.
