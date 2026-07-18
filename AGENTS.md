@@ -61,16 +61,28 @@ parts run off the window-creation critical path:
   cache hit — neighbours are prefetched, so the common case — installs synchronously via
   `apply_loaded_diff`; a miss, or a virtual/working-tree entry (content-keyed, so it can't be
   looked up until its content is computed), spawns a worker that computes the diff off-thread
-  and hands it back over `diff_load_rx`. The pane blanks until the result lands, but the
-  "Loading diff…" placeholder text only appears once the load outlives `DIFF_PLACEHOLDER_DELAY`
-  (100ms), so a fast uncached load — a quick jump through cold history — never flashes it. A
-  monotonic `diff_load_epoch` — bumped per selection, and by every synchronous install
-  — supersedes stale workers: a result whose epoch no longer matches the current one is dropped,
-  so clicking quickly through commits never installs an out-of-date diff. This keeps a large
-  diff, or `detect_copies` (O(sources×targets)), from freezing the window. Highlighting remains
-  a separate downstream async step (`ensure_diff_highlighted`); the worker only produces
-  `DiffData`. On arrival the result still prefers any cache entry under its key, so a neighbour
-  prefetch that highlighted the same commit meanwhile is reused instead of re-tokenized.
+  and hands it back over `diff_load_rx`. The **previous diff stays on screen** while the worker
+  runs — `dispatch_diff_load` does not clear the pane — and only once the load outlives
+  `DIFF_PLACEHOLDER_DELAY` (100ms) does the pane blank to the "Loading diff…" placeholder. So a
+  fast uncached load (a quick jump through cold history) swaps straight to the new diff with no
+  blank / sidebar-collapse strobe; only a genuinely slow load shows the placeholder. The single
+  `diff_load_started_at: Option<Instant>` is the source of truth for "a load is in flight"
+  (there is no separate bool); it is preserved across rapid re-dispatch (`get_or_insert`) so
+  continuous loading still crosses the threshold, and cleared when a load applies, fails, or is
+  cancelled. A monotonic `diff_load_epoch` — bumped per selection, and by every synchronous
+  install — supersedes stale workers so clicking quickly never installs an out-of-date diff;
+  but a superseded result that computed successfully is still **cached** (real commits only —
+  they are immutable) rather than discarded, so returning to a commit briefly passed over is
+  instant instead of a recompute. A worker whose `Repository::discover` fails reports an empty
+  result (`data: None`) so the loading state clears instead of the pane sticking on the
+  placeholder forever. This all keeps a large diff, or `detect_copies` (O(sources×targets)),
+  from freezing the window. Highlighting remains a separate downstream async step
+  (`ensure_diff_highlighted`); the worker only produces `DiffData`. On arrival the result still
+  prefers any cache entry under its key, so a neighbour prefetch that highlighted the same commit
+  meanwhile is reused instead of re-tokenized. `load_selected_diff` also early-returns when the
+  selected commit's diff is already on screen (same key), cancelling any abandoned in-flight
+  load — so a reload/refresh of the unchanged current commit, or navigating back after
+  overshooting, neither re-dispatches nor flashes the placeholder.
 - **Perf timing** — key startup phases log at `debug` (`perf: startup: …` / `perf:
   load_commits: …`). Run with `RUST_LOG=gitkay=debug` to see the per-phase breakdown.
 
