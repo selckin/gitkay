@@ -397,15 +397,6 @@ fn common_dir_prefix_len(a: &str, b: &str) -> usize {
     pfx
 }
 
-/// Assign `src` into `*dst`, returning whether it actually changed. Lets a batch of
-/// "did any of these settings change?" checks read as one `|=` per field instead of a
-/// copy-pasted `if src != *dst { *dst = src; flag = true }` block each.
-fn set_if_changed<T: PartialEq>(dst: &mut T, src: T) -> bool {
-    let changed = *dst != src;
-    *dst = src;
-    changed
-}
-
 /// git-style rename/copy display: the parts common to `old` and `new` are factored
 /// out at `/` boundaries, leaving the change in `{old ⇒ new}` braces. Returns
 /// `(common_dir_prefix, label)`, where `prefix + label` is the full form —
@@ -4558,7 +4549,8 @@ impl eframe::App for GitkApp {
                     // Update it before any reload so the reload rebuilds the rows under
                     // the new layout in one pass; if nothing reloads, rebuild the rows
                     // here for a layout-only change.
-                    let layout_changed = set_if_changed(&mut self.file_list, cfg.diff.file_list);
+                    let layout_changed = self.file_list != cfg.diff.file_list;
+                    self.file_list = cfg.diff.file_list;
                     if reload_diff {
                         self.load_selected_diff();
                     } else if layout_changed {

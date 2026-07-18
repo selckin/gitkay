@@ -37,8 +37,8 @@ RUST_LOG=gitkay=debug cargo run   # run with per-phase startup/perf timing logs
   inline there. History and fonts are prefetched on threads spawned in `main()` (overlapping
   window/GL init); the first diff is deferred to the first `ui()` frame; fonts swap in
   non-blocking on a cold fontdb scan. Keep new work off that path — prefetch or defer it.
-- **Immediate mode means manual virtualization:** the commit list uses pre/post spacers (not
-  egui `show_rows`), and diffs compute + syntax-highlight asynchronously off the UI thread. All
+- **Immediate mode means explicit virtualization:** the commit list and diff pane both virtualize
+  with egui `show_rows`, and diffs compute + syntax-highlight asynchronously off the UI thread. All
   app state lives in the `GitkApp` struct.
 
 When you change documented startup/architecture behavior, update `AGENTS.md` in the same change —
