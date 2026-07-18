@@ -481,44 +481,27 @@ pub fn build_fonts(cfg: &Config) -> (egui::FontDefinitions, Fonts, Vec<String>) 
         fontdb_scan(db, name)
     };
 
-    let mono = family_source(
-        &cfg.fonts.monospace,
-        &cfg.fonts.monospace_path,
-        &mut cache,
-        &exists,
-        &mut scan,
-    );
-    if let Some(path) = mono {
+    // Resolve each user font (by name via fontdb, or by explicit path) and install it,
+    // surfacing a read failure as a warning. One pipeline for both families.
+    for (name, path_override, key, family) in [
+        (
+            &cfg.fonts.monospace,
+            &cfg.fonts.monospace_path,
+            "user_monospace",
+            egui::FontFamily::Monospace,
+        ),
+        (
+            &cfg.fonts.proportional,
+            &cfg.fonts.proportional_path,
+            "user_proportional",
+            egui::FontFamily::Proportional,
+        ),
+    ] {
+        let Some(path) = family_source(name, path_override, &mut cache, &exists, &mut scan) else {
+            continue;
+        };
         match std::fs::read(&path) {
-            Ok(bytes) => apply_family(
-                &mut defs,
-                "user_monospace",
-                egui::FontFamily::Monospace,
-                bytes,
-            ),
-            Err(e) => {
-                let msg = format!("failed to read font {path:?}: {e}");
-                log::warn!("{msg}");
-                warnings.push(msg);
-            }
-        }
-    }
-
-    let prop = family_source(
-        &cfg.fonts.proportional,
-        &cfg.fonts.proportional_path,
-        &mut cache,
-        &exists,
-        &mut scan,
-    );
-    if let Some(path) = prop {
-        match std::fs::read(&path) {
-            Ok(bytes) => apply_family(
-                &mut defs,
-                "user_proportional",
-                egui::FontFamily::Proportional,
-                bytes,
-            ),
+            Ok(bytes) => apply_family(&mut defs, key, family, bytes),
             Err(e) => {
                 let msg = format!("failed to read font {path:?}: {e}");
                 log::warn!("{msg}");
