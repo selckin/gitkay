@@ -1217,6 +1217,13 @@ fn show_virtualized_diff(
 #[derive(Clone)]
 struct FileEntry {
     path: String,
+    /// For a `Renamed`/`Copied` delta, the source path (old side) when it differs
+    /// from `path`; `None` otherwise. Display-only — `path` (the new side) stays
+    /// the identity/patch-boundary key. Not yet read outside tests: the file list
+    /// doesn't render `old → new` yet (a follow-up task), so allow dead_code until
+    /// it grows a reader.
+    #[allow(dead_code)]
+    old_path: Option<String>,
     additions: usize,
     deletions: usize,
     /// `Some(n)`: this file's patch starts at `diff_lines[n]`. `None`: the file
@@ -1399,8 +1406,17 @@ fn append_diff_body(
     for i in 0..diff.deltas().len() {
         if let Some(delta) = diff.get_delta(i) {
             let bytes = delta_path_bytes(&delta);
+            let old_path = match delta.status() {
+                git2::Delta::Renamed | git2::Delta::Copied => delta
+                    .old_file()
+                    .path_bytes()
+                    .filter(|old| *old != bytes)
+                    .map(|old| String::from_utf8_lossy(old).into_owned()),
+                _ => None,
+            };
             files.push(FileEntry {
                 path: String::from_utf8_lossy(bytes).into_owned(),
+                old_path,
                 additions: 0,
                 deletions: 0,
                 diff_line_idx: None,
@@ -5443,6 +5459,7 @@ mod tests {
         ];
         let files = vec![FileEntry {
             path: "x.rs".to_string(),
+            old_path: None,
             additions: 1,
             deletions: 1,
             diff_line_idx: Some(1), // file's diff starts at the "diff --git" line
@@ -5614,6 +5631,7 @@ mod tests {
     fn file_ranges_and_index_lookup() {
         let f = |path: &str, idx: Option<usize>| FileEntry {
             path: path.to_string(),
+            old_path: None,
             additions: 0,
             deletions: 0,
             diff_line_idx: idx,
@@ -5655,6 +5673,7 @@ mod tests {
     fn next_file_line_steps_between_files() {
         let f = |idx: Option<usize>| FileEntry {
             path: "x".to_string(),
+            old_path: None,
             additions: 0,
             deletions: 0,
             diff_line_idx: idx,
@@ -5683,6 +5702,7 @@ mod tests {
     fn unsorted_files_and_clamping() {
         let f = |idx: Option<usize>| FileEntry {
             path: "x".to_string(),
+            old_path: None,
             additions: 0,
             deletions: 0,
             diff_line_idx: idx,
@@ -5772,12 +5792,14 @@ mod tests {
         let files = vec![
             FileEntry {
                 path: "bin.dat".to_string(),
+                old_path: None,
                 additions: 0,
                 deletions: 0,
                 diff_line_idx: None, // no patch body
             },
             FileEntry {
                 path: "foo.rs".to_string(),
+                old_path: None,
                 additions: 1,
                 deletions: 0,
                 diff_line_idx: Some(1), // real file starts here
@@ -5863,6 +5885,7 @@ mod tests {
         ];
         let files = vec![FileEntry {
             path: "x.rs".to_string(),
+            old_path: None,
             additions: 1,
             deletions: 0,
             diff_line_idx: Some(2), // file's range starts at index 2
@@ -5901,12 +5924,14 @@ mod tests {
         let files = vec![
             FileEntry {
                 path: "a.rs".to_string(),
+                old_path: None,
                 additions: 2,
                 deletions: 0,
                 diff_line_idx: Some(1),
             },
             FileEntry {
                 path: "b.rs".to_string(),
+                old_path: None,
                 additions: 2,
                 deletions: 0,
                 diff_line_idx: Some(3),
@@ -6259,6 +6284,60 @@ mod tests {
             vec!["new.txt".to_string(), "old.txt".to_string()],
             "no detection ⇒ add + delete",
         );
+    }
+
+    #[test]
+    fn renamed_file_has_old_path_and_header() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "old.txt", "same content\n", "base");
+        std::fs::rename(
+            repo.workdir().unwrap().join("old.txt"),
+            repo.workdir().unwrap().join("new.txt"),
+        )
+        .unwrap();
+        let oid = commit_rename(&repo, "old.txt", "new.txt", "rename");
+
+        let s = DiffSettings {
+            context: 3, ignore_ws: false, show_stats: false,
+            detect_renames: true, detect_copies: false,
+        };
+        let data = get_diff_data(&repo, oid, s, &[]);
+        assert_eq!(data.files.len(), 1);
+        assert_eq!(data.files[0].path, "new.txt");
+        assert_eq!(data.files[0].old_path.as_deref(), Some("old.txt"));
+
+        let body = data.lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(body.contains("rename from old.txt"), "header shows rename from: {body}");
+        assert!(body.contains("rename to new.txt"), "header shows rename to: {body}");
+    }
+
+    #[test]
+    fn copied_file_has_old_path() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.txt", "l1\nl2\nl3\nl4\nl5\n", "base");
+        // One commit that MODIFIES a.txt (plain -C only considers modified files as
+        // copy sources) and ADDS b.txt as a duplicate of a.txt's new content.
+        let root = repo.workdir().unwrap();
+        std::fs::write(root.join("a.txt"), "l1\nl2\nl3\nl4\nl5\nl6\n").unwrap();
+        std::fs::write(root.join("b.txt"), "l1\nl2\nl3\nl4\nl5\nl6\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("a.txt")).unwrap();
+        index.add_path(std::path::Path::new("b.txt")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = repo.signature().unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let oid = repo
+            .commit(Some("HEAD"), &sig, &sig, "copy a->b", &tree, &[&parent])
+            .unwrap();
+
+        let s = DiffSettings {
+            context: 3, ignore_ws: false, show_stats: false,
+            detect_renames: true, detect_copies: true,
+        };
+        let data = get_diff_data(&repo, oid, s, &[]);
+        let b = data.files.iter().find(|f| f.path == "b.txt").expect("b.txt present");
+        assert_eq!(b.old_path.as_deref(), Some("a.txt"), "b.txt detected as copy of a.txt");
     }
 
     #[test]
