@@ -249,8 +249,9 @@ fn split_dir(path: &str) -> (&str, &str) {
 /// Byte length of the leading directory segments that `a` and `b` share, ending at a
 /// `/` — whole-segment, so `x/foo/` and `x/bar/` share `x/` (2) while `src2/` and
 /// `src/` share nothing (0). Used to dim the ancestor path a directory header repeats
-/// from the header above it. Multibyte-safe (only ASCII `/` is a boundary, and the
-/// returned length always lands on one).
+/// from the header above it, and to factor the shared prefix out of a rename's
+/// old/new paths (`rename_brace`). Multibyte-safe (only ASCII `/` is a boundary, and
+/// the returned length always lands on one).
 fn common_dir_prefix_len(a: &str, b: &str) -> usize {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     let mut pfx = 0;
@@ -274,15 +275,9 @@ fn rename_brace(old: &str, new: &str) -> (String, String) {
     let (a, b) = (old.as_bytes(), new.as_bytes());
     let (la, lb) = (a.len(), b.len());
 
-    // Common prefix, snapped to the last shared '/'.
-    let mut pfx = 0;
-    let mut i = 0;
-    while i < la && i < lb && a[i] == b[i] {
-        if a[i] == b'/' {
-            pfx = i + 1;
-        }
-        i += 1;
-    }
+    // Common prefix, snapped to the last shared '/' — the same whole-segment shared
+    // prefix `common_dir_prefix_len` computes for directory-header dimming.
+    let pfx = common_dir_prefix_len(old, new);
 
     // Common suffix, snapped to a '/'. The floor lets the suffix reuse the slash that
     // ends the prefix (pfx > 0 ⇒ old[pfx-1] == '/'), which produces the
@@ -320,28 +315,29 @@ fn rename_brace(old: &str, new: &str) -> (String, String) {
 /// common to its old and new path, so the move reads clearly (`{ ⇒ admin}/File.java`
 /// under the `…/actions/` header) instead of a bare `File.java → File.java`.
 fn build_file_rows(files: &[(&str, Option<&str>)], layout: FileListLayout) -> Vec<FileListRow> {
-    // (group directory, rendered label) per file, resolved for this layout.
+    let grouped = layout == FileListLayout::Grouped;
+    let full = layout == FileListLayout::Full;
+    // (group directory, rendered label) per file, resolved for this layout. The group
+    // directory is read only by the Grouped arm below, so it's left empty (no
+    // allocation) for the flat Name/Full layouts that never look at it.
     let computed: Vec<(String, String)> = files
         .iter()
+        // `old` is already `None` for a non-rename — append_diff_body records it only
+        // when the raw *bytes* differ. This extra string-level guard is a rendering
+        // safeguard, not a second identity decision: it keeps rename_brace from
+        // emitting a degenerate `{ ⇒ }` when two distinct non-UTF-8 paths collide to
+        // the same lossy display string.
         .map(|&(new, old)| match old.filter(|o| *o != new) {
             Some(old) => {
                 let (prefix, brace) = rename_brace(old, new);
                 // Grouped/Name show the compact brace; Full prepends the full prefix.
-                let label = if layout == FileListLayout::Full {
-                    format!("{prefix}{brace}")
-                } else {
-                    brace
-                };
-                (prefix, label)
+                let label = if full { format!("{prefix}{brace}") } else { brace };
+                (if grouped { prefix } else { String::new() }, label)
             }
             None => {
                 let (dir, base) = split_dir(new);
-                let label = if layout == FileListLayout::Full {
-                    new.to_string()
-                } else {
-                    base.to_string()
-                };
-                (dir.to_string(), label)
+                let label = if full { new.to_string() } else { base.to_string() };
+                (if grouped { dir.to_string() } else { String::new() }, label)
             }
         })
         .collect();
@@ -3647,7 +3643,14 @@ impl GitkApp {
         }
 
         if resp.hovered() {
-            resp.show_tooltip_text(&self.diff_files[idx].path);
+            // Show the full path(s). For a rename/copy the row label is the elided
+            // `{old ⇒ new}` brace form, so spell both sides out in full here —
+            // otherwise the source path is never visible anywhere.
+            let f = &self.diff_files[idx];
+            match &f.old_path {
+                Some(old) => resp.show_tooltip_text(format!("{old} ⇒ {}", f.path)),
+                None => resp.show_tooltip_text(&f.path),
+            }
         }
         if resp.clicked() { line_idx } else { None }
     }
@@ -3817,39 +3820,40 @@ impl eframe::App for GitkApp {
                         // queued spans are dropped, not applied for a frame.
                         self.invalidate_diff_highlight();
                     }
-                    // show_stats changes the diff LINES (not just their colours),
-                    // so it needs a full rebuild, not a re-highlight. Update the
-                    // field first so the rebuild keys/builds under the new value;
-                    // the new cache key misses and rebuilds, stale entries evict.
-                    let new_show_stats = cfg.diff.show_stats;
-                    if new_show_stats != self.show_stats {
-                        self.show_stats = new_show_stats;
-                        if let Ok(repo) = Repository::discover(&self.repo_path) {
-                            self.load_selected_diff(&repo);
-                        }
+                    // show_stats and rename/copy detection all change the diff DATA
+                    // (stat lines appear/vanish; renamed files coalesce), so a change
+                    // to any needs a full rebuild, not just a re-highlight. Update the
+                    // fields first so the rebuild keys/builds under the new values; the
+                    // new cache key misses and rebuilds, stale entries evict. Config is
+                    // authoritative for the detection toggles — this re-asserts the
+                    // config value over any live toolbar toggle (a session override
+                    // that also resets on launch; config wins). Reload at most once,
+                    // even when several of these flip in the same save.
+                    let mut reload_diff = false;
+                    if cfg.diff.show_stats != self.show_stats {
+                        self.show_stats = cfg.diff.show_stats;
+                        reload_diff = true;
                     }
-                    // Render-only: the file-list layout doesn't change diff data, so
-                    // no diff rebuild — just recompute the cached rows when it changes.
-                    if self.file_list != cfg.diff.file_list {
-                        self.file_list = cfg.diff.file_list;
-                        self.rebuild_file_rows();
-                    }
-                    // Rename/copy detection changes the diff DATA (files coalesce), so
-                    // a change needs a full rebuild like show_stats. Config is
-                    // authoritative: this re-asserts the config value over any live
-                    // toolbar toggle (the toolbar toggle is a session override that
-                    // also resets on launch; config wins).
-                    let mut redetect = false;
                     if cfg.diff.detect_renames != self.diff_detect_renames {
                         self.diff_detect_renames = cfg.diff.detect_renames;
-                        redetect = true;
+                        reload_diff = true;
                     }
                     if cfg.diff.detect_copies != self.diff_detect_copies {
                         self.diff_detect_copies = cfg.diff.detect_copies;
-                        redetect = true;
+                        reload_diff = true;
                     }
-                    if redetect && let Ok(repo) = Repository::discover(&self.repo_path) {
-                        self.load_selected_diff(&repo);
+                    // The file-list layout is render-only (it doesn't touch diff data).
+                    // Update it before any reload so the reload rebuilds the rows under
+                    // the new layout in one pass; if nothing reloads, rebuild the rows
+                    // here for a layout-only change.
+                    let layout_changed = self.file_list != cfg.diff.file_list;
+                    self.file_list = cfg.diff.file_list;
+                    if reload_diff {
+                        if let Ok(repo) = Repository::discover(&self.repo_path) {
+                            self.load_selected_diff(&repo);
+                        }
+                    } else if layout_changed {
+                        self.rebuild_file_rows();
                     }
                     self.config_error_toast = warned.then(std::time::Instant::now);
                 }
