@@ -93,6 +93,13 @@ const PREFETCH_MARGIN: usize = 8;
 /// checkout still feels immediate.
 const RELOAD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// How long an async diff load may run before the "Loading diff…" placeholder is
+/// shown. A load that resolves faster than this (a small uncached diff) never flashes
+/// the placeholder — the pane just swaps straight to the new diff, so quick jumps
+/// through cold history don't strobe. Only a genuinely slow load (a large diff, or
+/// copy detection) crosses the threshold and shows the placeholder.
+const DIFF_PLACEHOLDER_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Everything a cached diff's content + spans depend on. `diff_bg` is excluded
 /// (it's a render-time tint, not baked into spans). `content` is 0 for real commits
 /// (the immutable oid already pins the content) and a hash of the generated diff text
@@ -2085,6 +2092,70 @@ fn prefetch_worker(job: PrefetchJob) {
     }
 }
 
+/// A finished async diff load handed back to the UI: the computed data plus the cache
+/// key to store it under (its `content` hash filled in here for a virtual entry) and
+/// the epoch it was dispatched under, so a stale result — the user has since selected
+/// another commit — is dropped on arrival. Mirrors the prefetch worker, but the result
+/// is the *displayed* diff rather than a cache warm.
+struct DiffLoadResult {
+    epoch: u64,
+    key: DiffCacheKey,
+    data: DiffData,
+}
+
+/// Everything a diff-load worker owns for one selection.
+struct DiffLoadJob {
+    repo_path: String,
+    oid: git2::Oid,
+    settings: DiffSettings,
+    paths: Vec<String>,
+    key: DiffCacheKey,
+    /// A virtual (uncommitted/staged) entry: content-keyed, so its `key.content` hash
+    /// is computed from the fresh data (off-thread, here) rather than left at 0.
+    is_virtual: bool,
+    epoch: u64,
+    current_epoch: Arc<AtomicU64>,
+    tx: mpsc::Sender<DiffLoadResult>,
+    ctx: egui::Context,
+}
+
+/// Compute one selected commit's diff off the UI thread — the potentially expensive
+/// `get_diff_data` (a large diff, plus rename/copy detection, can take hundreds of ms)
+/// — and hand the finished `DiffData` back for the UI to display. Bails as soon as a
+/// newer selection supersedes it (`epoch`). A failure just leaves the pane on its
+/// placeholder; the user can reselect.
+fn diff_load_worker(job: DiffLoadJob) {
+    let DiffLoadJob {
+        repo_path, oid, settings, paths, mut key, is_virtual, epoch, current_epoch, tx, ctx,
+    } = job;
+    // Superseded before we even ran — don't open the repo.
+    if epoch != current_epoch.load(Ordering::Relaxed) {
+        return;
+    }
+    let repo = match Repository::discover(&repo_path) {
+        Ok(r) => r,
+        Err(e) => {
+            log::debug!("diff-load: repo discover failed: {e}");
+            return;
+        }
+    };
+    if epoch != current_epoch.load(Ordering::Relaxed) {
+        return;
+    }
+    let t = std::time::Instant::now();
+    let data = get_diff_data(&repo, oid, settings, &paths);
+    // A virtual entry is content-keyed so an unchanged working tree hits the cache and
+    // reuses its highlighting; hash here, off-thread. Real commits key by oid alone.
+    if is_virtual {
+        key.content = hash_diff_content(&data);
+    }
+    log::debug!("diff-load: {oid} ({} lines) in {:?}", data.lines.len(), t.elapsed());
+    if tx.send(DiffLoadResult { epoch, key, data }).is_err() {
+        return; // UI gone
+    }
+    ctx.request_repaint();
+}
+
 /// Resolve the `[diff.bands]` config into a `DiffBg`, plus any warnings (unparseable
 /// hex falls back to a default). The `source` is a typed enum, so an invalid value is
 /// already a parse error — no mode warning to emit here. The caller surfaces the
@@ -2631,6 +2702,15 @@ struct GitkApp {
     prefetched_gen: u64,            // diff_generation we last dispatched prefetch for
     last_highlight_check_gen: u64,  // diff_generation we last ran diff_fully_highlighted for
     commit_view_range: std::ops::Range<usize>, // visible commit-list rows (set each frame)
+    // A cache miss (or virtual entry) computes get_diff_data on a worker so a large
+    // diff / rename+copy detection can't freeze the window; the pane shows a
+    // placeholder until the result lands (see load_selected_diff / dispatch_diff_load).
+    diff_load_tx: mpsc::Sender<DiffLoadResult>, // worker → UI: the selected commit's finished diff
+    diff_load_rx: mpsc::Receiver<DiffLoadResult>,
+    diff_load_epoch: Arc<AtomicU64>, // bumped per selection; supersedes older diff-load workers + results
+    diff_loading: bool,              // a diff-load worker is in flight; the pane shows a placeholder
+    diff_load_started_at: Option<std::time::Instant>, // when the in-flight load began (delays the placeholder)
+    egui_ctx: egui::Context,         // stored Context handle so workers can request a repaint
 }
 
 /// Widest diff line in characters — used to size the horizontal scroll content
@@ -2977,6 +3057,8 @@ impl GitkApp {
 
         let (highlight_tx, highlight_rx) = mpsc::channel();
         let (prefetch_tx, prefetch_rx) = mpsc::channel();
+        let (diff_load_tx, diff_load_rx) = mpsc::channel();
+        let egui_ctx = cc.egui_ctx.clone();
         let diff_max_chars = max_line_chars(&diff_lines);
 
         // Eagerly warm the highlighter off-thread so the first cross-language diff
@@ -3084,6 +3166,12 @@ impl GitkApp {
             // commit panel has rendered once still warms the top commits; the panel
             // overwrites this with the exact visible range every frame.
             commit_view_range: 0..64,
+            diff_load_tx,
+            diff_load_rx,
+            diff_load_epoch: Arc::new(AtomicU64::new(0)),
+            diff_loading: false,
+            diff_load_started_at: None,
+            egui_ctx,
         })
     }
 
@@ -3161,6 +3249,12 @@ impl GitkApp {
         }
     }
 
+    /// (Re)load the selected commit's diff. An oid-keyed cache hit installs instantly
+    /// on the UI thread; a miss (or a virtual/working-tree entry, which is content-
+    /// keyed and so can't be looked up before its content is computed) computes
+    /// `get_diff_data` on a worker thread and shows a placeholder until it lands —
+    /// so a large diff or rename/copy detection never freezes the window. The `repo`
+    /// arg is kept for the rare synchronous-fallback path (worker spawn failure).
     fn load_selected_diff(&mut self, repo: &Repository) {
         // A new diff invalidates the page-by-file nav state: drop any stale scroll
         // target a same-frame PageUp/Down queued against the outgoing diff, and reset
@@ -3172,7 +3266,8 @@ impl GitkApp {
         // Stash the outgoing diff under its stored key (a move, not a clone) so a
         // later revisit restores it — content and spans — instantly. Real commits are
         // keyed by their immutable oid; the virtual uncommitted/staged entries by a
-        // content hash (see load_selected_diff below), so they're cached too.
+        // content hash (see dispatch_diff_load), so they're cached too. Skip this while
+        // a load is still in flight — there's only a placeholder to stash, not a diff.
         if let Some(key) = self.current_diff_key.take() {
             let data = DiffData {
                 lines: std::mem::take(&mut self.diff_lines),
@@ -3190,62 +3285,113 @@ impl GitkApp {
             self.diff_cache.insert(key, data, weight);
         }
 
-        if let Some(sel) = self.selected.filter(|&s| s < self.commits.len()) {
-            let oid = self.commits[sel].oid;
-            log::debug!("select: commit {oid} (#{sel})");
-            let (key, data) = if is_real_commit(oid) {
-                // Real commit: oid-keyed, generated only on a cache miss.
-                let key = self.diff_cache_key(oid);
-                let data = match self.diff_cache.remove(&key) {
-                    Some(data) => {
-                        log::debug!("perf: diff cache hit ({} lines) for {oid}", data.lines.len());
-                        data
-                    }
-                    None => {
-                        // Resolve the pathspec only on a miss: a cache hit must do no
-                        // work, and under --follow diff_paths_for is an O(commits) scan.
-                        let t = std::time::Instant::now();
-                        let diff_paths = self.diff_paths_for_oid(oid);
-                        let data = get_diff_data(repo, oid, self.diff_settings(), &diff_paths);
-                        log::debug!(
-                            "perf: get_diff_data {:?} ({} lines, {} files) for {oid}",
-                            t.elapsed(),
-                            data.lines.len(),
-                            data.files.len()
-                        );
-                        data
-                    }
-                };
-                (key, data)
-            } else {
-                // Virtual (uncommitted/staged): the content tracks the working tree, so
-                // always regenerate (cheap) and key by a content hash — an unchanged
-                // tree hits the cache and reuses the highlighting; an edit misses and
-                // re-tokenizes, so a stale highlight is never shown.
-                let diff_paths = self.diff_paths_for_oid(oid);
-                let fresh = get_diff_data(repo, oid, self.diff_settings(), &diff_paths);
-                let mut key = self.diff_cache_key(oid);
-                key.content = hash_diff_content(&fresh);
-                let data = match self.diff_cache.remove(&key) {
-                    Some(data) => {
-                        log::debug!("perf: virtual diff cache hit ({} lines)", data.lines.len());
-                        data
-                    }
-                    None => fresh,
-                };
-                (key, data)
-            };
-            self.diff_lines = data.lines;
-            self.diff_files = data.files;
-            self.current_diff_key = Some(key);
-        } else {
+        let Some(sel) = self.selected.filter(|&s| s < self.commits.len()) else {
+            // No selection: supersede any in-flight load and clear the pane.
+            self.diff_load_epoch.fetch_add(1, Ordering::Relaxed);
+            self.diff_loading = false;
+            self.diff_load_started_at = None;
             self.diff_lines.clear();
             self.diff_files.clear();
             self.current_diff_key = None;
+            self.rebuild_file_rows();
+            self.diff_max_chars = 0;
+            self.invalidate_diff_highlight();
+            return;
+        };
+
+        let oid = self.commits[sel].oid;
+        log::debug!("select: commit {oid} (#{sel})");
+
+        // Real commit: an oid-keyed cache hit installs synchronously — no worker, no
+        // placeholder (neighbours are usually prefetched, so this is the common path).
+        if is_real_commit(oid) {
+            let key = self.diff_cache_key(oid);
+            if let Some(data) = self.diff_cache.remove(&key) {
+                log::debug!("perf: diff cache hit ({} lines) for {oid}", data.lines.len());
+                // Supersede any in-flight worker so its (now stale) result is dropped.
+                self.diff_load_epoch.fetch_add(1, Ordering::Relaxed);
+                self.apply_loaded_diff(key, data);
+                return;
+            }
         }
+
+        // Cache miss (or a virtual entry): compute off the UI thread. Resolve the
+        // pathspec only here — a hit above must do no work, and under --follow
+        // diff_paths_for is an O(commits) scan.
+        let paths = self.diff_paths_for_oid(oid);
+        let key = self.diff_cache_key(oid);
+        self.dispatch_diff_load(repo, oid, key, !is_real_commit(oid), paths);
+    }
+
+    /// Install a finished diff (from the cache or a diff-load worker) as the current
+    /// one: swap in the lines/files, rebuild the file-list rows, resize the h-scroll,
+    /// and (re)arm highlighting. Clears the loading placeholder.
+    fn apply_loaded_diff(&mut self, key: DiffCacheKey, data: DiffData) {
+        self.diff_loading = false;
+        self.diff_load_started_at = None;
+        self.diff_lines = data.lines;
+        self.diff_files = data.files;
+        self.current_diff_key = Some(key);
         self.rebuild_file_rows();
         self.diff_max_chars = max_line_chars(&self.diff_lines);
         self.invalidate_diff_highlight();
+    }
+
+    /// Spawn a diff-load worker for `oid`, show the loading placeholder, and bump the
+    /// epoch so any in-flight worker (and any not-yet-applied result) is superseded.
+    /// On thread-spawn failure, fall back to computing synchronously so the diff still
+    /// loads (accepting the old UI-thread stall in that rare case).
+    fn dispatch_diff_load(
+        &mut self,
+        repo: &Repository,
+        oid: git2::Oid,
+        key: DiffCacheKey,
+        is_virtual: bool,
+        paths: Vec<String>,
+    ) {
+        let epoch = self.diff_load_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        // Placeholder: clear the current diff so the pane shows "Loading…" (and the
+        // file list empties) rather than the previous commit's stale content. The
+        // placeholder itself only appears once the load outlives DIFF_PLACEHOLDER_DELAY.
+        self.diff_loading = true;
+        self.diff_load_started_at = Some(std::time::Instant::now());
+        self.diff_lines.clear();
+        self.diff_files.clear();
+        self.current_diff_key = None;
+        self.rebuild_file_rows();
+        self.diff_max_chars = 0;
+        self.invalidate_diff_highlight();
+
+        let settings = self.diff_settings();
+        let spawn = std::thread::Builder::new()
+            .name("gitkay-diff-load".to_string())
+            .spawn({
+                let (repo_path, paths, key) = (self.repo_path.clone(), paths.clone(), key.clone());
+                let (current_epoch, tx, ctx) = (
+                    Arc::clone(&self.diff_load_epoch),
+                    self.diff_load_tx.clone(),
+                    self.egui_ctx.clone(),
+                );
+                move || {
+                    diff_load_worker(DiffLoadJob {
+                        repo_path, oid, settings, paths, key, is_virtual, epoch, current_epoch, tx, ctx,
+                    })
+                }
+            });
+        if spawn.is_err() {
+            log::warn!("diff-load thread spawn failed; loading synchronously");
+            let mut key = key;
+            let data = get_diff_data(repo, oid, settings, &paths);
+            // Mirror the worker + receive path: hash a virtual entry's content and
+            // reuse a cached (already-highlighted) copy when the content is unchanged.
+            let data = if is_virtual {
+                key.content = hash_diff_content(&data);
+                self.diff_cache.remove(&key).unwrap_or(data)
+            } else {
+                data
+            };
+            self.apply_loaded_diff(key, data);
+        }
     }
 
     /// Mark the current diff as needing (re)highlighting and bump the generation
@@ -3862,6 +4008,22 @@ impl eframe::App for GitkApp {
                     self.config_error_toast = Some(std::time::Instant::now());
                 }
             }
+        }
+
+        // Install a finished async diff load (the selected commit's diff, computed off
+        // the UI thread). Only the latest dispatch's result is applied; older ones (the
+        // user moved on) fail the epoch check and are dropped.
+        while let Ok(result) = self.diff_load_rx.try_recv() {
+            if result.epoch != self.diff_load_epoch.load(Ordering::Relaxed) {
+                continue; // superseded
+            }
+            let DiffLoadResult { key, data, .. } = result;
+            // Prefer an already-cached copy under this key over the freshly computed
+            // one — a neighbour prefetch may have warmed (and highlighted) the same
+            // commit while the worker ran, or an unchanged virtual entry may still be
+            // cached — so we reuse that highlighting instead of re-tokenizing.
+            let data = self.diff_cache.remove(&key).unwrap_or(data);
+            self.apply_loaded_diff(key, data);
         }
 
         // Apply finished background-highlight results (one batch per file) for
@@ -4686,6 +4848,28 @@ impl eframe::App for GitkApp {
                     .frame(frame)
                     .show_inside(ui, |ui| {
                         ui.style_mut().override_font_id = Some(self.fonts.font_id(Role::Diff));
+                        // A diff-load worker is computing this commit's diff off the UI
+                        // thread; show a placeholder rather than the previous commit's
+                        // stale content. Returning here leaves diff_scroll_to untouched,
+                        // so the diff still opens where the caller asked once the real
+                        // content lands. (The file-list sidebar is hidden while
+                        // diff_files is empty, so there's no divider to draw either.)
+                        if self.diff_loading {
+                            // Delay the "Loading diff…" text past DIFF_PLACEHOLDER_DELAY
+                            // so a fast load never flashes it; wake at the threshold to
+                            // show it if the load is still running by then.
+                            let elapsed = self.diff_load_started_at.map(|t| t.elapsed());
+                            match elapsed {
+                                Some(e) if e >= DIFF_PLACEHOLDER_DELAY => {
+                                    ui.centered_and_justified(|ui| {
+                                        ui.label(egui::RichText::new("Loading diff…").color(SUBTEXT));
+                                    });
+                                }
+                                Some(e) => ui.ctx().request_repaint_after(DIFF_PLACEHOLDER_DELAY - e),
+                                None => {}
+                            }
+                            return;
+                        }
                         // Layout inputs are identical for both render branches (only the
                         // closures differ), so build the DiffView once. last_top_anchor
                         // is the deepest file start, which the bottom padding lets reach
