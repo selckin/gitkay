@@ -186,11 +186,42 @@ struct DiffCacheKey {
     content: u64,
 }
 
+/// What a commit-list row represents. `Real` rows are keyed in the diff cache by their
+/// immutable oid; the virtual `Uncommitted`/`Staged` rows track the working tree, so
+/// they're content-keyed instead (see `DiffCacheKey::content` / `finalize_diff_key`).
+/// `CommitKind::of` is the single place a row is classified from its oid — every other
+/// layer (the diff pipeline, the row tint) asks it rather than comparing the sentinel
+/// oids itself, and `get_diff_data` dispatches on the enum so a new kind can't be missed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CommitKind {
+    Real,
+    Uncommitted,
+    Staged,
+}
+
+impl CommitKind {
+    fn of(oid: git2::Oid) -> CommitKind {
+        if oid == oid_uncommitted() {
+            CommitKind::Uncommitted
+        } else if oid == oid_staged() {
+            CommitKind::Staged
+        } else {
+            CommitKind::Real
+        }
+    }
+
+    /// Virtual rows (uncommitted/staged) are content-keyed in the diff cache; a real
+    /// commit's oid already pins its content.
+    fn is_virtual(self) -> bool {
+        !matches!(self, CommitKind::Real)
+    }
+}
+
 /// A real commit (keyed in the diff cache by its immutable oid) vs the virtual
 /// uncommitted/staged entries (whose content tracks the working tree, so they're
 /// keyed by a content hash instead — see `DiffCacheKey::content`).
 fn is_real_commit(oid: git2::Oid) -> bool {
-    oid != oid_uncommitted() && oid != oid_staged()
+    CommitKind::of(oid) == CommitKind::Real
 }
 
 /// Whether `oid`'s lowercase hex starts with `prefix`, without allocating the full hex
@@ -1422,13 +1453,20 @@ fn local_tz_offset_min() -> i32 {
     chrono::Local::now().offset().local_minus_utc() / 60
 }
 
-fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, paths: &[String]) -> DiffData {
-    // Handle virtual entries
-    if oid == oid_uncommitted() {
-        return get_working_tree_diff(repo, settings, paths);
-    }
-    if oid == oid_staged() {
-        return get_staged_diff(repo, settings, paths);
+fn get_diff_data(
+    repo: &Repository,
+    oid: git2::Oid,
+    kind: CommitKind,
+    settings: DiffSettings,
+    paths: &[String],
+) -> DiffData {
+    // Virtual rows diff the working tree / index; a real commit diffs against its parent.
+    // Matching the kind (not re-sniffing the oid) keeps this exhaustive — a new kind can't
+    // silently fall through to the commit path.
+    match kind {
+        CommitKind::Uncommitted => return get_working_tree_diff(repo, settings, paths),
+        CommitKind::Staged => return get_staged_diff(repo, settings, paths),
+        CommitKind::Real => {}
     }
 
     let commit = match repo.find_commit(oid) {
@@ -1660,6 +1698,17 @@ fn get_staged_diff(repo: &Repository, settings: DiffSettings, paths: &[String]) 
         "staged changes",
         |repo, opts| repo.diff_tree_to_index(head_tree.as_ref(), None, Some(opts)),
     )
+}
+
+/// Finalize a freshly computed diff's cache key: a virtual (uncommitted/staged) row is
+/// content-keyed, so mix a hash of the diff text into the key — a working-tree edit then
+/// re-keys and can't be served a stale cached diff. A real commit's oid already pins it.
+/// The single place the "virtual ⇒ content-keyed" rule lives.
+fn finalize_diff_key(mut key: DiffCacheKey, kind: CommitKind, data: &DiffData) -> DiffCacheKey {
+    if kind.is_virtual() {
+        key.content = hash_diff_content(data);
+    }
+    key
 }
 
 /// Convert a git2::Diff into our DiffData format, under a single title line.
@@ -2135,7 +2184,7 @@ fn prefetch_worker(job: PrefetchJob) {
         }
         let t = std::time::Instant::now();
         log::debug!("prefetch: start {}", key.oid);
-        let mut data = get_diff_data(&repo, key.oid, key.settings, &paths);
+        let mut data = get_diff_data(&repo, key.oid, CommitKind::Real, key.settings, &paths);
         highlight_diff(&mut data.lines, &data.files, &hl);
         let (oid, lines) = (key.oid, data.lines.len());
         if tx.send((key, data)).is_err() {
@@ -2168,9 +2217,9 @@ struct DiffLoadJob {
     settings: DiffSettings,
     paths: Vec<String>,
     key: DiffCacheKey,
-    /// A virtual (uncommitted/staged) entry: content-keyed, so its `key.content` hash
-    /// is computed from the fresh data (off-thread, here) rather than left at 0.
-    is_virtual: bool,
+    /// The row's kind: selects which diff to compute, and (for a virtual row) drives the
+    /// content-keying — its `key.content` hash is filled from the fresh data off-thread.
+    kind: CommitKind,
     epoch: u64,
     current_epoch: Epoch,
     tx: mpsc::Sender<DiffLoadResult>,
@@ -2185,7 +2234,7 @@ struct DiffLoadJob {
 /// the placeholder forever.
 fn diff_load_worker(job: DiffLoadJob) {
     let DiffLoadJob {
-        repo_path, oid, settings, paths, mut key, is_virtual, epoch, current_epoch, tx, ctx,
+        repo_path, oid, settings, paths, key, kind, epoch, current_epoch, tx, ctx,
     } = job;
     // Superseded before we even ran — don't open the repo.
     if !current_epoch.is_current(epoch) {
@@ -2207,12 +2256,10 @@ fn diff_load_worker(job: DiffLoadJob) {
         return;
     }
     let t = std::time::Instant::now();
-    let data = get_diff_data(&repo, oid, settings, &paths);
-    // A virtual entry is content-keyed so an unchanged working tree hits the cache and
-    // reuses its highlighting; hash here, off-thread. Real commits key by oid alone.
-    if is_virtual {
-        key.content = hash_diff_content(&data);
-    }
+    let data = get_diff_data(&repo, oid, kind, settings, &paths);
+    // Content-key a virtual row off-thread here so an unchanged working tree hits the
+    // cache and reuses its highlighting.
+    let key = finalize_diff_key(key, kind, &data);
     log::debug!("diff-load: {oid} ({} lines) in {:?}", data.lines.len(), t.elapsed());
     if tx.send(DiffLoadResult { epoch, key, data: Some(data) }).is_err() {
         return; // UI gone
@@ -3396,7 +3443,7 @@ impl GitkApp {
         // Resolve the pathspec only here — a hit above must do no work, and under
         // --follow diff_paths_for is an O(commits) scan.
         let paths = self.diff_paths_for_oid(oid);
-        self.dispatch_diff_load(oid, key, !is_real_commit(oid), paths);
+        self.dispatch_diff_load(oid, key, CommitKind::of(oid), paths);
     }
 
     /// Move the currently-displayed diff into the cache under its stored key (a move,
@@ -3474,7 +3521,7 @@ impl GitkApp {
         &mut self,
         oid: git2::Oid,
         key: DiffCacheKey,
-        is_virtual: bool,
+        kind: CommitKind,
         paths: Vec<String>,
     ) {
         let epoch = self.diff_load_epoch.bump();
@@ -3503,7 +3550,7 @@ impl GitkApp {
                 );
                 move || {
                     diff_load_worker(DiffLoadJob {
-                        repo_path, oid, settings, paths, key, is_virtual, epoch, current_epoch, tx, ctx,
+                        repo_path, oid, settings, paths, key, kind, epoch, current_epoch, tx, ctx,
                     })
                 }
             });
@@ -3515,13 +3562,8 @@ impl GitkApp {
             match Repository::discover(&self.repo_path) {
                 Ok(repo) => {
                     let paths = self.diff_paths_for_oid(oid);
-                    let mut key = self.diff_cache_key(oid);
-                    let data = get_diff_data(&repo, oid, settings, &paths);
-                    // A virtual entry is content-keyed, so hash its content here (the
-                    // worker does this off-thread); real commits key by oid alone.
-                    if is_virtual {
-                        key.content = hash_diff_content(&data);
-                    }
+                    let data = get_diff_data(&repo, oid, kind, settings, &paths);
+                    let key = finalize_diff_key(self.diff_cache_key(oid), kind, &data);
                     self.install_preferring_cache(key, data);
                 }
                 // No repo and no worker — clear the just-armed loading state so the pane
@@ -4487,8 +4529,9 @@ impl eframe::App for GitkApp {
 
                             let is_search_match = !self.search_matches.is_empty()
                                 && self.search_matches.binary_search(&idx).is_ok();
-                            let is_uncommitted = commit.oid == oid_uncommitted();
-                            let is_staged = commit.oid == oid_staged();
+                            let kind = CommitKind::of(commit.oid);
+                            let is_uncommitted = kind == CommitKind::Uncommitted;
+                            let is_staged = kind == CommitKind::Staged;
                             let is_branch_member = self.branch_highlight.contains(&idx);
 
                             // Branch members: no background, handled via brighter text below
@@ -6637,6 +6680,7 @@ mod tests {
         let data = get_diff_data(
             &repo,
             c3,
+            CommitKind::Real,
             DiffSettings { context: 3, ignore_ws: false, show_stats: true, detect_renames: false, detect_copies: false },
             &s.paths,
         );
@@ -6657,6 +6701,7 @@ mod tests {
         let on = get_diff_data(
             &repo,
             c2,
+            CommitKind::Real,
             DiffSettings { context: 3, ignore_ws: false, show_stats: true, detect_renames: false, detect_copies: false },
             &[],
         );
@@ -6668,6 +6713,7 @@ mod tests {
         let off = get_diff_data(
             &repo,
             c2,
+            CommitKind::Real,
             DiffSettings { context: 3, ignore_ws: false, show_stats: false, detect_renames: false, detect_copies: false },
             &[],
         );
@@ -6699,7 +6745,7 @@ mod tests {
             detect_renames: true, detect_copies: false,
         };
         let files: Vec<String> =
-            get_diff_data(&repo, oid, on, &[]).files.iter().map(|f| f.path.clone()).collect();
+            get_diff_data(&repo, oid, CommitKind::Real, on, &[]).files.iter().map(|f| f.path.clone()).collect();
         assert_eq!(files, vec!["new.txt".to_string()], "rename detected ⇒ one entry");
 
         let off = DiffSettings {
@@ -6707,7 +6753,7 @@ mod tests {
             detect_renames: false, detect_copies: false,
         };
         let mut files: Vec<String> =
-            get_diff_data(&repo, oid, off, &[]).files.iter().map(|f| f.path.clone()).collect();
+            get_diff_data(&repo, oid, CommitKind::Real, off, &[]).files.iter().map(|f| f.path.clone()).collect();
         files.sort();
         assert_eq!(
             files,
@@ -6731,7 +6777,7 @@ mod tests {
             context: 3, ignore_ws: false, show_stats: false,
             detect_renames: true, detect_copies: false,
         };
-        let data = get_diff_data(&repo, oid, s, &[]);
+        let data = get_diff_data(&repo, oid, CommitKind::Real, s, &[]);
         assert_eq!(data.files.len(), 1);
         assert_eq!(data.files[0].path, "new.txt");
         assert_eq!(data.files[0].old_path.as_deref(), Some("old.txt"));
@@ -6765,7 +6811,7 @@ mod tests {
             context: 3, ignore_ws: false, show_stats: false,
             detect_renames: true, detect_copies: true,
         };
-        let data = get_diff_data(&repo, oid, s, &[]);
+        let data = get_diff_data(&repo, oid, CommitKind::Real, s, &[]);
         let b = data.files.iter().find(|f| f.path == "b.txt").expect("b.txt present");
         assert_eq!(b.old_path.as_deref(), Some("a.txt"), "b.txt detected as copy of a.txt");
     }
