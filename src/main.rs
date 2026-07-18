@@ -510,31 +510,23 @@ fn build_file_rows(files: &[(&str, Option<&str>)], layout: FileListLayout) -> Ve
             // Labels are cloned out of `computed`: they're short (basenames / brace forms)
             // and this runs once per selection, not per frame.
             let mut rows = Vec::with_capacity(computed.len() + by_dir.len() + 1);
-            let mut prev_dir = "";
-            for (dir, mut idxs) in by_dir {
+            let push_files = |rows: &mut Vec<FileListRow>, mut idxs: Vec<usize>, indented: bool| {
                 idxs.sort_by(|&a, &b| computed[a].1.cmp(&computed[b].1));
+                for idx in idxs {
+                    rows.push(FileListRow::File { idx, label: computed[idx].1.clone(), indented });
+                }
+            };
+            let mut prev_dir = "";
+            for (dir, idxs) in by_dir {
                 rows.push(FileListRow::Header {
                     dim_len: common_dir_prefix_len(prev_dir, dir),
                     dir: dir.to_string(),
                 });
                 prev_dir = dir;
-                for idx in idxs {
-                    rows.push(FileListRow::File {
-                        idx,
-                        label: computed[idx].1.clone(),
-                        indented: true,
-                    });
-                }
+                push_files(&mut rows, idxs, true);
             }
-            if let Some(mut idxs) = root {
-                idxs.sort_by(|&a, &b| computed[a].1.cmp(&computed[b].1));
-                for idx in idxs {
-                    rows.push(FileListRow::File {
-                        idx,
-                        label: computed[idx].1.clone(),
-                        indented: false,
-                    });
-                }
+            if let Some(idxs) = root {
+                push_files(&mut rows, idxs, false);
             }
             rows
         }
@@ -787,20 +779,15 @@ fn rewrite_parents(
     nearest: &std::collections::HashMap<git2::Oid, Vec<git2::Oid>>,
 ) -> Vec<git2::Oid> {
     let mut out: Vec<git2::Oid> = Vec::new();
+    let mut push = |oid: git2::Oid| {
+        if !out.contains(&oid) {
+            out.push(oid);
+        }
+    };
     for p in parents {
         match nearest.get(p) {
-            Some(ancestors) => {
-                for a in ancestors {
-                    if !out.contains(a) {
-                        out.push(*a);
-                    }
-                }
-            }
-            None => {
-                if !out.contains(p) {
-                    out.push(*p);
-                }
-            }
+            Some(ancestors) => ancestors.iter().for_each(|a| push(*a)),
+            None => push(*p),
         }
     }
     out
@@ -813,6 +800,49 @@ fn real_commit_count(commits: &[CommitInfo]) -> usize {
     commits.iter().filter(|c| is_real_commit(c.oid)).count()
 }
 
+/// The oid HEAD points at, or `None` for an unborn/detached-without-target HEAD.
+fn head_target(repo: &Repository) -> Option<git2::Oid> {
+    repo.head().ok().and_then(|h| h.target())
+}
+
+/// A persisted value by key, or `default` when storage is absent or the key is
+/// missing / no longer deserializable.
+fn stored<T: serde::de::DeserializeOwned>(
+    storage: Option<&dyn eframe::Storage>,
+    key: &str,
+    default: T,
+) -> T {
+    storage.and_then(|s| eframe::get_value(s, key)).unwrap_or(default)
+}
+
+/// Consume a directional key pair, returning +1 for `down`, -1 for `up`, or 0 if
+/// neither fired. Each arg is a `(modifiers, key)` pair.
+fn consume_dir(
+    i: &mut egui::InputState,
+    down: (egui::Modifiers, egui::Key),
+    up: (egui::Modifiers, egui::Key),
+) -> isize {
+    if i.consume_key(down.0, down.1) {
+        1
+    } else if i.consume_key(up.0, up.1) {
+        -1
+    } else {
+        0
+    }
+}
+
+/// Persist a panel size only on an actual resize-drag, not when egui clamps the
+/// panel to a narrow window (which would otherwise ratchet the saved value down
+/// across launches). `panel_id` must match the panel's `egui::Id`.
+fn persist_on_resize_drag(ctx: &egui::Context, panel_id: &str, dst: &mut f32, value: f32) {
+    if ctx
+        .read_response(egui::Id::new(panel_id).with("__resize"))
+        .is_some_and(|r| r.dragged())
+    {
+        *dst = value;
+    }
+}
+
 fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitInfo> {
     let t = std::time::Instant::now();
     let ref_map = build_ref_map(repo);
@@ -821,7 +851,7 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
         ref_map.len(),
         t.elapsed()
     );
-    let head_oid = repo.head().ok().and_then(|h| h.target());
+    let head_oid = head_target(repo);
 
     let mut commits = Vec::new();
 
@@ -1103,7 +1133,7 @@ fn build_ref_map(
 ) -> std::collections::HashMap<git2::Oid, Vec<(String, RefKind)>> {
     let mut map: std::collections::HashMap<git2::Oid, Vec<(String, RefKind)>> =
         std::collections::HashMap::new();
-    let head_oid = repo.head().ok().and_then(|h| h.target());
+    let head_oid = head_target(repo);
 
     if let Ok(references) = repo.references() {
         for reference in references.flatten() {
@@ -1204,9 +1234,12 @@ fn compute_word_emphasis(lines: &mut [DiffLine]) {
                 {
                     continue;
                 }
-                let del_body = lines[del_start + k].body().to_string();
-                let add_body = lines[add_start + k].body().to_string();
-                let (de, ae) = word_diff::line_emphasis(&del_body, &add_body);
+                // `line_emphasis` returns owned Vecs, so the two `&str` borrows of
+                // `lines` end before the `.emphasis` writes below — no clone needed.
+                let (de, ae) = word_diff::line_emphasis(
+                    lines[del_start + k].body(),
+                    lines[add_start + k].body(),
+                );
                 lines[del_start + k].emphasis = de;
                 lines[add_start + k].emphasis = ae;
             }
@@ -1416,6 +1449,14 @@ fn diff_opts(settings: DiffSettings) -> DiffOptions {
     opts
 }
 
+/// `diff_opts` scoped to `paths` — the settings + pathspec pair that every diff
+/// call site needs before handing options to git2.
+fn scoped_diff_opts(settings: DiffSettings, paths: &[String]) -> DiffOptions {
+    let mut opts = diff_opts(settings);
+    apply_pathspec(&mut opts, paths);
+    opts
+}
+
 /// Coalesce renamed/copied files in a freshly built diff, per the diff settings.
 /// No-op when both toggles are off. Renames are cheap; copies use plain `-C`
 /// (`DiffFindOptions::copies`), which only considers files modified in the same
@@ -1485,8 +1526,7 @@ fn get_diff_data(
     };
     let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
 
-    let mut opts = diff_opts(settings);
-    apply_pathspec(&mut opts, paths);
+    let mut opts = scoped_diff_opts(settings, paths);
     let mut diff = match repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts)) {
         Ok(d) => d,
         Err(e) => {
@@ -1659,8 +1699,7 @@ fn virtual_diff<'r>(
     what: &str,
     build: impl FnOnce(&'r Repository, &mut DiffOptions) -> Result<git2::Diff<'r>, git2::Error>,
 ) -> DiffData {
-    let mut opts = diff_opts(settings);
-    apply_pathspec(&mut opts, paths);
+    let mut opts = scoped_diff_opts(settings, paths);
     let mut diff = match build(repo, &mut opts) {
         Ok(d) => d,
         Err(e) => {
@@ -2488,6 +2527,24 @@ fn build_commit_indexes(
     (index_by_oid, first_child_of)
 }
 
+/// Everything derived from a `commits` list: the graph rows, the max lane count
+/// across them, and the (oid→index, oid→first-child) lookup maps. Shared by
+/// `GitkApp::new` and `resync_commits` so a freshly-(re)assigned `commits` always
+/// rebuilds all three the same way.
+fn derive_from_commits(
+    commits: &[CommitInfo],
+) -> (
+    Vec<GraphRow>,
+    usize,
+    std::collections::HashMap<git2::Oid, usize>,
+    std::collections::HashMap<git2::Oid, usize>,
+) {
+    let graph_rows = layout_graph(commits);
+    let graph_max_cols = graph_rows.iter().map(|r| r.num_cols).max().unwrap_or(1);
+    let (index_by_oid, first_child_of) = build_commit_indexes(commits);
+    (graph_rows, graph_max_cols, index_by_oid, first_child_of)
+}
+
 fn compute_branch_highlight(
     commits: &[CommitInfo],
     start_idx: usize,
@@ -2596,8 +2653,8 @@ fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
         // If the first parent is already tracked in another lane (convergence),
         // still continue in the node's column — the other lane will merge at
         // the parent's own row.
-        let mut first_parent = true;
-        for parent_oid in &commit.parents {
+        for (i, parent_oid) in commit.parents.iter().enumerate() {
+            let first_parent = i == 0;
             let in_scope = oid_set.contains(parent_oid);
 
             // Check if parent is already tracked in a different lane
@@ -2610,20 +2667,14 @@ fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
             };
 
             if first_parent {
-                // First parent always continues in the node's column.
-                // Even if parent is out of scope (not loaded yet), draw
-                // the continuation line so the graph doesn't show an orphan.
-                if let Some(existing_col) = existing {
-                    if existing_col == node_col {
-                        lines.push((node_col, node_col, node_color));
-                    } else {
-                        pipes[node_col] = Some((*parent_oid, node_color));
-                        lines.push((node_col, node_col, node_color));
-                    }
-                } else {
+                // First parent always continues in the node's column (even if the
+                // parent is out of scope / not loaded yet, so the graph doesn't show
+                // an orphan). Claim the column's pipe unless the parent already
+                // occupies exactly this column.
+                if existing != Some(node_col) {
                     pipes[node_col] = Some((*parent_oid, node_color));
-                    lines.push((node_col, node_col, node_color));
                 }
+                lines.push((node_col, node_col, node_color));
             } else if in_scope {
                 // Second+ parent (in scope)
                 if let Some(existing_col) = existing {
@@ -2637,7 +2688,6 @@ fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
                 }
             }
             // Second+ parent out of scope: skip (can't draw merge to unknown)
-            first_parent = false;
         }
 
         // All other active lanes continue straight — but skip:
@@ -2739,11 +2789,16 @@ const GREEN: egui::Color32 = egui::Color32::from_rgb(166, 227, 161);
 const RED: egui::Color32 = egui::Color32::from_rgb(243, 139, 168);
 const YELLOW: egui::Color32 = egui::Color32::from_rgb(249, 226, 175);
 
-/// Mauve selection accent (translucent) — the fill behind the selected commit row and
-/// the current file in the file list, so the two stay in sync. A fn (not a const)
+/// The mauve accent (`GRAPH_COLORS[0]`) at a given alpha. A fn (not a const)
 /// because `from_rgba_unmultiplied` is gamma-correct and not const-constructible.
+fn mauve(alpha: u8) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(203, 166, 247, alpha)
+}
+
+/// Mauve selection accent (translucent) — the fill behind the selected commit row and
+/// the current file in the file list, so the two stay in sync.
 fn select_accent() -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(203, 166, 247, 40)
+    mauve(40)
 }
 
 // ── App state ────────────────────────────────────────────────────────────
@@ -3087,27 +3142,17 @@ impl GitkApp {
             );
         }
         let t_layout = std::time::Instant::now();
-        let graph_rows = layout_graph(&commits);
-        let graph_max_cols = graph_rows.iter().map(|r| r.num_cols).max().unwrap_or(1);
-        let (commit_index_by_oid, first_child_of) = build_commit_indexes(&commits);
-        log::debug!("perf: startup: layout_graph {:?}", t_layout.elapsed());
+        let (graph_rows, graph_max_cols, commit_index_by_oid, first_child_of) =
+            derive_from_commits(&commits);
+        log::debug!("perf: startup: derive_from_commits {:?}", t_layout.elapsed());
 
         // Restore persisted diff options. The first commit is auto-selected, but its
         // diff is generated lazily on the first update() frame (see StartupDiff) — not
         // here — so window creation isn't blocked on a potentially slow get_diff_data.
-        let diff_context: u32 = cc
-            .storage
-            .and_then(|s| eframe::get_value(s, "diff_context"))
-            .unwrap_or(3)
-            .min(99); // clamp a stale/hand-edited value to the UI range
-        let diff_ignore_ws: bool = cc
-            .storage
-            .and_then(|s| eframe::get_value(s, "diff_ignore_ws"))
-            .unwrap_or(false);
-        let word_diff: bool = cc
-            .storage
-            .and_then(|s| eframe::get_value(s, "word_diff"))
-            .unwrap_or(false);
+        // clamp a stale/hand-edited value to the UI range
+        let diff_context: u32 = stored(cc.storage, "diff_context", 3u32).min(99);
+        let diff_ignore_ws: bool = stored(cc.storage, "diff_ignore_ws", false);
+        let word_diff: bool = stored(cc.storage, "word_diff", false);
 
         // The startup diff is deferred to the first frame: empty here, filled by
         // load_selected_diff on the StartupDiff::NeedsLoad pass. With no commits
@@ -3185,14 +3230,8 @@ impl GitkApp {
         };
 
         // Restore the persisted layout sizes (written in App::save).
-        let commit_panel_height: f32 = cc
-            .storage
-            .and_then(|s| eframe::get_value(s, "commit_panel_height"))
-            .unwrap_or(300.0);
-        let file_list_width: f32 = cc
-            .storage
-            .and_then(|s| eframe::get_value(s, "file_list_width"))
-            .unwrap_or(200.0);
+        let commit_panel_height: f32 = stored(cc.storage, "commit_panel_height", 300.0);
+        let file_list_width: f32 = stored(cc.storage, "file_list_width", 200.0);
 
         let (highlight_tx, highlight_rx) = mpsc::channel();
         let (prefetch_tx, prefetch_rx) = mpsc::channel();
@@ -3331,6 +3370,17 @@ impl GitkApp {
             .collect();
         if self.search_cursor >= self.search_matches.len() {
             self.search_cursor = 0;
+        }
+    }
+
+    /// Select the current search match (`search_matches[search_cursor]`) and center
+    /// it in the graph. The index is already valid for the loaded commit list, so
+    /// this selects directly — no full reload/relayout. No-op when there are no
+    /// matches.
+    fn jump_to_current_match(&mut self) {
+        if let Some(&idx) = self.search_matches.get(self.search_cursor) {
+            self.select_loaded(idx);
+            self.graph_scroll_to = Some((idx, Some(egui::Align::Center)));
         }
     }
 
@@ -3750,6 +3800,14 @@ impl GitkApp {
 
     fn reload_commits(&mut self, repo: &Repository, preferred_oid: Option<git2::Oid>) {
         let count = real_commit_count(&self.commits).max(200);
+        self.reload_to_count(repo, count, preferred_oid);
+    }
+
+    /// Reload history to `count` real commits and re-sync all derived state,
+    /// snapshotting then re-anchoring the selection (to `preferred_oid`, else the
+    /// previously-selected commit). The shared core of a full reload and the
+    /// lazy-load tail-extension.
+    fn reload_to_count(&mut self, repo: &Repository, count: usize, preferred_oid: Option<git2::Oid>) {
         let previous_oid = self
             .selected
             .and_then(|sel| self.commits.get(sel))
@@ -3773,9 +3831,12 @@ impl GitkApp {
         previous_oid: Option<git2::Oid>,
         previous_index: Option<usize>,
     ) {
-        self.graph_rows = layout_graph(&self.commits);
-        self.graph_max_cols = self.graph_rows.iter().map(|r| r.num_cols).max().unwrap_or(1);
-        (self.commit_index_by_oid, self.first_child_of) = build_commit_indexes(&self.commits);
+        (
+            self.graph_rows,
+            self.graph_max_cols,
+            self.commit_index_by_oid,
+            self.first_child_of,
+        ) = derive_from_commits(&self.commits);
         // `count` budgets real commits; compare against the real count so the virtual
         // rows don't make a fully-loaded history read as "more available".
         self.all_loaded = real_commit_count(&self.commits) < count;
@@ -3886,11 +3947,7 @@ impl GitkApp {
         if current_file == Some(idx) {
             ui.painter().rect_filled(rect, 2.0, select_accent());
         } else if resp.hovered() {
-            ui.painter().rect_filled(
-                rect,
-                2.0,
-                egui::Color32::from_rgba_unmultiplied(203, 166, 247, 20),
-            );
+            ui.painter().rect_filled(rect, 2.0, mauve(20));
         }
 
         let left = rect.min.x + 4.0 + indent;
@@ -4053,23 +4110,26 @@ impl GitkApp {
                             let is_search_match = !self.search_matches.is_empty()
                                 && self.search_matches.binary_search(&idx).is_ok();
                             let kind = CommitKind::of(commit.oid);
-                            let is_uncommitted = kind == CommitKind::Uncommitted;
-                            let is_staged = kind == CommitKind::Staged;
                             let is_branch_member = self.branch_highlight.contains(&idx);
 
-                            // Branch members: no background, handled via brighter text below
-                            if is_uncommitted {
-                                painter.rect_filled(
-                                    row_rect,
-                                    0.0,
-                                    egui::Color32::from_rgba_unmultiplied(243, 139, 168, 18),
-                                );
-                            } else if is_staged {
-                                painter.rect_filled(
-                                    row_rect,
-                                    0.0,
-                                    egui::Color32::from_rgba_unmultiplied(166, 227, 161, 18),
-                                );
+                            // Virtual rows get a faint tint; branch members get none here
+                            // (handled via brighter text below).
+                            match kind {
+                                CommitKind::Uncommitted => {
+                                    painter.rect_filled(
+                                        row_rect,
+                                        0.0,
+                                        egui::Color32::from_rgba_unmultiplied(243, 139, 168, 18),
+                                    );
+                                }
+                                CommitKind::Staged => {
+                                    painter.rect_filled(
+                                        row_rect,
+                                        0.0,
+                                        egui::Color32::from_rgba_unmultiplied(166, 227, 161, 18),
+                                    );
+                                }
+                                CommitKind::Real => {}
                             }
 
                             if self.selected == Some(idx) {
@@ -4088,11 +4148,7 @@ impl GitkApp {
                             if self.selected != Some(idx)
                                 && response.hover_pos().is_some_and(|p| row_rect.contains(p))
                             {
-                                painter.rect_filled(
-                                    row_rect,
-                                    0.0,
-                                    egui::Color32::from_rgba_unmultiplied(203, 166, 247, 12),
-                                );
+                                painter.rect_filled(row_rect, 0.0, mauve(12));
                             }
 
                             if !reflog_mode {
@@ -4289,36 +4345,28 @@ impl GitkApp {
                             ui.scroll_to_rect(target_rect, align);
                         }
 
-                        // Lazy load: when near the bottom, load more commits. Route
-                        // through resync_commits (same as a full reload) so search
+                        // Lazy load: when near the bottom, grow the window. Routes
+                        // through reload_to_count (same as a full reload) so search
                         // matches, the selection, and branch highlight track the new
                         // list — the load is normally a superset, but virtual rows /
                         // ref changes can shift or shrink it, so the indices must be
-                        // re-anchored rather than carried over blindly.
+                        // re-anchored rather than carried over blindly. all_loaded is
+                        // set inside resync (fewer than asked ⇒ source exhausted).
                         if !self.all_loaded
                             && last_row + 50 >= num_commits
                             && let Ok(repo) = Repository::discover(&self.repo_path)
                         {
-                            let previous_oid =
-                                self.selected.and_then(|i| self.commits.get(i)).map(|c| c.oid);
-                            let previous_index = self.selected;
                             let requested = real_commit_count(&self.commits) + 500;
-                            self.commits = load_history(&repo, requested, &self.scope);
-                            // all_loaded is set inside resync (commits.len() < requested):
-                            // fewer than asked ⇒ source exhausted.
-                            self.resync_commits(requested, None, previous_oid, previous_index);
+                            self.reload_to_count(&repo, requested, None);
                         }
                     });
             });
-        // Persist the commit-list height only on an actual resize-drag, so a
-        // window-clamped frame can't ratchet the saved value down across runs
-        // (mirrors the file-list panel).
-        if ctx
-            .read_response(egui::Id::new("commit_panel").with("__resize"))
-            .is_some_and(|r| r.dragged())
-        {
-            self.commit_panel_height = commit_panel.response.rect.height();
-        }
+        persist_on_resize_drag(
+            ctx,
+            "commit_panel",
+            &mut self.commit_panel_height,
+            commit_panel.response.rect.height(),
+        );
     }
 }
 
@@ -4628,13 +4676,11 @@ impl eframe::App for GitkApp {
         // Up/Down: cycle through search matches when the search bar is focused,
         // otherwise move the commit-list selection (view follows minimally).
         let arrow_delta: isize = ctx.input_mut(|i| {
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
-                1
-            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
-                -1
-            } else {
-                0
-            }
+            consume_dir(
+                i,
+                (egui::Modifiers::NONE, egui::Key::ArrowDown),
+                (egui::Modifiers::NONE, egui::Key::ArrowUp),
+            )
         });
         if arrow_delta != 0 {
             if search_has_focus {
@@ -4642,11 +4688,7 @@ impl eframe::App for GitkApp {
                     let len = self.search_matches.len() as isize;
                     self.search_cursor =
                         (self.search_cursor as isize + arrow_delta).rem_euclid(len) as usize;
-                    // Cycle to the match without reloading the whole history: the
-                    // match index is already valid for the current commit list.
-                    let idx = self.search_matches[self.search_cursor];
-                    self.select_loaded(idx);
-                    self.graph_scroll_to = Some((idx, Some(egui::Align::Center)));
+                    self.jump_to_current_match();
                 }
             } else if !self.commits.is_empty() {
                 let last = self.commits.len() as isize - 1;
@@ -4666,13 +4708,11 @@ impl eframe::App for GitkApp {
         // these keys. Skipped when a commit switch already queued a scroll reset this
         // frame (diff_scroll_to set), so the new commit's diff still opens at the top.
         let page_delta: isize = ctx.input_mut(|i| {
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown) {
-                1
-            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp) {
-                -1
-            } else {
-                0
-            }
+            consume_dir(
+                i,
+                (egui::Modifiers::NONE, egui::Key::PageDown),
+                (egui::Modifiers::NONE, egui::Key::PageUp),
+            )
         });
         if page_delta != 0 && self.diff_scroll_to.is_none() {
             // Step from the live top: the diff's bottom padding lets any file scroll to
@@ -4691,13 +4731,11 @@ impl eframe::App for GitkApp {
         // or a toolbar checkbox (where Space types / toggles).
         let space_dir: isize = if ctx.memory(|m| m.focused().is_none()) {
             ctx.input_mut(|i| {
-                if i.consume_key(egui::Modifiers::NONE, egui::Key::Space) {
-                    1
-                } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::Space) {
-                    -1
-                } else {
-                    0
-                }
+                consume_dir(
+                    i,
+                    (egui::Modifiers::NONE, egui::Key::Space),
+                    (egui::Modifiers::SHIFT, egui::Key::Space),
+                )
             })
         } else {
             0
@@ -4733,22 +4771,15 @@ impl eframe::App for GitkApp {
                     if resp.changed() {
                         self.search_cursor = 0;
                         self.refresh_search_matches();
-                        // Jump to the first match. It's already a valid index into the
-                        // current list (just built), so select it directly + center —
-                        // no full reload/relayout (refresh_for_selection) needed.
-                        if let Some(&idx) = self.search_matches.first() {
-                            self.select_loaded(idx);
-                            self.graph_scroll_to = Some((idx, Some(egui::Align::Center)));
-                        }
+                        // Jump to the first match (cursor just reset to 0).
+                        self.jump_to_current_match();
                     }
                     // Enter cycles through matches
                     if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         if !self.search_matches.is_empty() {
                             self.search_cursor =
                                 (self.search_cursor + 1) % self.search_matches.len();
-                            let idx = self.search_matches[self.search_cursor];
-                            self.select_loaded(idx);
-                            self.graph_scroll_to = Some((idx, Some(egui::Align::Center)));
+                            self.jump_to_current_match();
                         }
                         resp.request_focus();
                     }
@@ -4954,15 +4985,12 @@ impl eframe::App for GitkApp {
                                     ui.add_space(BOTTOM_PAD_ROWS as f32 * FILE_ROW_H);
                                 });
                         });
-                    // Only persist the width on an actual resize-drag, not when
-                    // egui clamps the panel to a narrow window (which would
-                    // otherwise ratchet the saved width down across launches).
-                    if ctx
-                        .read_response(egui::Id::new("file_list_panel").with("__resize"))
-                        .is_some_and(|r| r.dragged())
-                    {
-                        self.file_list_width = file_panel.response.rect.width();
-                    }
+                    persist_on_resize_drag(
+                        &ctx,
+                        "file_list_panel",
+                        &mut self.file_list_width,
+                        file_panel.response.rect.width(),
+                    );
                     divider = Some(file_panel.response.rect);
                 }
 
