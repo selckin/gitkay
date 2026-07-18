@@ -16,6 +16,34 @@ use config::{FileListLayout, Fonts, Role};
 use diff_cache::DiffCache;
 use highlight::{DiffBg, HighlightLines, Highlighter};
 
+/// A monotonic supersession token shared between the UI thread and a background worker.
+/// The UI calls `bump()` on each dispatch to get a fresh token that supersedes every
+/// earlier one; a worker (holding a clone) keeps its dispatch token and calls
+/// `is_current(token)` to check it hasn't been superseded — before running and before
+/// applying its result. Arc-backed, so it clones cheaply into worker closures. Replaces
+/// the three hand-rolled `Arc<AtomicU64>` counters, so the "bump once per dispatch;
+/// workers compare, never write" invariant lives in one place.
+#[derive(Clone, Default)]
+struct Epoch(Arc<AtomicU64>);
+
+impl Epoch {
+    /// Advance to a fresh token, superseding all earlier ones, and return it.
+    fn bump(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// The latest token issued (0 before any `bump`). For callers that remember a value
+    /// and watch it change, rather than validating a token they hold.
+    fn current(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Whether `token` is still the latest issued — i.e. no later `bump()` has run.
+    fn is_current(&self, token: u64) -> bool {
+        self.current() == token
+    }
+}
+
 /// One file's worth of finished highlight spans, sent worker → UI. Tagged with
 /// the generation it was computed for so stale results are dropped.
 struct HighlightBatch {
@@ -1808,7 +1836,7 @@ struct HighlightJob {
     files: Vec<FileEntry>,
     /// This worker's pass number; it stops once `current_gen` moves past it.
     generation: u64,
-    current_gen: Arc<AtomicU64>,
+    current_gen: Epoch,
     /// Visible file range (lo, hi) the UI updates each frame.
     priority: Arc<VisibleRange>,
     tx: mpsc::Sender<HighlightBatch>,
@@ -1867,7 +1895,7 @@ fn highlight_worker(job: HighlightJob) {
     const CHUNK: usize = 256;
 
     // This worker is superseded once a newer highlight pass has started.
-    let superseded = || current_gen.load(Ordering::Relaxed) != generation;
+    let superseded = || !current_gen.is_current(generation);
 
     // Repaint the first result immediately (so a small diff highlights with no
     // visible plain flash); throttle the rest to coalesce a chunk storm.
@@ -2061,7 +2089,7 @@ struct PrefetchJob {
     hl: Arc<Highlighter>,
     /// This dispatch's epoch; the worker bails once `current_epoch` moves past it.
     epoch: u64,
-    current_epoch: Arc<AtomicU64>,
+    current_epoch: Epoch,
     tx: mpsc::Sender<(DiffCacheKey, DiffData)>,
     ctx: egui::Context,
 }
@@ -2091,7 +2119,7 @@ fn spawn_guarded(
 fn prefetch_worker(job: PrefetchJob) {
     let PrefetchJob { repo_path, targets, hl, epoch, current_epoch, tx, ctx } = job;
     // Superseded before we even ran — don't open the repo.
-    if epoch != current_epoch.load(Ordering::Relaxed) {
+    if !current_epoch.is_current(epoch) {
         return;
     }
     let repo = match Repository::discover(&repo_path) {
@@ -2102,7 +2130,7 @@ fn prefetch_worker(job: PrefetchJob) {
         }
     };
     for (key, paths) in targets {
-        if epoch != current_epoch.load(Ordering::Relaxed) {
+        if !current_epoch.is_current(epoch) {
             return; // user moved on
         }
         let t = std::time::Instant::now();
@@ -2144,7 +2172,7 @@ struct DiffLoadJob {
     /// is computed from the fresh data (off-thread, here) rather than left at 0.
     is_virtual: bool,
     epoch: u64,
-    current_epoch: Arc<AtomicU64>,
+    current_epoch: Epoch,
     tx: mpsc::Sender<DiffLoadResult>,
     ctx: egui::Context,
 }
@@ -2160,7 +2188,7 @@ fn diff_load_worker(job: DiffLoadJob) {
         repo_path, oid, settings, paths, mut key, is_virtual, epoch, current_epoch, tx, ctx,
     } = job;
     // Superseded before we even ran — don't open the repo.
-    if epoch != current_epoch.load(Ordering::Relaxed) {
+    if !current_epoch.is_current(epoch) {
         return;
     }
     let repo = match Repository::discover(&repo_path) {
@@ -2175,7 +2203,7 @@ fn diff_load_worker(job: DiffLoadJob) {
             return;
         }
     };
-    if epoch != current_epoch.load(Ordering::Relaxed) {
+    if !current_epoch.is_current(epoch) {
         return;
     }
     let t = std::time::Instant::now();
@@ -2745,7 +2773,7 @@ struct GitkApp {
     diff_bg: DiffBg,                             // add/del row background mode + colors
     diff_palette: highlight::DiffPalette,        // theme-derived diff colours (both modes)
     diff_needs_highlight: bool,                  // diff_lines changed; re-run highlight_diff
-    diff_generation: Arc<AtomicU64>, // bumped each highlight pass; lets stale workers bail + results drop
+    diff_generation: Epoch, // bumped each highlight pass; lets stale workers bail + results drop
     highlight_tx: mpsc::Sender<HighlightBatch>, // worker → UI: per-file span updates
     highlight_rx: mpsc::Receiver<HighlightBatch>,
     highlight_priority: Option<Arc<VisibleRange>>, // visible file range (lo, hi) the worker prioritises
@@ -2755,7 +2783,7 @@ struct GitkApp {
     prewarm_rx: Option<mpsc::Receiver<Arc<Highlighter>>>, // startup-prewarmed highlighter, until installed
     prefetch_tx: mpsc::Sender<(DiffCacheKey, DiffData)>,
     prefetch_rx: mpsc::Receiver<(DiffCacheKey, DiffData)>,
-    prefetch_epoch: Arc<AtomicU64>, // bumped per dispatch; supersedes older prefetch workers
+    prefetch_epoch: Epoch, // bumped per dispatch; supersedes older prefetch workers
     prefetched_gen: u64,            // diff_generation we last dispatched prefetch for
     last_highlight_check_gen: u64,  // diff_generation we last ran diff_fully_highlighted for
     commit_view_range: std::ops::Range<usize>, // visible commit-list rows (set each frame)
@@ -2764,7 +2792,7 @@ struct GitkApp {
     // placeholder until the result lands (see load_selected_diff / dispatch_diff_load).
     diff_load_tx: mpsc::Sender<DiffLoadResult>, // worker → UI: the selected commit's finished diff
     diff_load_rx: mpsc::Receiver<DiffLoadResult>,
-    diff_load_epoch: Arc<AtomicU64>, // bumped per selection; supersedes older diff-load workers + results
+    diff_load_epoch: Epoch, // bumped per selection; supersedes older diff-load workers + results
     // A diff-load worker is in flight iff this is `Some` — the single source of truth
     // (no separate bool to keep in sync). Holds when the current load began, so the
     // "Loading diff…" placeholder can be delayed past DIFF_PLACEHOLDER_DELAY. Preserved
@@ -3208,7 +3236,7 @@ impl GitkApp {
             diff_bg,
             diff_palette,
             diff_needs_highlight: false, // no diff yet — the deferred startup load arms highlighting
-            diff_generation: Arc::new(AtomicU64::new(0)),
+            diff_generation: Epoch::default(),
             highlight_tx,
             highlight_rx,
             highlight_priority: None,
@@ -3217,7 +3245,7 @@ impl GitkApp {
             prewarm_rx,
             prefetch_tx,
             prefetch_rx,
-            prefetch_epoch: Arc::new(AtomicU64::new(0)),
+            prefetch_epoch: Epoch::default(),
             prefetched_gen: 0,
             last_highlight_check_gen: 0,
             // A generous first-frame estimate so a diff that settles before the
@@ -3226,7 +3254,7 @@ impl GitkApp {
             commit_view_range: 0..64,
             diff_load_tx,
             diff_load_rx,
-            diff_load_epoch: Arc::new(AtomicU64::new(0)),
+            diff_load_epoch: Epoch::default(),
             diff_load_started_at: None,
             egui_ctx,
         })
@@ -3329,7 +3357,7 @@ impl GitkApp {
             && self.current_diff_key.as_ref() == Some(&self.diff_cache_key(self.commits[s].oid))
         {
             if self.diff_load_started_at.take().is_some() {
-                self.diff_load_epoch.fetch_add(1, Ordering::Relaxed);
+                self.diff_load_epoch.bump();
             }
             return;
         }
@@ -3345,7 +3373,7 @@ impl GitkApp {
         let Some(sel) = sel else {
             // No selection: supersede any in-flight load, stash the outgoing diff for a
             // later revisit, and clear the pane.
-            self.diff_load_epoch.fetch_add(1, Ordering::Relaxed);
+            self.diff_load_epoch.bump();
             self.diff_load_started_at = None;
             self.stash_current_diff();
             self.clear_diff_pane();
@@ -3365,7 +3393,7 @@ impl GitkApp {
         {
             log::debug!("perf: diff cache hit ({} lines) for {oid}", data.lines.len());
             // Supersede any in-flight worker so its (now stale) result is dropped.
-            self.diff_load_epoch.fetch_add(1, Ordering::Relaxed);
+            self.diff_load_epoch.bump();
             self.apply_loaded_diff(key, data);
             return;
         }
@@ -3456,7 +3484,7 @@ impl GitkApp {
         is_virtual: bool,
         paths: Vec<String>,
     ) {
-        let epoch = self.diff_load_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        let epoch = self.diff_load_epoch.bump();
         // Keep the previous diff on screen while the worker runs — don't clear the pane.
         // The render path only blanks to the "Loading diff…" placeholder once the load
         // outlives DIFF_PLACEHOLDER_DELAY, so a fast uncached load swaps straight to the
@@ -3476,7 +3504,7 @@ impl GitkApp {
             .name("gitkay-diff-load".to_string())
             .spawn({
                 let (current_epoch, tx, ctx) = (
-                    Arc::clone(&self.diff_load_epoch),
+                    self.diff_load_epoch.clone(),
                     self.diff_load_tx.clone(),
                     self.egui_ctx.clone(),
                 );
@@ -3518,7 +3546,7 @@ impl GitkApp {
     /// diff/theme are dropped by the drain instead of landing on the new diff.
     fn invalidate_diff_highlight(&mut self) {
         self.diff_needs_highlight = true;
-        self.diff_generation.fetch_add(1, Ordering::Relaxed);
+        self.diff_generation.bump();
     }
 
     /// Build the highlighter on first use and (re)highlight the current diff if
@@ -3579,7 +3607,7 @@ impl GitkApp {
         self.diff_needs_highlight = false;
         // Bump the generation so any worker started for a previous diff/theme
         // bails early and its result is discarded on arrival.
-        let generation = self.diff_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let generation = self.diff_generation.bump();
 
         if self.diff_lines.is_empty() {
             self.highlight_priority = None;
@@ -3611,7 +3639,7 @@ impl GitkApp {
             lines: self.diff_lines.clone(),
             files: self.diff_files.clone(),
             generation,
-            current_gen: Arc::clone(&self.diff_generation),
+            current_gen: self.diff_generation.clone(),
             priority,
             tx: self.highlight_tx.clone(),
             ctx: ctx.clone(),
@@ -3665,14 +3693,14 @@ impl GitkApp {
             log::debug!("prefetch: skip — visible commits already cached (or none)");
             return;
         }
-        let epoch = self.prefetch_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        let epoch = self.prefetch_epoch.bump();
         log::debug!("prefetch: dispatched {} visible around commit #{sel}", jobs.len());
         let job = PrefetchJob {
             repo_path: self.repo_path.clone(),
             targets: jobs,
             hl,
             epoch,
-            current_epoch: Arc::clone(&self.prefetch_epoch),
+            current_epoch: self.prefetch_epoch.clone(),
             tx: self.prefetch_tx.clone(),
             ctx: ctx.clone(),
         };
@@ -4104,7 +4132,7 @@ impl eframe::App for GitkApp {
         // still cache it, so returning to that commit is instant instead of recomputing.
         while let Ok(result) = self.diff_load_rx.try_recv() {
             let DiffLoadResult { epoch, key, data } = result;
-            let current = epoch == self.diff_load_epoch.load(Ordering::Relaxed);
+            let current = self.diff_load_epoch.is_current(epoch);
             match data {
                 Some(data) if current => {
                     self.install_preferring_cache(key, data);
@@ -4137,7 +4165,7 @@ impl eframe::App for GitkApp {
         // worker was spawned).
         let mut applied_highlight = false;
         while let Ok(batch) = self.highlight_rx.try_recv() {
-            if batch.generation == self.diff_generation.load(Ordering::Relaxed) {
+            if self.diff_generation.is_current(batch.generation) {
                 for (i, spans) in batch.lines {
                     if let Some(line) = self.diff_lines.get_mut(i) {
                         line.spans = Some(spans);
@@ -4163,7 +4191,7 @@ impl eframe::App for GitkApp {
         // Once the current diff is fully coloured, warm the visible commit window
         // (closest-to-selected first), once per settled diff. Syntax-enabled only.
         if self.syntax_enabled {
-            let current_gen = self.diff_generation.load(Ordering::Relaxed);
+            let current_gen = self.diff_generation.current();
             // diff_fully_highlighted is O(lines); it can only flip to true when new
             // spans arrive (a batch was applied) or a fresh diff loaded. Skipping
             // the scan on the other repaints during the highlight window (scroll,
