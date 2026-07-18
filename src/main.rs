@@ -2750,12 +2750,13 @@ struct GitkApp {
     branch_highlight: HashSet<usize>, // indices of commits on the same branch as selected
     commit_panel_height: f32,         // persisted commit-list panel height (see App::save)
     file_list_width: f32,             // persisted file-list sidebar width (see App::save)
-    diff_context: u32,                // diff context lines (persisted)
-    diff_ignore_ws: bool,             // ignore all whitespace in diffs (persisted)
+    // The diff-shaping settings, grouped into their one type. This IS what keys the diff
+    // cache (see diff_cache_key), so a new data-affecting setting added to DiffSettings is
+    // automatically part of the cache key AND the config-reload comparison — no separate
+    // bucket to keep in sync. context/ignore_ws are toolbar-owned + persisted;
+    // show_stats/detect_* come from config.
+    diff_settings: DiffSettings,
     word_diff: bool,                  // highlight changed words within +/- lines (persisted)
-    show_stats: bool,                 // show the diffstat block (config [diff].show_stats)
-    diff_detect_renames: bool,        // detect renames in diffs (config [diff].detect_renames)
-    diff_detect_copies: bool,         // detect copies in diffs (config [diff].detect_copies)
     file_list: FileListLayout,        // file-list sidebar layout (config [diff].file_list)
     diff_toolbar_rect: Option<egui::Rect>, // last shown hover-toolbar bounds (flicker guard)
     fonts: Fonts, // resolved, clamped font settings; call .font_id(role) for a FontId
@@ -3215,12 +3216,14 @@ impl GitkApp {
             branch_highlight: HashSet::new(),
             commit_panel_height,
             file_list_width,
-            diff_context,
-            diff_ignore_ws,
+            diff_settings: DiffSettings {
+                context: diff_context,
+                ignore_ws: diff_ignore_ws,
+                show_stats,
+                detect_renames: diff_detect_renames,
+                detect_copies: diff_detect_copies,
+            },
             word_diff,
-            show_stats,
-            diff_detect_renames,
-            diff_detect_copies,
             file_list,
             diff_toolbar_rect: None,
             fonts,
@@ -3305,16 +3308,6 @@ impl GitkApp {
         };
     }
 
-    fn diff_settings(&self) -> DiffSettings {
-        DiffSettings {
-            context: self.diff_context,
-            ignore_ws: self.diff_ignore_ws,
-            show_stats: self.show_stats,
-            detect_renames: self.diff_detect_renames,
-            detect_copies: self.diff_detect_copies,
-        }
-    }
-
     /// Pathspec to scope a commit's diff to (delegates to the pure `diff_paths_for`).
     /// Both diff entry points — the selected diff and the prefetch worker — call this,
     /// so neither can drift from the --follow path resolution.
@@ -3328,7 +3321,7 @@ impl GitkApp {
     fn diff_cache_key(&self, oid: git2::Oid) -> DiffCacheKey {
         DiffCacheKey {
             oid,
-            settings: self.diff_settings(),
+            settings: self.diff_settings,
             theme: self.theme_slug.clone(),
             enabled: self.syntax_enabled,
             content: 0,
@@ -3494,7 +3487,7 @@ impl GitkApp {
         self.diff_load_started_at
             .get_or_insert_with(std::time::Instant::now);
 
-        let settings = self.diff_settings();
+        let settings = self.diff_settings;
         // The worker thread must own its inputs. repo_path is borrowed from self so it's
         // cloned; paths and key are moved in (not cloned) — on the common spawn-succeeds
         // path the originals would otherwise be dropped unused. The rare spawn-failure
@@ -3940,8 +3933,8 @@ impl eframe::App for GitkApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, "commit_panel_height", &self.commit_panel_height);
         eframe::set_value(storage, "file_list_width", &self.file_list_width);
-        eframe::set_value(storage, "diff_context", &self.diff_context);
-        eframe::set_value(storage, "diff_ignore_ws", &self.diff_ignore_ws);
+        eframe::set_value(storage, "diff_context", &self.diff_settings.context);
+        eframe::set_value(storage, "diff_ignore_ws", &self.diff_settings.ignore_ws);
         eframe::set_value(storage, "word_diff", &self.word_diff);
     }
 
@@ -4101,12 +4094,17 @@ impl eframe::App for GitkApp {
                     // config value over any live toolbar toggle (a session override
                     // that also resets on launch; config wins). Reload at most once,
                     // even when several of these flip in the same save.
-                    let mut reload_diff = false;
-                    reload_diff |= set_if_changed(&mut self.show_stats, cfg.diff.show_stats);
-                    reload_diff |=
-                        set_if_changed(&mut self.diff_detect_renames, cfg.diff.detect_renames);
-                    reload_diff |=
-                        set_if_changed(&mut self.diff_detect_copies, cfg.diff.detect_copies);
+                    // Config owns show_stats + rename/copy detection; context/ignore_ws are
+                    // toolbar-owned, so keep them (`..`). Comparing the whole DiffSettings
+                    // means a field added to it can't silently skip the reload.
+                    let new_settings = DiffSettings {
+                        show_stats: cfg.diff.show_stats,
+                        detect_renames: cfg.diff.detect_renames,
+                        detect_copies: cfg.diff.detect_copies,
+                        ..self.diff_settings
+                    };
+                    let reload_diff = new_settings != self.diff_settings;
+                    self.diff_settings = new_settings;
                     // The file-list layout is render-only (it doesn't touch diff data).
                     // Update it before any reload so the reload rebuilds the rows under
                     // the new layout in one pass; if nothing reloads, rebuild the rows
@@ -4810,27 +4808,28 @@ impl eframe::App for GitkApp {
                                 ui.horizontal(|ui| {
                                     ui.label("Context:");
                                     if ui.small_button("-").clicked() {
-                                        self.diff_context = self.diff_context.saturating_sub(1);
+                                        self.diff_settings.context =
+                                            self.diff_settings.context.saturating_sub(1);
                                         diff_opts_changed = true;
                                     }
                                     ui.label(
-                                        egui::RichText::new(self.diff_context.to_string())
+                                        egui::RichText::new(self.diff_settings.context.to_string())
                                             .font(self.fonts.font_id(Role::Ui)),
                                     );
                                     if ui.small_button("+").clicked() {
-                                        self.diff_context =
-                                            self.diff_context.saturating_add(1).min(99);
+                                        self.diff_settings.context =
+                                            self.diff_settings.context.saturating_add(1).min(99);
                                         diff_opts_changed = true;
                                     }
                                     ui.add_space(12.0);
                                     diff_opts_changed |= ui
-                                        .checkbox(&mut self.diff_ignore_ws, "Ignore whitespace")
+                                        .checkbox(&mut self.diff_settings.ignore_ws, "Ignore whitespace")
                                         .changed();
                                     diff_opts_changed |= ui
-                                        .checkbox(&mut self.diff_detect_renames, "Detect renames")
+                                        .checkbox(&mut self.diff_settings.detect_renames, "Detect renames")
                                         .changed();
                                     diff_opts_changed |= ui
-                                        .checkbox(&mut self.diff_detect_copies, "Detect copies")
+                                        .checkbox(&mut self.diff_settings.detect_copies, "Detect copies")
                                         .changed();
                                     // Word-diff only changes the render (emphasis is
                                     // precomputed), so no diff reload — toggling is instant.
