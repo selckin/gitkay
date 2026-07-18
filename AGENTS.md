@@ -75,6 +75,23 @@ parts run off the window-creation critical path:
 - **Top panel**: search bar (SHA/author/message/ref), Enter cycles matches, any keypress focuses search, graph auto-scrolls to match
 - **Central panel**: commit graph + list. Manual virtual scrolling (pre-spacer, painter, post-spacer). Lazy loading (200 initial, +500 on scroll-near-bottom)
 - **Bottom panel**: diff view (left, syntax-highlighted) + file list sidebar (right, dynamic width)
+- **Rename/copy detection**: `detect_similar` (`git2::Diff::find_similar`) runs as a post-pass in
+  `get_diff_data`, `get_working_tree_diff`, and `get_staged_diff`, coalescing an add+delete pair
+  into one `old → new` entry. Two independent toggles: `[diff].detect_renames` (default `true`,
+  cheap — git `-M`) and `[diff].detect_copies` (default `false`, plain git `-C` with no
+  `copies_from_unmodified` — more expensive, and a copy source must itself be modified in the
+  same diff), mirrored by "Detect renames"/"Detect copies" checkboxes in the diff hover toolbar.
+  **Config is authoritative**: the checkboxes are a live session override seeded from config at
+  `GitkApp::new`; a live config-file reload re-asserts the config value over any toolbar toggle,
+  so saving a config change resets the toggle back. Unlike `diff_ignore_ws` (eframe-persisted
+  across restarts), these two are not persisted at all. Renamed/copied files render as
+  `old → new` in the file-list sidebar via `FileEntry.old_path` plus the `apply_rename_labels`
+  post-pass. **Known limitations**: working-tree rename detection is tracked-only —
+  `get_working_tree_diff` diffs index→workdir, so an untracked file never appears as an old-side
+  delete for `find_similar` to match; and a rename whose old path falls outside an active
+  pathspec (`gitkay … -- <path>`) can't be detected, since `apply_pathspec` filters the diff
+  before `detect_similar` runs. The separate `--follow` tracer (`rename_source`) is unaffected —
+  it walks parent trees directly rather than post-processing a filtered diff.
 - **Graph rendering**: each edge `(from, to, color)` = one line segment. Lines touching node split around dot. No incoming line for first commits (no parent above)
 - **Text**: summary clipped via `with_clip_rect`. Authors colored by hash. Refs colored by name hash (12-color extended palette)
 - **Clipboard**: SHA copied to both clipboard + primary selection on click
@@ -115,4 +132,5 @@ resolution, rev-vs-path classification, LRU eviction).
 - Working-tree edits do not touch `.git`; refresh commits/diff on selection changes to keep virtual staged/uncommitted entries current without a recursive worktree watcher
 - Branch highlighting walks first-parent children upward, but all parents downward, so merge commits keep merged history highlighted
 - File-list sidebar is not row-virtualized — every row lays out each frame. `build_file_rows` (pure) turns paths into header/file rows per `[diff] file_list` (`grouped` sorts by full path, one header per directory); `left_elide` left-truncates labels, measuring the full string once and binary-searching only when it overflows
+- Any new diff-affecting setting must be added to **both** `DiffSettings` and `DiffCacheKey` (and `diff_cache_key()` / `diff_settings()` / the prefetch mapping) or cached diffs won't invalidate when it changes — `detect_renames`/`detect_copies` are keyed in both for this reason
 - `GitkApp::new` runs *during* window creation — eframe doesn't paint until it returns. Keep slow/IO-bound work (history walk, first diff) off it: prefetch on a thread or defer to the first `ui()` frame (see Startup & timing). The history walk's cost is cold first-touch IO, not the algorithm — don't "optimise" the walk; overlap it
