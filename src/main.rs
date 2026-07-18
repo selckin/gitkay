@@ -106,6 +106,8 @@ struct DiffCacheKey {
     theme: String,
     enabled: bool,
     show_stats: bool,
+    detect_renames: bool,
+    detect_copies: bool,
     content: u64,
 }
 
@@ -1256,6 +1258,8 @@ struct DiffSettings {
     context: u32,
     ignore_ws: bool,
     show_stats: bool,
+    detect_renames: bool,
+    detect_copies: bool,
 }
 
 fn diff_opts(settings: DiffSettings) -> DiffOptions {
@@ -1263,6 +1267,23 @@ fn diff_opts(settings: DiffSettings) -> DiffOptions {
     opts.context_lines(settings.context)
         .ignore_whitespace(settings.ignore_ws);
     opts
+}
+
+/// Coalesce renamed/copied files in a freshly built diff, per the diff settings.
+/// No-op when both toggles are off. Renames are cheap; copies use plain `-C`
+/// (`DiffFindOptions::copies`), which only considers files modified in the same
+/// diff as copy sources. A detection error is logged and left non-fatal — the
+/// diff simply stays in its raw add/delete form (mirrors `rename_source`).
+fn detect_similar(diff: &mut git2::Diff, settings: DiffSettings) {
+    if !settings.detect_renames && !settings.detect_copies {
+        return;
+    }
+    let mut find = git2::DiffFindOptions::new();
+    find.renames(settings.detect_renames);
+    find.copies(settings.detect_copies);
+    if let Err(e) = diff.find_similar(Some(&mut find)) {
+        log::warn!("gitkay: rename/copy detection failed: {e}");
+    }
 }
 
 /// Format a commit timestamp (Unix seconds) in its own recorded UTC offset
@@ -1312,7 +1333,7 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, path
 
     let mut opts = diff_opts(settings);
     apply_pathspec(&mut opts, paths);
-    let diff = match repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts)) {
+    let mut diff = match repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts)) {
         Ok(d) => d,
         Err(e) => {
             log::warn!("gitkay: cannot diff commit {oid}: {e}");
@@ -1344,6 +1365,7 @@ fn get_diff_data(repo: &Repository, oid: git2::Oid, settings: DiffSettings, path
     // straight into the diffstat/patch produced below.
     lines.push(DiffLine::new("", LineKind::Context));
 
+    detect_similar(&mut diff, settings);
     append_diff_body(&mut lines, &mut files, &diff, settings.show_stats);
     DiffData::new(lines, files)
 }
@@ -1465,13 +1487,14 @@ fn append_diff_body(
 fn get_working_tree_diff(repo: &Repository, settings: DiffSettings, paths: &[String]) -> DiffData {
     let mut opts = diff_opts(settings);
     apply_pathspec(&mut opts, paths);
-    let diff = match repo.diff_index_to_workdir(None, Some(&mut opts)) {
+    let mut diff = match repo.diff_index_to_workdir(None, Some(&mut opts)) {
         Ok(d) => d,
         Err(e) => {
             log::warn!("gitkay: cannot diff working tree: {e}");
             return DiffData::empty();
         }
     };
+    detect_similar(&mut diff, settings);
     diff_to_data(&diff, "Uncommitted changes (working tree)", settings.show_stats)
 }
 
@@ -1484,13 +1507,14 @@ fn get_staged_diff(repo: &Repository, settings: DiffSettings, paths: &[String]) 
         .and_then(|c| c.tree().ok());
     let mut opts = diff_opts(settings);
     apply_pathspec(&mut opts, paths);
-    let diff = match repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut opts)) {
+    let mut diff = match repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut opts)) {
         Ok(d) => d,
         Err(e) => {
             log::warn!("gitkay: cannot diff staged changes: {e}");
             return DiffData::empty();
         }
     };
+    detect_similar(&mut diff, settings);
     diff_to_data(&diff, "Staged changes (index)", settings.show_stats)
 }
 
@@ -1951,6 +1975,8 @@ fn prefetch_worker(job: PrefetchJob) {
             context: key.context,
             ignore_ws: key.ignore_ws,
             show_stats: key.show_stats,
+            detect_renames: key.detect_renames,
+            detect_copies: key.detect_copies,
         };
         let t = std::time::Instant::now();
         log::debug!("prefetch: start {}", key.oid);
@@ -2476,6 +2502,8 @@ struct GitkApp {
     diff_ignore_ws: bool,             // ignore all whitespace in diffs (persisted)
     word_diff: bool,                  // highlight changed words within +/- lines (persisted)
     show_stats: bool,                 // show the diffstat block (config [diff].show_stats)
+    diff_detect_renames: bool,        // detect renames in diffs (config [diff].detect_renames)
+    diff_detect_copies: bool,         // detect copies in diffs (config [diff].detect_copies)
     file_list: FileListLayout,        // file-list sidebar layout (config [diff].file_list)
     diff_toolbar_rect: Option<egui::Rect>, // last shown hover-toolbar bounds (flicker guard)
     fonts: Fonts, // resolved, clamped font settings; call .font_id(role) for a FontId
@@ -2625,6 +2653,8 @@ impl GitkApp {
             .unwrap_or_default();
         let syntax_enabled = cfg.diff.syntax;
         let show_stats = cfg.diff.show_stats;
+        let diff_detect_renames = cfg.diff.detect_renames;
+        let diff_detect_copies = cfg.diff.detect_copies;
         let file_list = cfg.diff.file_list;
         let theme_slug = cfg
             .diff
@@ -2922,6 +2952,8 @@ impl GitkApp {
             diff_ignore_ws,
             word_diff,
             show_stats,
+            diff_detect_renames,
+            diff_detect_copies,
             file_list,
             diff_toolbar_rect: None,
             fonts,
@@ -3001,6 +3033,8 @@ impl GitkApp {
             context: self.diff_context,
             ignore_ws: self.diff_ignore_ws,
             show_stats: self.show_stats,
+            detect_renames: self.diff_detect_renames,
+            detect_copies: self.diff_detect_copies,
         }
     }
 
@@ -3022,6 +3056,8 @@ impl GitkApp {
             theme: self.theme_slug.clone(),
             enabled: self.syntax_enabled,
             show_stats: self.show_stats,
+            detect_renames: self.diff_detect_renames,
+            detect_copies: self.diff_detect_copies,
             content: 0,
         }
     }
@@ -5864,6 +5900,8 @@ mod tests {
             theme: theme.to_string(),
             enabled,
             show_stats,
+            detect_renames: false,
+            detect_copies: false,
             content,
         };
         let mut c: DiffCache<DiffCacheKey, u32> = DiffCache::new(100);
@@ -5874,6 +5912,26 @@ mod tests {
         // content distinguishes virtual diffs whose working-tree content changed.
         assert_eq!(c.remove(&key("dark", true, true, 7)), None, "different content ⇒ miss");
         assert_eq!(c.remove(&key("dark", true, true, 0)), Some(1), "same key ⇒ hit");
+    }
+
+    #[test]
+    fn diff_cache_key_includes_detect_toggles() {
+        let key = |detect_renames: bool, detect_copies: bool| DiffCacheKey {
+            oid: git2::Oid::ZERO_SHA1,
+            context: 3,
+            ignore_ws: false,
+            theme: "dark".to_string(),
+            enabled: true,
+            show_stats: true,
+            detect_renames,
+            detect_copies,
+            content: 0,
+        };
+        let mut c: DiffCache<DiffCacheKey, u32> = DiffCache::new(100);
+        c.insert(key(false, false), 1, 1);
+        assert_eq!(c.remove(&key(true, false)), None, "different detect_renames ⇒ miss");
+        assert_eq!(c.remove(&key(false, true)), None, "different detect_copies ⇒ miss");
+        assert_eq!(c.remove(&key(false, false)), Some(1), "same key ⇒ hit");
     }
 
     #[test]
@@ -6092,7 +6150,12 @@ mod tests {
         assert!(!got.contains(&"touch-b".to_string()));
 
         // Diff of c3 is scoped to a.txt: its file list is exactly [a.txt].
-        let data = get_diff_data(&repo, c3, DiffSettings { context: 3, ignore_ws: false, show_stats: true }, &s.paths);
+        let data = get_diff_data(
+            &repo,
+            c3,
+            DiffSettings { context: 3, ignore_ws: false, show_stats: true, detect_renames: false, detect_copies: false },
+            &s.paths,
+        );
         let files: Vec<&str> = data.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(files, vec!["a.txt"]);
 
@@ -6110,7 +6173,7 @@ mod tests {
         let on = get_diff_data(
             &repo,
             c2,
-            DiffSettings { context: 3, ignore_ws: false, show_stats: true },
+            DiffSettings { context: 3, ignore_ws: false, show_stats: true, detect_renames: false, detect_copies: false },
             &[],
         );
         assert!(
@@ -6121,7 +6184,7 @@ mod tests {
         let off = get_diff_data(
             &repo,
             c2,
-            DiffSettings { context: 3, ignore_ws: false, show_stats: false },
+            DiffSettings { context: 3, ignore_ws: false, show_stats: false, detect_renames: false, detect_copies: false },
             &[],
         );
         assert!(
@@ -6134,6 +6197,39 @@ mod tests {
         assert_eq!(off.files.len(), on.files.len());
         assert_eq!(count(&off, LineKind::Add), count(&on, LineKind::Add));
         assert_eq!(count(&off, LineKind::Del), count(&on, LineKind::Del));
+    }
+
+    #[test]
+    fn detect_renames_coalesces_add_delete() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "old.txt", "same content\n", "base");
+        std::fs::rename(
+            repo.workdir().unwrap().join("old.txt"),
+            repo.workdir().unwrap().join("new.txt"),
+        )
+        .unwrap();
+        let oid = commit_rename(&repo, "old.txt", "new.txt", "rename");
+
+        let on = DiffSettings {
+            context: 3, ignore_ws: false, show_stats: false,
+            detect_renames: true, detect_copies: false,
+        };
+        let files: Vec<String> =
+            get_diff_data(&repo, oid, on, &[]).files.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(files, vec!["new.txt".to_string()], "rename detected ⇒ one entry");
+
+        let off = DiffSettings {
+            context: 3, ignore_ws: false, show_stats: false,
+            detect_renames: false, detect_copies: false,
+        };
+        let mut files: Vec<String> =
+            get_diff_data(&repo, oid, off, &[]).files.iter().map(|f| f.path.clone()).collect();
+        files.sort();
+        assert_eq!(
+            files,
+            vec!["new.txt".to_string(), "old.txt".to_string()],
+            "no detection ⇒ add + delete",
+        );
     }
 
     #[test]
