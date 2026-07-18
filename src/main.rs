@@ -42,11 +42,50 @@ struct CommitInfo {
     oid: git2::Oid,
     summary: String,
     author: String,
-    time: i64,
-    tz_offset_min: i32, // the commit's recorded UTC offset, so its time shows like git log
     parents: Vec<git2::Oid>,
     refs: Vec<(String, RefKind)>,
     follow_path: Option<String>, // in --follow mode, the file's name at this commit
+    // Derived once here, immutable per commit, so the hot paths don't recompute them:
+    // the row render runs every frame, and search scans every commit each keystroke.
+    // `time`/`tz_offset_min` aren't stored — they're only needed to format `date_str`.
+    summary_lc: String, // lowercased summary, for case-insensitive search
+    author_lc: String,  // lowercased author, for case-insensitive search
+    date_str: String,   // commit date formatted with its recorded UTC offset (row display)
+    short_sha: String,  // 7-char abbreviation, empty for the virtual (uncommitted/staged) rows
+}
+
+impl CommitInfo {
+    /// Build a `CommitInfo`, precomputing the search- and render-derived fields from the
+    /// base ones so the per-keystroke search and per-frame row render read them instead of
+    /// recomputing `to_lowercase`, the date format, and the short SHA every time.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        oid: git2::Oid,
+        summary: String,
+        author: String,
+        time: i64,
+        tz_offset_min: i32,
+        parents: Vec<git2::Oid>,
+        refs: Vec<(String, RefKind)>,
+        follow_path: Option<String>,
+    ) -> Self {
+        CommitInfo {
+            summary_lc: summary.to_lowercase(),
+            author_lc: author.to_lowercase(),
+            date_str: format_commit_time(time, tz_offset_min, false),
+            short_sha: if is_real_commit(oid) {
+                format!("{oid:.7}")
+            } else {
+                String::new()
+            },
+            oid,
+            summary,
+            author,
+            parents,
+            refs,
+            follow_path,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -124,6 +163,22 @@ struct DiffCacheKey {
 /// keyed by a content hash instead — see `DiffCacheKey::content`).
 fn is_real_commit(oid: git2::Oid) -> bool {
     oid != oid_uncommitted() && oid != oid_staged()
+}
+
+/// Whether `oid`'s lowercase hex starts with `prefix`, without allocating the full hex
+/// string — the search filter runs this over every commit on each keystroke. `prefix`
+/// is expected lowercase; any non-hex byte simply never matches.
+fn oid_hex_starts_with(oid: git2::Oid, prefix: &str) -> bool {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = oid.as_bytes();
+    if prefix.len() > bytes.len() * 2 {
+        return false;
+    }
+    prefix.bytes().enumerate().all(|(i, want)| {
+        let byte = bytes[i / 2];
+        let nibble = if i % 2 == 0 { byte >> 4 } else { byte & 0x0f };
+        HEX[nibble as usize] == want
+    })
 }
 
 /// A content fingerprint of a generated diff — the text and kind of every line, with
@@ -751,32 +806,32 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
 
     // Add virtual entries at the top
     if has_uncommitted {
-        commits.push(CommitInfo {
-            oid: oid_uncommitted(),
-            summary: "Uncommitted changes".to_string(),
-            author: String::new(),
-            time: chrono::Utc::now().timestamp(),
-            tz_offset_min: local_tz_offset_min(),
-            parents: if has_staged {
+        commits.push(CommitInfo::new(
+            oid_uncommitted(),
+            "Uncommitted changes".to_string(),
+            String::new(),
+            chrono::Utc::now().timestamp(),
+            local_tz_offset_min(),
+            if has_staged {
                 vec![oid_staged()]
             } else {
                 head_oid.into_iter().collect()
             },
-            refs: vec![("working tree".to_string(), RefKind::Head)],
-            follow_path: None,
-        });
+            vec![("working tree".to_string(), RefKind::Head)],
+            None,
+        ));
     }
     if has_staged {
-        commits.push(CommitInfo {
-            oid: oid_staged(),
-            summary: "Staged changes".to_string(),
-            author: String::new(),
-            time: chrono::Utc::now().timestamp(),
-            tz_offset_min: local_tz_offset_min(),
-            parents: head_oid.into_iter().collect(),
-            refs: vec![("index".to_string(), RefKind::Tag)],
-            follow_path: None,
-        });
+        commits.push(CommitInfo::new(
+            oid_staged(),
+            "Staged changes".to_string(),
+            String::new(),
+            chrono::Utc::now().timestamp(),
+            local_tz_offset_min(),
+            head_oid.into_iter().collect(),
+            vec![("index".to_string(), RefKind::Tag)],
+            None,
+        ));
     }
 
     // Load real commits
@@ -805,15 +860,17 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
             push_rev_token(&mut revwalk, repo, tok);
         }
     }
-    let build_info = |oid: git2::Oid, commit: &git2::Commit, parents: Vec<git2::Oid>| CommitInfo {
-        oid,
-        summary: commit.summary().ok().flatten().unwrap_or("").to_string(),
-        author: commit.author().name().unwrap_or("").to_string(),
-        time: commit.time().seconds(),
-        tz_offset_min: commit.time().offset_minutes(),
-        parents,
-        refs: ref_map.get(&oid).cloned().unwrap_or_default(),
-        follow_path: None,
+    let build_info = |oid: git2::Oid, commit: &git2::Commit, parents: Vec<git2::Oid>| {
+        CommitInfo::new(
+            oid,
+            commit.summary().ok().flatten().unwrap_or("").to_string(),
+            commit.author().name().unwrap_or("").to_string(),
+            commit.time().seconds(),
+            commit.time().offset_minutes(),
+            parents,
+            ref_map.get(&oid).cloned().unwrap_or_default(),
+            None,
+        )
     };
 
     let mut seen = HashSet::new();
@@ -968,16 +1025,16 @@ fn load_reflog(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitI
     for i in 0..reflog.len().min(max) {
         let Some(entry) = reflog.get(i) else { continue };
         let committer = entry.committer();
-        out.push(CommitInfo {
-            oid: entry.id_new(),
-            summary: entry.message().ok().flatten().unwrap_or("").to_string(),
-            author: committer.name().unwrap_or("").to_string(),
-            time: committer.when().seconds(),
-            tz_offset_min: committer.when().offset_minutes(),
-            parents: Vec::new(),
-            refs: vec![(format!("{refname}@{{{i}}}"), RefKind::Reflog)],
-            follow_path: None,
-        });
+        out.push(CommitInfo::new(
+            entry.id_new(),
+            entry.message().ok().flatten().unwrap_or("").to_string(),
+            committer.name().unwrap_or("").to_string(),
+            committer.when().seconds(),
+            committer.when().offset_minutes(),
+            Vec::new(),
+            vec![(format!("{refname}@{{{i}}}"), RefKind::Reflog)],
+            None,
+        ));
     }
     out
 }
@@ -2334,25 +2391,36 @@ fn diff_row_job(
 /// Compute the set of commit indices to emphasize for `start_idx`.
 /// Walks upward through first-parent children to stay on the selected lane,
 /// and downward through all parents so merged ancestry stays highlighted.
-fn compute_branch_highlight(commits: &[CommitInfo], start_idx: usize) -> HashSet<usize> {
-    let mut highlighted = HashSet::new();
-    highlighted.insert(start_idx);
-
-    let index_by_oid: std::collections::HashMap<git2::Oid, usize> = commits
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (c.oid, i))
-        .collect();
-
-    // Build first-parent child map: parent_oid → child index
+/// The two commit-derived lookup maps `compute_branch_highlight` needs: oid → index, and
+/// first-parent oid → its (topologically latest) child index. Built once when `commits`
+/// changes and cached on `GitkApp`, so per-selection highlighting doesn't rescan every
+/// commit on each arrow-key step.
+fn build_commit_indexes(
+    commits: &[CommitInfo],
+) -> (
+    std::collections::HashMap<git2::Oid, usize>,
+    std::collections::HashMap<git2::Oid, usize>,
+) {
+    let index_by_oid = commits.iter().enumerate().map(|(i, c)| (c.oid, i)).collect();
     let mut first_child_of: std::collections::HashMap<git2::Oid, usize> =
         std::collections::HashMap::new();
     for (i, c) in commits.iter().enumerate() {
         if let Some(first_parent) = c.parents.first() {
-            // Only record the first child we encounter (topologically latest)
+            // Only record the first child we encounter (topologically latest).
             first_child_of.entry(*first_parent).or_insert(i);
         }
     }
+    (index_by_oid, first_child_of)
+}
+
+fn compute_branch_highlight(
+    commits: &[CommitInfo],
+    start_idx: usize,
+    index_by_oid: &std::collections::HashMap<git2::Oid, usize>,
+    first_child_of: &std::collections::HashMap<git2::Oid, usize>,
+) -> HashSet<usize> {
+    let mut highlighted = HashSet::new();
+    highlighted.insert(start_idx);
 
     // Walk downward: follow all parents so merged-in history stays highlighted.
     let mut stack = vec![start_idx];
@@ -2626,6 +2694,11 @@ struct GitkApp {
     /// Cached `max(num_cols)` over `graph_rows`, recomputed only when `graph_rows` is
     /// rebuilt — so the per-frame graph-width sizing needn't rescan every row.
     graph_max_cols: usize,
+    /// Cached commit-index maps (oid → index, first-parent-oid → child index) for
+    /// `compute_branch_highlight`, rebuilt with `commits` so per-selection highlighting
+    /// doesn't rescan all commits on each arrow-key step. See `build_commit_indexes`.
+    commit_index_by_oid: std::collections::HashMap<git2::Oid, usize>,
+    first_child_of: std::collections::HashMap<git2::Oid, usize>,
     selected: Option<usize>,
     startup_diff: StartupDiff, // one-time: defer the first diff off the window-creation path
 
@@ -2940,6 +3013,7 @@ impl GitkApp {
         let t_layout = std::time::Instant::now();
         let graph_rows = layout_graph(&commits);
         let graph_max_cols = graph_rows.iter().map(|r| r.num_cols).max().unwrap_or(1);
+        let (commit_index_by_oid, first_child_of) = build_commit_indexes(&commits);
         log::debug!("perf: startup: layout_graph {:?}", t_layout.elapsed());
 
         // Restore persisted diff options. The first commit is auto-selected, but its
@@ -3089,6 +3163,8 @@ impl GitkApp {
             commits,
             graph_rows,
             graph_max_cols,
+            commit_index_by_oid,
+            first_child_of,
             selected: Some(0),
             startup_diff,
             diff_lines,
@@ -3168,9 +3244,9 @@ impl GitkApp {
             .iter()
             .enumerate()
             .filter(|(_, c)| {
-                c.summary.to_lowercase().contains(&q)
-                    || c.author.to_lowercase().contains(&q)
-                    || c.oid.to_string().starts_with(&q)
+                c.summary_lc.contains(&q)
+                    || c.author_lc.contains(&q)
+                    || oid_hex_starts_with(c.oid, &q)
                     || c.refs.iter().any(|(r, _)| r.to_lowercase().contains(&q))
             })
             .map(|(i, _)| i)
@@ -3188,7 +3264,12 @@ impl GitkApp {
             self.branch_highlight.clear();
             return;
         }
-        let highlight = compute_branch_highlight(&self.commits, idx);
+        let highlight = compute_branch_highlight(
+            &self.commits,
+            idx,
+            &self.commit_index_by_oid,
+            &self.first_child_of,
+        );
         self.branch_highlight = if highlight.len() < self.commits.len() {
             highlight
         } else {
@@ -3631,6 +3712,7 @@ impl GitkApp {
     ) {
         self.graph_rows = layout_graph(&self.commits);
         self.graph_max_cols = self.graph_rows.iter().map(|r| r.num_cols).max().unwrap_or(1);
+        (self.commit_index_by_oid, self.first_child_of) = build_commit_indexes(&self.commits);
         // `count` budgets real commits; compare against the real count so the virtual
         // rows don't make a fully-loaded history read as "more available".
         self.all_loaded = real_commit_count(&self.commits) < count;
@@ -4536,23 +4618,22 @@ impl eframe::App for GitkApp {
                                 cursor_x += label_w + 4.0;
                             }
 
-                            // Author + date (right-aligned) — compute first to know where summary must stop
+                            // Author + date (right-aligned) — compute first to know where
+                            // summary must stop. date_str / short_sha are precomputed per
+                            // commit (see CommitInfo::new), so this per-frame path only lays
+                            // them out, never re-formats.
                             let right_x = row_rect.max.x;
-                            let date_str =
-                                format_commit_time(commit.time, commit.tz_offset_min, false);
                             let date_font = self.fonts.font_id(Role::CommitMeta);
                             let date_galley =
-                                painter.layout_no_wrap(date_str, date_font.clone(), SUBTEXT);
+                                painter.layout_no_wrap(commit.date_str.clone(), date_font.clone(), SUBTEXT);
                             let date_w = date_galley.size().x;
 
                             // Short SHA
-                            let short_sha = if is_real_commit(commit.oid) {
-                                format!("{:.7}", commit.oid)
-                            } else {
-                                String::new()
-                            };
-                            let sha_galley =
-                                painter.layout_no_wrap(short_sha, date_font.clone(), SUBTEXT);
+                            let sha_galley = painter.layout_no_wrap(
+                                commit.short_sha.clone(),
+                                date_font.clone(),
+                                SUBTEXT,
+                            );
                             let sha_w = sha_galley.size().x;
 
                             let a_color = author_color(&commit.author);
@@ -5167,16 +5248,16 @@ mod tests {
     /// Build a CommitInfo for testing. Commits are listed in topological
     /// order (newest first), just like `load_commits` returns.
     fn commit(id: u32, parents: &[u32]) -> CommitInfo {
-        CommitInfo {
-            oid: oid(id),
-            summary: format!("Commit {id}"),
-            author: "test".into(),
-            time: 0,
-            tz_offset_min: 0,
-            parents: parents.iter().map(|p| oid(*p)).collect(),
-            refs: vec![],
-            follow_path: None,
-        }
+        CommitInfo::new(
+            oid(id),
+            format!("Commit {id}"),
+            "test".into(),
+            0,
+            0,
+            parents.iter().map(|p| oid(*p)).collect(),
+            vec![],
+            None,
+        )
     }
 
     /// Assert that a specific commit's node stays in the same column as
@@ -5360,7 +5441,8 @@ mod tests {
             commit(6, &[]),
         ];
 
-        let highlight = compute_branch_highlight(&commits, 0);
+        let (index_by_oid, first_child_of) = build_commit_indexes(&commits);
+        let highlight = compute_branch_highlight(&commits, 0, &index_by_oid, &first_child_of);
 
         assert!(highlight.contains(&0), "merge commit should be highlighted");
         assert!(
@@ -6345,6 +6427,24 @@ mod tests {
     }
 
     #[test]
+    fn oid_hex_starts_with_matches_full_string_semantics() {
+        let oid = git2::Oid::from_bytes(&[0xab; 20]).unwrap(); // hex "abab…ab" (40 chars)
+        assert!(oid_hex_starts_with(oid, "")); // empty prefix always matches
+        assert!(oid_hex_starts_with(oid, "a"));
+        assert!(oid_hex_starts_with(oid, "abab"));
+        assert!(oid_hex_starts_with(oid, &oid.to_string())); // whole hex
+        assert!(!oid_hex_starts_with(oid, "abc")); // 3rd char is 'a', not 'c'
+        assert!(!oid_hex_starts_with(oid, "xyz")); // non-hex never matches
+        assert!(!oid_hex_starts_with(oid, &format!("{oid}0"))); // longer than the hex
+        // Matches String::starts_with over the real hex for a mixed oid.
+        let mixed = git2::Oid::from_bytes(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        let hex = mixed.to_string();
+        for k in 0..=hex.len() {
+            assert_eq!(oid_hex_starts_with(mixed, &hex[..k]), hex.starts_with(&hex[..k]));
+        }
+    }
+
+    #[test]
     fn top_extensions_skips_extensionless_and_lowercases() {
         let paths = ["Makefile", "README", "X.TXT"].into_iter().map(String::from);
         assert_eq!(top_extensions(paths, 10, |_| true), vec!["txt".to_string()]);
@@ -6366,16 +6466,16 @@ mod tests {
 
     /// A bare CommitInfo carrying only an oid, for prefetch-target tests.
     fn ci(oid: git2::Oid) -> CommitInfo {
-        CommitInfo {
+        CommitInfo::new(
             oid,
-            summary: String::new(),
-            author: String::new(),
-            time: 0,
-            tz_offset_min: 0,
-            parents: Vec::new(),
-            refs: Vec::new(),
-            follow_path: None,
-        }
+            String::new(),
+            String::new(),
+            0,
+            0,
+            Vec::new(),
+            Vec::new(),
+            None,
+        )
     }
 
     #[test]
@@ -6903,15 +7003,8 @@ mod tests {
 
     #[test]
     fn diff_paths_for_follows_per_commit_name() {
-        let mk = |o: git2::Oid, fp: Option<&str>| CommitInfo {
-            oid: o,
-            summary: String::new(),
-            author: String::new(),
-            time: 0,
-            tz_offset_min: 0,
-            parents: Vec::new(),
-            refs: Vec::new(),
-            follow_path: fp.map(String::from),
+        let mk = |o: git2::Oid, fp: Option<&str>| {
+            CommitInfo::new(o, String::new(), String::new(), 0, 0, Vec::new(), Vec::new(), fp.map(String::from))
         };
         let commits = vec![mk(oid(2), Some("new.txt")), mk(oid(1), Some("old.txt"))];
         let follow = cli::Scope {
