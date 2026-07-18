@@ -3707,6 +3707,23 @@ impl eframe::App for GitkApp {
                         self.file_list = cfg.diff.file_list;
                         self.rebuild_file_rows();
                     }
+                    // Rename/copy detection changes the diff DATA (files coalesce), so
+                    // a change needs a full rebuild like show_stats. Config is
+                    // authoritative: this re-asserts the config value over any live
+                    // toolbar toggle (the toolbar toggle is a session override that
+                    // also resets on launch; config wins).
+                    let mut redetect = false;
+                    if cfg.diff.detect_renames != self.diff_detect_renames {
+                        self.diff_detect_renames = cfg.diff.detect_renames;
+                        redetect = true;
+                    }
+                    if cfg.diff.detect_copies != self.diff_detect_copies {
+                        self.diff_detect_copies = cfg.diff.detect_copies;
+                        redetect = true;
+                    }
+                    if redetect && let Ok(repo) = Repository::discover(&self.repo_path) {
+                        self.load_selected_diff(&repo);
+                    }
                     self.config_error_toast = warned.then(std::time::Instant::now);
                 }
                 Err(e) => {
@@ -4388,6 +4405,18 @@ impl eframe::App for GitkApp {
                                     ui.add_space(12.0);
                                     if ui
                                         .checkbox(&mut self.diff_ignore_ws, "Ignore whitespace")
+                                        .changed()
+                                    {
+                                        diff_opts_changed = true;
+                                    }
+                                    if ui
+                                        .checkbox(&mut self.diff_detect_renames, "Detect renames")
+                                        .changed()
+                                    {
+                                        diff_opts_changed = true;
+                                    }
+                                    if ui
+                                        .checkbox(&mut self.diff_detect_copies, "Detect copies")
                                         .changed()
                                     {
                                         diff_opts_changed = true;
