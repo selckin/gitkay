@@ -327,7 +327,7 @@ fn build_file_rows(files: &[(&str, Option<&str>)], layout: FileListLayout) -> Ve
     // (group directory, rendered label) per file, resolved for this layout. The group
     // directory is read only by the Grouped arm below, so it's left empty (no
     // allocation) for the flat Name/Full layouts that never look at it.
-    let computed: Vec<(String, String)> = files
+    let mut computed: Vec<(String, String)> = files
         .iter()
         // `old` is already `None` for a non-rename — append_diff_body records it only
         // when the raw *bytes* differ. This extra string-level guard is a rendering
@@ -351,11 +351,11 @@ fn build_file_rows(files: &[(&str, Option<&str>)], layout: FileListLayout) -> Ve
 
     match layout {
         FileListLayout::Name | FileListLayout::Full => computed
-            .iter()
+            .into_iter()
             .enumerate()
             .map(|(idx, (_, label))| FileListRow::File {
                 idx,
-                label: label.clone(),
+                label,
                 indented: false,
             })
             .collect(),
@@ -369,25 +369,30 @@ fn build_file_rows(files: &[(&str, Option<&str>)], layout: FileListLayout) -> Ve
                 by_dir.entry(dir.as_str()).or_default().push(idx);
             }
             let root = by_dir.remove("");
-            let mut rows = Vec::with_capacity(computed.len() + by_dir.len());
+            // Resolve the emit order — (header, its file indices) sorted by label — into
+            // an owned plan. Collecting it drops by_dir's borrow on `computed`, so the
+            // labels below can be moved out (mem::take) instead of cloned; each index is
+            // emitted exactly once, so taking leaves no reachable gap.
+            let mut plan: Vec<(Option<String>, Vec<usize>)> = Vec::with_capacity(by_dir.len() + 1);
             for (dir, mut idxs) in by_dir {
                 idxs.sort_by(|&a, &b| computed[a].1.cmp(&computed[b].1));
-                rows.push(FileListRow::Header(dir.to_string()));
-                for idx in idxs {
-                    rows.push(FileListRow::File {
-                        idx,
-                        label: computed[idx].1.clone(),
-                        indented: true,
-                    });
-                }
+                plan.push((Some(dir.to_string()), idxs));
             }
             if let Some(mut idxs) = root {
                 idxs.sort_by(|&a, &b| computed[a].1.cmp(&computed[b].1));
+                plan.push((None, idxs));
+            }
+            let mut rows = Vec::with_capacity(computed.len() + plan.len());
+            for (header, idxs) in plan {
+                let indented = header.is_some();
+                if let Some(dir) = header {
+                    rows.push(FileListRow::Header(dir));
+                }
                 for idx in idxs {
                     rows.push(FileListRow::File {
                         idx,
-                        label: computed[idx].1.clone(),
-                        indented: false,
+                        label: std::mem::take(&mut computed[idx].1),
+                        indented,
                     });
                 }
             }
