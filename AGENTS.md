@@ -55,8 +55,22 @@ parts run off the window-creation critical path:
 - **Deferred first diff** (`StartupDiff` state machine) — `GitkApp::new` does *not* compute
   the startup diff (window creation blocks until the creator returns). It auto-selects
   commit 0 with an empty diff pane; `ui()` paints the graph on the first frame, then calls
-  `load_selected_diff` on the next — the same path a commit-click takes. Keeps a slow,
-  IO-bound `get_diff_data` (the working-tree entry stats files) off window creation.
+  `load_selected_diff` on the next — the same path a commit-click takes.
+- **Async diff load** (`gitkay-diff-load` worker) — `load_selected_diff` does *not* run
+  `get_diff_data` on the UI thread (except a rare thread-spawn-failure fallback). An oid-keyed
+  cache hit — neighbours are prefetched, so the common case — installs synchronously via
+  `apply_loaded_diff`; a miss, or a virtual/working-tree entry (content-keyed, so it can't be
+  looked up until its content is computed), spawns a worker that computes the diff off-thread
+  and hands it back over `diff_load_rx`. The pane blanks until the result lands, but the
+  "Loading diff…" placeholder text only appears once the load outlives `DIFF_PLACEHOLDER_DELAY`
+  (100ms), so a fast uncached load — a quick jump through cold history — never flashes it. A
+  monotonic `diff_load_epoch` — bumped per selection, and by every synchronous install
+  — supersedes stale workers: a result whose epoch no longer matches the current one is dropped,
+  so clicking quickly through commits never installs an out-of-date diff. This keeps a large
+  diff, or `detect_copies` (O(sources×targets)), from freezing the window. Highlighting remains
+  a separate downstream async step (`ensure_diff_highlighted`); the worker only produces
+  `DiffData`. On arrival the result still prefers any cache entry under its key, so a neighbour
+  prefetch that highlighted the same commit meanwhile is reused instead of re-tokenized.
 - **Perf timing** — key startup phases log at `debug` (`perf: startup: …` / `perf:
   load_commits: …`). Run with `RUST_LOG=gitkay=debug` to see the per-phase breakdown.
 
