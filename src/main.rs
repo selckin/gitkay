@@ -108,13 +108,13 @@ const DIFF_PLACEHOLDER_DELAY: std::time::Duration = std::time::Duration::from_mi
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct DiffCacheKey {
     oid: git2::Oid,
-    context: u32,
-    ignore_ws: bool,
+    /// The diff-shaping options (context, whitespace, stats, rename/copy detection).
+    /// Embedding the whole `DiffSettings` — rather than copying its fields out — keeps a
+    /// new diff-affecting setting to a single edit site and stops the cache key from
+    /// drifting out of sync with the diff it keys.
+    settings: DiffSettings,
     theme: String,
     enabled: bool,
-    show_stats: bool,
-    detect_renames: bool,
-    detect_copies: bool,
     content: u64,
 }
 
@@ -234,8 +234,11 @@ fn right_elide(s: &str, max_width: f32, measure: impl Fn(&str) -> f32) -> String
 
 /// One rendered row of the file-list sidebar.
 enum FileListRow {
-    /// A directory header (grouped layout only); the full dir path with trailing `/`.
-    Header(String),
+    /// A directory header (grouped layout only): the full dir path with trailing `/`,
+    /// plus `dim_len` — the byte length of the leading path it shares with the header
+    /// above it. Precomputed at build time (the header sequence is fixed per rebuild) and
+    /// drawn dimmed by `draw_dir_header`, so the draw loop needn't re-derive it per frame.
+    Header { dir: String, dim_len: usize },
     /// A file row. `idx` indexes `diff_files`; `label` is what to draw.
     File {
         idx: usize,
@@ -270,6 +273,15 @@ fn common_dir_prefix_len(a: &str, b: &str) -> usize {
         i += 1;
     }
     pfx
+}
+
+/// Assign `src` into `*dst`, returning whether it actually changed. Lets a batch of
+/// "did any of these settings change?" checks read as one `|=` per field instead of a
+/// copy-pasted `if src != *dst { *dst = src; flag = true }` block each.
+fn set_if_changed<T: PartialEq>(dst: &mut T, src: T) -> bool {
+    let changed = *dst != src;
+    *dst = src;
+    changed
 }
 
 /// git-style rename/copy display: the parts common to `old` and `new` are factored
@@ -327,7 +339,7 @@ fn build_file_rows(files: &[(&str, Option<&str>)], layout: FileListLayout) -> Ve
     // (group directory, rendered label) per file, resolved for this layout. The group
     // directory is read only by the Grouped arm below, so it's left empty (no
     // allocation) for the flat Name/Full layouts that never look at it.
-    let mut computed: Vec<(String, String)> = files
+    let computed: Vec<(String, String)> = files
         .iter()
         // `old` is already `None` for a non-rename — append_diff_body records it only
         // when the raw *bytes* differ. This extra string-level guard is a rendering
@@ -369,30 +381,36 @@ fn build_file_rows(files: &[(&str, Option<&str>)], layout: FileListLayout) -> Ve
                 by_dir.entry(dir.as_str()).or_default().push(idx);
             }
             let root = by_dir.remove("");
-            // Resolve the emit order — (header, its file indices) sorted by label — into
-            // an owned plan. Collecting it drops by_dir's borrow on `computed`, so the
-            // labels below can be moved out (mem::take) instead of cloned; each index is
-            // emitted exactly once, so taking leaves no reachable gap.
-            let mut plan: Vec<(Option<String>, Vec<usize>)> = Vec::with_capacity(by_dir.len() + 1);
+            // Emit each directory's header then its files (sorted by label); root files
+            // trail last, headerless. `dim_len` — the leading path a header shares with
+            // the one above it — is fixed by the header sequence, so it's computed here
+            // (once per rebuild) rather than re-derived every frame in the draw loop.
+            // Labels are cloned out of `computed`: they're short (basenames / brace forms)
+            // and this runs once per selection, not per frame.
+            let mut rows = Vec::with_capacity(computed.len() + by_dir.len() + 1);
+            let mut prev_dir = "";
             for (dir, mut idxs) in by_dir {
                 idxs.sort_by(|&a, &b| computed[a].1.cmp(&computed[b].1));
-                plan.push((Some(dir.to_string()), idxs));
-            }
-            if let Some(mut idxs) = root {
-                idxs.sort_by(|&a, &b| computed[a].1.cmp(&computed[b].1));
-                plan.push((None, idxs));
-            }
-            let mut rows = Vec::with_capacity(computed.len() + plan.len());
-            for (header, idxs) in plan {
-                let indented = header.is_some();
-                if let Some(dir) = header {
-                    rows.push(FileListRow::Header(dir));
-                }
+                rows.push(FileListRow::Header {
+                    dim_len: common_dir_prefix_len(prev_dir, dir),
+                    dir: dir.to_string(),
+                });
+                prev_dir = dir;
                 for idx in idxs {
                     rows.push(FileListRow::File {
                         idx,
-                        label: std::mem::take(&mut computed[idx].1),
-                        indented,
+                        label: computed[idx].1.clone(),
+                        indented: true,
+                    });
+                }
+            }
+            if let Some(mut idxs) = root {
+                idxs.sort_by(|&a, &b| computed[a].1.cmp(&computed[b].1));
+                for idx in idxs {
+                    rows.push(FileListRow::File {
+                        idx,
+                        label: computed[idx].1.clone(),
+                        indented: false,
                     });
                 }
             }
@@ -1349,7 +1367,7 @@ impl DiffData {
 /// Diff rendering options. `context`/`ignore_ws` shape the git diff itself (via
 /// `diff_opts`); `show_stats` is a config-driven presentation flag (whether the
 /// diffstat block is emitted) and is NOT read by `diff_opts`.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct DiffSettings {
     context: u32,
     ignore_ws: bool,
@@ -2076,16 +2094,9 @@ fn prefetch_worker(job: PrefetchJob) {
         if epoch != current_epoch.load(Ordering::Relaxed) {
             return; // user moved on
         }
-        let settings = DiffSettings {
-            context: key.context,
-            ignore_ws: key.ignore_ws,
-            show_stats: key.show_stats,
-            detect_renames: key.detect_renames,
-            detect_copies: key.detect_copies,
-        };
         let t = std::time::Instant::now();
         log::debug!("prefetch: start {}", key.oid);
-        let mut data = get_diff_data(&repo, key.oid, settings, &paths);
+        let mut data = get_diff_data(&repo, key.oid, key.settings, &paths);
         highlight_diff(&mut data.lines, &data.files, &hl);
         let (oid, lines) = (key.oid, data.lines.len());
         if tx.send((key, data)).is_err() {
@@ -3255,13 +3266,9 @@ impl GitkApp {
     fn diff_cache_key(&self, oid: git2::Oid) -> DiffCacheKey {
         DiffCacheKey {
             oid,
-            context: self.diff_context,
-            ignore_ws: self.diff_ignore_ws,
+            settings: self.diff_settings(),
             theme: self.theme_slug.clone(),
             enabled: self.syntax_enabled,
-            show_stats: self.show_stats,
-            detect_renames: self.diff_detect_renames,
-            detect_copies: self.diff_detect_copies,
             content: 0,
         }
     }
@@ -3282,8 +3289,9 @@ impl GitkApp {
         // the reload is safe; a virtual entry's stored key carries a content hash while
         // diff_cache_key leaves it 0 here, so its key never matches and it always
         // refreshes. Return before touching scroll state so the user keeps their position.
-        if let Some(sel) = self.selected.filter(|&s| s < self.commits.len())
-            && self.current_diff_key.as_ref() == Some(&self.diff_cache_key(self.commits[sel].oid))
+        let sel = self.selected.filter(|&s| s < self.commits.len());
+        if let Some(s) = sel
+            && self.current_diff_key.as_ref() == Some(&self.diff_cache_key(self.commits[s].oid))
         {
             if self.diff_load_started_at.take().is_some() {
                 self.diff_load_epoch.fetch_add(1, Ordering::Relaxed);
@@ -3299,7 +3307,7 @@ impl GitkApp {
         // the outgoing diff keeps its scroll position while a fast load is in flight.
         self.diff_scroll_to = None;
 
-        let Some(sel) = self.selected.filter(|&s| s < self.commits.len()) else {
+        let Some(sel) = sel else {
             // No selection: supersede any in-flight load, stash the outgoing diff for a
             // later revisit, and clear the pane.
             self.diff_load_epoch.fetch_add(1, Ordering::Relaxed);
@@ -3311,18 +3319,20 @@ impl GitkApp {
 
         let oid = self.commits[sel].oid;
         log::debug!("select: commit {oid} (#{sel})");
+        // Identical for the synchronous hit-install and the async miss-dispatch below, so
+        // build the cache key once here.
+        let key = self.diff_cache_key(oid);
 
         // Real commit: an oid-keyed cache hit installs synchronously — no worker, no
         // placeholder (neighbours are usually prefetched, so this is the common path).
-        if is_real_commit(oid) {
-            let key = self.diff_cache_key(oid);
-            if let Some(data) = self.diff_cache.remove(&key) {
-                log::debug!("perf: diff cache hit ({} lines) for {oid}", data.lines.len());
-                // Supersede any in-flight worker so its (now stale) result is dropped.
-                self.diff_load_epoch.fetch_add(1, Ordering::Relaxed);
-                self.apply_loaded_diff(key, data);
-                return;
-            }
+        if is_real_commit(oid)
+            && let Some(data) = self.diff_cache.remove(&key)
+        {
+            log::debug!("perf: diff cache hit ({} lines) for {oid}", data.lines.len());
+            // Supersede any in-flight worker so its (now stale) result is dropped.
+            self.diff_load_epoch.fetch_add(1, Ordering::Relaxed);
+            self.apply_loaded_diff(key, data);
+            return;
         }
 
         // Cache miss (or a virtual entry): compute off the UI thread, keeping the
@@ -3330,7 +3340,6 @@ impl GitkApp {
         // Resolve the pathspec only here — a hit above must do no work, and under
         // --follow diff_paths_for is an O(commits) scan.
         let paths = self.diff_paths_for_oid(oid);
-        let key = self.diff_cache_key(oid);
         self.dispatch_diff_load(repo, oid, key, !is_real_commit(oid), paths);
     }
 
@@ -3390,6 +3399,15 @@ impl GitkApp {
         self.invalidate_diff_highlight();
     }
 
+    /// Install a freshly computed diff, but prefer an already-cached copy under the same
+    /// key over the fresh one — a neighbour prefetch may have warmed (and highlighted)
+    /// the same commit while the worker ran, or an unchanged virtual entry may still be
+    /// cached — so its highlighting is reused instead of re-tokenized.
+    fn install_preferring_cache(&mut self, key: DiffCacheKey, data: DiffData) {
+        let data = self.diff_cache.remove(&key).unwrap_or(data);
+        self.apply_loaded_diff(key, data);
+    }
+
     /// Spawn a diff-load worker for `oid`, arm the loading state, and bump the epoch so
     /// any in-flight worker (and any not-yet-applied result) is superseded. The previous
     /// diff stays on screen until the result lands or the load outlives the placeholder
@@ -3441,15 +3459,12 @@ impl GitkApp {
             let paths = self.diff_paths_for_oid(oid);
             let mut key = self.diff_cache_key(oid);
             let data = get_diff_data(repo, oid, settings, &paths);
-            // Mirror the worker + receive path: hash a virtual entry's content and
-            // reuse a cached (already-highlighted) copy when the content is unchanged.
-            let data = if is_virtual {
+            // A virtual entry is content-keyed, so hash its content here (the worker does
+            // this off-thread); real commits key by oid alone.
+            if is_virtual {
                 key.content = hash_diff_content(&data);
-                self.diff_cache.remove(&key).unwrap_or(data)
-            } else {
-                data
-            };
-            self.apply_loaded_diff(key, data);
+            }
+            self.install_preferring_cache(key, data);
         }
     }
 
@@ -3710,7 +3725,6 @@ impl GitkApp {
         self.file_rows = build_file_rows(&files, self.file_list);
     }
 
-    /// One non-interactive directory-header row in the grouped file list.
     /// Draw one grouped directory header, breadcrumb-style. `dim_len` is the byte
     /// length of the leading path this header shares with the header above it
     /// (`common_dir_prefix_len`); that repeated ancestor is drawn dimmed
@@ -4035,18 +4049,11 @@ impl eframe::App for GitkApp {
                     // that also resets on launch; config wins). Reload at most once,
                     // even when several of these flip in the same save.
                     let mut reload_diff = false;
-                    if cfg.diff.show_stats != self.show_stats {
-                        self.show_stats = cfg.diff.show_stats;
-                        reload_diff = true;
-                    }
-                    if cfg.diff.detect_renames != self.diff_detect_renames {
-                        self.diff_detect_renames = cfg.diff.detect_renames;
-                        reload_diff = true;
-                    }
-                    if cfg.diff.detect_copies != self.diff_detect_copies {
-                        self.diff_detect_copies = cfg.diff.detect_copies;
-                        reload_diff = true;
-                    }
+                    reload_diff |= set_if_changed(&mut self.show_stats, cfg.diff.show_stats);
+                    reload_diff |=
+                        set_if_changed(&mut self.diff_detect_renames, cfg.diff.detect_renames);
+                    reload_diff |=
+                        set_if_changed(&mut self.diff_detect_copies, cfg.diff.detect_copies);
                     // The file-list layout is render-only (it doesn't touch diff data).
                     // Update it before any reload so the reload rebuilds the rows under
                     // the new layout in one pass; if nothing reloads, rebuild the rows
@@ -4078,13 +4085,7 @@ impl eframe::App for GitkApp {
             let current = epoch == self.diff_load_epoch.load(Ordering::Relaxed);
             match data {
                 Some(data) if current => {
-                    // Prefer an already-cached copy under this key over the freshly
-                    // computed one — a neighbour prefetch may have warmed (and
-                    // highlighted) the same commit while the worker ran, or an unchanged
-                    // virtual entry may still be cached — so we reuse that highlighting
-                    // instead of re-tokenizing.
-                    let data = self.diff_cache.remove(&key).unwrap_or(data);
-                    self.apply_loaded_diff(key, data);
+                    self.install_preferring_cache(key, data);
                 }
                 Some(data) => {
                     // Superseded but successfully computed. Cache real commits (immutable,
@@ -4861,17 +4862,10 @@ impl eframe::App for GitkApp {
                                     // (elide from the back, keeping the name's start).
                                     let elide_left = self.file_list == FileListLayout::Full;
                                     let mut scroll_to: Option<usize> = None;
-                                    // Breadcrumb dimming: each header dims the path it
-                                    // shares with the header drawn just above it.
-                                    let mut prev_header_dir: Option<&str> = None;
                                     for row in &self.file_rows {
                                         match row {
-                                            FileListRow::Header(dir) => {
-                                                let dim_len = prev_header_dir.map_or(0, |p| {
-                                                    common_dir_prefix_len(p, dir)
-                                                });
-                                                self.draw_dir_header(ui, dir, dim_len);
-                                                prev_header_dir = Some(dir);
+                                            FileListRow::Header { dir, dim_len } => {
+                                                self.draw_dir_header(ui, dir, *dim_len);
                                             }
                                             FileListRow::File {
                                                 idx,
@@ -6353,13 +6347,15 @@ mod tests {
     fn diff_cache_key_includes_theme_enabled_show_stats_and_content() {
         let key = |theme: &str, enabled: bool, show_stats: bool, content: u64| DiffCacheKey {
             oid: git2::Oid::ZERO_SHA1,
-            context: 3,
-            ignore_ws: false,
+            settings: DiffSettings {
+                context: 3,
+                ignore_ws: false,
+                show_stats,
+                detect_renames: false,
+                detect_copies: false,
+            },
             theme: theme.to_string(),
             enabled,
-            show_stats,
-            detect_renames: false,
-            detect_copies: false,
             content,
         };
         let mut c: DiffCache<DiffCacheKey, u32> = DiffCache::new(100);
@@ -6376,13 +6372,15 @@ mod tests {
     fn diff_cache_key_includes_detect_toggles() {
         let key = |detect_renames: bool, detect_copies: bool| DiffCacheKey {
             oid: git2::Oid::ZERO_SHA1,
-            context: 3,
-            ignore_ws: false,
+            settings: DiffSettings {
+                context: 3,
+                ignore_ws: false,
+                show_stats: true,
+                detect_renames,
+                detect_copies,
+            },
             theme: "dark".to_string(),
             enabled: true,
-            show_stats: true,
-            detect_renames,
-            detect_copies,
             content: 0,
         };
         let mut c: DiffCache<DiffCacheKey, u32> = DiffCache::new(100);
@@ -7185,7 +7183,7 @@ mod tests {
     fn build_file_rows_grouped_multibyte_dir() {
         let files = [("α/β.rs", None), ("α/γ.rs", None)];
         let rows = build_file_rows(&files, FileListLayout::Grouped);
-        assert!(matches!(&rows[0], FileListRow::Header(d) if d == "α/"));
+        assert!(matches!(&rows[0], FileListRow::Header { dir, .. } if dir == "α/"));
         assert_eq!(rows.len(), 3); // header + 2 files
     }
 
@@ -7280,7 +7278,7 @@ mod tests {
     /// Compact one row to a string for assertions.
     fn row_desc(r: &FileListRow) -> String {
         match r {
-            FileListRow::Header(d) => format!("H:{d}"),
+            FileListRow::Header { dir, .. } => format!("H:{dir}"),
             FileListRow::File { idx, label, indented } => {
                 format!("F:{idx}:{label}:{indented}")
             }
