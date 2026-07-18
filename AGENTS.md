@@ -84,9 +84,14 @@ parts run off the window-creation critical path:
   **Config is authoritative**: the checkboxes are a live session override seeded from config at
   `GitkApp::new`; a live config-file reload re-asserts the config value over any toolbar toggle,
   so saving a config change resets the toggle back. Unlike `diff_ignore_ws` (eframe-persisted
-  across restarts), these two are not persisted at all. Renamed/copied files render as
-  `old → new` in the file-list sidebar via `FileEntry.old_path` plus the `apply_rename_labels`
-  post-pass. **Known limitations**: working-tree rename detection is tracked-only —
+  across restarts), these two are not persisted at all. Renamed/copied files (`FileEntry.old_path`)
+  render git-style in the file-list sidebar via `rename_brace`, which factors out the parts common
+  to the old and new path at `/` boundaries and shows only the change in `{old ⇒ new}` braces —
+  `d/{Old.java ⇒ New.java}` (rename in place), `ui/{foo ⇒ baz}/Bar.java` (sibling move),
+  `ui/actions/{ ⇒ admin}/Panel.html` (moved into `admin/`). In `Grouped` layout the file is grouped
+  under the directory COMMON to old and new (the brace prefix), so a move reads clearly instead of
+  a bare `Panel.html → Panel.html`; `Full` shows the full braced path, `Name` the compact brace.
+  **Known limitations**: working-tree rename detection is tracked-only —
   `get_working_tree_diff` diffs index→workdir, so an untracked file never appears as an old-side
   delete for `find_similar` to match; and a rename whose old path falls outside an active
   pathspec (`gitkay … -- <path>`) can't be detected, since `apply_pathspec` filters the diff
@@ -131,6 +136,6 @@ resolution, rev-vs-path classification, LRU eviction).
 - `collect_refs` per commit is O(commits × refs) → precompute ref map once
 - Working-tree edits do not touch `.git`; refresh commits/diff on selection changes to keep virtual staged/uncommitted entries current without a recursive worktree watcher
 - Branch highlighting walks first-parent children upward, but all parents downward, so merge commits keep merged history highlighted
-- File-list sidebar is not row-virtualized — every row lays out each frame. `build_file_rows` (pure) turns paths into header/file rows per `[diff] file_list` (`grouped` sorts by full path, one header per directory); `left_elide` left-truncates labels, measuring the full string once and binary-searching only when it overflows
+- File-list sidebar is not row-virtualized — every row lays out each frame. `build_file_rows` (pure) turns `(new_path, Option<old_path>)` pairs into header/file rows per `[diff] file_list` (`grouped` = one header per directory, files sorted by label; renames/copies group under their `rename_brace` common directory); `left_elide` left-truncates labels, measuring the full string once and binary-searching only when it overflows. `grouped` directory headers are drawn breadcrumb-style (`draw_dir_header` + `common_dir_prefix_len`): the ancestor path a header shares with the header drawn just above it is dimmed (`SUBTEXT_DIM`) and the distinguishing tail is `SUBTEXT`, so deep trees don't repeat the same long prefix on every header
 - Any new diff-affecting setting must be added to **both** `DiffSettings` and `DiffCacheKey` (and `diff_cache_key()` / `diff_settings()` / the prefetch mapping) or cached diffs won't invalidate when it changes — `detect_renames`/`detect_copies` are keyed in both for this reason
 - `GitkApp::new` runs *during* window creation — eframe doesn't paint until it returns. Keep slow/IO-bound work (history walk, first diff) off it: prefetch on a thread or defer to the first `ui()` frame (see Startup & timing). The history walk's cost is cold first-touch IO, not the algorithm — don't "optimise" the walk; overlap it
