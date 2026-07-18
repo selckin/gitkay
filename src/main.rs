@@ -3963,474 +3963,12 @@ impl GitkApp {
         }
         if resp.clicked() { line_idx } else { None }
     }
-}
 
-impl eframe::App for GitkApp {
-    // Persist only the diff-panel splitter height (below), not the whole egui
-    // memory blob — persisting the blob would also restore scroll positions.
-    fn persist_egui_memory(&self) -> bool {
-        false
-    }
-
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, "commit_panel_height", &self.commit_panel_height);
-        eframe::set_value(storage, "file_list_width", &self.file_list_width);
-        eframe::set_value(storage, "diff_context", &self.diff_settings.context);
-        eframe::set_value(storage, "diff_ignore_ws", &self.diff_settings.ignore_ws);
-        eframe::set_value(storage, "word_diff", &self.word_diff);
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // 0.34 split App::update into ui/logic; we keep one body and take a cheap
-        // (Arc) clone of the Context so the existing ctx-based logic is unchanged,
-        // while the top-level panels attach to `ui` via show_inside.
-        let ctx = ui.ctx().clone();
-
-        // Deferred startup diff: paint the graph on the first frame, then compute the
-        // initial diff on the next one (load_selected_diff runs get_diff_data + arms
-        // async highlighting), so window creation isn't blocked on it. See StartupDiff.
-        match self.startup_diff {
-            StartupDiff::NeedsPaint => {
-                self.startup_diff = StartupDiff::NeedsLoad;
-                ctx.request_repaint(); // come back next frame to load the diff
-            }
-            StartupDiff::NeedsLoad => {
-                self.startup_diff = StartupDiff::Done;
-                let t = std::time::Instant::now();
-                self.load_selected_diff();
-                log::debug!("perf: startup: deferred first diff loaded {:?}", t.elapsed());
-            }
-            StartupDiff::Done => {}
-        }
-
-        // Apply deferred fonts once a cold fontdb scan finishes (it outlived window
-        // init). Until they land, keep waking at a modest cadence so the swap happens
-        // promptly — the off-thread builder has no Context handle to wake us itself.
-        if let Some(rx) = &self.pending_fonts {
-            match rx.try_recv() {
-                Ok((font_defs, _fonts, warnings)) => {
-                    ctx.set_fonts(font_defs);
-                    if !warnings.is_empty() {
-                        self.config_error_toast = Some(std::time::Instant::now());
-                    }
-                    self.pending_fonts = None;
-                    log::debug!("perf: startup: deferred fonts applied");
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(33));
-                }
-                Err(mpsc::TryRecvError::Disconnected) => self.pending_fonts = None, // builder died; keep defaults
-            }
-        }
-
-        // Auto-reload when git refs change, debounced: a new .git event (re)arms
-        // a timer, and the reload runs only once the writes settle. This collapses
-        // the burst of ref/index churn from a rebase or fetch into a single
-        // (synchronous) history walk instead of one per event.
-        if self.needs_reload.swap(false, Ordering::Relaxed) {
-            self.reload_armed_at = Some(std::time::Instant::now());
-        }
-        if let Some(armed) = self.reload_armed_at {
-            let elapsed = armed.elapsed();
-            if elapsed >= RELOAD_DEBOUNCE {
-                self.reload_armed_at = None;
-                if let Ok(repo) = Repository::discover(&self.repo_path) {
-                    self.reload_commits(&repo, None);
-                    self.load_selected_diff();
-                }
-            } else {
-                // Wake up when the debounce window closes to run the reload.
-                ctx.request_repaint_after(RELOAD_DEBOUNCE - elapsed);
-            }
-        }
-
-        // Live-reload fonts when the config file changes. On a parse error, keep
-        // the current fonts and flash a toast — never blank the UI.
-        if self.needs_config_reload.swap(false, Ordering::Relaxed)
-            && let Some(ref p) = self.config_path
-        {
-            match config::read_config(p) {
-                Ok(cfg) => {
-                    let (defs, fonts, warns) = config::build_fonts(&cfg);
-                    ctx.set_fonts(defs);
-                    self.fonts = fonts;
-                    let new_enabled = cfg.diff.syntax;
-                    let new_slug = cfg
-                        .diff
-                        .theme
-                        .clone()
-                        .unwrap_or_else(|| highlight::DEFAULT_THEME_SLUG.to_string());
-                    let (new_diff_bg, diff_bg_warnings) = resolve_diff_bg(&cfg.diff.bands);
-                    // Surface font + diff-background warnings (stderr now, toast
-                    // below) so config typos aren't silent on a headless desktop.
-                    let mut warned = !warns.is_empty();
-                    for w in &diff_bg_warnings {
-                        log::warn!("{w}");
-                        warned = true;
-                    }
-                    if new_enabled != self.syntax_enabled
-                        || new_slug != self.theme_slug
-                        || new_diff_bg != self.diff_bg
-                    {
-                        self.syntax_enabled = new_enabled;
-                        self.theme_slug = new_slug;
-                        self.diff_bg = new_diff_bg;
-                        // If syntax was just turned off, drop any in-flight prewarm
-                        // receiver: it would otherwise linger as a dead channel, and
-                        // on re-enable a still-warming thread could leave the diff
-                        // plain (the Empty branch returns and the thread's single
-                        // request_repaint already fired). Re-enabling then takes the
-                        // synchronous build path.
-                        if !self.syntax_enabled {
-                            self.prewarm_rx = None;
-                        }
-                        // Refresh the theme-derived palette (used by the syntax-off
-                        // render and as the pre-highlighter fallback) and rebuild
-                        // the highlighter for the new theme. When a highlighter
-                        // exists, take the palette from its rebuild so the theme
-                        // blob is loaded once, not twice; a new Arc leaves any
-                        // in-flight worker holding the old one valid. Either way
-                        // surface a bad-slug warning, regardless of syntax mode.
-                        let dp_warn = if let Some(old_hl) = self.highlighter.take() {
-                            let (new_hl, w) =
-                                old_hl.with_theme(&self.theme_slug, self.diff_bg);
-                            self.diff_palette = new_hl.palette().clone();
-                            self.highlighter = Some(Arc::new(new_hl));
-                            w
-                        } else {
-                            let (palette, w) =
-                                highlight::palette_for(&self.theme_slug, self.diff_bg);
-                            self.diff_palette = palette;
-                            w
-                        };
-                        if let Some(w) = dp_warn {
-                            log::warn!("{w}");
-                            warned = true;
-                        }
-                        // Re-highlight the visible diff under the new settings.
-                        // Reset live spans to None so the worker re-colours every
-                        // file (the skip-done filter would otherwise keep the old
-                        // theme's colours), preserving the invariant that a `Some`
-                        // spans value always reflects the current (theme, enabled).
-                        for line in &mut self.diff_lines {
-                            line.spans = None;
-                        }
-                        // Re-key the live diff so its eventual stash lands under
-                        // the new theme/enabled, not the old key.
-                        let (rekey_theme, rekey_enabled) =
-                            (self.theme_slug.clone(), self.syntax_enabled);
-                        if let Some(key) = &mut self.current_diff_key {
-                            key.theme = rekey_theme;
-                            key.enabled = rekey_enabled;
-                        }
-                        // Bumps the generation so an in-flight old-theme worker's
-                        // queued spans are dropped, not applied for a frame.
-                        self.invalidate_diff_highlight();
-                    }
-                    // show_stats and rename/copy detection all change the diff DATA
-                    // (stat lines appear/vanish; renamed files coalesce), so a change
-                    // to any needs a full rebuild, not just a re-highlight. Update the
-                    // fields first so the rebuild keys/builds under the new values; the
-                    // new cache key misses and rebuilds, stale entries evict. Config is
-                    // authoritative for the detection toggles — this re-asserts the
-                    // config value over any live toolbar toggle (a session override
-                    // that also resets on launch; config wins). Reload at most once,
-                    // even when several of these flip in the same save.
-                    // Config owns show_stats + rename/copy detection; context/ignore_ws are
-                    // toolbar-owned, so keep them (`..`). Comparing the whole DiffSettings
-                    // means a field added to it can't silently skip the reload.
-                    let new_settings = DiffSettings {
-                        show_stats: cfg.diff.show_stats,
-                        detect_renames: cfg.diff.detect_renames,
-                        detect_copies: cfg.diff.detect_copies,
-                        ..self.diff_settings
-                    };
-                    let reload_diff = new_settings != self.diff_settings;
-                    self.diff_settings = new_settings;
-                    // The file-list layout is render-only (it doesn't touch diff data).
-                    // Update it before any reload so the reload rebuilds the rows under
-                    // the new layout in one pass; if nothing reloads, rebuild the rows
-                    // here for a layout-only change.
-                    let layout_changed = set_if_changed(&mut self.file_list, cfg.diff.file_list);
-                    if reload_diff {
-                        self.load_selected_diff();
-                    } else if layout_changed {
-                        self.rebuild_file_rows();
-                    }
-                    self.config_error_toast = warned.then(std::time::Instant::now);
-                }
-                Err(e) => {
-                    log::warn!("{e}");
-                    self.config_error_toast = Some(std::time::Instant::now());
-                }
-            }
-        }
-
-        // Install a finished async diff load (the selected commit's diff, computed off
-        // the UI thread). Only the latest dispatch's result is displayed; an older one
-        // (the user moved on) fails the epoch check — but if it computed successfully we
-        // still cache it, so returning to that commit is instant instead of recomputing.
-        while let Ok(result) = self.diff_load_rx.try_recv() {
-            let DiffLoadResult { epoch, key, data } = result;
-            let current = self.diff_load_epoch.is_current(epoch);
-            match data {
-                Some(data) if current => {
-                    self.install_preferring_cache(key, data);
-                }
-                Some(data) => {
-                    // Superseded but successfully computed. Cache real commits (immutable,
-                    // so always valid) without clobbering an existing (possibly already
-                    // highlighted) entry; skip virtual entries, whose content-keyed result
-                    // may already be stale.
-                    if is_real_commit(key.oid) && !self.diff_cache.contains(&key) {
-                        let weight = data.lines.len();
-                        self.diff_cache.insert(key, data, weight);
-                    }
-                }
-                None if current => {
-                    // The current load failed (the repo was momentarily unavailable).
-                    // Stop the spinner and clear the pane — keeping the previous commit's
-                    // diff would misattribute it to the now-selected commit. Stash it
-                    // first so a revisit is instant; re-selecting this commit retries.
-                    self.diff_load_started_at = None;
-                    self.stash_current_diff();
-                    self.clear_diff_pane();
-                }
-                None => {} // a superseded failure: nothing to do
-            }
-        }
-
-        // Apply finished background-highlight results (one batch per file) for
-        // the current diff; drop stale ones (the diff or theme changed since the
-        // worker was spawned).
-        let mut applied_highlight = false;
-        while let Ok(batch) = self.highlight_rx.try_recv() {
-            if self.diff_generation.is_current(batch.generation) {
-                for (i, spans) in batch.lines {
-                    if let Some(line) = self.diff_lines.get_mut(i) {
-                        line.spans = Some(spans);
-                    }
-                }
-                applied_highlight = true;
-            }
-        }
-        self.ensure_diff_highlighted(&ctx);
-
-        // Apply prefetched neighbour diffs into the cache. Skip one that became the
-        // live diff in the meantime (load_selected_diff owns that key), and drop one
-        // whose settings no longer match the current ones: a prefetch dispatched under
-        // an old context/theme/etc finishes with a key pinning those old settings, so
-        // it could never be hit again and would only bloat the LRU. (Settings unchanged
-        // but selection moved still matches — those neighbour diffs stay useful.)
-        while let Ok((key, data)) = self.prefetch_rx.try_recv() {
-            if key == self.diff_cache_key(key.oid) && self.current_diff_key.as_ref() != Some(&key) {
-                let weight = data.lines.len();
-                self.diff_cache.insert(key, data, weight);
-            }
-        }
-        // Once the current diff is fully coloured, warm the visible commit window
-        // (closest-to-selected first), once per settled diff. Syntax-enabled only.
-        if self.syntax_enabled {
-            let current_gen = self.diff_generation.current();
-            // diff_fully_highlighted is O(lines); it can only flip to true when new
-            // spans arrive (a batch was applied) or a fresh diff loaded. Skipping
-            // the scan on the other repaints during the highlight window (scroll,
-            // hover) avoids re-scanning the whole diff for nothing.
-            let maybe_settled =
-                applied_highlight || self.last_highlight_check_gen != current_gen;
-            if self.prefetched_gen != current_gen && maybe_settled {
-                self.last_highlight_check_gen = current_gen;
-                if diff_fully_highlighted(&self.diff_lines, &self.diff_files) {
-                    self.prefetched_gen = current_gen;
-                    self.dispatch_prefetch(&ctx);
-                }
-            }
-        }
-
+    fn show_commit_list(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let row_height = 20.0;
         let col_width = 12.0;
         let dot_radius = 3.5;
         let max_graph_cols = 20;
-
-        let search_id = egui::Id::new("search_field");
-
-        // Any printable keypress when search bar is not focused → focus it. The literal
-        // Space is the one exception: it's the diff page-scroll key, so it must not open
-        // search (you'd never start a search with a leading space anyway). Only ' ' is
-        // excluded — other whitespace (Tab, NBSP, …) still focuses and types normally.
-        let mut search_has_focus = ctx.memory(|m| m.has_focus(search_id));
-        if !search_has_focus {
-            let has_text_event = ctx.input(|i| {
-                i.events
-                    .iter()
-                    .any(|e| matches!(e, egui::Event::Text(t) if !t.is_empty() && t.as_str() != " "))
-            });
-            if has_text_event {
-                ctx.memory_mut(|m| m.request_focus(search_id));
-                // Focus takes effect this frame; route keys to search accordingly.
-                search_has_focus = true;
-            }
-        }
-
-        // Up/Down: cycle through search matches when the search bar is focused,
-        // otherwise move the commit-list selection (view follows minimally).
-        let arrow_delta: isize = ctx.input_mut(|i| {
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
-                1
-            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
-                -1
-            } else {
-                0
-            }
-        });
-        if arrow_delta != 0 {
-            if search_has_focus {
-                if !self.search_matches.is_empty() {
-                    let len = self.search_matches.len() as isize;
-                    self.search_cursor =
-                        (self.search_cursor as isize + arrow_delta).rem_euclid(len) as usize;
-                    // Cycle to the match without reloading the whole history: the
-                    // match index is already valid for the current commit list.
-                    let idx = self.search_matches[self.search_cursor];
-                    self.select_loaded(idx);
-                    self.graph_scroll_to = Some((idx, Some(egui::Align::Center)));
-                }
-            } else if !self.commits.is_empty() {
-                let last = self.commits.len() as isize - 1;
-                let new = match self.selected {
-                    Some(s) => (s as isize + arrow_delta).clamp(0, last) as usize,
-                    None => 0,
-                };
-                if Some(new) != self.selected {
-                    self.select_loaded(new);
-                    self.graph_scroll_to = Some((new, None));
-                }
-            }
-        }
-
-        // PageDown / PageUp: jump to the next / previous file in the diff. Handled
-        // even while the search field is focused — a single-line field has no use for
-        // these keys. Skipped when a commit switch already queued a scroll reset this
-        // frame (diff_scroll_to set), so the new commit's diff still opens at the top.
-        let page_delta: isize = ctx.input_mut(|i| {
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown) {
-                1
-            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp) {
-                -1
-            } else {
-                0
-            }
-        });
-        if page_delta != 0 && self.diff_scroll_to.is_none() {
-            // Step from the live top: the diff's bottom padding lets any file scroll to
-            // the top, so `top` always reflects a reachable position (no clamp to work
-            // around) and a manual scroll is honoured.
-            let top = self.diff_top_line.load(Ordering::Relaxed);
-            if let Some(line) =
-                next_file_line(&self.diff_files, self.diff_lines.len(), top, page_delta > 0)
-            {
-                self.diff_scroll_to = Some(line);
-            }
-        }
-
-        // Space / Shift+Space: scroll the diff down / up by ~a page. Only when no
-        // widget has keyboard focus, so it doesn't steal Space from the search field
-        // or a toolbar checkbox (where Space types / toggles).
-        let space_dir: isize = if ctx.memory(|m| m.focused().is_none()) {
-            ctx.input_mut(|i| {
-                if i.consume_key(egui::Modifiers::NONE, egui::Key::Space) {
-                    1
-                } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::Space) {
-                    -1
-                } else {
-                    0
-                }
-            })
-        } else {
-            0
-        };
-        if space_dir != 0 && self.diff_scroll_to.is_none() && !self.diff_lines.is_empty() {
-            let top = self.diff_top_line.load(Ordering::Relaxed);
-            // Half a viewport per press — enough to advance, little enough to keep
-            // context (a full page scrolls away almost everything you were reading).
-            let page = (self.diff_visible_rows.load(Ordering::Relaxed) / 2).max(1);
-            let new_top = if space_dir > 0 {
-                (top + page).min(self.diff_lines.len())
-            } else {
-                top.saturating_sub(page)
-            };
-            self.diff_scroll_to = Some(new_top);
-        }
-
-        // ── Top panel: search bar ──
-        egui::Panel::top("search_panel")
-            .exact_size(28.0)
-            .show_inside(ui, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.label(egui::RichText::new("🔍").size(14.0));
-                    let avail = ui.available_width() - 120.0; // leave space for match count
-                    let ui_font = self.fonts.font_id(Role::Ui);
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.search_text)
-                            .id(search_id)
-                            .desired_width(avail.max(100.0))
-                            .hint_text("Search SHA, author, message...")
-                            .font(ui_font),
-                    );
-                    if resp.changed() {
-                        self.search_cursor = 0;
-                        self.refresh_search_matches();
-                        // Jump to the first match. It's already a valid index into the
-                        // current list (just built), so select it directly + center —
-                        // no full reload/relayout (refresh_for_selection) needed.
-                        if let Some(&idx) = self.search_matches.first() {
-                            self.select_loaded(idx);
-                            self.graph_scroll_to = Some((idx, Some(egui::Align::Center)));
-                        }
-                    }
-                    // Enter cycles through matches
-                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        if !self.search_matches.is_empty() {
-                            self.search_cursor =
-                                (self.search_cursor + 1) % self.search_matches.len();
-                            let idx = self.search_matches[self.search_cursor];
-                            self.select_loaded(idx);
-                            self.graph_scroll_to = Some((idx, Some(egui::Align::Center)));
-                        }
-                        resp.request_focus();
-                    }
-                    let ui_font = self.fonts.font_id(Role::Ui);
-                    if !self.search_matches.is_empty() {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{}/{}",
-                                self.search_cursor + 1,
-                                self.search_matches.len()
-                            ))
-                            .color(SUBTEXT)
-                            .font(self.fonts.font_id(Role::Ui)),
-                        );
-                    }
-                    // Copied toast
-                    show_toast(
-                        ui,
-                        &mut self.copied_toast,
-                        2.0,
-                        "SHA copied!",
-                        GREEN,
-                        ui_font.clone(),
-                    );
-                    // Config-error toast
-                    show_toast(
-                        ui,
-                        &mut self.config_error_toast,
-                        4.0,
-                        "config error — see terminal",
-                        RED,
-                        ui_font,
-                    );
-                });
-            });
 
         // ── Commit list: a resizable top panel. egui remembers its height
         // across window resizes, so growing the window grows the diff (the
@@ -4451,34 +3989,19 @@ impl eframe::App for GitkApp {
                     (self.graph_max_cols.min(max_graph_cols) as f32) * col_width + 8.0
                 };
 
-                let panel_height = ui.available_height();
                 let graph_scroll_to = self.graph_scroll_to.take();
+                // Virtualize with egui show_rows (same as the diff pane): it reserves the
+                // full virtual height and hands back the visible row range. An early-egui
+                // bottom-gap bug once forced manual pre/post spacers here; that's fixed as
+                // of 0.34, so there's no manual spacing to keep in sync anymore.
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        // Total content height
-                        let total_content = num_commits as f32 * row_height;
-                        let total_height = total_content.max(panel_height);
-
-                        // Spacer before visible rows
-                        let scroll_offset = ui.clip_rect().min.y - ui.cursor().min.y;
-                        // Clamp to num_commits: if the list shrank below the retained
-                        // scroll position (a reload to fewer rows before egui re-clamps
-                        // the offset), an unclamped first_row > num_commits would make
-                        // last_row < first_row and underflow the unsigned subtraction.
-                        let first_row =
-                            ((scroll_offset / row_height).floor().max(0.0) as usize).min(num_commits);
-                        let visible_rows = (panel_height / row_height).ceil() as usize + 2;
-                        let last_row = (first_row + visible_rows).min(num_commits);
-                        let row_range = first_row..last_row;
+                    .show_rows(ui, row_height, num_commits, |ui, row_range| {
+                        let first_row = row_range.start;
+                        let last_row = row_range.end;
                         // Remember the visible rows so the prefetcher can warm them
                         // (read next frame, before this panel renders again).
                         self.commit_view_range = row_range.clone();
-
-                        // Pre-spacer
-                        if first_row > 0 {
-                            ui.allocate_space(egui::vec2(0.0, first_row as f32 * row_height));
-                        }
 
                         let rows_height = last_row.saturating_sub(first_row) as f32 * row_height;
                         let (response, painter) = ui.allocate_painter(
@@ -4766,13 +4289,6 @@ impl eframe::App for GitkApp {
                             ui.scroll_to_rect(target_rect, align);
                         }
 
-                        // Post-spacer to maintain correct total scroll height
-                        let drawn_bottom = last_row as f32 * row_height;
-                        let remaining = total_height - drawn_bottom;
-                        if remaining > 0.0 {
-                            ui.allocate_space(egui::vec2(0.0, remaining));
-                        }
-
                         // Lazy load: when near the bottom, load more commits. Route
                         // through resync_commits (same as a full reload) so search
                         // matches, the selection, and branch highlight track the new
@@ -4803,6 +4319,473 @@ impl eframe::App for GitkApp {
         {
             self.commit_panel_height = commit_panel.response.rect.height();
         }
+    }
+}
+
+impl eframe::App for GitkApp {
+    // Persist only the diff-panel splitter height (below), not the whole egui
+    // memory blob — persisting the blob would also restore scroll positions.
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, "commit_panel_height", &self.commit_panel_height);
+        eframe::set_value(storage, "file_list_width", &self.file_list_width);
+        eframe::set_value(storage, "diff_context", &self.diff_settings.context);
+        eframe::set_value(storage, "diff_ignore_ws", &self.diff_settings.ignore_ws);
+        eframe::set_value(storage, "word_diff", &self.word_diff);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 0.34 split App::update into ui/logic; we keep one body and take a cheap
+        // (Arc) clone of the Context so the existing ctx-based logic is unchanged,
+        // while the top-level panels attach to `ui` via show_inside.
+        let ctx = ui.ctx().clone();
+
+        // Deferred startup diff: paint the graph on the first frame, then compute the
+        // initial diff on the next one (load_selected_diff runs get_diff_data + arms
+        // async highlighting), so window creation isn't blocked on it. See StartupDiff.
+        match self.startup_diff {
+            StartupDiff::NeedsPaint => {
+                self.startup_diff = StartupDiff::NeedsLoad;
+                ctx.request_repaint(); // come back next frame to load the diff
+            }
+            StartupDiff::NeedsLoad => {
+                self.startup_diff = StartupDiff::Done;
+                let t = std::time::Instant::now();
+                self.load_selected_diff();
+                log::debug!("perf: startup: deferred first diff loaded {:?}", t.elapsed());
+            }
+            StartupDiff::Done => {}
+        }
+
+        // Apply deferred fonts once a cold fontdb scan finishes (it outlived window
+        // init). Until they land, keep waking at a modest cadence so the swap happens
+        // promptly — the off-thread builder has no Context handle to wake us itself.
+        if let Some(rx) = &self.pending_fonts {
+            match rx.try_recv() {
+                Ok((font_defs, _fonts, warnings)) => {
+                    ctx.set_fonts(font_defs);
+                    if !warnings.is_empty() {
+                        self.config_error_toast = Some(std::time::Instant::now());
+                    }
+                    self.pending_fonts = None;
+                    log::debug!("perf: startup: deferred fonts applied");
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(33));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.pending_fonts = None, // builder died; keep defaults
+            }
+        }
+
+        // Auto-reload when git refs change, debounced: a new .git event (re)arms
+        // a timer, and the reload runs only once the writes settle. This collapses
+        // the burst of ref/index churn from a rebase or fetch into a single
+        // (synchronous) history walk instead of one per event.
+        if self.needs_reload.swap(false, Ordering::Relaxed) {
+            self.reload_armed_at = Some(std::time::Instant::now());
+        }
+        if let Some(armed) = self.reload_armed_at {
+            let elapsed = armed.elapsed();
+            if elapsed >= RELOAD_DEBOUNCE {
+                self.reload_armed_at = None;
+                if let Ok(repo) = Repository::discover(&self.repo_path) {
+                    self.reload_commits(&repo, None);
+                    self.load_selected_diff();
+                }
+            } else {
+                // Wake up when the debounce window closes to run the reload.
+                ctx.request_repaint_after(RELOAD_DEBOUNCE - elapsed);
+            }
+        }
+
+        // Live-reload fonts when the config file changes. On a parse error, keep
+        // the current fonts and flash a toast — never blank the UI.
+        if self.needs_config_reload.swap(false, Ordering::Relaxed)
+            && let Some(ref p) = self.config_path
+        {
+            match config::read_config(p) {
+                Ok(cfg) => {
+                    let (defs, fonts, warns) = config::build_fonts(&cfg);
+                    ctx.set_fonts(defs);
+                    self.fonts = fonts;
+                    let new_enabled = cfg.diff.syntax;
+                    let new_slug = cfg
+                        .diff
+                        .theme
+                        .clone()
+                        .unwrap_or_else(|| highlight::DEFAULT_THEME_SLUG.to_string());
+                    let (new_diff_bg, diff_bg_warnings) = resolve_diff_bg(&cfg.diff.bands);
+                    // Surface font + diff-background warnings (stderr now, toast
+                    // below) so config typos aren't silent on a headless desktop.
+                    let mut warned = !warns.is_empty();
+                    for w in &diff_bg_warnings {
+                        log::warn!("{w}");
+                        warned = true;
+                    }
+                    if new_enabled != self.syntax_enabled
+                        || new_slug != self.theme_slug
+                        || new_diff_bg != self.diff_bg
+                    {
+                        self.syntax_enabled = new_enabled;
+                        self.theme_slug = new_slug;
+                        self.diff_bg = new_diff_bg;
+                        // If syntax was just turned off, drop any in-flight prewarm
+                        // receiver: it would otherwise linger as a dead channel, and
+                        // on re-enable a still-warming thread could leave the diff
+                        // plain (the Empty branch returns and the thread's single
+                        // request_repaint already fired). Re-enabling then takes the
+                        // synchronous build path.
+                        if !self.syntax_enabled {
+                            self.prewarm_rx = None;
+                        }
+                        // Refresh the theme-derived palette (used by the syntax-off
+                        // render and as the pre-highlighter fallback) and rebuild
+                        // the highlighter for the new theme. When a highlighter
+                        // exists, take the palette from its rebuild so the theme
+                        // blob is loaded once, not twice; a new Arc leaves any
+                        // in-flight worker holding the old one valid. Either way
+                        // surface a bad-slug warning, regardless of syntax mode.
+                        let dp_warn = if let Some(old_hl) = self.highlighter.take() {
+                            let (new_hl, w) =
+                                old_hl.with_theme(&self.theme_slug, self.diff_bg);
+                            self.diff_palette = new_hl.palette().clone();
+                            self.highlighter = Some(Arc::new(new_hl));
+                            w
+                        } else {
+                            let (palette, w) =
+                                highlight::palette_for(&self.theme_slug, self.diff_bg);
+                            self.diff_palette = palette;
+                            w
+                        };
+                        if let Some(w) = dp_warn {
+                            log::warn!("{w}");
+                            warned = true;
+                        }
+                        // Re-highlight the visible diff under the new settings.
+                        // Reset live spans to None so the worker re-colours every
+                        // file (the skip-done filter would otherwise keep the old
+                        // theme's colours), preserving the invariant that a `Some`
+                        // spans value always reflects the current (theme, enabled).
+                        for line in &mut self.diff_lines {
+                            line.spans = None;
+                        }
+                        // Re-key the live diff so its eventual stash lands under
+                        // the new theme/enabled, not the old key.
+                        let (rekey_theme, rekey_enabled) =
+                            (self.theme_slug.clone(), self.syntax_enabled);
+                        if let Some(key) = &mut self.current_diff_key {
+                            key.theme = rekey_theme;
+                            key.enabled = rekey_enabled;
+                        }
+                        // Bumps the generation so an in-flight old-theme worker's
+                        // queued spans are dropped, not applied for a frame.
+                        self.invalidate_diff_highlight();
+                    }
+                    // show_stats and rename/copy detection all change the diff DATA
+                    // (stat lines appear/vanish; renamed files coalesce), so a change
+                    // to any needs a full rebuild, not just a re-highlight. Update the
+                    // fields first so the rebuild keys/builds under the new values; the
+                    // new cache key misses and rebuilds, stale entries evict. Config is
+                    // authoritative for the detection toggles — this re-asserts the
+                    // config value over any live toolbar toggle (a session override
+                    // that also resets on launch; config wins). Reload at most once,
+                    // even when several of these flip in the same save.
+                    // Config owns show_stats + rename/copy detection; context/ignore_ws are
+                    // toolbar-owned, so keep them (`..`). Comparing the whole DiffSettings
+                    // means a field added to it can't silently skip the reload.
+                    let new_settings = DiffSettings {
+                        show_stats: cfg.diff.show_stats,
+                        detect_renames: cfg.diff.detect_renames,
+                        detect_copies: cfg.diff.detect_copies,
+                        ..self.diff_settings
+                    };
+                    let reload_diff = new_settings != self.diff_settings;
+                    self.diff_settings = new_settings;
+                    // The file-list layout is render-only (it doesn't touch diff data).
+                    // Update it before any reload so the reload rebuilds the rows under
+                    // the new layout in one pass; if nothing reloads, rebuild the rows
+                    // here for a layout-only change.
+                    let layout_changed = set_if_changed(&mut self.file_list, cfg.diff.file_list);
+                    if reload_diff {
+                        self.load_selected_diff();
+                    } else if layout_changed {
+                        self.rebuild_file_rows();
+                    }
+                    self.config_error_toast = warned.then(std::time::Instant::now);
+                }
+                Err(e) => {
+                    log::warn!("{e}");
+                    self.config_error_toast = Some(std::time::Instant::now());
+                }
+            }
+        }
+
+        // Install a finished async diff load (the selected commit's diff, computed off
+        // the UI thread). Only the latest dispatch's result is displayed; an older one
+        // (the user moved on) fails the epoch check — but if it computed successfully we
+        // still cache it, so returning to that commit is instant instead of recomputing.
+        while let Ok(result) = self.diff_load_rx.try_recv() {
+            let DiffLoadResult { epoch, key, data } = result;
+            let current = self.diff_load_epoch.is_current(epoch);
+            match data {
+                Some(data) if current => {
+                    self.install_preferring_cache(key, data);
+                }
+                Some(data) => {
+                    // Superseded but successfully computed. Cache real commits (immutable,
+                    // so always valid) without clobbering an existing (possibly already
+                    // highlighted) entry; skip virtual entries, whose content-keyed result
+                    // may already be stale.
+                    if is_real_commit(key.oid) && !self.diff_cache.contains(&key) {
+                        let weight = data.lines.len();
+                        self.diff_cache.insert(key, data, weight);
+                    }
+                }
+                None if current => {
+                    // The current load failed (the repo was momentarily unavailable).
+                    // Stop the spinner and clear the pane — keeping the previous commit's
+                    // diff would misattribute it to the now-selected commit. Stash it
+                    // first so a revisit is instant; re-selecting this commit retries.
+                    self.diff_load_started_at = None;
+                    self.stash_current_diff();
+                    self.clear_diff_pane();
+                }
+                None => {} // a superseded failure: nothing to do
+            }
+        }
+
+        // Apply finished background-highlight results (one batch per file) for
+        // the current diff; drop stale ones (the diff or theme changed since the
+        // worker was spawned).
+        let mut applied_highlight = false;
+        while let Ok(batch) = self.highlight_rx.try_recv() {
+            if self.diff_generation.is_current(batch.generation) {
+                for (i, spans) in batch.lines {
+                    if let Some(line) = self.diff_lines.get_mut(i) {
+                        line.spans = Some(spans);
+                    }
+                }
+                applied_highlight = true;
+            }
+        }
+        self.ensure_diff_highlighted(&ctx);
+
+        // Apply prefetched neighbour diffs into the cache. Skip one that became the
+        // live diff in the meantime (load_selected_diff owns that key), and drop one
+        // whose settings no longer match the current ones: a prefetch dispatched under
+        // an old context/theme/etc finishes with a key pinning those old settings, so
+        // it could never be hit again and would only bloat the LRU. (Settings unchanged
+        // but selection moved still matches — those neighbour diffs stay useful.)
+        while let Ok((key, data)) = self.prefetch_rx.try_recv() {
+            if key == self.diff_cache_key(key.oid) && self.current_diff_key.as_ref() != Some(&key) {
+                let weight = data.lines.len();
+                self.diff_cache.insert(key, data, weight);
+            }
+        }
+        // Once the current diff is fully coloured, warm the visible commit window
+        // (closest-to-selected first), once per settled diff. Syntax-enabled only.
+        if self.syntax_enabled {
+            let current_gen = self.diff_generation.current();
+            // diff_fully_highlighted is O(lines); it can only flip to true when new
+            // spans arrive (a batch was applied) or a fresh diff loaded. Skipping
+            // the scan on the other repaints during the highlight window (scroll,
+            // hover) avoids re-scanning the whole diff for nothing.
+            let maybe_settled =
+                applied_highlight || self.last_highlight_check_gen != current_gen;
+            if self.prefetched_gen != current_gen && maybe_settled {
+                self.last_highlight_check_gen = current_gen;
+                if diff_fully_highlighted(&self.diff_lines, &self.diff_files) {
+                    self.prefetched_gen = current_gen;
+                    self.dispatch_prefetch(&ctx);
+                }
+            }
+        }
+
+
+        let search_id = egui::Id::new("search_field");
+
+        // Any printable keypress when search bar is not focused → focus it. The literal
+        // Space is the one exception: it's the diff page-scroll key, so it must not open
+        // search (you'd never start a search with a leading space anyway). Only ' ' is
+        // excluded — other whitespace (Tab, NBSP, …) still focuses and types normally.
+        let mut search_has_focus = ctx.memory(|m| m.has_focus(search_id));
+        if !search_has_focus {
+            let has_text_event = ctx.input(|i| {
+                i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Text(t) if !t.is_empty() && t.as_str() != " "))
+            });
+            if has_text_event {
+                ctx.memory_mut(|m| m.request_focus(search_id));
+                // Focus takes effect this frame; route keys to search accordingly.
+                search_has_focus = true;
+            }
+        }
+
+        // Up/Down: cycle through search matches when the search bar is focused,
+        // otherwise move the commit-list selection (view follows minimally).
+        let arrow_delta: isize = ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                1
+            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                -1
+            } else {
+                0
+            }
+        });
+        if arrow_delta != 0 {
+            if search_has_focus {
+                if !self.search_matches.is_empty() {
+                    let len = self.search_matches.len() as isize;
+                    self.search_cursor =
+                        (self.search_cursor as isize + arrow_delta).rem_euclid(len) as usize;
+                    // Cycle to the match without reloading the whole history: the
+                    // match index is already valid for the current commit list.
+                    let idx = self.search_matches[self.search_cursor];
+                    self.select_loaded(idx);
+                    self.graph_scroll_to = Some((idx, Some(egui::Align::Center)));
+                }
+            } else if !self.commits.is_empty() {
+                let last = self.commits.len() as isize - 1;
+                let new = match self.selected {
+                    Some(s) => (s as isize + arrow_delta).clamp(0, last) as usize,
+                    None => 0,
+                };
+                if Some(new) != self.selected {
+                    self.select_loaded(new);
+                    self.graph_scroll_to = Some((new, None));
+                }
+            }
+        }
+
+        // PageDown / PageUp: jump to the next / previous file in the diff. Handled
+        // even while the search field is focused — a single-line field has no use for
+        // these keys. Skipped when a commit switch already queued a scroll reset this
+        // frame (diff_scroll_to set), so the new commit's diff still opens at the top.
+        let page_delta: isize = ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown) {
+                1
+            } else if i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp) {
+                -1
+            } else {
+                0
+            }
+        });
+        if page_delta != 0 && self.diff_scroll_to.is_none() {
+            // Step from the live top: the diff's bottom padding lets any file scroll to
+            // the top, so `top` always reflects a reachable position (no clamp to work
+            // around) and a manual scroll is honoured.
+            let top = self.diff_top_line.load(Ordering::Relaxed);
+            if let Some(line) =
+                next_file_line(&self.diff_files, self.diff_lines.len(), top, page_delta > 0)
+            {
+                self.diff_scroll_to = Some(line);
+            }
+        }
+
+        // Space / Shift+Space: scroll the diff down / up by ~a page. Only when no
+        // widget has keyboard focus, so it doesn't steal Space from the search field
+        // or a toolbar checkbox (where Space types / toggles).
+        let space_dir: isize = if ctx.memory(|m| m.focused().is_none()) {
+            ctx.input_mut(|i| {
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::Space) {
+                    1
+                } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::Space) {
+                    -1
+                } else {
+                    0
+                }
+            })
+        } else {
+            0
+        };
+        if space_dir != 0 && self.diff_scroll_to.is_none() && !self.diff_lines.is_empty() {
+            let top = self.diff_top_line.load(Ordering::Relaxed);
+            // Half a viewport per press — enough to advance, little enough to keep
+            // context (a full page scrolls away almost everything you were reading).
+            let page = (self.diff_visible_rows.load(Ordering::Relaxed) / 2).max(1);
+            let new_top = if space_dir > 0 {
+                (top + page).min(self.diff_lines.len())
+            } else {
+                top.saturating_sub(page)
+            };
+            self.diff_scroll_to = Some(new_top);
+        }
+
+        // ── Top panel: search bar ──
+        egui::Panel::top("search_panel")
+            .exact_size(28.0)
+            .show_inside(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.label(egui::RichText::new("🔍").size(14.0));
+                    let avail = ui.available_width() - 120.0; // leave space for match count
+                    let ui_font = self.fonts.font_id(Role::Ui);
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.search_text)
+                            .id(search_id)
+                            .desired_width(avail.max(100.0))
+                            .hint_text("Search SHA, author, message...")
+                            .font(ui_font),
+                    );
+                    if resp.changed() {
+                        self.search_cursor = 0;
+                        self.refresh_search_matches();
+                        // Jump to the first match. It's already a valid index into the
+                        // current list (just built), so select it directly + center —
+                        // no full reload/relayout (refresh_for_selection) needed.
+                        if let Some(&idx) = self.search_matches.first() {
+                            self.select_loaded(idx);
+                            self.graph_scroll_to = Some((idx, Some(egui::Align::Center)));
+                        }
+                    }
+                    // Enter cycles through matches
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        if !self.search_matches.is_empty() {
+                            self.search_cursor =
+                                (self.search_cursor + 1) % self.search_matches.len();
+                            let idx = self.search_matches[self.search_cursor];
+                            self.select_loaded(idx);
+                            self.graph_scroll_to = Some((idx, Some(egui::Align::Center)));
+                        }
+                        resp.request_focus();
+                    }
+                    let ui_font = self.fonts.font_id(Role::Ui);
+                    if !self.search_matches.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{}/{}",
+                                self.search_cursor + 1,
+                                self.search_matches.len()
+                            ))
+                            .color(SUBTEXT)
+                            .font(self.fonts.font_id(Role::Ui)),
+                        );
+                    }
+                    // Copied toast
+                    show_toast(
+                        ui,
+                        &mut self.copied_toast,
+                        2.0,
+                        "SHA copied!",
+                        GREEN,
+                        ui_font.clone(),
+                    );
+                    // Config-error toast
+                    show_toast(
+                        ui,
+                        &mut self.config_error_toast,
+                        4.0,
+                        "config error — see terminal",
+                        RED,
+                        ui_font,
+                    );
+                });
+            });
+
+        self.show_commit_list(ui, &ctx);
 
         // ── Diff view: the central panel, so it fills the height left below
         // the commit list and absorbs window resizes. ──

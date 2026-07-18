@@ -99,7 +99,7 @@ parts run off the window-creation critical path:
 
 ### UI (egui immediate mode)
 - **Top panel**: search bar (SHA/author/message/ref), Enter cycles matches, any keypress focuses search, graph auto-scrolls to match
-- **Central panel**: commit graph + list. Manual virtual scrolling (pre-spacer, painter, post-spacer). Lazy loading (200 initial, +500 on scroll-near-bottom)
+- **Central panel**: commit graph + list (`show_commit_list`), virtualized with egui `show_rows` (same mechanism as the diff pane). Lazy loading (200 initial, +500 on scroll-near-bottom)
 - **Bottom panel**: diff view (left, syntax-highlighted) + file list sidebar (right, dynamic width)
 - **Rename/copy detection**: `detect_similar` (`git2::Diff::find_similar`) runs as a post-pass in
   `get_diff_data`, `get_working_tree_diff`, and `get_staged_diff`, coalescing an add+delete pair
@@ -154,7 +154,7 @@ resolution, rev-vs-path classification, LRU eviction).
 
 ## Common Pitfalls
 
-- egui `show_rows` leaves a gap → manual virtualization with pre/post spacers
+- Both scrolled lists (commit list + diff pane) virtualize with egui `show_rows`. An early-egui bottom-gap bug once forced manual pre/post spacers on the commit list; that's fixed as of 0.34 (verified — no gap at end-of-list / few commits / on resize), so `show_rows` is used throughout. Don't reintroduce manual spacers.
 - `layout_no_wrap` + `with_clip_rect` for text truncation (egui `layout()` wraps)
 - Lane colors: track per-pipe, not per-column, or colors change on shifts
 - Two branches → same parent: both keep lanes, convergence at parent row
