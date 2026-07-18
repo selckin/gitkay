@@ -40,14 +40,17 @@ fn word_tokens(s: &str) -> Vec<(Range<usize>, &str)> {
 /// that's unaligned, not the value.) O(n·m), fine for one short line.
 fn changed_tokens(a: &[&str], b: &[&str]) -> (Vec<usize>, Vec<usize>) {
     let (n, m) = (a.len(), b.len());
-    // dp[i][j] = LCS length of a[i..] and b[j..].
-    let mut dp = vec![vec![0u16; m + 1]; n + 1];
+    // dp[at(i, j)] = LCS length of a[i..] and b[j..]. One flat allocation (row-major,
+    // stride m+1) instead of n+1 separate Vecs.
+    let stride = m + 1;
+    let at = |i: usize, j: usize| i * stride + j;
+    let mut dp = vec![0u16; (n + 1) * stride];
     for i in (0..n).rev() {
         for j in (0..m).rev() {
-            dp[i][j] = if a[i] == b[j] {
-                dp[i + 1][j + 1] + 1
+            dp[at(i, j)] = if a[i] == b[j] {
+                dp[at(i + 1, j + 1)] + 1
             } else {
-                dp[i + 1][j].max(dp[i][j + 1])
+                dp[at(i + 1, j)].max(dp[at(i, j + 1)])
             };
         }
     }
@@ -57,7 +60,7 @@ fn changed_tokens(a: &[&str], b: &[&str]) -> (Vec<usize>, Vec<usize>) {
         if a[i] == b[j] {
             i += 1;
             j += 1;
-        } else if dp[i + 1][j] >= dp[i][j + 1] {
+        } else if dp[at(i + 1, j)] >= dp[at(i, j + 1)] {
             a_ch.push(i);
             i += 1;
         } else {
