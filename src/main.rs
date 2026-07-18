@@ -1143,12 +1143,13 @@ fn build_ref_map(
             let Ok(shorthand) = reference.shorthand() else {
                 continue;
             };
-            let name = reference.name().unwrap_or("");
-            let kind = if name.starts_with("refs/tags/") {
+            // Classify via git2's own refname predicates rather than re-deriving
+            // the refs/tags|remotes|heads/ prefixes by hand.
+            let kind = if reference.is_tag() {
                 RefKind::Tag
-            } else if name.starts_with("refs/remotes/") {
+            } else if reference.is_remote() {
                 RefKind::Remote
-            } else if name.starts_with("refs/heads/") {
+            } else if reference.is_branch() {
                 RefKind::Branch
             } else {
                 continue;
@@ -2310,6 +2311,15 @@ fn diff_load_worker(job: DiffLoadJob) {
 /// hex falls back to a default). The `source` is a typed enum, so an invalid value is
 /// already a parse error — no mode warning to emit here. The caller surfaces the
 /// warnings (stderr + the in-UI toast).
+/// The configured diff theme slug, falling back to the built-in default when
+/// `[diff] theme` is unset. Shared by the startup and live-reload config paths.
+fn configured_theme_slug(cfg: &config::Config) -> String {
+    cfg.diff
+        .theme
+        .clone()
+        .unwrap_or_else(|| highlight::DEFAULT_THEME_SLUG.to_string())
+}
+
 fn resolve_diff_bg(bands: &config::BandsSection) -> (DiffBg, Vec<String>) {
     let mut warnings = Vec::new();
     // Validate any explicitly-set band hex even in Theme mode (where the parsed
@@ -3024,11 +3034,7 @@ impl GitkApp {
         let diff_detect_renames = cfg.diff.detect_renames;
         let diff_detect_copies = cfg.diff.detect_copies;
         let file_list = cfg.diff.file_list;
-        let theme_slug = cfg
-            .diff
-            .theme
-            .clone()
-            .unwrap_or_else(|| highlight::DEFAULT_THEME_SLUG.to_string());
+        let theme_slug = configured_theme_slug(&cfg);
         let (diff_bg, diff_bg_warnings) = resolve_diff_bg(&cfg.diff.bands);
         for w in &diff_bg_warnings {
             log::warn!("{w}");
@@ -4460,11 +4466,7 @@ impl eframe::App for GitkApp {
                     ctx.set_fonts(defs);
                     self.fonts = fonts;
                     let new_enabled = cfg.diff.syntax;
-                    let new_slug = cfg
-                        .diff
-                        .theme
-                        .clone()
-                        .unwrap_or_else(|| highlight::DEFAULT_THEME_SLUG.to_string());
+                    let new_slug = configured_theme_slug(&cfg);
                     let (new_diff_bg, diff_bg_warnings) = resolve_diff_bg(&cfg.diff.bands);
                     // Surface font + diff-background warnings (stderr now, toast
                     // below) so config typos aren't silent on a headless desktop.
