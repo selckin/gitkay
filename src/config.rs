@@ -140,6 +140,12 @@ pub struct DiffSection {
     /// Highlight theme slug (see `default_template()` for valid slugs). None ⇒ default.
     pub(crate) theme: Option<String>,
     pub(crate) bands: BandsSection,
+    /// Detect renamed files (git -M): a rename renders as one `old → new` entry
+    /// instead of a separate delete + add. Cheap.
+    pub(crate) detect_renames: bool,
+    /// Detect copied files (git -C): a new file copied from another modified file
+    /// renders as `source → copy`. Off by default — more expensive than renames.
+    pub(crate) detect_copies: bool,
 }
 
 impl Default for DiffSection {
@@ -150,6 +156,8 @@ impl Default for DiffSection {
             file_list: FileListLayout::Grouped,
             theme: None,
             bands: BandsSection::default(),
+            detect_renames: true,
+            detect_copies: false,
         }
     }
 }
@@ -284,6 +292,13 @@ fn default_template() -> String {
          # commit message and the patch. false = hide it; the file-list sidebar\n\
          # still lists every changed file.\n\
          # show_stats = true\n\
+         # Detect renamed files (git -M): a rename shows as one entry \"old → new\"\n\
+         # instead of a separate delete + add. Cheap; on by default.\n\
+         # detect_renames = true\n\
+         # Detect copied files (git -C): a new file copied from another shows as\n\
+         # \"source → copy\". Only files modified in the same commit are copy sources.\n\
+         # More expensive than renames; off by default.\n\
+         # detect_copies = false\n\
          # File-list sidebar layout. \"grouped\" (default) groups files under\n\
          # directory headers with basenames indented; \"full\" shows each file's\n\
          # full repo-relative path; \"name\" shows just basenames.\n\
@@ -653,6 +668,8 @@ mod tests {
         assert_eq!(cfg.diff.file_list, FileListLayout::Grouped); // default
         assert_eq!(cfg.diff.bands.source, BandSource::Fixed);
         assert_eq!(cfg.diff.bands.added, None);
+        assert!(cfg.diff.detect_renames); // default on (matches git -M)
+        assert!(!cfg.diff.detect_copies); // default off (git -C, expensive)
     }
 
     #[test]
@@ -665,6 +682,14 @@ mod tests {
         assert!(!cfg.diff.show_stats);
         assert_eq!(cfg.diff.bands.source, BandSource::Theme);
         assert_eq!(cfg.diff.bands.added.as_deref(), Some("#0a300a"));
+    }
+
+    #[test]
+    fn detect_rename_copy_keys_parse() {
+        let cfg: Config =
+            toml::from_str("[diff]\ndetect_renames = false\ndetect_copies = true\n").unwrap();
+        assert!(!cfg.diff.detect_renames);
+        assert!(cfg.diff.detect_copies);
     }
 
     #[test]
@@ -686,6 +711,8 @@ mod tests {
         let t = default_template();
         assert!(t.contains("[diff]"));
         assert!(t.contains("show_stats ="));
+        assert!(t.contains("detect_renames ="));
+        assert!(t.contains("detect_copies ="));
     }
 
     #[test]
