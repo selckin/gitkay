@@ -4500,7 +4500,7 @@ impl eframe::App for GitkApp {
                                     } else {
                                         0.7
                                     });
-                                    let stroke = egui::Stroke::new(2.0, c);
+                                    let stroke = egui::Stroke::new(2.0_f32, c);
                                     let x_top = gx(from);
                                     let x_bot = gx(to);
 
