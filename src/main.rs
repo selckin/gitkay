@@ -3587,20 +3587,18 @@ impl GitkApp {
         // path the originals would otherwise be dropped unused. The rare spawn-failure
         // fallback re-resolves them instead.
         let repo_path = self.repo_path.clone();
-        let spawn = std::thread::Builder::new()
-            .name("gitkay-diff-load".to_string())
-            .spawn({
-                let (current_epoch, tx, ctx) = (
-                    self.diff_load_epoch.clone(),
-                    self.diff_load_tx.clone(),
-                    self.egui_ctx.clone(),
-                );
-                move || {
-                    diff_load_worker(DiffLoadJob {
-                        repo_path, oid, settings, paths, key, kind, epoch, current_epoch, tx, ctx,
-                    })
-                }
-            });
+        let spawn = spawn_guarded("gitkay-diff-load", "diff-load thread panicked", {
+            let (current_epoch, tx, ctx) = (
+                self.diff_load_epoch.clone(),
+                self.diff_load_tx.clone(),
+                self.egui_ctx.clone(),
+            );
+            move || {
+                diff_load_worker(DiffLoadJob {
+                    repo_path, oid, settings, paths, key, kind, epoch, current_epoch, tx, ctx,
+                })
+            }
+        });
         if spawn.is_err() {
             log::warn!("diff-load thread spawn failed; loading synchronously");
             // paths/key were moved into the (dropped) closure; re-resolve them for the
@@ -4405,8 +4403,9 @@ impl eframe::App for GitkApp {
             StartupDiff::Done => {}
         }
 
-        // Apply deferred fonts once a cold fontdb scan finishes (it outlived window
-        // init). Until they land, keep waking at a modest cadence so the swap happens
+        // Apply deferred fonts once an off-thread build finishes — the startup
+        // cold fontdb scan that outlived window init, or a config-reload rebuild.
+        // Until they land, keep waking at a modest cadence so the swap happens
         // promptly — the off-thread builder has no Context handle to wake us itself.
         if let Some(rx) = &self.pending_fonts {
             match rx.try_recv() {
@@ -4416,7 +4415,7 @@ impl eframe::App for GitkApp {
                         self.config_error_toast = Some(std::time::Instant::now());
                     }
                     self.pending_fonts = None;
-                    log::debug!("perf: startup: deferred fonts applied");
+                    log::debug!("perf: deferred fonts applied");
                 }
                 Err(mpsc::TryRecvError::Empty) => {
                     ctx.request_repaint_after(std::time::Duration::from_millis(33));
@@ -4453,15 +4452,37 @@ impl eframe::App for GitkApp {
         {
             match config::read_config(p) {
                 Ok(cfg) => {
-                    let (defs, fonts, warns) = config::build_fonts(&cfg);
-                    ctx.set_fonts(defs);
-                    self.fonts = fonts;
+                    // The role map (sizes/families) is cheap — apply it now. The
+                    // FontDefinitions rebuild can hit fontdb's system scan (~150ms,
+                    // up to ~1.5s on a cold font cache) when a named family isn't
+                    // cached, so it builds off-thread and lands via the
+                    // pending_fonts poll — the same path as the startup cold scan,
+                    // which also surfaces the thread's font warnings as the toast.
+                    self.fonts = Fonts::from_config(&cfg);
+                    let (font_tx, font_rx) = mpsc::channel();
+                    let spawned = spawn_guarded("gitkay-fonts", "font reload thread panicked", {
+                        let cfg = cfg.clone();
+                        move || {
+                            let _ = font_tx.send(config::build_fonts(&cfg));
+                        }
+                    });
+                    let mut warned = false;
+                    match spawned {
+                        Ok(_) => self.pending_fonts = Some(font_rx),
+                        Err(_) => {
+                            // Rare spawn failure: build inline (blocking) rather
+                            // than dropping the font change. self.fonts is already
+                            // set (build_fonts returns the same role map).
+                            let (defs, _fonts, warns) = config::build_fonts(&cfg);
+                            ctx.set_fonts(defs);
+                            warned |= !warns.is_empty();
+                        }
+                    }
                     let new_enabled = cfg.diff.syntax;
                     let new_slug = configured_theme_slug(&cfg);
                     let (new_diff_bg, diff_bg_warnings) = resolve_diff_bg(&cfg.diff.bands);
-                    // Surface font + diff-background warnings (stderr now, toast
-                    // below) so config typos aren't silent on a headless desktop.
-                    let mut warned = !warns.is_empty();
+                    // Surface diff-background warnings (stderr now, toast below)
+                    // so config typos aren't silent on a headless desktop.
                     for w in &diff_bg_warnings {
                         log::warn!("{w}");
                         warned = true;
@@ -5480,25 +5501,6 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_commit_has_diagonal() {
-        // 1 (merge: parents 2 and 3)
-        // 2 (parent: 4)
-        // 3 (parent: 4)
-        // 4 (root)
-        let commits = vec![
-            commit(1, &[2, 3]),
-            commit(2, &[4]),
-            commit(3, &[4]),
-            commit(4, &[]),
-        ];
-        let rows = layout_graph(&commits);
-
-        // Commit 1 should have at least one diagonal (the merge)
-        let has_diagonal = rows[0].lines.iter().any(|&(f, t, _)| f != t);
-        assert!(has_diagonal, "Merge commit 1 should have a diagonal edge");
-    }
-
-    #[test]
     fn test_merge_highlight_includes_merged_branch_ancestry() {
         //   1 (merge: parents 2, 3)
         //  / \
@@ -5641,9 +5643,11 @@ mod tests {
 
     #[test]
     fn test_merge_new_lane_no_vertical_but_diagonal() {
-        // A merge commit's newly created lane should have the diagonal
-        // but NO vertical in the merge row. The renderer draws the
-        // incoming line for the next row from the diagonal's endpoint.
+        // A merge commit creates a NEW lane for its second parent: the merge row
+        // gets the diagonal but NO vertical for that lane — nothing feeds it from
+        // above, so a vertical would be a stub hanging in empty space. The
+        // renderer draws the incoming line for the next row from the diagonal's
+        // endpoint instead.
         let commits = vec![
             commit(1, &[2, 3]),
             commit(2, &[4]),
@@ -5735,37 +5739,6 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_new_lane_no_vertical_even_with_pending_commit() {
-        // Even though the newly created lane has a pending commit,
-        // the merge row should NOT have a vertical for it. The
-        // renderer handles the incoming line for the next row.
-        let commits = vec![
-            commit(1, &[2, 3]),
-            commit(2, &[4]),
-            commit(3, &[4]),
-            commit(4, &[]),
-        ];
-        let rows = layout_graph(&commits);
-
-        let merge_row = &rows[0];
-        let target_col = merge_row
-            .lines
-            .iter()
-            .find(|&&(f, t, _)| f == merge_row.node_col && t != f)
-            .unwrap()
-            .1;
-
-        let has_vertical = merge_row
-            .lines
-            .iter()
-            .any(|&(f, t, _)| f == target_col && t == target_col);
-        assert!(
-            !has_vertical,
-            "New merge lane should not have vertical in merge row"
-        );
-    }
-
-    #[test]
     fn test_convergence_no_vertical_on_consumed_lane() {
         // When two lanes converge at a commit, the consumed lane should
         // NOT have a vertical continuation.
@@ -5803,50 +5776,6 @@ mod tests {
                 "Consumed convergence lane (col {src_col}) should not have vertical"
             );
         }
-    }
-
-    #[test]
-    fn test_merge_new_lane_no_vertical() {
-        // A merge commit creates a NEW lane for its second parent.
-        // That new lane should NOT have a vertical continuation in the
-        // merge row because nothing is feeding it from above — only
-        // the merge diagonal connects to it.
-        //
-        // 1 (merge: 2, 3)
-        // 2 (parent: 4)
-        // 3 (parent: 4)
-        // 4 (root)
-        //
-        // At row 0: commit 1 creates a diagonal to col 1 for commit 3.
-        // Col 1 should NOT also have a vertical (1,1) — there's nothing
-        // above it, so the vertical is a stub hanging in empty space.
-        let commits = vec![
-            commit(1, &[2, 3]),
-            commit(2, &[4]),
-            commit(3, &[4]),
-            commit(4, &[]),
-        ];
-        let rows = layout_graph(&commits);
-
-        let merge_row = &rows[0];
-        // Find the new lane created by the merge
-        let new_lane_col = merge_row
-            .lines
-            .iter()
-            .find(|&&(f, t, _)| f == merge_row.node_col && t != f)
-            .unwrap()
-            .1;
-
-        // This lane was JUST created by the merge — nothing above it.
-        // It should NOT have a vertical continuation.
-        let has_vertical = merge_row
-            .lines
-            .iter()
-            .any(|&(f, t, _)| f == new_lane_col && t == new_lane_col);
-        assert!(
-            !has_vertical,
-            "Newly created merge lane (col {new_lane_col}) should not have vertical — nothing feeds it from above"
-        );
     }
 
     #[test]
@@ -5898,13 +5827,7 @@ mod tests {
 
     #[test]
     fn highlight_diff_colors_code_and_skips_structure() {
-        let (hl, _) = Highlighter::new(
-            "catppuccin-mocha",
-            DiffBg::Fixed {
-                added: None,
-                deleted: None,
-            },
-        );
+        let hl = highlight::test_highlighter();
         let mut lines = vec![
             DiffLine::new("commit abc123", LineKind::Meta),
             DiffLine::new("diff --git a/x.rs b/x.rs", LineKind::FileMeta),
@@ -5913,13 +5836,8 @@ mod tests {
             DiffLine::new("-let old = 0;", LineKind::Del),
             DiffLine::new("let x = 1;", LineKind::Context),
         ];
-        let files = vec![FileEntry {
-            path: "x.rs".to_string(),
-            old_path: None,
-            additions: 1,
-            deletions: 1,
-            diff_line_idx: Some(1), // file's diff starts at the "diff --git" line
-        }];
+        // file's diff starts at the "diff --git" line
+        let files = vec![fe("x.rs", Some(1))];
 
         highlight_diff(&mut lines, &files, &hl);
 
@@ -5988,13 +5906,7 @@ mod tests {
         use config::{BandSource, BandsSection};
         // Default → fixed mode, no explicit colors, no warnings.
         let (bg, warns) = resolve_diff_bg(&BandsSection::default());
-        assert_eq!(
-            bg,
-            DiffBg::Fixed {
-                added: None,
-                deleted: None
-            }
-        );
+        assert_eq!(bg, highlight::FIXED_DEFAULT_BANDS);
         assert!(warns.is_empty());
 
         // Theme mode.
@@ -6026,13 +5938,7 @@ mod tests {
             added: Some("nothex".to_string()),
             ..Default::default()
         });
-        assert_eq!(
-            bg,
-            DiffBg::Fixed {
-                added: None,
-                deleted: None
-            }
-        );
+        assert_eq!(bg, highlight::FIXED_DEFAULT_BANDS);
         assert_eq!(warns.len(), 1);
     }
 
@@ -6083,17 +5989,33 @@ mod tests {
         assert_eq!(format_commit_time(secs, 100_000, false), "");
     }
 
-    #[test]
-    fn file_ranges_and_index_lookup() {
-        let f = |path: &str, idx: Option<usize>| FileEntry {
+    /// A FileEntry fixture: no rename, zero counts (nothing below asserts them).
+    fn fe(path: &str, diff_line_idx: Option<usize>) -> FileEntry {
+        FileEntry {
             path: path.to_string(),
             old_path: None,
             additions: 0,
             deletions: 0,
-            diff_line_idx: idx,
-        };
+            diff_line_idx,
+        }
+    }
+
+    /// Baseline DiffSettings (default context, every toggle off); tests flip the
+    /// flag under test via struct-update syntax: `DiffSettings { show_stats: true, ..ds() }`.
+    fn ds() -> DiffSettings {
+        DiffSettings {
+            context: 3,
+            ignore_ws: false,
+            show_stats: false,
+            detect_renames: false,
+            detect_copies: false,
+        }
+    }
+
+    #[test]
+    fn file_ranges_and_index_lookup() {
         // File "a" at line 2, a no-patch file (None, skipped), file "b" at 5.
-        let files = vec![f("a", Some(2)), f("bin", None), f("b", Some(5))];
+        let files = vec![fe("a", Some(2)), fe("bin", None), fe("b", Some(5))];
 
         // Ranges: ordered by start, no-patch skipped, end = next start / total.
         assert_eq!(file_line_ranges(&files, 9), vec![(0, 2, 5), (2, 5, 9)]);
@@ -6127,15 +6049,8 @@ mod tests {
 
     #[test]
     fn next_file_line_steps_between_files() {
-        let f = |idx: Option<usize>| FileEntry {
-            path: "x".to_string(),
-            old_path: None,
-            additions: 0,
-            deletions: 0,
-            diff_line_idx: idx,
-        };
         // File starts at lines 2 and 5 (a no-patch file in between is skipped).
-        let files = vec![f(Some(2)), f(None), f(Some(5))];
+        let files = vec![fe("x", Some(2)), fe("x", None), fe("x", Some(5))];
         let down = |top| next_file_line(&files, 9, top, true);
         let up = |top| next_file_line(&files, 9, top, false);
 
@@ -6156,15 +6071,8 @@ mod tests {
 
     #[test]
     fn unsorted_files_and_clamping() {
-        let f = |idx: Option<usize>| FileEntry {
-            path: "x".to_string(),
-            old_path: None,
-            additions: 0,
-            deletions: 0,
-            diff_line_idx: idx,
-        };
         // Input out of order: ranges must still come out start-ordered.
-        let files = vec![f(Some(5)), f(Some(2))];
+        let files = vec![fe("x", Some(5)), fe("x", Some(2))];
         assert_eq!(file_line_ranges(&files, 9), vec![(1, 2, 5), (0, 5, 9)]);
         // total_lines below a start clamps both ends to total.
         assert_eq!(file_line_ranges(&files, 3), vec![(1, 2, 3), (0, 3, 3)]);
@@ -6211,13 +6119,7 @@ mod tests {
 
     #[test]
     fn diff_row_job_background_by_kind() {
-        let (hl, _) = Highlighter::new(
-            "catppuccin-mocha",
-            DiffBg::Fixed {
-                added: None,
-                deleted: None,
-            },
-        );
+        let hl = highlight::test_highlighter();
         let palette = hl.palette().clone();
         let fid = egui::FontId::monospace(13.0);
         let bg = |text: &str, kind| {
@@ -6234,32 +6136,14 @@ mod tests {
         // A FileEntry with no patch body has diff_line_idx == None. It must NOT
         // cause the commit header at index 0 to be tokenized as code. (In practice
         // git2 positions every delta, so None is a defensive case.)
-        let (hl, _) = Highlighter::new(
-            "catppuccin-mocha",
-            DiffBg::Fixed {
-                added: None,
-                deleted: None,
-            },
-        );
+        let hl = highlight::test_highlighter();
         let mut lines = vec![
             DiffLine::new("commit abc123", LineKind::Context), // index 0 — header
             DiffLine::new("+fn foo() {}", LineKind::Add),      // index 1 — real file patch
         ];
         let files = vec![
-            FileEntry {
-                path: "bin.dat".to_string(),
-                old_path: None,
-                additions: 0,
-                deletions: 0,
-                diff_line_idx: None, // no patch body
-            },
-            FileEntry {
-                path: "foo.rs".to_string(),
-                old_path: None,
-                additions: 1,
-                deletions: 0,
-                diff_line_idx: Some(1), // real file starts here
-            },
+            fe("bin.dat", None),     // no patch body
+            fe("foo.rs", Some(1)),   // real file starts here
         ];
 
         highlight_diff(&mut lines, &files, &hl);
@@ -6339,13 +6223,7 @@ mod tests {
             a0,                                          // 2 file code (Some)
             a1,                                          // 3 file code (Some)
         ];
-        let files = vec![FileEntry {
-            path: "x.rs".to_string(),
-            old_path: None,
-            additions: 1,
-            deletions: 0,
-            diff_line_idx: Some(2), // file's range starts at index 2
-        }];
+        let files = vec![fe("x.rs", Some(2))]; // file's range starts at index 2
         // The blank Context header line (index 1) is None but outside any file
         // range, so the diff still counts as fully highlighted. This is the bug
         // that made the prefetch trigger never fire with file_fully_highlighted(0,len).
@@ -6377,22 +6255,7 @@ mod tests {
             b0,
             b1, // file B: [3,5)
         ];
-        let files = vec![
-            FileEntry {
-                path: "a.rs".to_string(),
-                old_path: None,
-                additions: 2,
-                deletions: 0,
-                diff_line_idx: Some(1),
-            },
-            FileEntry {
-                path: "b.rs".to_string(),
-                old_path: None,
-                additions: 2,
-                deletions: 0,
-                diff_line_idx: Some(3),
-            },
-        ];
+        let files = vec![fe("a.rs", Some(1)), fe("b.rs", Some(3))];
 
         let pending: Vec<usize> = pending_files(&lines, &files)
             .into_iter()
@@ -6405,13 +6268,7 @@ mod tests {
     fn diff_cache_key_includes_theme_enabled_show_stats_and_content() {
         let key = |theme: &str, enabled: bool, show_stats: bool, content: u64| DiffCacheKey {
             oid: git2::Oid::ZERO_SHA1,
-            settings: DiffSettings {
-                context: 3,
-                ignore_ws: false,
-                show_stats,
-                detect_renames: false,
-                detect_copies: false,
-            },
+            settings: DiffSettings { show_stats, ..ds() },
             theme: theme.to_string(),
             enabled,
             content,
@@ -6430,13 +6287,7 @@ mod tests {
     fn diff_cache_key_includes_detect_toggles() {
         let key = |detect_renames: bool, detect_copies: bool| DiffCacheKey {
             oid: git2::Oid::ZERO_SHA1,
-            settings: DiffSettings {
-                context: 3,
-                ignore_ws: false,
-                show_stats: true,
-                detect_renames,
-                detect_copies,
-            },
+            settings: DiffSettings { show_stats: true, detect_renames, detect_copies, ..ds() },
             theme: "dark".to_string(),
             enabled: true,
             content: 0,
@@ -6555,26 +6406,24 @@ mod tests {
 
     #[test]
     fn prefetch_targets_closest_first_below_wins_ties() {
-        let real = |n: u8| git2::Oid::from_bytes(&[n; 20]).unwrap();
-        let commits: Vec<CommitInfo> = (0..9).map(|n| ci(real(n))).collect();
+        let commits: Vec<CommitInfo> = (0..9).map(|n| ci(oid(n))).collect();
         // selected = 4, whole list visible. Ordered by |i-4|; on a tie the row below
         // (larger index) first: 5,3, 6,2, 7,1, 8,0. Capped at 4.
         assert_eq!(
             prefetch_targets(&commits, 4, 0..9, 4),
-            vec![real(5), real(3), real(6), real(2)]
+            vec![oid(5), oid(3), oid(6), oid(2)]
         );
         // Only the rows in `view` are eligible — a narrow window excludes the rest.
-        assert_eq!(prefetch_targets(&commits, 4, 3..6, 10), vec![real(5), real(3)]);
+        assert_eq!(prefetch_targets(&commits, 4, 3..6, 10), vec![oid(5), oid(3)]);
     }
 
     #[test]
     fn prefetch_targets_excludes_virtual_and_caps() {
-        let real = |n: u8| git2::Oid::from_bytes(&[n; 20]).unwrap();
         let mut commits = vec![ci(oid_uncommitted()), ci(oid_staged())];
-        commits.extend((2..7).map(|n| ci(real(n)))); // indices 2..=6
+        commits.extend((2..7).map(|n| ci(oid(n)))); // indices 2..=6
         // selected = 2 (first real), whole list visible. Virtual rows 0,1 excluded;
         // candidates 3,4,5,6 by distance; capped at 2.
-        assert_eq!(prefetch_targets(&commits, 2, 0..7, 2), vec![real(3), real(4)]);
+        assert_eq!(prefetch_targets(&commits, 2, 0..7, 2), vec![oid(3), oid(4)]);
     }
 
     fn temp_repo() -> (tempfile::TempDir, git2::Repository) {
@@ -6586,15 +6435,9 @@ mod tests {
         (dir, repo)
     }
 
-    fn commit_file(repo: &git2::Repository, path: &str, content: &str, msg: &str) -> git2::Oid {
-        let root = repo.workdir().unwrap();
-        let full = root.join(path);
-        if let Some(p) = full.parent() {
-            std::fs::create_dir_all(p).unwrap();
-        }
-        std::fs::write(&full, content).unwrap();
-        let mut index = repo.index().unwrap();
-        index.add_path(std::path::Path::new(path)).unwrap();
+    /// Write the (already-staged) `index`, commit its tree onto HEAD, and return
+    /// the new commit's oid — the shared tail of every staging helper below.
+    fn commit_index(repo: &git2::Repository, index: &mut git2::Index, msg: &str) -> git2::Oid {
         index.write().unwrap();
         let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
         let sig = repo.signature().unwrap();
@@ -6604,18 +6447,24 @@ mod tests {
             .unwrap()
     }
 
+    fn commit_file(repo: &git2::Repository, path: &str, content: &str, msg: &str) -> git2::Oid {
+        let root = repo.workdir().unwrap();
+        let full = root.join(path);
+        if let Some(p) = full.parent() {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        std::fs::write(&full, content).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new(path)).unwrap();
+        commit_index(repo, &mut index, msg)
+    }
+
     /// Stage a rename `old` -> `new` (the file is already moved on disk) and commit.
     fn commit_rename(repo: &git2::Repository, old: &str, new: &str, msg: &str) -> git2::Oid {
         let mut index = repo.index().unwrap();
         index.remove_path(std::path::Path::new(old)).unwrap();
         index.add_path(std::path::Path::new(new)).unwrap();
-        index.write().unwrap();
-        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
-        let sig = repo.signature().unwrap();
-        let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
-        let parents: Vec<&git2::Commit> = parent.iter().collect();
-        repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents)
-            .unwrap()
+        commit_index(repo, &mut index, msg)
     }
 
     fn scope(all: bool, revs: &[&str]) -> cli::Scope {
@@ -6686,7 +6535,7 @@ mod tests {
             &repo,
             c3,
             CommitKind::Real,
-            DiffSettings { context: 3, ignore_ws: false, show_stats: true, detect_renames: false, detect_copies: false },
+            DiffSettings { show_stats: true, ..ds() },
             &s.paths,
         );
         let files: Vec<&str> = data.files.iter().map(|f| f.path.as_str()).collect();
@@ -6707,7 +6556,7 @@ mod tests {
             &repo,
             c2,
             CommitKind::Real,
-            DiffSettings { context: 3, ignore_ws: false, show_stats: true, detect_renames: false, detect_copies: false },
+            DiffSettings { show_stats: true, ..ds() },
             &[],
         );
         assert!(
@@ -6715,13 +6564,7 @@ mod tests {
             "show_stats=true must include the diffstat block"
         );
 
-        let off = get_diff_data(
-            &repo,
-            c2,
-            CommitKind::Real,
-            DiffSettings { context: 3, ignore_ws: false, show_stats: false, detect_renames: false, detect_copies: false },
-            &[],
-        );
+        let off = get_diff_data(&repo, c2, CommitKind::Real, ds(), &[]);
         assert!(
             !off.lines.iter().any(|l| l.kind == LineKind::Stat),
             "show_stats=false must omit the diffstat block"
@@ -6745,20 +6588,13 @@ mod tests {
         .unwrap();
         let oid = commit_rename(&repo, "old.txt", "new.txt", "rename");
 
-        let on = DiffSettings {
-            context: 3, ignore_ws: false, show_stats: false,
-            detect_renames: true, detect_copies: false,
-        };
+        let on = DiffSettings { detect_renames: true, ..ds() };
         let files: Vec<String> =
             get_diff_data(&repo, oid, CommitKind::Real, on, &[]).files.iter().map(|f| f.path.clone()).collect();
         assert_eq!(files, vec!["new.txt".to_string()], "rename detected ⇒ one entry");
 
-        let off = DiffSettings {
-            context: 3, ignore_ws: false, show_stats: false,
-            detect_renames: false, detect_copies: false,
-        };
         let mut files: Vec<String> =
-            get_diff_data(&repo, oid, CommitKind::Real, off, &[]).files.iter().map(|f| f.path.clone()).collect();
+            get_diff_data(&repo, oid, CommitKind::Real, ds(), &[]).files.iter().map(|f| f.path.clone()).collect();
         files.sort();
         assert_eq!(
             files,
@@ -6778,10 +6614,7 @@ mod tests {
         .unwrap();
         let oid = commit_rename(&repo, "old.txt", "new.txt", "rename");
 
-        let s = DiffSettings {
-            context: 3, ignore_ws: false, show_stats: false,
-            detect_renames: true, detect_copies: false,
-        };
+        let s = DiffSettings { detect_renames: true, ..ds() };
         let data = get_diff_data(&repo, oid, CommitKind::Real, s, &[]);
         assert_eq!(data.files.len(), 1);
         assert_eq!(data.files[0].path, "new.txt");
@@ -6804,18 +6637,9 @@ mod tests {
         let mut index = repo.index().unwrap();
         index.add_path(std::path::Path::new("a.txt")).unwrap();
         index.add_path(std::path::Path::new("b.txt")).unwrap();
-        index.write().unwrap();
-        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
-        let sig = repo.signature().unwrap();
-        let parent = repo.head().unwrap().peel_to_commit().unwrap();
-        let oid = repo
-            .commit(Some("HEAD"), &sig, &sig, "copy a->b", &tree, &[&parent])
-            .unwrap();
+        let oid = commit_index(&repo, &mut index, "copy a->b");
 
-        let s = DiffSettings {
-            context: 3, ignore_ws: false, show_stats: false,
-            detect_renames: true, detect_copies: true,
-        };
+        let s = DiffSettings { detect_renames: true, detect_copies: true, ..ds() };
         let data = get_diff_data(&repo, oid, CommitKind::Real, s, &[]);
         let b = data.files.iter().find(|f| f.path == "b.txt").expect("b.txt present");
         assert_eq!(b.old_path.as_deref(), Some("a.txt"), "b.txt detected as copy of a.txt");
@@ -6895,12 +6719,6 @@ mod tests {
             load_commits(&repo, 100, &scope)
                 .iter()
                 .any(|c| c.oid == oid_uncommitted())
-        };
-        let scope = |all: bool, revs: &[&str]| cli::Scope {
-            all,
-            revs: revs.iter().map(|s| s.to_string()).collect(),
-            paths: Vec::new(),
-            ..Default::default()
         };
 
         // Default (current-branch) view shows your local state.

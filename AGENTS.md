@@ -51,7 +51,10 @@ parts run off the window-creation critical path:
   the scan lands (the off-thread builder has no Context handle to wake the UI). `set_fonts`
   always runs on the creator/main thread. A named font fontdb can't resolve is **not**
   cached, so it re-scans every launch — `resolve_font_path` warns (default level) so the
-  misconfig is visible rather than a silent permanent tax.
+  misconfig is visible rather than a silent permanent tax. A live config-file reload takes
+  the same route: it applies the cheap role map synchronously but rebuilds `FontDefinitions`
+  on a fresh `gitkay-fonts` thread landing via `pending_fonts`, so a config save never
+  freezes the UI on a font scan (an unresolvable name would otherwise rescan on every save).
 - **Deferred first diff** (`StartupDiff` state machine) — `GitkApp::new` does *not* compute
   the startup diff (window creation blocks until the creator returns). It auto-selects
   commit 0 with an empty diff pane; `ui()` paints the graph on the first frame, then calls

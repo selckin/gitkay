@@ -70,6 +70,27 @@ pub fn theme_for_slug(slug: &str) -> Option<EmbeddedThemeName> {
     THEMES.iter().find(|(s, _)| *s == slug).map(|(_, t)| *t)
 }
 
+/// Every selectable theme slug, default first — the config template documents
+/// the set from this, so `THEMES` stays the single source of truth.
+pub fn theme_slugs() -> impl Iterator<Item = &'static str> {
+    THEMES.iter().map(|(s, _)| *s)
+}
+
+/// Built-in fixed diff-band colours for dark themes (light themes get pastel
+/// equivalents chosen by luminance in `DiffPalette::from_theme`). Public so the
+/// config template documents the real values rather than a re-typed copy.
+pub const DEFAULT_ADDED_BAND_DARK: egui::Color32 = egui::Color32::from_rgb(10, 48, 10);
+pub const DEFAULT_DELETED_BAND_DARK: egui::Color32 = egui::Color32::from_rgb(64, 12, 14);
+
+/// Test fixtures shared by this module's and main.rs's test suites: the
+/// `[diff.bands]` default value, and a default-theme highlighter over it.
+#[cfg(test)]
+pub(crate) const FIXED_DEFAULT_BANDS: DiffBg = DiffBg::Fixed { added: None, deleted: None };
+#[cfg(test)]
+pub(crate) fn test_highlighter() -> Highlighter {
+    Highlighter::new(DEFAULT_THEME_SLUG, FIXED_DEFAULT_BANDS).0
+}
+
 /// A run of text sharing one foreground color: the color plus the byte range
 /// `[start, end)` of the run *within the line's own text* (`DiffLine::body()`).
 /// Storing a range instead of an owned `String` avoids duplicating the line text
@@ -232,10 +253,7 @@ impl DiffPalette {
                         egui::Color32::from_rgb(252, 206, 206),
                     )
                 } else {
-                    (
-                        egui::Color32::from_rgb(10, 48, 10),
-                        egui::Color32::from_rgb(64, 12, 14),
-                    )
+                    (DEFAULT_ADDED_BAND_DARK, DEFAULT_DELETED_BAND_DARK)
                 };
                 (added.unwrap_or(def_added), deleted.unwrap_or(def_deleted))
             }
@@ -448,13 +466,7 @@ mod tests {
 
     #[test]
     fn tokenizes_rust_into_multiple_spans() {
-        let (hl, warn) = Highlighter::new(
-            "catppuccin-mocha",
-            DiffBg::Fixed {
-                added: None,
-                deleted: None,
-            },
-        );
+        let (hl, warn) = Highlighter::new("catppuccin-mocha", FIXED_DEFAULT_BANDS);
         assert!(warn.is_none());
         let mut state = hl.new_file_state("x.rs");
         let code = "fn main() {}";
@@ -467,13 +479,7 @@ mod tests {
 
     #[test]
     fn unknown_extension_falls_back_to_plain_text() {
-        let (hl, _) = Highlighter::new(
-            "catppuccin-mocha",
-            DiffBg::Fixed {
-                added: None,
-                deleted: None,
-            },
-        );
+        let hl = test_highlighter();
         let mut state = hl.new_file_state("file.unknownext");
         let code = "just some text";
         let spans = hl.tokenize_line(&mut state, code);
@@ -483,13 +489,7 @@ mod tests {
 
     #[test]
     fn tokenizes_multibyte_source_on_char_boundaries() {
-        let (hl, _) = Highlighter::new(
-            "catppuccin-mocha",
-            DiffBg::Fixed {
-                added: None,
-                deleted: None,
-            },
-        );
+        let hl = test_highlighter();
         let mut state = hl.new_file_state("x.rs");
         // Mixed multi-byte content: accented letters (2 bytes), an arrow (3),
         // a Greek letter (2), an emoji (4). tokenize_line records byte ranges via
@@ -506,13 +506,7 @@ mod tests {
 
     #[test]
     fn empty_line_yields_no_spans() {
-        let (hl, _) = Highlighter::new(
-            "catppuccin-mocha",
-            DiffBg::Fixed {
-                added: None,
-                deleted: None,
-            },
-        );
+        let hl = test_highlighter();
         let mut state = hl.new_file_state("x.rs");
         // code_len == 0: every span's end clamps to 0, so the `start < end` guard
         // drops them all. Must yield no spans (and not panic), not a span for '\n'.
@@ -522,13 +516,7 @@ mod tests {
 
     #[test]
     fn unknown_slug_warns_and_falls_back() {
-        let (hl, warn) = Highlighter::new(
-            "no-such-theme",
-            DiffBg::Fixed {
-                added: None,
-                deleted: None,
-            },
-        );
+        let (hl, warn) = Highlighter::new("no-such-theme", FIXED_DEFAULT_BANDS);
         assert!(warn.is_some());
         // Falls back to the (dark) default, so a palette is still derived.
         assert!(luminance(hl.palette().background) < 0.5);
@@ -538,13 +526,7 @@ mod tests {
     fn mocha_palette_is_dark_with_distinct_diff_colors() {
         let set = two_face::theme::extra();
         let theme = &set[EmbeddedThemeName::CatppuccinMocha];
-        let p = DiffPalette::from_theme(
-            theme,
-            DiffBg::Fixed {
-                added: None,
-                deleted: None,
-            },
-        );
+        let p = DiffPalette::from_theme(theme, FIXED_DEFAULT_BANDS);
         // Catppuccin Mocha is a dark theme.
         assert!(luminance(p.background) < 0.5, "background should be dark");
         // It defines diff scopes, so added/deleted must differ from plain text.
@@ -560,13 +542,7 @@ mod tests {
     fn diff_bg_mode_controls_row_background() {
         let set = two_face::theme::extra();
         let theme = &set[EmbeddedThemeName::CatppuccinMocha];
-        let fixed = DiffPalette::from_theme(
-            theme,
-            DiffBg::Fixed {
-                added: None,
-                deleted: None,
-            },
-        );
+        let fixed = DiffPalette::from_theme(theme, FIXED_DEFAULT_BANDS);
         let derived = DiffPalette::from_theme(theme, DiffBg::Theme);
         // Fixed mode (no explicit colors) uses gitkay's dark-green default;
         // theme mode pulls a different background from the theme.
@@ -578,13 +554,7 @@ mod tests {
     fn latte_palette_is_light_with_light_bands() {
         let set = two_face::theme::extra();
         let theme = &set[EmbeddedThemeName::CatppuccinLatte];
-        let p = DiffPalette::from_theme(
-            theme,
-            DiffBg::Fixed {
-                added: None,
-                deleted: None,
-            },
-        );
+        let p = DiffPalette::from_theme(theme, FIXED_DEFAULT_BANDS);
         // Catppuccin Latte is a light theme: the luminance branch must flip and
         // pick the light pastel bands (not the dark defaults).
         assert!(
@@ -599,21 +569,9 @@ mod tests {
     fn with_theme_swaps_palette() {
         // Build on a dark theme, derive a light one — the palette background
         // must follow (dark → light).
-        let (hl, _) = Highlighter::new(
-            "catppuccin-mocha",
-            DiffBg::Fixed {
-                added: None,
-                deleted: None,
-            },
-        );
+        let hl = test_highlighter();
         assert!(luminance(hl.palette().background) < 0.5);
-        let (hl2, warn) = hl.with_theme(
-            "catppuccin-latte",
-            DiffBg::Fixed {
-                added: None,
-                deleted: None,
-            },
-        );
+        let (hl2, warn) = hl.with_theme("catppuccin-latte", FIXED_DEFAULT_BANDS);
         assert!(warn.is_none());
         assert!(luminance(hl2.palette().background) > 0.5);
     }
@@ -651,10 +609,7 @@ mod tests {
 
     #[test]
     fn warm_extension_compiles_and_still_tokenizes() {
-        let (hl, _) = Highlighter::new(
-            "catppuccin-mocha",
-            DiffBg::Fixed { added: None, deleted: None },
-        );
+        let hl = test_highlighter();
         hl.warm_extension("rs"); // must not panic
         // After warming, tokenizing Rust still works (keywords → multiple spans).
         let mut state = hl.new_file_state("after.rs");
