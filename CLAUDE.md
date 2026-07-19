@@ -10,7 +10,7 @@ Pitfalls" list. Read it first; this file is the quick orientation plus what CI e
 
 ```sh
 cargo build                       # debug; release: cargo build --release
-cargo test                        # all tests; they live in the main/config/highlight/cli/diff_cache modules
+cargo test                        # all tests; they live in the main/config/highlight/cli/diff_cache/word_diff modules
 cargo test test_pr_merge_pattern  # one test by name (substring match)
 cargo test config::               # one module's suite
 cargo clippy -- -D warnings       # CI gate: any warning fails CI — keep it clean
@@ -25,10 +25,10 @@ RUST_LOG=gitkay=debug cargo run   # run with per-phase startup/perf timing logs
 
 ## Architecture (big picture — see AGENTS.md for depth)
 
-- **One egui/eframe immediate-mode app.** ~6500 lines in `src/main.rs` (data layer via `git2`,
-  graph layout, and the UI) plus four extracted modules: `config.rs` (TOML config + fontdb font
+- **One egui/eframe immediate-mode app.** ~7200 lines in `src/main.rs` (data layer via `git2`,
+  graph layout, and the UI) plus five extracted modules: `config.rs` (TOML config + fontdb font
   resolution), `highlight.rs` (syntect), `diff_cache.rs` (line-budget LRU), `cli.rs` (argv →
-  rev/path `Scope`).
+  rev/path `Scope`), `word_diff.rs` (intra-line word diff).
 - **The commit-graph layout (`layout_graph`) is the subtle part** — lane/pipe tracking with a
   load-bearing "first parent always continues straight" invariant. It has a large `#[cfg(test)]`
   suite using fake OIDs (`oid(n)`), so no real repo is needed; change it only with those tests green.
