@@ -48,6 +48,10 @@
 - True syntax-highlighted diffs (syntect): language-aware token colors over the chosen theme's background, with green/red row tints and a +/- gutter for additions/deletions
 - Selectable color theme via `[diff] theme` in the config (any of 29 bundled themes — a curated allowlist; default Catppuccin Mocha), applied live on save; or turn highlighting off for the original flat per-line coloring
 - File list sidebar with per-file `+/-` stats, grouped under directory headers by default (`[diff] file_list` = `grouped`/`full`/`name`)
+- Renamed/copied files shown git-style — one `dir/{old ⇒ new}` entry instead of a delete + add pair
+- **Word diff** toggle — highlights the exact words that changed within a modified line
+- Hover toolbar on the diff: context-line count, ignore whitespace, rename/copy detection, word diff
+- Highlighting runs in the background, on-screen files first — large diffs never block the UI; diffs are cached and the neighbouring commits prefetched, so stepping through history is instant
 - Click a file to jump to its diff section
 - Commit header with author, date, full message
 
@@ -60,6 +64,9 @@
 
 ### Quality of Life
 - **Click a commit** to copy its SHA to both clipboard and primary selection
+- **Uncommitted / staged rows** — working-tree and index changes appear as virtual rows at the top when viewing the checked-out branch
+- **Live view** — `.git` (refs, HEAD, index) is watched, so the graph reloads itself after a commit, fetch, or rebase
+- **Persistent layout** — window size/position and the panel splitters survive restarts
 - **Auto-select** first commit on startup with diff shown
 - **Lazy loading** — starts with 200 commits, loads more as you scroll
 - **Unique author colors** — each contributor gets a distinct color
@@ -143,6 +150,12 @@ gitkay -C /path/to/repo
 gitkay --all
 gitkay v1.0..main
 gitkay -- src/
+
+# Follow one file through renames, like git log --follow -p
+gitkay --follow src/main.rs
+
+# Browse a ref's reflog
+gitkay --reflog
 ```
 
 ### Controls
@@ -161,10 +174,10 @@ gitkay -- src/
 
 ## Architecture
 
-Rust app (~7200 lines in `src/main.rs`, plus `src/config.rs` for fonts + syntax
-config, `src/highlight.rs` for syntect highlighting, `src/diff_cache.rs` for the
+Rust app (`src/main.rs`, plus `src/config.rs` for fonts + syntax config,
+`src/highlight.rs` for syntect highlighting, `src/diff_cache.rs` for the
 line-budget LRU diff cache, `src/cli.rs` for argument parsing, and
-`src/word_diff.rs` for intra-line word diffing) with 163 unit tests:
+`src/word_diff.rs` for intra-line word diffing):
 
 - **egui** + **eframe** — native Wayland window with OpenGL (glow) rendering
 - **git2** (libgit2) — repository access, revwalk, diff
