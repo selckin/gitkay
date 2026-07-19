@@ -102,7 +102,7 @@ pub struct DiffLine {
     pub text: String,
     pub kind: LineKind,
     pub spans: Option<Vec<highlight::Span>>, // None ⇒ not highlighted yet; Some(..) ⇒ highlighted (maybe empty)
-    pub emphasis: Vec<std::ops::Range<usize>>, // word-diff changed byte ranges in body(); empty ⇒ none
+    pub emphasis: Option<Vec<std::ops::Range<usize>>>, // word-diff changed byte ranges in body(); None ⇒ not computed yet
 }
 
 impl DiffLine {
@@ -111,7 +111,7 @@ impl DiffLine {
             text: text.to_string(),
             kind,
             spans: None,
-            emphasis: Vec::new(),
+            emphasis: None,
         }
     }
 
@@ -131,45 +131,67 @@ impl DiffLine {
 /// table grows too large and the highlight isn't readable anyway.
 pub const MAX_WORD_DIFF_LINE: usize = 2048;
 
-/// Fill in each line's word-diff `emphasis` ranges. A change block (a run of `-`
-/// lines followed by a run of `+` lines) is intra-line diffed only when the two
-/// runs have equal length, pairing them 1:1 — the common "edited in place" case.
-pub fn compute_word_emphasis(lines: &mut [DiffLine]) {
-    let mut i = 0;
-    while i < lines.len() {
+/// Fill in word-diff `emphasis` for every change-block pair with a line in `rows`,
+/// skipping pairs already computed (`Some`). A change block (a run of `-` lines
+/// followed by a run of `+` lines) is intra-line diffed only when the two runs have
+/// equal length, pairing them 1:1 — the common "edited in place" case.
+///
+/// Lazy per window: the UI calls this each frame with the rows around the viewport,
+/// so the LCS cost is bounded by the window no matter how large the diff is, and a
+/// pass over an already-emphasized window is just kind checks. `rows` is clamped to
+/// the slice; the walk extends it to the enclosing run of changed lines (kind checks
+/// only), because a pair straddling the window edge needs the true run lengths to
+/// pair correctly.
+pub fn emphasize_rows(lines: &mut [DiffLine], rows: std::ops::Range<usize>) {
+    let (lo, hi) = (rows.start.min(lines.len()), rows.end.min(lines.len()));
+    if lo >= hi {
+        return;
+    }
+    let in_window = |idx: usize| lo <= idx && idx < hi;
+    let mut i = lo;
+    while i > 0 && matches!(lines[i - 1].kind, LineKind::Del | LineKind::Add) {
+        i -= 1;
+    }
+    let mut end = hi;
+    while end < lines.len() && matches!(lines[end].kind, LineKind::Del | LineKind::Add) {
+        end += 1;
+    }
+    while i < end {
         if lines[i].kind != LineKind::Del {
             i += 1;
             continue;
         }
         let del_start = i;
-        while i < lines.len() && lines[i].kind == LineKind::Del {
+        while i < end && lines[i].kind == LineKind::Del {
             i += 1;
         }
         let add_start = i;
-        while i < lines.len() && lines[i].kind == LineKind::Add {
+        while i < end && lines[i].kind == LineKind::Add {
             i += 1;
         }
         let dn = add_start - del_start;
         let an = i - add_start;
         if dn == an {
             for k in 0..dn {
+                let (d, a) = (del_start + k, add_start + k);
+                if (!in_window(d) && !in_window(a)) || lines[d].emphasis.is_some() {
+                    continue;
+                }
                 // The LCS table is O(tokens²) and there are at most body.len()
                 // tokens (each is ≥1 byte), so the byte length bounds it — skip very
                 // long lines (minified JS, one-line JSON) that would blow up memory
-                // for a word-diff nobody can read anyway.
-                if lines[del_start + k].body().len() > MAX_WORD_DIFF_LINE
-                    || lines[add_start + k].body().len() > MAX_WORD_DIFF_LINE
+                // for a word-diff nobody can read anyway. Marked computed-empty so
+                // the window doesn't re-consider them every frame.
+                if lines[d].body().len() > MAX_WORD_DIFF_LINE
+                    || lines[a].body().len() > MAX_WORD_DIFF_LINE
                 {
+                    (lines[d].emphasis, lines[a].emphasis) = (Some(Vec::new()), Some(Vec::new()));
                     continue;
                 }
                 // `line_emphasis` returns owned Vecs, so the two `&str` borrows of
                 // `lines` end before the `.emphasis` writes below — no clone needed.
-                let (de, ae) = word_diff::line_emphasis(
-                    lines[del_start + k].body(),
-                    lines[add_start + k].body(),
-                );
-                lines[del_start + k].emphasis = de;
-                lines[add_start + k].emphasis = ae;
+                let (de, ae) = word_diff::line_emphasis(lines[d].body(), lines[a].body());
+                (lines[d].emphasis, lines[a].emphasis) = (Some(de), Some(ae));
             }
         }
     }
@@ -218,31 +240,15 @@ pub struct FileEntry {
 pub struct DiffData {
     pub lines: Vec<DiffLine>,
     pub files: Vec<FileEntry>,
-    /// Whether `compute_word_emphasis` has run over `lines`. The pass (an LCS per
-    /// changed block) is deferred while the word-diff toggle is off — nothing would
-    /// render it — and run on demand via `ensure_word_emphasis`.
-    pub word_emphasized: bool,
 }
 
 impl DiffData {
-    /// Finalize a diff builder's output. The word-diff emphasis pass is NOT run
-    /// here — it's deferred to `ensure_word_emphasis`, which the workers call when
-    /// the toggle is on (keeping the LCS off the UI thread) and `set_diff_content`
-    /// backstops at install, so a displayed diff always matches the toggle.
+    /// Finalize a diff builder's output. Word-diff emphasis is NOT computed here
+    /// — each line's `emphasis` starts `None` and is filled lazily per visible
+    /// window by the UI (`emphasize_rows`), so no builder or worker ever pays the
+    /// LCS for lines nobody looks at.
     pub const fn new(lines: Vec<DiffLine>, files: Vec<FileEntry>) -> Self {
-        Self {
-            lines,
-            files,
-            word_emphasized: false,
-        }
-    }
-
-    /// Run the word-diff emphasis pass if it hasn't run yet. Idempotent.
-    pub fn ensure_word_emphasis(&mut self) {
-        if !self.word_emphasized {
-            compute_word_emphasis(&mut self.lines);
-            self.word_emphasized = true;
-        }
+        Self { lines, files }
     }
 
     /// An empty diff — returned when a git2 operation fails (the error is logged
@@ -251,7 +257,6 @@ impl DiffData {
         Self {
             lines: Vec::new(),
             files: Vec::new(),
-            word_emphasized: true, // vacuously: no lines to emphasize
         }
     }
 }
@@ -793,60 +798,77 @@ mod tests {
         );
     }
 
+    /// True when the line's emphasis was computed AND found changed ranges.
+    fn emphasized(line: &DiffLine) -> bool {
+        line.emphasis.as_ref().is_some_and(|e| !e.is_empty())
+    }
+
     #[test]
-    fn word_emphasis_deferred_until_ensured() {
-        let lines = vec![
+    fn word_emphasis_lazy_by_window_and_memoized() {
+        // Two change blocks separated by context.
+        let mut lines = vec![
+            DiffLine::new("-foo bar", LineKind::Del),
+            DiffLine::new("+foo baz", LineKind::Add),
+            DiffLine::new(" ctx", LineKind::Context),
+            DiffLine::new("-a b", LineKind::Del),
+            DiffLine::new("+a c", LineKind::Add),
+        ];
+        // Nothing computes until a window asks for it.
+        assert!(lines.iter().all(|l| l.emphasis.is_none()));
+        // A window over the first block computes it and leaves the second alone.
+        emphasize_rows(&mut lines, 0..2);
+        assert!(emphasized(&lines[0]));
+        assert!(emphasized(&lines[1]));
+        assert!(lines[3].emphasis.is_none());
+        assert!(lines[4].emphasis.is_none());
+        // Idempotent: a second pass over the same window changes nothing; a
+        // window over the rest completes the diff.
+        let snapshot: Vec<_> = lines.iter().map(|l| l.emphasis.clone()).collect();
+        emphasize_rows(&mut lines, 0..2);
+        let after: Vec<_> = lines.iter().map(|l| l.emphasis.clone()).collect();
+        assert_eq!(after, snapshot);
+        emphasize_rows(&mut lines, 3..5);
+        assert!(emphasized(&lines[3]));
+        assert!(emphasized(&lines[4]));
+    }
+
+    #[test]
+    fn word_emphasis_window_extends_to_block_boundaries() {
+        // The window covers only the Add half of a pair: the walk must still see
+        // the full Del-run above it to pair correctly, and emphasizes both sides.
+        let mut lines = vec![
+            DiffLine::new(" ctx", LineKind::Context),
             DiffLine::new("-foo bar", LineKind::Del),
             DiffLine::new("+foo baz", LineKind::Add),
         ];
-        let mut data = DiffData::new(lines, Vec::new());
-        // The pass is deferred: nothing computes until a consumer needs it.
-        assert!(!data.word_emphasized);
-        assert!(data.lines.iter().all(|l| l.emphasis.is_empty()));
-        data.ensure_word_emphasis();
-        assert!(data.word_emphasized);
-        assert!(!data.lines[0].emphasis.is_empty());
-        assert!(!data.lines[1].emphasis.is_empty());
-        // Idempotent: a second ensure leaves the computed ranges alone.
-        let snapshot: Vec<_> = data.lines.iter().map(|l| l.emphasis.clone()).collect();
-        data.ensure_word_emphasis();
-        let after: Vec<_> = data.lines.iter().map(|l| l.emphasis.clone()).collect();
-        assert_eq!(after, snapshot);
+        emphasize_rows(&mut lines, 2..3);
+        assert!(emphasized(&lines[1]));
+        assert!(emphasized(&lines[2]));
     }
 
     #[test]
     fn word_emphasis_pairs_equal_blocks_only() {
-        // Equal-count block (1 del, 1 add): both lines get emphasis.
-        let mut lines = vec![
-            DiffLine::new("-let a = old();", LineKind::Del),
-            DiffLine::new("+let a = new();", LineKind::Add),
-        ];
-        compute_word_emphasis(&mut lines);
-        assert!(!lines[0].emphasis.is_empty());
-        assert!(!lines[1].emphasis.is_empty());
-
-        // Unequal block (1 del, 2 add): skipped entirely.
+        // Unequal block (1 del, 2 add): no 1:1 pairing, nothing computes.
         let mut lines = vec![
             DiffLine::new("-x", LineKind::Del),
             DiffLine::new("+y", LineKind::Add),
             DiffLine::new("+z", LineKind::Add),
         ];
-        compute_word_emphasis(&mut lines);
-        assert!(lines.iter().all(|l| l.emphasis.is_empty()));
+        emphasize_rows(&mut lines, 0..3);
+        assert!(lines.iter().all(|l| l.emphasis.is_none()));
     }
 
     #[test]
-    fn word_emphasis_skips_overlong_lines() {
-        // A very long edited-in-place line must not be word-diffed — the O(tokens²)
-        // LCS table would explode (minified JS / one-line JSON).
-        let del = format!("-{}", "a ".repeat(MAX_WORD_DIFF_LINE));
-        let add = format!("+{}", "b ".repeat(MAX_WORD_DIFF_LINE));
+    fn word_emphasis_marks_overlong_pairs_computed() {
+        // A pair over MAX_WORD_DIFF_LINE is skipped, but marked computed-empty so
+        // the per-frame window doesn't re-consider it forever.
+        let long = format!("-{}", "x".repeat(MAX_WORD_DIFF_LINE + 1));
         let mut lines = vec![
-            DiffLine::new(&del, LineKind::Del),
-            DiffLine::new(&add, LineKind::Add),
+            DiffLine::new(&long, LineKind::Del),
+            DiffLine::new("+short", LineKind::Add),
         ];
-        compute_word_emphasis(&mut lines);
-        assert!(lines[0].emphasis.is_empty());
-        assert!(lines[1].emphasis.is_empty());
+        emphasize_rows(&mut lines, 0..2);
+        assert_eq!(lines[0].emphasis, Some(Vec::new()));
+        assert_eq!(lines[1].emphasis, Some(Vec::new()));
     }
 }
