@@ -371,6 +371,52 @@ enum FileListRow {
     },
 }
 
+/// Lazily-built render caches for the file-list sidebar. The sidebar isn't
+/// row-virtualized — every row draws every frame — so per-row text is elided and
+/// laid out into galleys once, not re-allocated and re-measured per frame. Scoped
+/// to the current `file_rows`: `rebuild_file_rows` resets it (a font change must
+/// too), and `ensure` drops the elided labels whenever the row width changes
+/// (sidebar drag / window resize).
+/// One file's cached `+n`/`-n` stat galleys (an inner `None`: that count is zero,
+/// nothing to draw).
+type StatGalleys = (Option<Arc<egui::Galley>>, Option<Arc<egui::Galley>>);
+
+#[derive(Default)]
+struct SidebarCache {
+    /// Per file index: the stat galleys, `None` until first drawn.
+    stats: Vec<Option<StatGalleys>>,
+    /// The row width the elided labels below were computed for.
+    elide_width: f32,
+    /// Per file index: the label elided for `elide_width`, laid out in
+    /// `Color32::PLACEHOLDER` so the normal/hover color applies at paint time
+    /// (one galley serves both states).
+    elided: Vec<Option<Arc<egui::Galley>>>,
+}
+
+impl SidebarCache {
+    /// Size both caches for `files` entries and key the elided labels to `width`:
+    /// a width change drops only the elided labels (the stat galleys are
+    /// width-independent), a size mismatch (fresh diff) drops both.
+    fn ensure(&mut self, files: usize, width: f32) {
+        if self.stats.len() != files {
+            self.stats = vec![None; files];
+        }
+        if self.elided.len() != files || self.elide_width != width {
+            self.elided = vec![None; files];
+            self.elide_width = width;
+        }
+    }
+}
+
+/// Per-frame context threaded through the sidebar's file-row draws: the shared
+/// row height, the diff-tracked current file, and the render cache (taken out of
+/// `GitkApp` for the loop, so the `&self` draws can fill it).
+struct SidebarFrame<'c> {
+    row_h: f32,
+    current_file: Option<usize>,
+    cache: &'c mut SidebarCache,
+}
+
 /// Split a path into (directory-with-trailing-slash, basename). The directory is
 /// "" for a root-level file. Slices only at an ASCII `/`, so multibyte-safe.
 fn split_dir(path: &str) -> (&str, &str) {
@@ -3198,6 +3244,8 @@ struct GitkApp {
     /// `DiffData::word_emphasized` while the lines sit detached in `diff_lines`
     /// (`stash_current_diff` reassembles a `DiffData` carrying it back).
     diff_word_emphasized: bool,
+    /// Cached per-row galleys for the (un-virtualized) file-list sidebar.
+    sidebar_cache: SidebarCache,
     /// Lazily-created arboard connection for the primary selection, kept for the
     /// session instead of reconnecting to the display server on every SHA click.
     clipboard: Option<arboard::Clipboard>,
@@ -3663,6 +3711,7 @@ impl GitkApp {
             diff_max_chars,
             diff_last_top_anchor: None,
             diff_word_emphasized: true, // empty startup diff — vacuously computed
+            sidebar_cache: SidebarCache::default(),
             clipboard: None,
             highlighter: None,
             syntax_enabled,
@@ -4370,6 +4419,8 @@ impl GitkApp {
             .map(|f| (f.path.as_str(), f.old_path.as_deref()))
             .collect();
         self.file_rows = build_file_rows(&files, self.file_list);
+        // New rows ⇒ the per-row galleys no longer correspond; rebuild lazily.
+        self.sidebar_cache = SidebarCache::default();
     }
 
     /// Draw one grouped directory header, breadcrumb-style. `dim_len` is the byte
@@ -4419,7 +4470,9 @@ impl GitkApp {
     /// current-file accent, hover highlight, and full-path tooltip. The label is
     /// elided to fit the space before the stats — `Full` layout draws full paths and
     /// elides from the front (keeping the filename); the others draw basenames and
-    /// elide from the back (keeping the name's start). Returns the diff line to
+    /// elide from the back (keeping the name's start). The elide (a binary search
+    /// of measured candidates) and the text layout go through `frame.cache`, built
+    /// once per (diff, width, font) instead of per frame. Returns the diff line to
     /// scroll to if the row was clicked, so the caller (not this `&self` method)
     /// does the scroll write.
     fn draw_file_row(
@@ -4428,19 +4481,16 @@ impl GitkApp {
         idx: usize,
         label: &str,
         indent: f32,
-        current_file: Option<usize>,
-        row_h: f32,
+        frame: &mut SidebarFrame,
     ) -> Option<usize> {
-        let additions = self.diff_files[idx].additions;
-        let deletions = self.diff_files[idx].deletions;
         let line_idx = self.diff_files[idx].diff_line_idx;
 
         let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), row_h),
+            egui::vec2(ui.available_width(), frame.row_h),
             egui::Sense::click(),
         );
 
-        if current_file == Some(idx) {
+        if frame.current_file == Some(idx) {
             ui.painter().rect_filled(rect, 2.0, select_accent());
         } else if resp.hovered() {
             ui.painter().rect_filled(rect, 2.0, mauve(20));
@@ -4455,20 +4505,30 @@ impl GitkApp {
         } else {
             TEXT
         };
-        let name_font = self.fonts.font_id(Role::FileList);
 
-        // Stats (+adds / -dels), right-aligned. Two optionals instead of a Vec to
-        // avoid a per-row heap allocation (this list isn't virtualized).
-        let stats_font = self.fonts.file_stats_font_id();
+        // Stats (+adds / -dels), right-aligned — galleys built once per diff (the
+        // colors are fixed, so they're baked in at build time).
         let stat_gap = 3.0;
-        let add_galley = (additions > 0).then(|| {
-            ui.painter()
-                .layout_no_wrap(format!("+{additions}"), stats_font.clone(), GREEN)
-        });
-        let del_galley = (deletions > 0).then(|| {
-            ui.painter()
-                .layout_no_wrap(format!("-{deletions}"), stats_font.clone(), RED)
-        });
+        let (add_galley, del_galley) = {
+            let entry = &mut frame.cache.stats[idx];
+            if entry.is_none() {
+                let f = &self.diff_files[idx];
+                let stats_font = self.fonts.file_stats_font_id();
+                let add = (f.additions > 0).then(|| {
+                    ui.painter().layout_no_wrap(
+                        format!("+{}", f.additions),
+                        stats_font.clone(),
+                        GREEN,
+                    )
+                });
+                let del = (f.deletions > 0).then(|| {
+                    ui.painter()
+                        .layout_no_wrap(format!("-{}", f.deletions), stats_font, RED)
+                });
+                *entry = Some((add, del));
+            }
+            entry.clone().unwrap()
+        };
         let add_w = add_galley.as_ref().map_or(0.0, |g| g.size().x);
         let del_w = del_galley.as_ref().map_or(0.0, |g| g.size().x);
         let inner_gap = if add_galley.is_some() && del_galley.is_some() {
@@ -4483,18 +4543,29 @@ impl GitkApp {
             0.0
         };
 
-        // Label, elided into the width left of the stats.
-        let label_max = (right - left - stats_w - pad).max(0.0);
-        let measure = |s: &str| text_width(ui.painter(), s, &name_font);
-        let elide_left = self.file_list == FileListLayout::Full;
-        let elided = if elide_left {
-            left_elide(label, label_max, measure)
-        } else {
-            right_elide(label, label_max, measure)
+        // Label, elided into the width left of the stats — cached in PLACEHOLDER
+        // color so the normal/hover color is applied at paint time (one galley
+        // serves both states).
+        let g = {
+            let entry = &mut frame.cache.elided[idx];
+            if entry.is_none() {
+                let name_font = self.fonts.font_id(Role::FileList);
+                let label_max = (right - left - stats_w - pad).max(0.0);
+                let measure = |s: &str| text_width(ui.painter(), s, &name_font);
+                let elide_left = self.file_list == FileListLayout::Full;
+                let elided = if elide_left {
+                    left_elide(label, label_max, measure)
+                } else {
+                    right_elide(label, label_max, measure)
+                };
+                *entry = Some(ui.painter().layout_no_wrap(
+                    elided,
+                    name_font,
+                    egui::Color32::PLACEHOLDER,
+                ));
+            }
+            Arc::clone(entry.as_ref().unwrap())
         };
-        let g = ui
-            .painter()
-            .layout_no_wrap(elided, name_font.clone(), name_color);
         let gy = cy - g.size().y / 2.0;
         ui.painter().galley(egui::pos2(left, gy), g, name_color);
 
@@ -4989,6 +5060,9 @@ impl GitkApp {
                 // pending_fonts poll — the same path as the startup cold scan,
                 // which also surfaces the thread's font warnings as the toast.
                 self.fonts = Fonts::from_config(&cfg);
+                // The sidebar's cached galleys bake the old font metrics; rebuild
+                // them lazily under the new role map.
+                self.sidebar_cache = SidebarCache::default();
                 let mut warned = false;
                 self.pending_fonts = spawn_font_build(Some(cfg.clone()));
                 if self.pending_fonts.is_none() {
@@ -5570,6 +5644,16 @@ impl eframe::App for GitkApp {
                                         // lookup takes the font lock, so don't repeat
                                         // it per row (this list isn't virtualized).
                                         let row_h = self.file_row_h(ui);
+                                        // Take the render cache out of self so the
+                                        // `&self` row draws can fill it while the
+                                        // row list is borrowed.
+                                        let mut cache = std::mem::take(&mut self.sidebar_cache);
+                                        cache.ensure(self.diff_files.len(), ui.available_width());
+                                        let mut frame = SidebarFrame {
+                                            row_h,
+                                            current_file,
+                                            cache: &mut cache,
+                                        };
                                         let mut scroll_to: Option<usize> = None;
                                         for row in &self.file_rows {
                                             match row {
@@ -5584,18 +5668,14 @@ impl eframe::App for GitkApp {
                                                     let indent =
                                                         if *indented { FILE_INDENT } else { 0.0 };
                                                     if let Some(li) = self.draw_file_row(
-                                                        ui,
-                                                        *idx,
-                                                        label,
-                                                        indent,
-                                                        current_file,
-                                                        row_h,
+                                                        ui, *idx, label, indent, &mut frame,
                                                     ) {
                                                         scroll_to = Some(li);
                                                     }
                                                 }
                                             }
                                         }
+                                        self.sidebar_cache = cache;
                                         // Ignore a click while a diff load is in flight:
                                         // the sidebar still shows the OUTGOING diff, so
                                         // the clicked line index is in its coordinates —
@@ -7762,6 +7842,37 @@ mod tests {
         assert_eq!(create.follow_path.as_deref(), Some("old.txt"));
         let edit = rows.iter().find(|c| c.summary == "edit new").unwrap();
         assert_eq!(edit.follow_path.as_deref(), Some("new.txt"));
+    }
+
+    #[test]
+    fn sidebar_cache_ensure_scopes_invalidation() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let galley = || {
+                ui.painter().layout_no_wrap(
+                    "x".to_string(),
+                    egui::FontId::monospace(12.0),
+                    egui::Color32::PLACEHOLDER,
+                )
+            };
+            let mut c = SidebarCache::default();
+            c.ensure(2, 100.0);
+            assert_eq!((c.stats.len(), c.elided.len()), (2, 2));
+            c.stats[0] = Some((Some(galley()), None));
+            c.elided[0] = Some(galley());
+            // Same shape ⇒ everything kept.
+            c.ensure(2, 100.0);
+            assert!(c.stats[0].is_some() && c.elided[0].is_some());
+            // Width change ⇒ elided labels dropped, stat galleys kept.
+            c.ensure(2, 90.0);
+            assert!(c.stats[0].is_some());
+            assert!(c.elided.iter().all(Option::is_none));
+            // File-count change (fresh diff) ⇒ both dropped.
+            c.elided[0] = Some(galley());
+            c.ensure(3, 90.0);
+            assert!(c.stats.iter().all(Option::is_none));
+            assert!(c.elided.iter().all(Option::is_none));
+        });
     }
 
     #[test]
