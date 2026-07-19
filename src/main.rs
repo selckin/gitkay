@@ -3335,6 +3335,47 @@ fn config_watch_targets(
     (files, dirs)
 }
 
+/// Everything the `.git` watcher needs to know about where git actually keeps
+/// the reload-relevant state.
+struct GitWatchTargets {
+    /// The dir refs (and the shared HEAD/packed-refs) live in — the MAIN repo's
+    /// `.git` for a worktree, `git_dir` itself otherwise.
+    refs_dir: std::path::PathBuf,
+    /// `refs_dir/refs`, watched recursively; any event under it counts.
+    refs_root: std::path::PathBuf,
+    /// The reload-relevant files events are filtered to.
+    interesting: [std::path::PathBuf; 4],
+}
+
+/// Resolve the `.git` watch targets from `git_dir` and the `commondir` file's
+/// contents (`None` ⇒ not a worktree, everything lives in `git_dir`; a relative
+/// commondir resolves against `git_dir`, as git writes for worktrees). Pure —
+/// the trickiest filesystem-layout logic in the watcher, unit-tested like its
+/// config-file analogue `config_watch_targets`.
+fn git_watch_targets(git_dir: &std::path::Path, commondir: Option<&str>) -> GitWatchTargets {
+    let refs_dir = commondir.map_or_else(
+        || git_dir.to_path_buf(),
+        |content| {
+            let p = content.trim();
+            if std::path::Path::new(p).is_absolute() {
+                std::path::PathBuf::from(p)
+            } else {
+                git_dir.join(p)
+            }
+        },
+    );
+    GitWatchTargets {
+        refs_root: refs_dir.join("refs"),
+        interesting: [
+            git_dir.join("HEAD"),
+            git_dir.join("index"),
+            refs_dir.join("HEAD"),
+            refs_dir.join("packed-refs"),
+        ],
+        refs_dir,
+    }
+}
+
 /// Build a notify watcher whose callback sets `flag` and requests a repaint for
 /// events matching `keep`. Returns None (logged) if the watcher can't be created;
 /// per-event OS watch errors are silently dropped.
@@ -3573,32 +3614,15 @@ impl GitkApp {
         let needs_reload = Arc::new(AtomicBool::new(false));
         let watcher = {
             let git_dir = repo.path().to_path_buf();
-            // In a worktree, refs (and the shared HEAD/packed-refs) live in the
-            // main repo's .git dir (commondir), not the worktree's .git dir.
-            let common_dir = git_dir.join("commondir");
-            let refs_dir = if common_dir.exists() {
-                // Worktree: commondir file contains path to the main .git
-                std::fs::read_to_string(&common_dir).map_or_else(
-                    |_| git_dir.clone(),
-                    |content| {
-                        let p = content.trim();
-                        if std::path::Path::new(p).is_absolute() {
-                            std::path::PathBuf::from(p)
-                        } else {
-                            git_dir.join(p)
-                        }
-                    },
-                )
-            } else {
-                git_dir.clone()
-            };
-            let refs_root = refs_dir.join("refs");
-            let interesting = [
-                git_dir.join("HEAD"),
-                git_dir.join("index"),
-                refs_dir.join("HEAD"),
-                refs_dir.join("packed-refs"),
-            ];
+            // A worktree's commondir file names the main repo's .git dir (where
+            // refs and the shared HEAD/packed-refs live); a failed read means
+            // this isn't a worktree and everything lives in git_dir itself.
+            let commondir = std::fs::read_to_string(git_dir.join("commondir")).ok();
+            let GitWatchTargets {
+                refs_dir,
+                refs_root,
+                interesting,
+            } = git_watch_targets(&git_dir, commondir.as_deref());
             let mut watcher = make_watcher(&cc.egui_ctx, needs_reload.clone(), {
                 let refs_root = refs_root.clone();
                 move |event| {
@@ -7871,6 +7895,41 @@ mod tests {
         assert_eq!(create.follow_path.as_deref(), Some("old.txt"));
         let edit = rows.iter().find(|c| c.summary == "edit new").unwrap();
         assert_eq!(edit.follow_path.as_deref(), Some("new.txt"));
+    }
+
+    #[test]
+    fn git_watch_targets_plain_worktree_and_relative_commondir() {
+        let gd = std::path::Path::new("/repo/.git");
+
+        // Plain repo: everything lives under .git itself.
+        let t = git_watch_targets(gd, None);
+        assert_eq!(t.refs_dir, gd);
+        assert_eq!(t.refs_root, gd.join("refs"));
+        assert!(t.interesting.contains(&gd.join("HEAD")));
+        assert!(t.interesting.contains(&gd.join("index")));
+
+        // Worktree with an absolute commondir (trailing newline, as git writes).
+        let t = git_watch_targets(gd, Some("/main/.git\n"));
+        let main = std::path::Path::new("/main/.git");
+        assert_eq!(t.refs_dir, main);
+        assert_eq!(t.refs_root, main.join("refs"));
+        // The WORKTREE's own HEAD/index stay watched; the shared HEAD and
+        // packed-refs come from the main repo.
+        assert!(t.interesting.contains(&gd.join("HEAD")));
+        assert!(t.interesting.contains(&gd.join("index")));
+        assert!(t.interesting.contains(&main.join("HEAD")));
+        assert!(t.interesting.contains(&main.join("packed-refs")));
+
+        // Relative commondir (what git actually writes for worktrees:
+        // "../.." from .git/worktrees/<name>) resolves against git_dir.
+        let wt = std::path::Path::new("/main/.git/worktrees/w");
+        let t = git_watch_targets(wt, Some("../..\n"));
+        assert_eq!(t.refs_dir, wt.join("../.."));
+        assert_eq!(t.refs_root, wt.join("../..").join("refs"));
+        assert!(
+            t.interesting
+                .contains(&wt.join("../..").join("packed-refs"))
+        );
     }
 
     #[test]
