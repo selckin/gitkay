@@ -24,6 +24,12 @@
 
 ---
 
+> [!NOTE]
+> This is a fork of [Marenz/gitkay](https://github.com/Marenz/gitkay), developed
+> entirely with [Claude](https://www.claude.com/product/claude-code). It's my daily
+> git viewer, and the fork has grown the features I kept reaching for in real
+> day-to-day work, along with steady UX and DX polish.
+
 ## Why?
 
 **gitk** is a Tcl/Tk app from 2005. On Wayland it needs XWayland, has stale X11 selection bugs, and looks like it time-traveled from Windows 98.
