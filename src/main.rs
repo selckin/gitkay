@@ -4043,8 +4043,10 @@ impl GitkApp {
                 .fixed_pos(rect.right_bottom() + egui::vec2(0.0, 4.0))
                 .show(ui.ctx(), |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.set_max_width(ui.spacing().tooltip_width);
-                        ui.label(text);
+                        // Never wrap: a path reads far better as one long line, and
+                        // the tooltip is transient anyway. Extend keeps the label at
+                        // its natural width instead of the default tooltip wrap.
+                        ui.add(egui::Label::new(text).extend());
                     });
                 });
         }
