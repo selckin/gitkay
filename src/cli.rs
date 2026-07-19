@@ -1,6 +1,8 @@
-//! Pure parsing of gitkay's command line into a `Scope`. Knows nothing of git or
-//! egui: `classify` takes `is_rev`/`is_path` predicates so it's testable without a
-//! repo. Grammar: `gitkay [-C <dir>] [--all] [<rev>...] [-- <path>...]`.
+//! Pure parsing of gitkay's command line into a `Scope`, plus the CLI-facing
+//! helpers around it (pathspec resolution, the window-title suffix, help/version
+//! text). Knows nothing of git or egui: `classify` takes `is_rev`/`is_path`
+//! predicates so it's testable without a repo.
+//! Grammar: `gitkay [-C <dir>] [--all] [<rev>...] [-- <path>...]`.
 
 /// The resolved command-line scope.
 #[derive(Default, Clone)]
@@ -183,12 +185,150 @@ pub fn rev_token_kind(tok: &str) -> RevTokenKind {
     RevTokenKind::Single(tok.to_string())
 }
 
+/// Lexically normalize a `/`-separated relative path: drop `.` and empty segments,
+/// resolve `..` against a preceding normal segment. Never touches the filesystem, so
+/// it works on pathspecs for files that no longer exist.
+fn normalize_rel(path: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if matches!(out.last(), Some(&s) if s != "..") {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            s => out.push(s),
+        }
+    }
+    out.join("/")
+}
+
+/// Translate a user-supplied path token into a repo-root-relative pathspec. `prefix`
+/// is the run directory's location inside the repo (e.g. "src" when started in
+/// `<repo>/src`). Relative tokens are joined onto `prefix`; absolute tokens are made
+/// relative to `workdir`. A token that resolves to the repo root (e.g. `.` at the
+/// top) yields "" — the caller drops those so they impose no restriction.
+pub fn token_to_pathspec(token: &str, prefix: &str, workdir: &std::path::Path) -> String {
+    let p = std::path::Path::new(token);
+    if p.is_absolute() {
+        p.strip_prefix(workdir).map_or_else(
+            |_| token.to_string(), // outside the repo — will simply match nothing
+            |rel| normalize_rel(&rel.to_string_lossy()),
+        )
+    } else {
+        normalize_rel(&format!("{prefix}/{token}"))
+    }
+}
+
+/// The parenthetical scope shown in the window title, e.g. `--all`, `main`,
+/// `a..b -- src`. Empty when the default (current branch, no path filter) is active.
+pub fn scope_title_suffix(scope: &Scope) -> String {
+    if scope.reflog {
+        return scope
+            .revs
+            .first()
+            .map_or_else(|| "reflog".to_string(), |r| format!("reflog {r}"));
+    }
+    let mut head: Vec<String> = Vec::new();
+    if scope.all {
+        head.push("--all".to_string());
+    }
+    head.extend(scope.revs.iter().cloned());
+    let mut s = head.join(" ");
+    if !scope.paths.is_empty() {
+        if !s.is_empty() {
+            s.push(' ');
+        }
+        s.push_str(if scope.follow { "follow " } else { "-- " });
+        s.push_str(&scope.paths.join(" "));
+    }
+    s
+}
+
+pub fn print_help() {
+    print!(
+        r"gitkay — a git history viewer
+
+USAGE:
+    gitkay [-C <dir>] [--all] [<rev>...] [-- <path>...]
+    gitkay [-C <dir>] --reflog [<ref>]
+    gitkay [-C <dir>] --follow [<rev>...] <path>
+
+OPTIONS:
+    -C <dir>        Run as if started in <dir>
+    --all           Show all refs (branches, remotes, tags), not just the current branch
+    --reflog        Show <ref>'s reflog (default HEAD) instead of its history
+    --follow        Follow a single <path> across renames (exactly one path)
+    -h, --help      Print this help and exit
+    -V, --version   Print version and exit
+
+ARGS:
+    <rev>...        Revisions to show: <rev>, <a>..<b>, <a>...<b>, ^<rev>
+                    (default: the current branch)
+    <path>...       Limit history and diffs to commits touching these paths
+                    (relative to the current directory, like git)
+"
+    );
+}
+
+pub fn print_version() {
+    println!("gitkay {}", env!("CARGO_PKG_VERSION"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn v(xs: &[&str]) -> Vec<String> {
         xs.iter().map(std::string::ToString::to_string).collect()
+    }
+
+    #[test]
+    fn normalize_rel_resolves_dot_and_dotdot() {
+        assert_eq!(normalize_rel("src/./foo"), "src/foo");
+        assert_eq!(normalize_rel("src/../foo"), "foo");
+        assert_eq!(normalize_rel("a//b"), "a/b");
+        assert_eq!(normalize_rel("src/.."), "");
+        assert_eq!(normalize_rel("./."), "");
+        assert_eq!(normalize_rel("/foo"), "foo"); // leading slash from an empty prefix
+    }
+
+    #[test]
+    fn token_to_pathspec_anchors_relative_to_prefix() {
+        let wd = std::path::Path::new("/repo"); // only consulted for absolute tokens
+        // In <repo>/src, `.` is the whole src dir.
+        assert_eq!(token_to_pathspec(".", "src", wd), "src");
+        assert_eq!(token_to_pathspec("foo.rs", "src", wd), "src/foo.rs");
+        assert_eq!(token_to_pathspec("../README", "src", wd), "README");
+        // At the repo root `.` is the whole repo → "" (dropped by the caller).
+        assert_eq!(token_to_pathspec(".", "", wd), "");
+        assert_eq!(token_to_pathspec("a/b", "", wd), "a/b");
+        // Absolute token under the worktree → made repo-root-relative.
+        assert_eq!(
+            token_to_pathspec("/repo/src/foo.rs", "src", wd),
+            "src/foo.rs"
+        );
+    }
+
+    #[test]
+    fn scope_title_suffix_formats() {
+        let s = |all: bool, revs: &[&str], paths: &[&str]| Scope {
+            all,
+            revs: revs.iter().map(std::string::ToString::to_string).collect(),
+            paths: paths.iter().map(std::string::ToString::to_string).collect(),
+            ..Default::default()
+        };
+        assert_eq!(scope_title_suffix(&s(false, &[], &[])), "");
+        assert_eq!(scope_title_suffix(&s(true, &[], &[])), "--all");
+        assert_eq!(scope_title_suffix(&s(false, &["main"], &[])), "main");
+        assert_eq!(scope_title_suffix(&s(false, &[], &["src"])), "-- src");
+        assert_eq!(
+            scope_title_suffix(&s(false, &["a..b"], &["src", "x"])),
+            "a..b -- src x"
+        );
     }
 
     #[test]

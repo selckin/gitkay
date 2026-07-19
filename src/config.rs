@@ -20,6 +20,19 @@ pub enum Role {
     Ui,
 }
 
+impl Role {
+    /// Every role, in declaration order — so `role as usize` indexes it (and the
+    /// per-role array in `Fonts`).
+    const ALL: [Self; 6] = [
+        Self::Diff,
+        Self::CommitSummary,
+        Self::CommitMeta,
+        Self::Refs,
+        Self::FileList,
+        Self::Ui,
+    ];
+}
+
 /// Which configured family a role draws with.
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -196,12 +209,8 @@ struct ResolvedStyle {
 
 /// Resolved, clamped per-role font settings ready to hand to egui.
 pub struct Fonts {
-    diff: ResolvedStyle,
-    commit_summary: ResolvedStyle,
-    commit_meta: ResolvedStyle,
-    refs: ResolvedStyle,
-    file_list: ResolvedStyle,
-    ui: ResolvedStyle,
+    /// One entry per `Role`, indexed by discriminant (`Role::ALL` order).
+    styles: [ResolvedStyle; Role::ALL.len()],
 }
 
 impl Fonts {
@@ -217,24 +226,12 @@ impl Fonts {
             }
         };
         Self {
-            diff: resolve(Role::Diff),
-            commit_summary: resolve(Role::CommitSummary),
-            commit_meta: resolve(Role::CommitMeta),
-            refs: resolve(Role::Refs),
-            file_list: resolve(Role::FileList),
-            ui: resolve(Role::Ui),
+            styles: Role::ALL.map(resolve),
         }
     }
 
     const fn style(&self, role: Role) -> ResolvedStyle {
-        match role {
-            Role::Diff => self.diff,
-            Role::CommitSummary => self.commit_summary,
-            Role::CommitMeta => self.commit_meta,
-            Role::Refs => self.refs,
-            Role::FileList => self.file_list,
-            Role::Ui => self.ui,
-        }
+        self.styles[role as usize]
     }
 
     pub const fn font_id(&self, role: Role) -> egui::FontId {
@@ -244,7 +241,7 @@ impl Fonts {
 
     /// File-list +/- stats: same family as the file list, two px smaller.
     pub fn file_stats_font_id(&self) -> egui::FontId {
-        let s = self.file_list;
+        let s = self.style(Role::FileList);
         let size = (s.size - 2.0).max(MIN_SIZE);
         egui::FontId::new(size, egui_family(s.family))
     }
@@ -481,10 +478,12 @@ fn fontdb_scan(db: &fontdb::Database, name: &str) -> Option<PathBuf> {
     }
 }
 
-/// Resolve both configured families, build the egui font set (bundled fonts plus
-/// any user overrides), and the clamped per-role settings (`Fonts`); returns any
-/// font-load warning messages. fontdb is loaded lazily.
-pub fn build_fonts(cfg: &Config) -> (egui::FontDefinitions, Fonts, Vec<String>) {
+/// Resolve both configured families and build the egui font set (bundled fonts plus
+/// any user overrides); returns any font-load warning messages. fontdb is loaded
+/// lazily. The cheap per-role map is built separately (`Fonts::from_config`) —
+/// always synchronously at the boundary, never through this (possibly off-thread,
+/// possibly slow) path.
+pub fn build_fonts(cfg: &Config) -> (egui::FontDefinitions, Vec<String>) {
     let mut defs = egui::FontDefinitions::default();
     let mut warnings: Vec<String> = Vec::new();
 
@@ -497,6 +496,7 @@ pub fn build_fonts(cfg: &Config) -> (egui::FontDefinitions, Fonts, Vec<String>) 
     } else {
         BTreeMap::new()
     };
+    let loaded_cache = cache.clone();
     let exists = |p: &Path| p.exists();
 
     let mut db: Option<fontdb::Database> = None;
@@ -553,16 +553,17 @@ pub fn build_fonts(cfg: &Config) -> (egui::FontDefinitions, Fonts, Vec<String>) 
         }
     }
 
-    // Only persist when we actually resolved something — keeps the default
-    // (no named fonts) path from writing an empty cache file, and keeps unit
-    // tests free of filesystem side effects.
+    // Only persist when resolution actually changed the cache — the common warm
+    // launch (every name already cached) skips the rewrite, and the default
+    // (no named fonts) path never writes an empty cache file at all (which also
+    // keeps unit tests free of filesystem side effects).
     if let Some(p) = cache_file
-        && !cache.is_empty()
+        && cache != loaded_cache
     {
         save_cache(&p, &cache);
     }
 
-    (defs, Fonts::from_config(cfg), warnings)
+    (defs, warnings)
 }
 
 #[cfg(test)]
@@ -875,7 +876,7 @@ mod tests {
 
     #[test]
     fn build_fonts_default_adds_no_user_fonts() {
-        let (defs, _fonts, warns) = build_fonts(&Config::default());
+        let (defs, warns) = build_fonts(&Config::default());
         assert!(!defs.font_data.contains_key("user_monospace"));
         assert!(!defs.font_data.contains_key("user_proportional"));
         assert!(warns.is_empty());
@@ -945,7 +946,7 @@ mod tests {
     fn build_fonts_bad_explicit_path_warns_and_falls_back() {
         let mut cfg = Config::default();
         cfg.fonts.monospace_path = Some("/nonexistent/gitkay-test-font.ttf".to_owned());
-        let (defs, _fonts, warns) = build_fonts(&cfg);
+        let (defs, warns) = build_fonts(&cfg);
         assert!(!defs.font_data.contains_key("user_monospace"));
         assert!(!warns.is_empty());
     }
@@ -969,7 +970,7 @@ mod tests {
     fn build_fonts_bad_proportional_path_warns_and_falls_back() {
         let mut cfg = Config::default();
         cfg.fonts.proportional_path = Some("/nonexistent/gitkay-test-prop-font.ttf".to_owned());
-        let (defs, _fonts, warns) = build_fonts(&cfg);
+        let (defs, warns) = build_fonts(&cfg);
         assert!(!defs.font_data.contains_key("user_proportional"));
         assert!(!warns.is_empty());
     }

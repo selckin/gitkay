@@ -13,13 +13,16 @@ use syntect::parsing::{Scope, SyntaxSet};
 
 /// Default syntax theme when none is configured or the configured slug is unknown.
 pub const DEFAULT_THEME_SLUG: &str = "catppuccin-mocha";
+/// The theme `DEFAULT_THEME_SLUG` names. `THEMES` lists the pair as its first entry,
+/// so the slug and the enum variant can't drift apart.
+const DEFAULT_THEME: EmbeddedThemeName = EmbeddedThemeName::CatppuccinMocha;
 
 /// Clean kebab-case slug → two-face theme. This is the full selectable set
 /// (light and dark); it doubles as the validation list and the documented set
 /// in the config template. The special-purpose `Ansi` / `Base16` / `Base16-256`
 /// templates are intentionally omitted — they don't produce meaningful code colors.
 const THEMES: &[(&str, EmbeddedThemeName)] = &[
-    ("catppuccin-mocha", EmbeddedThemeName::CatppuccinMocha),
+    (DEFAULT_THEME_SLUG, DEFAULT_THEME),
     (
         "catppuccin-macchiato",
         EmbeddedThemeName::CatppuccinMacchiato,
@@ -156,12 +159,6 @@ pub fn luminance(c: egui::Color32) -> f32 {
     (0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32) / 255.0
 }
 
-/// Linear blend of two opaque colours (`t` toward `b`).
-pub fn blend(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
-    let m = |x: u8, y: u8| (x as f32 * (1.0 - t) + y as f32 * t).round() as u8;
-    egui::Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
-}
-
 /// First scope in `scopes` for which `pick` (the foreground or background) differs
 /// from `default` — i.e. the theme actually defines that attribute — mapped to egui,
 /// else None. `scope_color`/`scope_bg` are the two thin specializations.
@@ -243,7 +240,7 @@ impl DiffPalette {
             scope_color(&hl, default.foreground, &["meta.diff.header"]).unwrap_or(foreground);
         let dim = scope_color(&hl, default.foreground, &["comment"])
             .or_else(|| theme.settings.gutter_foreground.map(syn_to_egui))
-            .unwrap_or_else(|| blend(foreground, background, 0.5));
+            .unwrap_or_else(|| foreground.lerp_to_gamma(background, 0.5));
         let marker = theme
             .settings
             .gutter_foreground
@@ -270,13 +267,13 @@ impl DiffPalette {
                     default.background,
                     &["markup.inserted.diff", "markup.inserted"],
                 )
-                .unwrap_or_else(|| blend(background, added, 0.30));
+                .unwrap_or_else(|| background.lerp_to_gamma(added, 0.30));
                 let d = scope_bg(
                     &hl,
                     default.background,
                     &["markup.deleted.diff", "markup.deleted"],
                 )
-                .unwrap_or_else(|| blend(background, deleted, 0.30));
+                .unwrap_or_else(|| background.lerp_to_gamma(deleted, 0.30));
                 (a, d)
             }
         };
@@ -312,8 +309,8 @@ fn load_theme(slug: &str) -> (Theme, Option<String>) {
         || {
             (
                 // Index the default variant directly — no runtime unwrap in the
-                // error-recovery path (DEFAULT_THEME_SLUG names this same theme).
-                set[EmbeddedThemeName::CatppuccinMocha].clone(),
+                // error-recovery path.
+                set[DEFAULT_THEME].clone(),
                 Some(format!(
                     "unknown syntax theme {slug:?}; using {DEFAULT_THEME_SLUG}"
                 )),
