@@ -98,7 +98,7 @@ impl CommitInfo {
         refs: Vec<(String, RefKind)>,
         follow_path: Option<String>,
     ) -> Self {
-        CommitInfo {
+        Self {
             summary_lc: summary.to_lowercase(),
             author_lc: author.to_lowercase(),
             refs_lc: refs.iter().map(|(r, _)| r.to_lowercase()).collect(),
@@ -204,20 +204,20 @@ enum CommitKind {
 }
 
 impl CommitKind {
-    fn of(oid: git2::Oid) -> CommitKind {
+    fn of(oid: git2::Oid) -> Self {
         if oid == oid_uncommitted() {
-            CommitKind::Uncommitted
+            Self::Uncommitted
         } else if oid == oid_staged() {
-            CommitKind::Staged
+            Self::Staged
         } else {
-            CommitKind::Real
+            Self::Real
         }
     }
 
     /// Virtual rows (uncommitted/staged) are content-keyed in the diff cache; a real
     /// commit's oid already pins its content.
-    fn is_virtual(self) -> bool {
-        !matches!(self, CommitKind::Real)
+    const fn is_virtual(self) -> bool {
+        !matches!(self, Self::Real)
     }
 }
 
@@ -310,7 +310,7 @@ fn elide_bsearch(
     let mut best = 0usize;
     let (mut lo, mut hi) = (1usize, n.saturating_sub(1));
     while lo <= hi {
-        let mid = (lo + hi) / 2; // lo >= 1 => mid >= 1, so `mid - 1` never underflows
+        let mid = usize::midpoint(lo, hi); // lo >= 1 => mid >= 1, so `mid - 1` never underflows
         if measure(&cand(mid)) <= max_width {
             best = mid;
             lo = mid + 1;
@@ -376,10 +376,7 @@ enum FileListRow {
 /// Split a path into (directory-with-trailing-slash, basename). The directory is
 /// "" for a root-level file. Slices only at an ASCII `/`, so multibyte-safe.
 fn split_dir(path: &str) -> (&str, &str) {
-    match path.rfind('/') {
-        Some(i) => (&path[..=i], &path[i + 1..]),
-        None => ("", path),
-    }
+    path.rfind('/').map_or(("", path), |i| (&path[..=i], &path[i + 1..]))
 }
 
 /// Byte length of the leading directory segments that `a` and `b` share, ending at a
@@ -463,18 +460,20 @@ fn build_file_rows(files: &[(&str, Option<&str>)], layout: FileListLayout) -> Ve
         // safeguard, not a second identity decision: it keeps rename_brace from
         // emitting a degenerate `{ ⇒ }` when two distinct non-UTF-8 paths collide to
         // the same lossy display string.
-        .map(|&(new, old)| match old.filter(|o| *o != new) {
-            Some(old) => {
-                let (prefix, brace) = rename_brace(old, new);
-                // Grouped/Name show the compact brace; Full prepends the full prefix.
-                let label = if full { format!("{prefix}{brace}") } else { brace };
-                (if grouped { prefix } else { String::new() }, label)
-            }
-            None => {
-                let (dir, base) = split_dir(new);
-                let label = if full { new.to_string() } else { base.to_string() };
-                (if grouped { dir.to_string() } else { String::new() }, label)
-            }
+        .map(|&(new, old)| {
+            old.filter(|o| *o != new).map_or_else(
+                || {
+                    let (dir, base) = split_dir(new);
+                    let label = if full { new.to_string() } else { base.to_string() };
+                    (if grouped { dir.to_string() } else { String::new() }, label)
+                },
+                |old| {
+                    let (prefix, brace) = rename_brace(old, new);
+                    // Grouped/Name show the compact brace; Full prepends the full prefix.
+                    let label = if full { format!("{prefix}{brace}") } else { brace };
+                    (if grouped { prefix } else { String::new() }, label)
+                },
+            )
         })
         .collect();
 
@@ -536,10 +535,10 @@ fn build_file_rows(files: &[(&str, Option<&str>)], layout: FileListLayout) -> Ve
 fn token_to_pathspec(token: &str, prefix: &str, workdir: &std::path::Path) -> String {
     let p = std::path::Path::new(token);
     if p.is_absolute() {
-        match p.strip_prefix(workdir) {
-            Ok(rel) => normalize_rel(&rel.to_string_lossy().replace('\\', "/")),
-            Err(_) => token.to_string(), // outside the repo — will simply match nothing
-        }
+        p.strip_prefix(workdir).map_or_else(
+            |_| token.to_string(), // outside the repo — will simply match nothing
+            |rel| normalize_rel(&rel.to_string_lossy().replace('\\', "/")),
+        )
     } else {
         normalize_rel(&format!("{prefix}/{token}"))
     }
@@ -549,10 +548,10 @@ fn token_to_pathspec(token: &str, prefix: &str, workdir: &std::path::Path) -> St
 /// `a..b -- src`. Empty when the default (current branch, no path filter) is active.
 fn scope_title_suffix(scope: &cli::Scope) -> String {
     if scope.reflog {
-        return match scope.revs.first() {
-            Some(r) => format!("reflog {r}"),
-            None => "reflog".to_string(),
-        };
+        return scope
+            .revs
+            .first()
+            .map_or_else(|| "reflog".to_string(), |r| format!("reflog {r}"));
     }
     let mut head: Vec<String> = Vec::new();
     if scope.all {
@@ -572,7 +571,7 @@ fn scope_title_suffix(scope: &cli::Scope) -> String {
 
 fn print_help() {
     print!(
-        r#"gitkay — a git history viewer
+        r"gitkay — a git history viewer
 
 USAGE:
     gitkay [-C <dir>] [--all] [<rev>...] [-- <path>...]
@@ -592,7 +591,7 @@ ARGS:
                     (default: the current branch)
     <path>...       Limit history and diffs to commits touching these paths
                     (relative to the current directory, like git)
-"#
+"
     );
 }
 
@@ -922,9 +921,8 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
 
     // Load real commits
     let t = std::time::Instant::now();
-    let mut revwalk = match repo.revwalk() {
-        Ok(r) => r,
-        Err(_) => return commits,
+    let Ok(mut revwalk) = repo.revwalk() else {
+        return commits;
     };
     if let Err(e) = revwalk.set_sorting(Sort::TIME | Sort::TOPOLOGICAL) {
         log::warn!("gitkay: cannot set commit sort order: {e}");
@@ -1013,10 +1011,10 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
             };
             let parents: Vec<git2::Oid> = commit.parent_ids().collect();
             walked.push((oid, parents.clone()));
-            let touched = match &follow_path {
-                Some(p) => commit_touches_paths(repo, &commit, std::slice::from_ref(p)),
-                None => commit_touches_paths(repo, &commit, &scope.paths),
-            };
+            let touched = follow_path.as_ref().map_or_else(
+                || commit_touches_paths(repo, &commit, &scope.paths),
+                |p| commit_touches_paths(repo, &commit, std::slice::from_ref(p)),
+            );
             if touched {
                 kept_set.insert(oid);
                 let mut info = build_info(oid, &commit, parents);
@@ -1073,8 +1071,7 @@ fn diff_paths_for(scope: &cli::Scope, commits: &[CommitInfo], oid: git2::Oid) ->
             .iter()
             .find(|c| c.oid == oid)
             .and_then(|c| c.follow_path.clone())
-            .map(|p| vec![p])
-            .unwrap_or_else(|| scope.paths.clone())
+            .map_or_else(|| scope.paths.clone(), |p| vec![p])
     } else {
         scope.paths.clone()
     }
@@ -1095,24 +1092,18 @@ fn load_history(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
 /// plain column — showing the reflog message, the commit it pointed to, and an
 /// `@{n}` selector chip. `--all` and path filters don't apply in this mode.
 fn load_reflog(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitInfo> {
-    let refname = scope.revs.first().map(String::as_str).unwrap_or("HEAD");
+    let refname = scope.revs.first().map_or("HEAD", String::as_str);
     // git2's reflog() wants a canonical ref name; resolve a shorthand like `main`.
     let canonical = if refname == "HEAD" {
         "HEAD".to_string()
-    } else {
-        match repo
-            .resolve_reference_from_short_name(refname)
-            .ok()
-            .and_then(|r| r.name().map(str::to_string).ok())
-        {
-            Some(name) => name,
-            None => {
-                // Don't fall through silently to a guaranteed-empty reflog read —
-                // a typo'd ref is otherwise indistinguishable from an empty reflog.
-                log::warn!("gitkay: --reflog: unknown ref {refname:?}");
-                refname.to_string()
-            }
-        }
+    } else if let Some(name) = repo
+        .resolve_reference_from_short_name(refname)
+        .ok()
+        .and_then(|r| r.name().map(str::to_string).ok()) { name } else {
+        // Don't fall through silently to a guaranteed-empty reflog read —
+        // a typo'd ref is otherwise indistinguishable from an empty reflog.
+        log::warn!("gitkay: --reflog: unknown ref {refname:?}");
+        refname.to_string()
     };
     let reflog = match repo.reflog(&canonical) {
         Ok(r) => r,
@@ -1290,8 +1281,8 @@ enum LineKind {
 impl LineKind {
     /// Code lines (additions, deletions, context) are the ones we syntax
     /// highlight; structural lines (hunk/file headers, stats) are not.
-    fn is_code(self) -> bool {
-        matches!(self, LineKind::Add | LineKind::Del | LineKind::Context)
+    const fn is_code(self) -> bool {
+        matches!(self, Self::Add | Self::Del | Self::Context)
     }
 }
 
@@ -1302,23 +1293,21 @@ impl LineKind {
 /// `palette.foreground` (only the +/- marker and a row tint carry the add/del
 /// colour), so the two modes agree on non-code lines but intentionally differ
 /// on code lines.
-fn kind_color(kind: LineKind, palette: &highlight::DiffPalette) -> egui::Color32 {
+const fn kind_color(kind: LineKind, palette: &highlight::DiffPalette) -> egui::Color32 {
     match kind {
         LineKind::Add => palette.added,
         LineKind::Del => palette.deleted,
         LineKind::Hunk => palette.hunk,
         LineKind::FileName => palette.file_header,
-        LineKind::FileMeta => palette.dim,
-        LineKind::Stat => palette.dim,
-        LineKind::Meta => palette.foreground,
-        LineKind::Context => palette.foreground,
-        LineKind::Blank => palette.foreground,
+        LineKind::FileMeta | LineKind::Stat => palette.dim,
+        LineKind::Meta | LineKind::Context | LineKind::Blank => palette.foreground,
     }
 }
 
 /// Layout inputs for `show_virtualized_diff`: total rows, the widest line (sizes the
 /// horizontal scroll), an optional forced scroll line, and the deepest file start the
 /// bottom padding must let reach the top (`None` ⇒ no files ⇒ no padding).
+#[derive(Clone, Copy)]
 struct DiffView {
     n_lines: usize,
     content_chars: usize,
@@ -1353,7 +1342,7 @@ fn diff_pad_rows(n_lines: usize, last_top_anchor: Option<usize>, viewport_rows: 
 }
 
 /// Render `n_lines` rows of the diff with row virtualization — only the visible
-/// rows get a LayoutJob (diffs can be tens of thousands of lines, all uniform
+/// rows get a `LayoutJob` (diffs can be tens of thousands of lines, all uniform
 /// single-line height). `on_visible` receives the visible (real) row range and the
 /// full viewport height in rows — the range tells the highlight worker which files are
 /// on screen (the flat path ignores it), the height drives the Space page-scroll and is
@@ -1442,17 +1431,17 @@ struct DiffData {
 
 impl DiffData {
     /// Finalize a diff builder's output: store the lines + files, computing the
-    /// word-diff emphasis once. The single place every builder produces a DiffData,
+    /// word-diff emphasis once. The single place every builder produces a `DiffData`,
     /// so no source can forget the emphasis pass.
     fn new(mut lines: Vec<DiffLine>, files: Vec<FileEntry>) -> Self {
         compute_word_emphasis(&mut lines);
-        DiffData { lines, files }
+        Self { lines, files }
     }
 
     /// An empty diff — returned when a git2 operation fails (the error is logged
     /// at the call site before returning this).
-    fn empty() -> Self {
-        DiffData {
+    const fn empty() -> Self {
+        Self {
             lines: Vec::new(),
             files: Vec::new(),
         }
@@ -1789,7 +1778,7 @@ fn finalize_diff_key(mut key: DiffCacheKey, kind: CommitKind, data: &DiffData) -
     key
 }
 
-/// Convert a git2::Diff into our DiffData format, under a single title line.
+/// Convert a `git2::Diff` into our `DiffData` format, under a single title line.
 fn diff_to_data(diff: &git2::Diff, title: &str, show_stats: bool) -> DiffData {
     let mut lines = Vec::new();
     let mut files = Vec::new();
@@ -2006,6 +1995,10 @@ fn top_extensions(
 /// it re-queues the rest and switches — so selecting a file never waits behind a
 /// large off-screen one. It bails as soon as a newer highlight pass supersedes it.
 fn highlight_worker(job: HighlightJob) {
+    // Lines per chunk between priority/cancellation re-checks. Small enough to
+    // switch quickly, large enough that the per-chunk overhead is negligible.
+    const CHUNK: usize = 256;
+
     let HighlightJob {
         hl,
         lines,
@@ -2016,10 +2009,6 @@ fn highlight_worker(job: HighlightJob) {
         tx,
         ctx,
     } = job;
-
-    // Lines per chunk between priority/cancellation re-checks. Small enough to
-    // switch quickly, large enough that the per-chunk overhead is negligible.
-    const CHUNK: usize = 256;
 
     // This worker is superseded once a newer highlight pass has started.
     let superseded = || !current_gen.is_current(generation);
@@ -2113,7 +2102,7 @@ fn collect_tree_blob_names(
     depth: usize,
     out: &mut Vec<String>,
 ) {
-    for entry in tree.iter() {
+    for entry in tree {
         if out.len() >= max {
             return;
         }
@@ -2162,14 +2151,14 @@ fn repo_head_extensions(
 /// the shared `SyntaxSet` so the first diff in each is already coloured. Pure
 /// optimization — any failure simply warms fewer or no languages.
 fn prewarm_highlighter(
-    repo_path: String,
-    theme_slug: String,
+    repo_path: &str,
+    theme_slug: &str,
     diff_bg: DiffBg,
-    tx: mpsc::Sender<Arc<Highlighter>>,
-    ctx: egui::Context,
+    tx: &mpsc::Sender<Arc<Highlighter>>,
+    ctx: &egui::Context,
 ) {
     let t = std::time::Instant::now();
-    let (hl, warning) = Highlighter::new(&theme_slug, diff_bg);
+    let (hl, warning) = Highlighter::new(theme_slug, diff_bg);
     // Surface a bad-theme-slug warning to the log even though the UI re-derives
     // (and re-warns) via with_theme at install — the install warning is lost if
     // the config is corrected before the prewarm is installed.
@@ -2185,7 +2174,7 @@ fn prewarm_highlighter(
     }
     ctx.request_repaint();
 
-    let exts = match git2::Repository::discover(&repo_path) {
+    let exts = match git2::Repository::discover(repo_path) {
         Ok(repo) => repo_head_extensions(&repo, MAX_TREE_ENTRIES, MAX_WARM_LANGS, &hl),
         Err(e) => {
             log::debug!("prewarm: repo discover failed: {e}; no languages warmed");
@@ -2429,8 +2418,7 @@ fn body_sections(
         let color = spans
             .iter()
             .find(|(_, r)| r.start <= a && a < r.end)
-            .map(|(c, _)| *c)
-            .unwrap_or(base_color);
+            .map_or(base_color, |(c, _)| *c);
         let emph = emphasis.iter().any(|r| r.start <= a && a < r.end);
         out.push((a..b, color, emph));
     }
@@ -2478,7 +2466,7 @@ fn append_body(
     }
 }
 
-/// Build the LayoutJob for one diff row plus its optional background tint. With
+/// Build the `LayoutJob` for one diff row plus its optional background tint. With
 /// `syntax` on, code lines render their token spans over the theme foreground, an
 /// accent +/-/space gutter (synthesized from `kind`, so context and changed lines
 /// share one column), and an add/del row tint. With `syntax` off the whole line
@@ -2637,7 +2625,7 @@ struct GraphRow {
 /// Place `slot` in the first empty pipe (reusing a freed lane) or append a new one,
 /// returning its column.
 fn alloc_lane(pipes: &mut Vec<Option<(git2::Oid, usize)>>, slot: (git2::Oid, usize)) -> usize {
-    if let Some(pos) = pipes.iter().position(|p| p.is_none()) {
+    if let Some(pos) = pipes.iter().position(std::option::Option::is_none) {
         pipes[pos] = Some(slot);
         pos
     } else {
@@ -3037,7 +3025,7 @@ impl GitkApp {
         cc: &eframe::CreationContext<'_>,
         repo_path: String,
         scope: cli::Scope,
-        history_rx: mpsc::Receiver<Vec<CommitInfo>>,
+        history_rx: &mpsc::Receiver<Vec<CommitInfo>>,
         font_rx: mpsc::Receiver<(egui::FontDefinitions, Fonts, Vec<String>)>,
     ) -> Result<Self, String> {
         let startup_t0 = std::time::Instant::now();
@@ -3146,7 +3134,9 @@ impl GitkApp {
             for dir in &dirs {
                 match w.watch(dir, RecursiveMode::NonRecursive) {
                     Ok(()) => watched_any = true,
-                    Err(e) => log::warn!("config watcher: cannot watch {dir:?}: {e}"),
+                    Err(e) => {
+                        log::warn!("config watcher: cannot watch {}: {e}", dir.display());
+                    }
                 }
             }
             watched_any.then_some(w)
@@ -3166,10 +3156,9 @@ impl GitkApp {
         // init). recv() blocks only if the off-thread walk hasn't finished yet; on a
         // disconnected channel (prefetch failed to spawn/discover) load synchronously.
         let t_history = std::time::Instant::now();
-        let commits = match history_rx.recv() {
-            Ok(c) => c,
-            Err(_) => load_history(&repo, 200, &scope),
-        };
+        let commits = history_rx
+            .recv()
+            .unwrap_or_else(|_| load_history(&repo, 200, &scope));
         log::debug!(
             "perf: startup: history ready ({} rows, new() waited {:?})",
             commits.len(),
@@ -3182,7 +3171,7 @@ impl GitkApp {
         if scope.reflog && commits.is_empty() {
             log::warn!(
                 "--reflog: no entries for {} (unknown ref or empty reflog)",
-                scope.revs.first().map(String::as_str).unwrap_or("HEAD")
+                scope.revs.first().map_or("HEAD", String::as_str)
             );
         } else if !scope.paths.is_empty() && !commits.iter().any(|c| is_real_commit(c.oid)) {
             log::warn!(
@@ -3230,16 +3219,17 @@ impl GitkApp {
             let common_dir = git_dir.join("commondir");
             let refs_dir = if common_dir.exists() {
                 // Worktree: commondir file contains path to the main .git
-                if let Ok(content) = std::fs::read_to_string(&common_dir) {
-                    let p = content.trim();
-                    if std::path::Path::new(p).is_absolute() {
-                        std::path::PathBuf::from(p)
-                    } else {
-                        git_dir.join(p)
-                    }
-                } else {
-                    git_dir.clone()
-                }
+                std::fs::read_to_string(&common_dir).map_or_else(
+                    |_| git_dir.clone(),
+                    |content| {
+                        let p = content.trim();
+                        if std::path::Path::new(p).is_absolute() {
+                            std::path::PathBuf::from(p)
+                        } else {
+                            git_dir.join(p)
+                        }
+                    },
+                )
             } else {
                 git_dir.clone()
             };
@@ -3269,7 +3259,7 @@ impl GitkApp {
                 // The non-recursive dir watch covers HEAD + index (+ packed-refs
                 // when this is not a worktree) surviving their atomic renames.
                 if let Err(e) = w.watch(&git_dir, RecursiveMode::NonRecursive) {
-                    failed.push(format!("{git_dir:?} ({e})"));
+                    failed.push(format!("{} ({e})", git_dir.display()));
                 }
                 if let Err(e) = w.watch(&refs_root, RecursiveMode::Recursive) {
                     failed.push(format!("refs ({e})"));
@@ -3277,7 +3267,7 @@ impl GitkApp {
                 if refs_dir != git_dir
                     && let Err(e) = w.watch(&refs_dir, RecursiveMode::NonRecursive)
                 {
-                    failed.push(format!("commondir {refs_dir:?} ({e})"));
+                    failed.push(format!("commondir {} ({e})", refs_dir.display()));
                 }
 
                 if !failed.is_empty() {
@@ -3315,7 +3305,7 @@ impl GitkApp {
             match spawn_guarded(
                 "gitkay-prewarm",
                 "prewarm thread panicked; highlighting falls back to the installed or synchronous highlighter",
-                move || prewarm_highlighter(repo_path_pw, theme_pw, diff_bg, tx, ctx),
+                move || prewarm_highlighter(&repo_path_pw, &theme_pw, diff_bg, &tx, &ctx),
             ) {
                 Ok(_) => Some(rx),
                 Err(e) => {
@@ -3679,7 +3669,7 @@ impl GitkApp {
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     diff_load_worker(DiffLoadJob {
                         repo_path, oid, settings, paths, key, kind, epoch, current_epoch, tx, ctx,
-                    })
+                    });
                 }))
                 .is_err()
                 {
@@ -3748,7 +3738,7 @@ impl GitkApp {
             return;
         }
         if self.highlighter.is_none() {
-            match self.prewarm_rx.as_ref().map(|rx| rx.try_recv()) {
+            match self.prewarm_rx.as_ref().map(std::sync::mpsc::Receiver::try_recv) {
                 // Prewarmed highlighter ready: install it, re-deriving the palette
                 // for the current theme (it may have changed since startup) — this
                 // reuses the warm SyntaxSet.
@@ -3822,7 +3812,7 @@ impl GitkApp {
         // this a bad grammar/line would kill the highlight thread and leave every later
         // diff plain for the rest of the session.
         if spawn_guarded("gitkay-highlight", "highlight thread panicked", move || {
-            highlight_worker(job)
+            highlight_worker(job);
         })
         .is_err()
         {
@@ -3876,7 +3866,7 @@ impl GitkApp {
             ctx: ctx.clone(),
         };
         if spawn_guarded("gitkay-prefetch", "prefetch thread panicked", move || {
-            prefetch_worker(job)
+            prefetch_worker(job);
         })
         .is_err()
         {
@@ -3979,7 +3969,7 @@ impl GitkApp {
     /// like an indented breadcrumb instead of a wall of repeated path.
     /// File-list row height: `FILE_ROW_H` as the floor, growing with the configured
     /// `file_list` font so larger sizes don't overlap (mirrors the commit list).
-    fn file_row_h(&self, ui: &mut egui::Ui) -> f32 {
+    fn file_row_h(&self, ui: &egui::Ui) -> f32 {
         let font = self.fonts.font_id(Role::FileList);
         FILE_ROW_H.max(ui.fonts_mut(|f| f.row_height(&font)) + 4.0)
     }
@@ -4361,6 +4351,7 @@ impl GitkApp {
                                     RefKind::WorkingTree => {
                                         (egui::Color32::from_rgb(80, 40, 50), RED)
                                     }
+                                    #[allow(clippy::match_same_arms)] // deliberately identical to Tag, not merged (see above)
                                     RefKind::Index => (egui::Color32::from_rgb(60, 55, 30), YELLOW),
                                     RefKind::Branch | RefKind::Remote => {
                                         // Unique color per branch/remote name
@@ -4585,7 +4576,7 @@ impl eframe::App for GitkApp {
                 }
             } else {
                 // Wake up when the debounce window closes to run the reload.
-                ctx.request_repaint_after(RELOAD_DEBOUNCE - elapsed);
+                ctx.request_repaint_after(RELOAD_DEBOUNCE.saturating_sub(elapsed));
             }
         }
 
@@ -4611,16 +4602,15 @@ impl eframe::App for GitkApp {
                         }
                     });
                     let mut warned = false;
-                    match spawned {
-                        Ok(_) => self.pending_fonts = Some(font_rx),
-                        Err(_) => {
-                            // Rare spawn failure: build inline (blocking) rather
-                            // than dropping the font change. self.fonts is already
-                            // set (build_fonts returns the same role map).
-                            let (defs, _fonts, warns) = config::build_fonts(&cfg);
-                            ctx.set_fonts(defs);
-                            warned |= !warns.is_empty();
-                        }
+                    if spawned.is_ok() {
+                        self.pending_fonts = Some(font_rx);
+                    } else {
+                        // Rare spawn failure: build inline (blocking) rather
+                        // than dropping the font change. self.fonts is already
+                        // set (build_fonts returns the same role map).
+                        let (defs, _fonts, warns) = config::build_fonts(&cfg);
+                        ctx.set_fonts(defs);
+                        warned |= !warns.is_empty();
                     }
                     let new_enabled = cfg.diff.syntax;
                     let new_slug = configured_theme_slug(&cfg);
@@ -4867,10 +4857,9 @@ impl eframe::App for GitkApp {
                 }
             } else if !self.commits.is_empty() {
                 let last = self.commits.len() as isize - 1;
-                let new = match self.selected {
-                    Some(s) => (s as isize + arrow_delta).clamp(0, last) as usize,
-                    None => 0,
-                };
+                let new = self
+                    .selected
+                    .map_or(0, |s| (s as isize + arrow_delta).clamp(0, last) as usize);
                 if Some(new) != self.selected {
                     self.select_loaded(new);
                     self.graph_scroll_to = Some((new, None));
@@ -5090,8 +5079,9 @@ impl eframe::App for GitkApp {
                 // Right: resizable file-list sidebar — draggable splitter, width
                 // persisted across runs (see App::save). Shown only when the selected
                 // commit touches files and we're not blanked to the placeholder.
-                let mut divider: Option<egui::Rect> = None;
-                if !self.diff_files.is_empty() && !showing_placeholder {
+                let divider: Option<egui::Rect> = if !self.diff_files.is_empty()
+                    && !showing_placeholder
+                {
                     let saved_w = self.file_list_width;
                     // Let the sidebar grow with the window — up to all but a readable
                     // ~300px strip for the diff — so paths have room on wide screens.
@@ -5175,8 +5165,10 @@ impl eframe::App for GitkApp {
                         &mut self.file_list_width,
                         file_panel.response.rect.width(),
                     );
-                    divider = Some(file_panel.response.rect);
-                }
+                    Some(file_panel.response.rect)
+                } else {
+                    None
+                };
 
                 // Left: diff content fills the remaining width. Right padding keeps
                 // the diff scrollbar from crowding the file-list resize bar — only
@@ -5194,8 +5186,7 @@ impl eframe::App for GitkApp {
                 let palette = self.syntax_enabled.then(|| {
                     self.highlighter
                         .as_ref()
-                        .map(|h| h.palette().clone())
-                        .unwrap_or_else(|| self.diff_palette.clone())
+                        .map_or_else(|| self.diff_palette.clone(), |h| h.palette().clone())
                 });
                 let mut frame = egui::Frame::NONE.inner_margin(egui::Margin {
                     left: 0,
@@ -5223,7 +5214,8 @@ impl eframe::App for GitkApp {
                                 });
                                 return;
                             }
-                            ui.ctx().request_repaint_after(DIFF_PLACEHOLDER_DELAY - elapsed);
+                            ui.ctx()
+                                .request_repaint_after(DIFF_PLACEHOLDER_DELAY.saturating_sub(elapsed));
                             // fall through: keep rendering the previous diff below
                         }
                         // Layout inputs are identical for both render branches (only the
@@ -5325,22 +5317,19 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let repo_path = raw.repo_dir.clone().unwrap_or_else(|| ".".to_string());
-    let repo = match Repository::discover(&repo_path) {
-        Ok(r) => r,
-        Err(_) => {
-            eprintln!("gitkay: not a git repository: {repo_path}");
-            std::process::exit(1);
-        }
+    let Ok(repo) = Repository::discover(&repo_path) else {
+        eprintln!("gitkay: not a git repository: {repo_path}");
+        std::process::exit(1);
     };
 
     // Paths are taken relative to where gitkay runs (the `-C` dir, or the cwd) and
     // rewritten to repo-root-relative pathspecs, like git. `prefix` is that run
     // directory's location inside the repo (empty at the repo root).
-    let run_dir = match &raw.repo_dir {
-        Some(d) => std::fs::canonicalize(d).unwrap_or_else(|_| std::path::PathBuf::from(d)),
-        None => std::env::current_dir().unwrap_or_default(),
-    };
-    let workdir = repo.workdir().map(|w| w.to_path_buf());
+    let run_dir = raw.repo_dir.as_ref().map_or_else(
+        || std::env::current_dir().unwrap_or_default(),
+        |d| std::fs::canonicalize(d).unwrap_or_else(|_| std::path::PathBuf::from(d)),
+    );
+    let workdir = repo.workdir().map(std::path::Path::to_path_buf);
     let prefix = workdir
         .as_ref()
         .and_then(|w| std::fs::canonicalize(w).ok())
@@ -5487,7 +5476,7 @@ fn main() -> eframe::Result {
             );
             // …and this end-to-end figure covers the whole path from process start
             // to a built app: pre-eframe work, window/GL init, and GitkApp::new.
-            let app = GitkApp::new(cc, repo_path, scope, history_rx, font_rx)?;
+            let app = GitkApp::new(cc, repo_path, scope, &history_rx, font_rx)?;
             log::debug!(
                 "perf: startup: ready (process start -> app built) {:?}",
                 startup_t0.elapsed()
@@ -5508,7 +5497,7 @@ mod tests {
         git2::Oid::from_bytes(&bytes).unwrap()
     }
 
-    /// Build a CommitInfo for testing. Commits are listed in topological
+    /// Build a `CommitInfo` for testing. Commits are listed in topological
     /// order (newest first), just like `load_commits` returns.
     fn commit(id: u32, parents: &[u32]) -> CommitInfo {
         CommitInfo::new(
@@ -6156,7 +6145,7 @@ mod tests {
         assert_eq!(format_commit_time(secs, 100_000, false), "");
     }
 
-    /// A FileEntry fixture: no rename, zero counts (nothing below asserts them).
+    /// A `FileEntry` fixture: no rename, zero counts (nothing below asserts them).
     fn fe(path: &str, diff_line_idx: Option<usize>) -> FileEntry {
         FileEntry {
             path: path.to_string(),
@@ -6167,7 +6156,7 @@ mod tests {
         }
     }
 
-    /// Baseline DiffSettings (default context, every toggle off); tests flip the
+    /// Baseline `DiffSettings` (default context, every toggle off); tests flip the
     /// flag under test via struct-update syntax: `DiffSettings { show_stats: true, ..ds() }`.
     fn ds() -> DiffSettings {
         DiffSettings {
@@ -6371,7 +6360,7 @@ mod tests {
         // All code lines Some (incl. a blank Some(empty)); structural ignored.
         let done = vec![
             highlighted.clone(),
-            blank_done.clone(),
+            blank_done,
             DiffLine::new("@@ -1 +1 @@", LineKind::Hunk),
         ];
         assert!(file_fully_highlighted(&done, 0, 3));
@@ -6563,7 +6552,7 @@ mod tests {
         );
     }
 
-    /// A bare CommitInfo carrying only an oid, for prefetch-target tests.
+    /// A bare `CommitInfo` carrying only an oid, for prefetch-target tests.
     fn ci(oid: git2::Oid) -> CommitInfo {
         CommitInfo::new(
             oid,
@@ -6643,7 +6632,7 @@ mod tests {
     fn scope(all: bool, revs: &[&str]) -> cli::Scope {
         cli::Scope {
             all,
-            revs: revs.iter().map(|s| s.to_string()).collect(),
+            revs: revs.iter().map(std::string::ToString::to_string).collect(),
             paths: Vec::new(),
             ..Default::default()
         }
@@ -7045,8 +7034,8 @@ mod tests {
     fn scope_title_suffix_formats() {
         let s = |all: bool, revs: &[&str], paths: &[&str]| cli::Scope {
             all,
-            revs: revs.iter().map(|x| x.to_string()).collect(),
-            paths: paths.iter().map(|x| x.to_string()).collect(),
+            revs: revs.iter().map(std::string::ToString::to_string).collect(),
+            paths: paths.iter().map(std::string::ToString::to_string).collect(),
             ..Default::default()
         };
         assert_eq!(scope_title_suffix(&s(false, &[], &[])), "");

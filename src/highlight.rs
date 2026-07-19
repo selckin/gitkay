@@ -1,4 +1,4 @@
-//! Syntax highlighting for the diff view: owns the syntect SyntaxSet, the active
+//! Syntax highlighting for the diff view: owns the syntect `SyntaxSet`, the active
 //! theme, and a theme-derived diff palette. Built lazily on the first diff.
 
 use std::sync::Arc;
@@ -85,9 +85,9 @@ pub const DEFAULT_DELETED_BAND_DARK: egui::Color32 = egui::Color32::from_rgb(64,
 /// Test fixtures shared by this module's and main.rs's test suites: the
 /// `[diff.bands]` default value, and a default-theme highlighter over it.
 #[cfg(test)]
-pub(crate) const FIXED_DEFAULT_BANDS: DiffBg = DiffBg::Fixed { added: None, deleted: None };
+pub const FIXED_DEFAULT_BANDS: DiffBg = DiffBg::Fixed { added: None, deleted: None };
 #[cfg(test)]
-pub(crate) fn test_highlighter() -> Highlighter {
+pub fn test_highlighter() -> Highlighter {
     Highlighter::new(DEFAULT_THEME_SLUG, FIXED_DEFAULT_BANDS).0
 }
 
@@ -100,7 +100,7 @@ pub type Span = (egui::Color32, std::ops::Range<usize>);
 
 /// Convert a syntect color to an opaque egui color (alpha is discarded — diff
 /// rows are painted opaque).
-pub fn syn_to_egui(c: SynColor) -> egui::Color32 {
+pub const fn syn_to_egui(c: SynColor) -> egui::Color32 {
     egui::Color32::from_rgb(c.r, c.g, c.b)
 }
 
@@ -117,7 +117,7 @@ pub fn parse_hex(s: &str) -> Option<egui::Color32> {
 }
 
 /// How the add/remove row backgrounds are chosen.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DiffBg {
     /// gitkay's bands: the given colors, or built-in dark/light defaults when None.
     Fixed {
@@ -154,7 +154,7 @@ pub fn luminance(c: egui::Color32) -> f32 {
 }
 
 /// Linear blend of two opaque colours (`t` toward `b`).
-pub(crate) fn blend(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+pub fn blend(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
     let m = |x: u8, y: u8| (x as f32 * (1.0 - t) + y as f32 * t).round() as u8;
     egui::Color32::from_rgb(m(a.r(), b.r()), m(a.g(), b.g()), m(a.b(), b.b()))
 }
@@ -196,15 +196,14 @@ impl DiffPalette {
     /// Build the palette from `theme`. `diff_bg` controls the add/del row
     /// backgrounds: fixed colors (explicit or built-in dark/light defaults) or
     /// colors derived from the theme's own diff scopes.
-    pub fn from_theme(theme: &Theme, diff_bg: DiffBg) -> DiffPalette {
+    pub fn from_theme(theme: &Theme, diff_bg: DiffBg) -> Self {
         let hl = SynHighlighter::new(theme);
         let default = hl.get_default();
         let foreground = syn_to_egui(default.foreground);
         let background = theme
             .settings
             .background
-            .map(syn_to_egui)
-            .unwrap_or_else(|| syn_to_egui(default.background));
+            .map_or_else(|| syn_to_egui(default.background), syn_to_egui);
         let light = luminance(background) > 0.5;
 
         let added = scope_color(
@@ -241,8 +240,7 @@ impl DiffPalette {
         let marker = theme
             .settings
             .gutter_foreground
-            .map(syn_to_egui)
-            .unwrap_or(foreground);
+            .map_or(foreground, syn_to_egui);
         let (added_bg, deleted_bg) = match diff_bg {
             DiffBg::Fixed { added, deleted } => {
                 // Explicit config colors win; otherwise built-in defaults chosen
@@ -276,7 +274,7 @@ impl DiffPalette {
             }
         };
 
-        DiffPalette {
+        Self {
             background,
             foreground,
             added,
@@ -303,17 +301,19 @@ pub struct Highlighter {
 
 fn load_theme(slug: &str) -> (Theme, Option<String>) {
     let set = two_face::theme::extra();
-    match theme_for_slug(slug) {
-        Some(name) => (set[name].clone(), None),
-        None => (
-            // Index the default variant directly — no runtime unwrap in the
-            // error-recovery path (DEFAULT_THEME_SLUG names this same theme).
-            set[EmbeddedThemeName::CatppuccinMocha].clone(),
-            Some(format!(
-                "unknown syntax theme {slug:?}; using {DEFAULT_THEME_SLUG}"
-            )),
-        ),
-    }
+    theme_for_slug(slug).map_or_else(
+        || {
+            (
+                // Index the default variant directly — no runtime unwrap in the
+                // error-recovery path (DEFAULT_THEME_SLUG names this same theme).
+                set[EmbeddedThemeName::CatppuccinMocha].clone(),
+                Some(format!(
+                    "unknown syntax theme {slug:?}; using {DEFAULT_THEME_SLUG}"
+                )),
+            )
+        },
+        |name| (set[name].clone(), None),
+    )
 }
 
 /// Load the theme blob for `slug` and derive its palette in one step — the
@@ -338,11 +338,11 @@ pub fn palette_for(slug: &str, diff_bg: DiffBg) -> (DiffPalette, Option<String>)
 impl Highlighter {
     /// Build the highlighter for `slug`. Deserializes the bundled syntax set
     /// (multi-MB) once — call this lazily, not at startup.
-    pub fn new(slug: &str, diff_bg: DiffBg) -> (Highlighter, Option<String>) {
+    pub fn new(slug: &str, diff_bg: DiffBg) -> (Self, Option<String>) {
         let syntaxes = Arc::new(two_face::syntax::extra_newlines());
         let (theme, palette, warning) = theme_and_palette(slug, diff_bg);
         (
-            Highlighter {
+            Self {
                 syntaxes,
                 theme,
                 palette,
@@ -355,10 +355,10 @@ impl Highlighter {
     /// reusing this one's syntax set (a cheap `Arc` clone — no reload). Returns
     /// a warning if the slug was unknown. The old instance stays valid for any
     /// in-flight worker still holding it.
-    pub fn with_theme(&self, slug: &str, diff_bg: DiffBg) -> (Highlighter, Option<String>) {
+    pub fn with_theme(&self, slug: &str, diff_bg: DiffBg) -> (Self, Option<String>) {
         let (theme, palette, warning) = theme_and_palette(slug, diff_bg);
         (
-            Highlighter {
+            Self {
                 syntaxes: Arc::clone(&self.syntaxes),
                 theme,
                 palette,
@@ -367,7 +367,7 @@ impl Highlighter {
         )
     }
 
-    pub fn palette(&self) -> &DiffPalette {
+    pub const fn palette(&self) -> &DiffPalette {
         &self.palette
     }
 
@@ -414,18 +414,20 @@ impl Highlighter {
         let line = format!("{code}\n");
         let base = line.as_ptr() as usize;
         let code_len = code.len();
-        match state.highlight_line(&line, &self.syntaxes) {
-            Ok(ranges) => ranges
-                .into_iter()
-                .filter_map(|(style, text)| {
-                    let start = text.as_ptr() as usize - base;
-                    let end = (start + text.len()).min(code_len); // drop the trailing '\n'
-                    (start < end).then(|| (syn_to_egui(style.foreground), start..end))
-                })
-                .collect(),
+        state.highlight_line(&line, &self.syntaxes).map_or_else(
             // A grammar hiccup must never drop the line: render it plain.
-            Err(_) => vec![(self.palette.foreground, 0..code_len)],
-        }
+            |_| vec![(self.palette.foreground, 0..code_len)],
+            |ranges| {
+                ranges
+                    .into_iter()
+                    .filter_map(|(style, text)| {
+                        let start = text.as_ptr() as usize - base;
+                        let end = (start + text.len()).min(code_len); // drop the trailing '\n'
+                        (start < end).then(|| (syn_to_egui(style.foreground), start..end))
+                    })
+                    .collect()
+            },
+        )
     }
 }
 

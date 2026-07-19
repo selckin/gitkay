@@ -148,16 +148,17 @@ pub fn rev_token_kind(tok: &str) -> RevTokenKind {
         }
     };
     if let Some(rest) = tok.strip_prefix('^') {
-        RevTokenKind::Exclude(rest.to_string())
-    } else if let Some((a, b)) = tok.split_once("...") {
-        let (a, b) = fill_head(a, b);
-        RevTokenKind::Symmetric(a, b)
-    } else if let Some((a, b)) = tok.split_once("..") {
-        let (a, b) = fill_head(a, b);
-        RevTokenKind::Range(a, b)
-    } else {
-        RevTokenKind::Single(tok.to_string())
+        return RevTokenKind::Exclude(rest.to_string());
     }
+    if let Some((a, b)) = tok.split_once("...") {
+        let (a, b) = fill_head(a, b);
+        return RevTokenKind::Symmetric(a, b);
+    }
+    if let Some((a, b)) = tok.split_once("..") {
+        let (a, b) = fill_head(a, b);
+        return RevTokenKind::Range(a, b);
+    }
+    RevTokenKind::Single(tok.to_string())
 }
 
 #[cfg(test)]
@@ -165,7 +166,7 @@ mod tests {
     use super::*;
 
     fn v(xs: &[&str]) -> Vec<String> {
-        xs.iter().map(|s| s.to_string()).collect()
+        xs.iter().map(std::string::ToString::to_string).collect()
     }
 
     #[test]
@@ -282,6 +283,6 @@ mod tests {
         );
         // A bare `..` stays empty-endpointed so classify() can still treat the
         // token as the parent-directory path.
-        assert_eq!(rev_token_kind(".."), RevTokenKind::Range("".into(), "".into()));
+        assert_eq!(rev_token_kind(".."), RevTokenKind::Range(String::new(), String::new()));
     }
 }
