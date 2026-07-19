@@ -49,7 +49,8 @@ extracted modules: `src/config.rs`
 (`[fonts]`/`[text]`/`[diff]` config: TOML parsing, fontdb resolution + cache,
 role→FontId map), `src/highlight.rs` (syntect highlighter, theme/palette
 resolution, per-line tokenization), `src/diff_cache.rs` (line-budget LRU cache),
-`src/cli.rs` (pure argv parser, rev-vs-path classification), and
+`src/cli.rs` (pure argv parser, rev-vs-path classification, pathspec
+resolution, window-title suffix, help/version text), and
 `src/word_diff.rs` (pure intra-line word diff: tokenizer + LCS alignment; the
 `DiffLine`-aware driver `compute_word_emphasis` stays in `main.rs`).
 
@@ -149,8 +150,8 @@ parts run off the window-creation critical path:
 
 Each module carries its own `#[cfg(test)]` suite: `config` (TOML parsing +
 clamping), `highlight` (theme/palette resolution), `cli` (rev-vs-path
-classification), `diff_cache` (LRU eviction), `word_diff` (LCS word alignment),
-and `main` (graph layout and diff/UI helpers). The graph-layout suite uses fake
+classification + pathspec/title helpers), `diff_cache` (LRU eviction),
+`word_diff` (LCS word alignment), and `main` (graph layout and diff/UI helpers). The graph-layout suite uses fake
 OIDs via `oid(n)` — no real repo needed — and pins the layout invariants (lane
 stability, merge diagonals, convergence, out-of-scope-parent continuation
 lines; `grep 'fn test_' src/main.rs` for the list). Change `layout_graph` only

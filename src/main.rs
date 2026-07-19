@@ -190,6 +190,25 @@ struct DiffCacheKey {
     content: u64,
 }
 
+impl DiffCacheKey {
+    /// True when the keys are identical apart from their content hash — i.e. they name
+    /// the same (virtual) diff at possibly different working-tree states. Destructures
+    /// exhaustively so a newly added key field can't silently be left out.
+    fn same_modulo_content(&self, other: &Self) -> bool {
+        let Self {
+            oid,
+            settings,
+            theme,
+            enabled,
+            content: _,
+        } = other;
+        self.oid == *oid
+            && self.settings == *settings
+            && self.theme == *theme
+            && self.enabled == *enabled
+    }
+}
+
 /// What a commit-list row represents. `Real` rows are keyed in the diff cache by their
 /// immutable oid; the virtual `Uncommitted`/`Staged` rows track the working tree, so
 /// they're content-keyed instead (see `DiffCacheKey::content` / `finalize_diff_key`).
@@ -264,27 +283,6 @@ fn hash_diff_content(data: &DiffData) -> u64 {
         (line.kind as u8).hash(&mut h);
     }
     h.finish()
-}
-
-/// Lexically normalize a `/`-separated relative path: drop `.` and empty segments,
-/// resolve `..` against a preceding normal segment. Never touches the filesystem, so
-/// it works on pathspecs for files that no longer exist.
-fn normalize_rel(path: &str) -> String {
-    let mut out: Vec<&str> = Vec::new();
-    for seg in path.split('/') {
-        match seg {
-            "" | "." => {}
-            ".." => {
-                if matches!(out.last(), Some(&s) if s != "..") {
-                    out.pop();
-                } else {
-                    out.push("..");
-                }
-            }
-            s => out.push(s),
-        }
-    }
-    out.join("/")
 }
 
 /// Width in points of `s` laid out on one line in `font` — the measurement the elide
@@ -452,11 +450,9 @@ fn rename_brace(old: &str, new: &str) -> (String, String) {
 /// common to its old and new path, so the move reads clearly (`{ ⇒ admin}/File.java`
 /// under the `…/actions/` header) instead of a bare `File.java → File.java`.
 fn build_file_rows(files: &[(&str, Option<&str>)], layout: FileListLayout) -> Vec<FileListRow> {
-    let grouped = layout == FileListLayout::Grouped;
     let full = layout == FileListLayout::Full;
-    // (group directory, rendered label) per file, resolved for this layout. The group
-    // directory is read only by the Grouped arm below, so it's left empty (no
-    // allocation) for the flat Name/Full layouts that never look at it.
+    // (group directory, rendered label) per file. The group directory is read only
+    // by the Grouped arm below; the flat Name/Full layouts ignore it.
     let computed: Vec<(String, String)> = files
         .iter()
         // `old` is already `None` for a non-rename — append_diff_body records it only
@@ -468,19 +464,8 @@ fn build_file_rows(files: &[(&str, Option<&str>)], layout: FileListLayout) -> Ve
             old.filter(|o| *o != new).map_or_else(
                 || {
                     let (dir, base) = split_dir(new);
-                    let label = if full {
-                        new.to_string()
-                    } else {
-                        base.to_string()
-                    };
-                    (
-                        if grouped {
-                            dir.to_string()
-                        } else {
-                            String::new()
-                        },
-                        label,
-                    )
+                    let label = if full { new } else { base };
+                    (dir.to_string(), label.to_string())
                 },
                 |old| {
                     let (prefix, brace) = rename_brace(old, new);
@@ -490,7 +475,7 @@ fn build_file_rows(files: &[(&str, Option<&str>)], layout: FileListLayout) -> Ve
                     } else {
                         brace
                     };
-                    (if grouped { prefix } else { String::new() }, label)
+                    (prefix, label)
                 },
             )
         })
@@ -548,78 +533,6 @@ fn build_file_rows(files: &[(&str, Option<&str>)], layout: FileListLayout) -> Ve
             rows
         }
     }
-}
-
-/// Translate a user-supplied path token into a repo-root-relative pathspec. `prefix`
-/// is the run directory's location inside the repo (e.g. "src" when started in
-/// `<repo>/src`). Relative tokens are joined onto `prefix`; absolute tokens are made
-/// relative to `workdir`. A token that resolves to the repo root (e.g. `.` at the
-/// top) yields "" — the caller drops those so they impose no restriction.
-fn token_to_pathspec(token: &str, prefix: &str, workdir: &std::path::Path) -> String {
-    let p = std::path::Path::new(token);
-    if p.is_absolute() {
-        p.strip_prefix(workdir).map_or_else(
-            |_| token.to_string(), // outside the repo — will simply match nothing
-            |rel| normalize_rel(&rel.to_string_lossy().replace('\\', "/")),
-        )
-    } else {
-        normalize_rel(&format!("{prefix}/{token}"))
-    }
-}
-
-/// The parenthetical scope shown in the window title, e.g. `--all`, `main`,
-/// `a..b -- src`. Empty when the default (current branch, no path filter) is active.
-fn scope_title_suffix(scope: &cli::Scope) -> String {
-    if scope.reflog {
-        return scope
-            .revs
-            .first()
-            .map_or_else(|| "reflog".to_string(), |r| format!("reflog {r}"));
-    }
-    let mut head: Vec<String> = Vec::new();
-    if scope.all {
-        head.push("--all".to_string());
-    }
-    head.extend(scope.revs.iter().cloned());
-    let mut s = head.join(" ");
-    if !scope.paths.is_empty() {
-        if !s.is_empty() {
-            s.push(' ');
-        }
-        s.push_str(if scope.follow { "follow " } else { "-- " });
-        s.push_str(&scope.paths.join(" "));
-    }
-    s
-}
-
-fn print_help() {
-    print!(
-        r"gitkay — a git history viewer
-
-USAGE:
-    gitkay [-C <dir>] [--all] [<rev>...] [-- <path>...]
-    gitkay [-C <dir>] --reflog [<ref>]
-    gitkay [-C <dir>] --follow [<rev>...] <path>
-
-OPTIONS:
-    -C <dir>        Run as if started in <dir>
-    --all           Show all refs (branches, remotes, tags), not just the current branch
-    --reflog        Show <ref>'s reflog (default HEAD) instead of its history
-    --follow        Follow a single <path> across renames (exactly one path)
-    -h, --help      Print this help and exit
-    -V, --version   Print version and exit
-
-ARGS:
-    <rev>...        Revisions to show: <rev>, <a>..<b>, <a>...<b>, ^<rev>
-                    (default: the current branch)
-    <path>...       Limit history and diffs to commits touching these paths
-                    (relative to the current directory, like git)
-"
-    );
-}
-
-fn print_version() {
-    println!("gitkay {}", env!("CARGO_PKG_VERSION"));
 }
 
 /// The real-commit oids to prefetch: every row in `view` (a row range, clamped to the
@@ -894,14 +807,8 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
     // staged change outside the path doesn't add a virtual row on its own lane.
     let t = std::time::Instant::now();
     let has_staged = show_local && {
-        // No HEAD tree (unborn HEAD — fresh `git init` + `git add`) diffs the
-        // index against the EMPTY tree, exactly like `git diff --cached`, so a
-        // staged initial commit still gets its row (mirrors get_staged_diff).
-        let head_tree = head_oid
-            .and_then(|head| repo.find_commit(head).ok())
-            .and_then(|head_commit| head_commit.tree().ok());
         let mut opts = pathspec_opts(&scope.paths);
-        repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut opts))
+        staged_git_diff(repo, &mut opts)
             .ok()
             .is_some_and(|diff| diff.deltas().len() > 0)
     };
@@ -914,7 +821,7 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
     let t = std::time::Instant::now();
     let has_uncommitted = show_local && {
         let mut opts = pathspec_opts(&scope.paths);
-        repo.diff_index_to_workdir(None, Some(&mut opts))
+        worktree_git_diff(repo, &mut opts)
             .ok()
             .is_some_and(|diff| diff.deltas().len() > 0)
     };
@@ -1097,13 +1004,11 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
 }
 
 /// Pathspec to scope a commit's diff to. In --follow mode it's the file's name *at
-/// that commit* (a pre-rename commit resolves under its old name); otherwise the
-/// global path filter. Pure (no `GitkApp`) so it's unit-testable.
-fn diff_paths_for(scope: &cli::Scope, commits: &[CommitInfo], oid: git2::Oid) -> Vec<String> {
+/// that commit* (`commit`'s follow path — a pre-rename commit resolves under its old
+/// name); otherwise the global path filter. Pure (no `GitkApp`) so it's unit-testable.
+fn diff_paths_for(scope: &cli::Scope, commit: Option<&CommitInfo>) -> Vec<String> {
     if scope.follow {
-        commits
-            .iter()
-            .find(|c| c.oid == oid)
+        commit
             .and_then(|c| c.follow_path.clone())
             .map_or_else(|| scope.paths.clone(), |p| vec![p])
     } else {
@@ -1150,8 +1055,7 @@ fn load_reflog(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitI
         }
     };
     let mut out = Vec::new();
-    for i in 0..reflog.len().min(max) {
-        let Some(entry) = reflog.get(i) else { continue };
+    for (i, entry) in reflog.iter().take(max).enumerate() {
         let committer = entry.committer();
         out.push(CommitInfo::new(
             entry.id_new(),
@@ -1658,26 +1562,24 @@ fn append_diff_body(
     // matching patch lines back to their file below — `files[i].path` is a lossy
     // display string, so two non-UTF-8 names could share one and collide.
     let mut byte_paths: Vec<Vec<u8>> = Vec::new();
-    for i in 0..diff.deltas().len() {
-        if let Some(delta) = diff.get_delta(i) {
-            let bytes = delta_path_bytes(&delta);
-            let old_path = match delta.status() {
-                git2::Delta::Renamed | git2::Delta::Copied => delta
-                    .old_file()
-                    .path_bytes()
-                    .filter(|old| *old != bytes)
-                    .map(|old| String::from_utf8_lossy(old).into_owned()),
-                _ => None,
-            };
-            files.push(FileEntry {
-                path: String::from_utf8_lossy(bytes).into_owned(),
-                old_path,
-                additions: 0,
-                deletions: 0,
-                diff_line_idx: None,
-            });
-            byte_paths.push(bytes.to_vec());
-        }
+    for delta in diff.deltas() {
+        let bytes = delta_path_bytes(&delta);
+        let old_path = match delta.status() {
+            git2::Delta::Renamed | git2::Delta::Copied => delta
+                .old_file()
+                .path_bytes()
+                .filter(|old| *old != bytes)
+                .map(|old| String::from_utf8_lossy(old).into_owned()),
+            _ => None,
+        };
+        files.push(FileEntry {
+            path: String::from_utf8_lossy(bytes).into_owned(),
+            old_path,
+            additions: 0,
+            deletions: 0,
+            diff_line_idx: None,
+        });
+        byte_paths.push(bytes.to_vec());
     }
 
     // Stats — the diffstat block (per-file list + summary) plus its trailing
@@ -1785,6 +1687,36 @@ fn virtual_diff<'r>(
     diff_to_data(&diff, title, settings.show_stats)
 }
 
+/// The HEAD commit's tree, or `None` on an unborn HEAD (fresh `git init`) — a staged
+/// diff then runs against the EMPTY tree, exactly like `git diff --cached`, so a
+/// staged initial commit still shows.
+fn head_tree(repo: &Repository) -> Option<git2::Tree<'_>> {
+    repo.head()
+        .ok()
+        .and_then(|h| h.peel_to_commit().ok())
+        .and_then(|c| c.tree().ok())
+}
+
+/// The git diff that defines "staged changes" (index vs HEAD tree; empty tree on an
+/// unborn HEAD). Both the virtual-row probe in `load_commits` and `get_staged_diff`
+/// call this, so the row's existence and its diff can't disagree.
+fn staged_git_diff<'r>(
+    repo: &'r Repository,
+    opts: &mut DiffOptions,
+) -> Result<git2::Diff<'r>, git2::Error> {
+    repo.diff_tree_to_index(head_tree(repo).as_ref(), None, Some(opts))
+}
+
+/// The git diff that defines "uncommitted changes" (workdir vs index — tracked files
+/// only). Shared by the virtual-row probe and `get_working_tree_diff`, like
+/// `staged_git_diff`.
+fn worktree_git_diff<'r>(
+    repo: &'r Repository,
+    opts: &mut DiffOptions,
+) -> Result<git2::Diff<'r>, git2::Error> {
+    repo.diff_index_to_workdir(None, Some(opts))
+}
+
 /// Generate diff for uncommitted working tree changes (workdir vs index).
 fn get_working_tree_diff(repo: &Repository, settings: DiffSettings, paths: &[String]) -> DiffData {
     virtual_diff(
@@ -1793,24 +1725,19 @@ fn get_working_tree_diff(repo: &Repository, settings: DiffSettings, paths: &[Str
         paths,
         "Uncommitted changes (working tree)",
         "working tree",
-        |repo, opts| repo.diff_index_to_workdir(None, Some(opts)),
+        worktree_git_diff,
     )
 }
 
 /// Generate diff for staged changes (index vs HEAD).
 fn get_staged_diff(repo: &Repository, settings: DiffSettings, paths: &[String]) -> DiffData {
-    let head_tree = repo
-        .head()
-        .ok()
-        .and_then(|h| h.peel_to_commit().ok())
-        .and_then(|c| c.tree().ok());
     virtual_diff(
         repo,
         settings,
         paths,
         "Staged changes (index)",
         "staged changes",
-        |repo, opts| repo.diff_tree_to_index(head_tree.as_ref(), None, Some(opts)),
+        staged_git_diff,
     )
 }
 
@@ -2282,6 +2209,33 @@ fn spawn_guarded(
         })
 }
 
+/// Spawn the `gitkay-fonts` thread: run `config::build_fonts` off the main thread
+/// (fontdb's system scan takes ~150ms warm-ish, up to ~1.5s cold) and send the result.
+/// `cfg: None` makes the thread read the config itself (startup — the main thread
+/// hasn't parsed it yet); the live config reload passes the just-parsed config.
+/// Returns the receiving end, or `None` on spawn failure (callers build inline).
+/// Startup and reload both take this route, so a config save never freezes the UI.
+fn spawn_font_build(
+    cfg: Option<config::Config>,
+) -> Option<mpsc::Receiver<(egui::FontDefinitions, Vec<String>)>> {
+    let (tx, rx) = mpsc::channel();
+    spawn_guarded(
+        "gitkay-fonts",
+        "font build thread panicked; keeping current fonts",
+        move || {
+            let cfg = cfg.unwrap_or_else(|| {
+                config::config_path()
+                    .as_ref()
+                    .and_then(|p| config::read_config(p).ok())
+                    .unwrap_or_default()
+            });
+            let _ = tx.send(config::build_fonts(&cfg));
+        },
+    )
+    .ok()
+    .map(|_| rx)
+}
+
 /// Background prefetch: for each neighbour `DiffCacheKey`, compute its diff and
 /// fully highlight it, sending the finished `(key, DiffData)` back for the UI to
 /// cache. Bails as soon as a newer dispatch supersedes it (`epoch`). Pure
@@ -2313,7 +2267,13 @@ fn prefetch_worker(job: PrefetchJob) {
         }
         let t = std::time::Instant::now();
         log::debug!("prefetch: start {}", key.oid);
-        let mut data = get_diff_data(&repo, key.oid, CommitKind::Real, key.settings, &paths);
+        let mut data = get_diff_data(
+            &repo,
+            key.oid,
+            CommitKind::of(key.oid),
+            key.settings,
+            &paths,
+        );
         highlight_diff(&mut data.lines, &data.files, &hl);
         let (oid, lines) = (key.oid, data.lines.len());
         if tx.send((key, data)).is_err() {
@@ -2339,16 +2299,13 @@ struct DiffLoadResult {
     data: Option<DiffData>,
 }
 
-/// Everything a diff-load worker owns for one selection.
+/// Everything a diff-load worker owns for one selection. The commit (`key.oid`), the
+/// diff-shaping settings (`key.settings`), and the row's kind (`CommitKind::of`) all
+/// come from `key` — carrying them separately could only let them disagree.
 struct DiffLoadJob {
     repo_path: String,
-    oid: git2::Oid,
-    settings: DiffSettings,
-    paths: Vec<String>,
     key: DiffCacheKey,
-    /// The row's kind: selects which diff to compute, and (for a virtual row) drives the
-    /// content-keying — its `key.content` hash is filled from the fresh data off-thread.
-    kind: CommitKind,
+    paths: Vec<String>,
     epoch: u64,
     current_epoch: Epoch,
     tx: mpsc::Sender<DiffLoadResult>,
@@ -2364,11 +2321,8 @@ struct DiffLoadJob {
 fn diff_load_worker(job: DiffLoadJob) {
     let DiffLoadJob {
         repo_path,
-        oid,
-        settings,
-        paths,
         key,
-        kind,
+        paths,
         epoch,
         current_epoch,
         tx,
@@ -2398,12 +2352,14 @@ fn diff_load_worker(job: DiffLoadJob) {
         return;
     }
     let t = std::time::Instant::now();
-    let data = get_diff_data(&repo, oid, kind, settings, &paths);
+    let kind = CommitKind::of(key.oid);
+    let data = get_diff_data(&repo, key.oid, kind, key.settings, &paths);
     // Content-key a virtual row off-thread here so an unchanged working tree hits the
     // cache and reuses its highlighting.
     let key = finalize_diff_key(key, kind, &data);
     log::debug!(
-        "diff-load: {oid} ({} lines) in {:?}",
+        "diff-load: {} ({} lines) in {:?}",
+        key.oid,
         data.lines.len(),
         t.elapsed()
     );
@@ -2473,7 +2429,7 @@ fn emphasis_bg(
         LineKind::Del => palette.deleted,
         _ => palette.added,
     };
-    highlight::blend(backdrop, accent, 0.5)
+    backdrop.lerp_to_gamma(accent, 0.5)
 }
 
 /// Split `body` into the maximal segments that share one syntax colour and one
@@ -2873,16 +2829,9 @@ fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
 
 // ── Colors ───────────────────────────────────────────────────────────────
 
-const GRAPH_COLORS: &[(u8, u8, u8)] = &[
-    (203, 166, 247), // mauve
-    (148, 226, 213), // teal
-    (249, 226, 175), // yellow
-    (166, 227, 161), // green
-    (245, 194, 231), // pink
-    (137, 180, 250), // blue
-    (250, 179, 135), // peach
-    (137, 220, 235), // sky
-];
+/// Graph lane palette: the first 8 (most distinct) entries of `REF_COLORS`, so the
+/// two palettes stay one table.
+const GRAPH_COLORS: &[(u8, u8, u8)] = REF_COLORS.split_at(8).0;
 
 fn graph_color(col: usize) -> egui::Color32 {
     let (r, g, b) = GRAPH_COLORS[col % GRAPH_COLORS.len()];
@@ -2939,7 +2888,8 @@ const YELLOW: egui::Color32 = egui::Color32::from_rgb(249, 226, 175);
 /// The mauve accent (`GRAPH_COLORS[0]`) at a given alpha. A fn (not a const)
 /// because `from_rgba_unmultiplied` is gamma-correct and not const-constructible.
 fn mauve(alpha: u8) -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(203, 166, 247, alpha)
+    let (r, g, b) = GRAPH_COLORS[0];
+    egui::Color32::from_rgba_unmultiplied(r, g, b, alpha)
 }
 
 /// Mauve selection accent (translucent) — the fill behind the selected commit row and
@@ -3012,7 +2962,7 @@ struct GitkApp {
     // Deferred FontDefinitions from the off-thread build: Some until applied. Set when a
     // cold fontdb scan outlives window-init, so the window paints in default fonts and
     // swaps to the configured ones once the scan lands (polled in ui()). None once applied.
-    pending_fonts: Option<mpsc::Receiver<(egui::FontDefinitions, Fonts, Vec<String>)>>,
+    pending_fonts: Option<mpsc::Receiver<(egui::FontDefinitions, Vec<String>)>>,
     config_path: Option<std::path::PathBuf>, // ~/.config/gitkay/config.toml (for live reload)
     needs_config_reload: Arc<AtomicBool>,    // set by the config-file watcher
     _config_watcher: Option<RecommendedWatcher>, // watches the config's parent dir so atomic-rename saves are caught
@@ -3028,6 +2978,12 @@ struct GitkApp {
     highlight_rx: mpsc::Receiver<HighlightBatch>,
     highlight_priority: Option<Arc<VisibleRange>>, // visible file range (lo, hi) the worker prioritises
     diff_max_chars: usize, // widest diff line (chars); sizes the virtualized h-scroll for off-screen lines
+    /// Deepest file-start line of the current diff (None ⇒ no files) — the render's
+    /// `last_top_anchor`. Fixed per diff, so computed at install, not per frame.
+    diff_last_top_anchor: Option<usize>,
+    /// Lazily-created arboard connection for the primary selection, kept for the
+    /// session instead of reconnecting to the display server on every SHA click.
+    clipboard: Option<arboard::Clipboard>,
     diff_cache: DiffCache<DiffCacheKey, DiffData>, // diffs the user navigated away from
     current_diff_key: Option<DiffCacheKey>, // key the live diff_lines was built under (None ⇒ virtual/none)
     prewarm_rx: Option<mpsc::Receiver<Arc<Highlighter>>>, // startup-prewarmed highlighter, until installed
@@ -3137,7 +3093,7 @@ impl GitkApp {
         repo_path: String,
         scope: cli::Scope,
         history_rx: &mpsc::Receiver<Vec<CommitInfo>>,
-        font_rx: mpsc::Receiver<(egui::FontDefinitions, Fonts, Vec<String>)>,
+        font_rx: mpsc::Receiver<(egui::FontDefinitions, Vec<String>)>,
     ) -> Result<Self, String> {
         let startup_t0 = std::time::Instant::now();
         let mut style = (*cc.egui_ctx.global_style()).clone();
@@ -3172,10 +3128,6 @@ impl GitkApp {
             })
             .unwrap_or_default();
         let syntax_enabled = cfg.diff.syntax;
-        let show_stats = cfg.diff.show_stats;
-        let diff_detect_renames = cfg.diff.detect_renames;
-        let diff_detect_copies = cfg.diff.detect_copies;
-        let file_list = cfg.diff.file_list;
         let theme_slug = configured_theme_slug(&cfg);
         let (diff_bg, diff_bg_warnings) = resolve_diff_bg(&cfg.diff.bands);
         for w in &diff_bg_warnings {
@@ -3203,7 +3155,7 @@ impl GitkApp {
         // set_fonts must run on this (the creator/main) thread — it needs the Context.
         let fonts = Fonts::from_config(&cfg);
         let pending_fonts = match font_rx.try_recv() {
-            Ok((font_defs, _fonts, font_warnings)) => {
+            Ok((font_defs, font_warnings)) => {
                 startup_issue |= !font_warnings.is_empty();
                 cc.egui_ctx.set_fonts(font_defs);
                 log::debug!("perf: startup: fonts applied at startup (warm cache)");
@@ -3217,7 +3169,7 @@ impl GitkApp {
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 // Prefetch thread failed to spawn — build inline (blocking, rare).
-                let (font_defs, _fonts, font_warnings) = config::build_fonts(&cfg);
+                let (font_defs, font_warnings) = config::build_fonts(&cfg);
                 startup_issue |= !font_warnings.is_empty();
                 cc.egui_ctx.set_fonts(font_defs);
                 None
@@ -3435,14 +3387,6 @@ impl GitkApp {
             None
         };
 
-        let file_rows = build_file_rows(
-            &diff_files
-                .iter()
-                .map(|f| (f.path.as_str(), f.old_path.as_deref()))
-                .collect::<Vec<_>>(),
-            file_list,
-        );
-
         log::debug!(
             "perf: startup: GitkApp::new total {:?}",
             startup_t0.elapsed()
@@ -3457,7 +3401,8 @@ impl GitkApp {
             startup_diff,
             diff_lines,
             diff_files,
-            file_rows,
+            // Empty like diff_files — the deferred startup load rebuilds them together.
+            file_rows: Vec::new(),
             diff_scroll_to: None,
             diff_top_line: Arc::new(AtomicUsize::new(0)),
             diff_visible_rows: Arc::new(AtomicUsize::new(1)),
@@ -3478,12 +3423,12 @@ impl GitkApp {
             diff_settings: DiffSettings {
                 context: diff_context,
                 ignore_ws: diff_ignore_ws,
-                show_stats,
-                detect_renames: diff_detect_renames,
-                detect_copies: diff_detect_copies,
+                show_stats: cfg.diff.show_stats,
+                detect_renames: cfg.diff.detect_renames,
+                detect_copies: cfg.diff.detect_copies,
             },
             word_diff,
-            file_list,
+            file_list: cfg.diff.file_list,
             diff_toolbar_rect: None,
             fonts,
             pending_fonts,
@@ -3492,6 +3437,8 @@ impl GitkApp {
             _config_watcher: config_watcher,
             config_error_toast: startup_issue.then(std::time::Instant::now),
             diff_max_chars,
+            diff_last_top_anchor: None,
+            clipboard: None,
             highlighter: None,
             syntax_enabled,
             theme_slug,
@@ -3582,7 +3529,11 @@ impl GitkApp {
     /// Both diff entry points — the selected diff and the prefetch worker — call this,
     /// so neither can drift from the --follow path resolution.
     fn diff_paths_for_oid(&self, oid: git2::Oid) -> Vec<String> {
-        diff_paths_for(&self.scope, &self.commits, oid)
+        let commit = self
+            .commit_index_by_oid
+            .get(&oid)
+            .and_then(|&i| self.commits.get(i));
+        diff_paths_for(&self.scope, commit)
     }
 
     /// The cache key for a real commit (its immutable oid pins the content). The
@@ -3669,7 +3620,7 @@ impl GitkApp {
         // Resolve the pathspec only here — a hit above must do no work, and under
         // --follow diff_paths_for is an O(commits) scan.
         let paths = self.diff_paths_for_oid(oid);
-        self.dispatch_diff_load(oid, key, CommitKind::of(oid), paths);
+        self.dispatch_diff_load(key, paths);
     }
 
     /// Move the currently-displayed diff into the cache under its stored key (a move,
@@ -3683,7 +3634,6 @@ impl GitkApp {
                 lines: std::mem::take(&mut self.diff_lines),
                 files: std::mem::take(&mut self.diff_files),
             };
-            let weight = data.lines.len();
             // A virtual entry is content-keyed, so each working-tree edit produces a
             // fresh hash and the previous content would linger under the same sentinel
             // oid as unreachable dead weight. Drop superseded same-oid entries before
@@ -3692,52 +3642,65 @@ impl GitkApp {
             // still reachable by flipping the toolbar back, and a stale-content one
             // is never served anyway (the fresh content hash just misses).
             if !is_real_commit(key.oid) {
-                let probe = DiffCacheKey {
-                    content: 0,
-                    ..key.clone()
-                };
-                self.diff_cache.retain_keys(|k| {
-                    k.oid != key.oid
-                        || DiffCacheKey {
-                            content: 0,
-                            ..k.clone()
-                        } != probe
-                });
+                self.diff_cache
+                    .retain_keys(|k| !k.same_modulo_content(&key));
             }
-            self.diff_cache.insert(key, data, weight);
+            self.cache_diff(key, data);
         }
+    }
+
+    /// Insert a finished diff into the cache under `key` — the single place the
+    /// cache's weight unit (line count) is decided.
+    fn cache_diff(&mut self, key: DiffCacheKey, data: DiffData) {
+        let weight = data.lines.len();
+        self.diff_cache.insert(key, data, weight);
+    }
+
+    /// True when `key` still matches the current settings/theme for its oid — the rule
+    /// both result drains apply to keep stale-settings keys out of the LRU (such a key
+    /// could never be hit again and would only bloat the cache).
+    fn key_is_current(&self, key: &DiffCacheKey) -> bool {
+        *key == self.diff_cache_key(key.oid)
+    }
+
+    /// Swap `key`/`data` in as the displayed diff and run the install tail every
+    /// installer needs: reset the scroll top, rebuild the file-list rows, resize the
+    /// h-scroll, and (re)arm highlighting.
+    fn set_diff_content(&mut self, key: Option<DiffCacheKey>, data: DiffData) {
+        self.diff_lines = data.lines;
+        self.diff_files = data.files;
+        self.current_diff_key = key;
+        self.diff_top_line.store(0, Ordering::Relaxed);
+        self.rebuild_file_rows();
+        self.diff_max_chars = max_line_chars(&self.diff_lines);
+        self.diff_last_top_anchor = self.diff_files.iter().filter_map(|f| f.diff_line_idx).max();
+        self.invalidate_diff_highlight();
     }
 
     /// Clear the diff pane to empty (no current diff, no file rows). Callers that want
     /// the outgoing diff preserved call `stash_current_diff` first.
     fn clear_diff_pane(&mut self) {
-        self.diff_lines.clear();
-        self.diff_files.clear();
-        self.current_diff_key = None;
-        self.diff_top_line.store(0, Ordering::Relaxed);
-        self.rebuild_file_rows();
-        self.diff_max_chars = 0;
-        self.invalidate_diff_highlight();
+        self.set_diff_content(
+            None,
+            DiffData {
+                lines: Vec::new(),
+                files: Vec::new(),
+            },
+        );
     }
 
     /// Install a finished diff (from the cache or a diff-load worker) as the current
-    /// one: stash the outgoing diff, swap in the lines/files, reset the scroll top,
-    /// rebuild the file-list rows, resize the h-scroll, and (re)arm highlighting. Clears
-    /// the loading state. A caller's `diff_scroll_to` (set after `load_selected_diff`)
-    /// survives an in-flight load and overrides the reset top for the new diff.
+    /// one: stash the outgoing diff, then swap in the new content (`set_diff_content`).
+    /// Clears the loading state. A caller's `diff_scroll_to` (set after
+    /// `load_selected_diff`) survives an in-flight load and overrides the reset top
+    /// for the new diff.
     fn apply_loaded_diff(&mut self, key: DiffCacheKey, data: DiffData) {
         // Stash whatever was on screen (the previous commit kept visible during the
         // load, or nothing if the pane already blanked to a placeholder) before it's
         // replaced, so a later revisit restores it instantly.
         self.stash_current_diff();
         self.diff_load_started_at = None;
-        self.diff_lines = data.lines;
-        self.diff_files = data.files;
-        self.current_diff_key = Some(key);
-        self.diff_top_line.store(0, Ordering::Relaxed);
-        self.rebuild_file_rows();
-        self.diff_max_chars = max_line_chars(&self.diff_lines);
-        self.invalidate_diff_highlight();
+        self.set_diff_content(Some(key), data);
     }
 
     /// Install a freshly computed diff, but prefer an already-available copy of the
@@ -3763,13 +3726,7 @@ impl GitkApp {
     /// delay (see the render path). On thread-spawn failure, fall back to computing
     /// synchronously so the diff still loads (accepting the old UI-thread stall in that
     /// rare case).
-    fn dispatch_diff_load(
-        &mut self,
-        oid: git2::Oid,
-        key: DiffCacheKey,
-        kind: CommitKind,
-        paths: Vec<String>,
-    ) {
+    fn dispatch_diff_load(&mut self, key: DiffCacheKey, paths: Vec<String>) {
         let epoch = self.diff_load_epoch.bump();
         // Keep the previous diff on screen while the worker runs — don't clear the pane.
         // The render path only blanks to the "Loading diff…" placeholder once the load
@@ -3780,51 +3737,50 @@ impl GitkApp {
         self.diff_load_started_at
             .get_or_insert_with(std::time::Instant::now);
 
-        let settings = self.diff_settings;
+        let oid = key.oid;
         // The worker thread must own its inputs. repo_path is borrowed from self so it's
         // cloned; paths and key are moved in (not cloned) — on the common spawn-succeeds
         // path the originals would otherwise be dropped unused. The rare spawn-failure
         // fallback re-resolves them instead.
         let repo_path = self.repo_path.clone();
-        let spawn = spawn_guarded("gitkay-diff-load", "diff-load thread panicked", {
-            let (current_epoch, tx, ctx) = (
-                self.diff_load_epoch.clone(),
-                self.diff_load_tx.clone(),
-                self.egui_ctx.clone(),
-            );
-            move || {
-                // A panic mid-compute must still report a failed load: the drain's
-                // `data: None` arm clears the loading state, otherwise the pane
-                // sticks on "Loading diff…" forever (the retained tx clone means
-                // the channel never disconnects to signal the death).
-                let fail = (tx.clone(), key.clone(), ctx.clone());
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    diff_load_worker(DiffLoadJob {
-                        repo_path,
-                        oid,
-                        settings,
-                        paths,
-                        key,
-                        kind,
-                        epoch,
-                        current_epoch,
-                        tx,
-                        ctx,
-                    });
-                }))
-                .is_err()
-                {
-                    log::warn!("diff-load worker panicked; reporting the load as failed");
-                    let (tx, key, ctx) = fail;
-                    let _ = tx.send(DiffLoadResult {
-                        epoch,
-                        key,
-                        data: None,
-                    });
-                    ctx.request_repaint();
+        // Not spawn_guarded: a panic here must do more than log — it has to report a
+        // failed load so the drain's `data: None` arm clears the loading state,
+        // otherwise the pane sticks on "Loading diff…" forever (the retained tx clone
+        // means the channel never disconnects to signal the death).
+        let spawn = std::thread::Builder::new()
+            .name("gitkay-diff-load".into())
+            .spawn({
+                let (current_epoch, tx, ctx) = (
+                    self.diff_load_epoch.clone(),
+                    self.diff_load_tx.clone(),
+                    self.egui_ctx.clone(),
+                );
+                move || {
+                    let fail = (tx.clone(), key.clone(), ctx.clone());
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        diff_load_worker(DiffLoadJob {
+                            repo_path,
+                            key,
+                            paths,
+                            epoch,
+                            current_epoch,
+                            tx,
+                            ctx,
+                        });
+                    }))
+                    .is_err()
+                    {
+                        log::warn!("diff-load worker panicked; reporting the load as failed");
+                        let (tx, key, ctx) = fail;
+                        let _ = tx.send(DiffLoadResult {
+                            epoch,
+                            key,
+                            data: None,
+                        });
+                        ctx.request_repaint();
+                    }
                 }
-            }
-        });
+            });
         if spawn.is_err() {
             log::warn!("diff-load thread spawn failed; loading synchronously");
             // paths/key were moved into the (dropped) closure; re-resolve them for the
@@ -3832,8 +3788,9 @@ impl GitkApp {
             // it here rather than on every navigation.
             match Repository::discover(&self.repo_path) {
                 Ok(repo) => {
+                    let kind = CommitKind::of(oid);
                     let paths = self.diff_paths_for_oid(oid);
-                    let data = get_diff_data(&repo, oid, kind, settings, &paths);
+                    let data = get_diff_data(&repo, oid, kind, self.diff_settings, &paths);
                     let key = finalize_diff_key(self.diff_cache_key(oid), kind, &data);
                     self.install_preferring_cache(key, data);
                 }
@@ -4085,7 +4042,7 @@ impl GitkApp {
         } else {
             preferred_oid
                 .or(previous_oid)
-                .and_then(|oid| self.commits.iter().position(|c| c.oid == oid))
+                .and_then(|oid| self.commit_index_by_oid.get(&oid).copied())
                 .or_else(|| (!self.commits.is_empty()).then_some(0))
         };
 
@@ -4131,8 +4088,7 @@ impl GitkApp {
         FILE_ROW_H.max(ui.fonts_mut(|f| f.row_height(&font)) + 4.0)
     }
 
-    fn draw_dir_header(&self, ui: &mut egui::Ui, dir: &str, dim_len: usize) {
-        let row_h = self.file_row_h(ui);
+    fn draw_dir_header(&self, ui: &mut egui::Ui, dir: &str, dim_len: usize, row_h: f32) {
         let (rect, _) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), row_h),
             egui::Sense::hover(),
@@ -4165,24 +4121,24 @@ impl GitkApp {
 
     /// One file row: `label` at `indent`, with right-aligned `+/-` stats,
     /// current-file accent, hover highlight, and full-path tooltip. The label is
-    /// elided to fit the space before the stats — from the front (`elide_left`,
-    /// for full paths, keeping the filename) or from the back (basenames, keeping
-    /// the name's start). Returns the diff line to scroll to if the row was
-    /// clicked, so the caller (not this `&self` method) does the scroll write.
+    /// elided to fit the space before the stats — `Full` layout draws full paths and
+    /// elides from the front (keeping the filename); the others draw basenames and
+    /// elide from the back (keeping the name's start). Returns the diff line to
+    /// scroll to if the row was clicked, so the caller (not this `&self` method)
+    /// does the scroll write.
     fn draw_file_row(
         &self,
         ui: &mut egui::Ui,
         idx: usize,
         label: &str,
         indent: f32,
-        elide_left: bool,
         current_file: Option<usize>,
+        row_h: f32,
     ) -> Option<usize> {
         let additions = self.diff_files[idx].additions;
         let deletions = self.diff_files[idx].deletions;
         let line_idx = self.diff_files[idx].diff_line_idx;
 
-        let row_h = self.file_row_h(ui);
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), row_h),
             egui::Sense::click(),
@@ -4234,6 +4190,7 @@ impl GitkApp {
         // Label, elided into the width left of the stats.
         let label_max = (right - left - stats_w - pad).max(0.0);
         let measure = |s: &str| text_width(ui.painter(), s, &name_font);
+        let elide_left = self.file_list == FileListLayout::Full;
         let elided = if elide_left {
             left_elide(label, label_max, measure)
         } else {
@@ -4339,8 +4296,13 @@ impl GitkApp {
                                 if is_real_commit(clicked_oid) {
                                     let sha = clicked_oid.to_string();
                                     ctx.copy_text(sha.clone());
-                                    // Also set primary selection (middle-click paste)
-                                    if let Ok(mut clip) = arboard::Clipboard::new() {
+                                    // Also set primary selection (middle-click paste),
+                                    // over a display-server connection made once and
+                                    // kept for the session.
+                                    if self.clipboard.is_none() {
+                                        self.clipboard = arboard::Clipboard::new().ok();
+                                    }
+                                    if let Some(clip) = self.clipboard.as_mut() {
                                         let _ = clip
                                             .set()
                                             .clipboard(arboard::LinuxClipboardKind::Primary)
@@ -4661,56 +4623,15 @@ impl GitkApp {
             commit_panel.response.rect.height(),
         );
     }
-}
 
-impl eframe::App for GitkApp {
-    // Persist only the diff-panel splitter height (below), not the whole egui
-    // memory blob — persisting the blob would also restore scroll positions.
-    fn persist_egui_memory(&self) -> bool {
-        false
-    }
-
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, "commit_panel_height", &self.commit_panel_height);
-        eframe::set_value(storage, "file_list_width", &self.file_list_width);
-        eframe::set_value(storage, "diff_context", &self.diff_settings.context);
-        eframe::set_value(storage, "diff_ignore_ws", &self.diff_settings.ignore_ws);
-        eframe::set_value(storage, "word_diff", &self.word_diff);
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // 0.34 split App::update into ui/logic; we keep one body and take a cheap
-        // (Arc) clone of the Context so the existing ctx-based logic is unchanged,
-        // while the top-level panels attach to `ui` via show_inside.
-        let ctx = ui.ctx().clone();
-
-        // Deferred startup diff: paint the graph on the first frame, then compute the
-        // initial diff on the next one (load_selected_diff runs get_diff_data + arms
-        // async highlighting), so window creation isn't blocked on it. See StartupDiff.
-        match self.startup_diff {
-            StartupDiff::NeedsPaint => {
-                self.startup_diff = StartupDiff::NeedsLoad;
-                ctx.request_repaint(); // come back next frame to load the diff
-            }
-            StartupDiff::NeedsLoad => {
-                self.startup_diff = StartupDiff::Done;
-                let t = std::time::Instant::now();
-                self.load_selected_diff();
-                log::debug!(
-                    "perf: startup: deferred first diff loaded {:?}",
-                    t.elapsed()
-                );
-            }
-            StartupDiff::Done => {}
-        }
-
-        // Apply deferred fonts once an off-thread build finishes — the startup
-        // cold fontdb scan that outlived window init, or a config-reload rebuild.
-        // Until they land, keep waking at a modest cadence so the swap happens
-        // promptly — the off-thread builder has no Context handle to wake us itself.
+    /// Apply deferred fonts once an off-thread build finishes — the startup
+    /// cold fontdb scan that outlived window init, or a config-reload rebuild.
+    /// Until they land, keep waking at a modest cadence so the swap happens
+    /// promptly — the off-thread builder has no Context handle to wake us itself.
+    fn apply_pending_fonts(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.pending_fonts {
             match rx.try_recv() {
-                Ok((font_defs, _fonts, warnings)) => {
+                Ok((font_defs, warnings)) => {
                     ctx.set_fonts(font_defs);
                     if !warnings.is_empty() {
                         self.config_error_toast = Some(std::time::Instant::now());
@@ -4724,11 +4645,13 @@ impl eframe::App for GitkApp {
                 Err(mpsc::TryRecvError::Disconnected) => self.pending_fonts = None, // builder died; keep defaults
             }
         }
+    }
 
-        // Auto-reload when git refs change, debounced: a new .git event (re)arms
-        // a timer, and the reload runs only once the writes settle. This collapses
-        // the burst of ref/index churn from a rebase or fetch into a single
-        // (synchronous) history walk instead of one per event.
+    /// Auto-reload when git refs change, debounced: a new .git event (re)arms
+    /// a timer, and the reload runs only once the writes settle. This collapses
+    /// the burst of ref/index churn from a rebase or fetch into a single
+    /// (synchronous) history walk instead of one per event.
+    fn handle_git_reload(&mut self, ctx: &egui::Context) {
         if self.needs_reload.swap(false, Ordering::Relaxed) {
             self.reload_armed_at = Some(std::time::Instant::now());
         }
@@ -4745,146 +4668,149 @@ impl eframe::App for GitkApp {
                 ctx.request_repaint_after(RELOAD_DEBOUNCE.saturating_sub(elapsed));
             }
         }
+    }
 
-        // Live-reload fonts when the config file changes. On a parse error, keep
-        // the current fonts and flash a toast — never blank the UI.
-        if self.needs_config_reload.swap(false, Ordering::Relaxed)
-            && let Some(ref p) = self.config_path
-        {
-            match config::read_config(p) {
-                Ok(cfg) => {
-                    // The role map (sizes/families) is cheap — apply it now. The
-                    // FontDefinitions rebuild can hit fontdb's system scan (~150ms,
-                    // up to ~1.5s on a cold font cache) when a named family isn't
-                    // cached, so it builds off-thread and lands via the
-                    // pending_fonts poll — the same path as the startup cold scan,
-                    // which also surfaces the thread's font warnings as the toast.
-                    self.fonts = Fonts::from_config(&cfg);
-                    let (font_tx, font_rx) = mpsc::channel();
-                    let spawned = spawn_guarded("gitkay-fonts", "font reload thread panicked", {
-                        let cfg = cfg.clone();
-                        move || {
-                            let _ = font_tx.send(config::build_fonts(&cfg));
-                        }
-                    });
-                    let mut warned = false;
-                    if spawned.is_ok() {
-                        self.pending_fonts = Some(font_rx);
-                    } else {
-                        // Rare spawn failure: build inline (blocking) rather
-                        // than dropping the font change. self.fonts is already
-                        // set (build_fonts returns the same role map).
-                        let (defs, _fonts, warns) = config::build_fonts(&cfg);
-                        ctx.set_fonts(defs);
-                        warned |= !warns.is_empty();
+    /// Live-reload the config when its file changes: fonts (off-thread rebuild),
+    /// theme/syntax/bands (re-palette + re-highlight), and the diff-shaping and
+    /// layout settings (re-diff / row rebuild as needed). On a parse error, keep
+    /// the current state and flash a toast — never blank the UI.
+    fn handle_config_reload(&mut self, ctx: &egui::Context) {
+        let armed = self.needs_config_reload.swap(false, Ordering::Relaxed);
+        if !armed {
+            return;
+        }
+        let Some(ref p) = self.config_path else {
+            return;
+        };
+        match config::read_config(p) {
+            Ok(cfg) => {
+                // The role map (sizes/families) is cheap — apply it now. The
+                // FontDefinitions rebuild can hit fontdb's system scan (~150ms,
+                // up to ~1.5s on a cold font cache) when a named family isn't
+                // cached, so it builds off-thread and lands via the
+                // pending_fonts poll — the same path as the startup cold scan,
+                // which also surfaces the thread's font warnings as the toast.
+                self.fonts = Fonts::from_config(&cfg);
+                let mut warned = false;
+                self.pending_fonts = spawn_font_build(Some(cfg.clone()));
+                if self.pending_fonts.is_none() {
+                    // Rare spawn failure: build inline (blocking) rather
+                    // than dropping the font change. self.fonts is already
+                    // set (Fonts::from_config above).
+                    let (defs, warns) = config::build_fonts(&cfg);
+                    ctx.set_fonts(defs);
+                    warned |= !warns.is_empty();
+                }
+                let new_enabled = cfg.diff.syntax;
+                let new_slug = configured_theme_slug(&cfg);
+                let (new_diff_bg, diff_bg_warnings) = resolve_diff_bg(&cfg.diff.bands);
+                // Surface diff-background warnings (stderr now, toast below)
+                // so config typos aren't silent on a headless desktop.
+                for w in &diff_bg_warnings {
+                    log::warn!("{w}");
+                    warned = true;
+                }
+                if new_enabled != self.syntax_enabled
+                    || new_slug != self.theme_slug
+                    || new_diff_bg != self.diff_bg
+                {
+                    self.syntax_enabled = new_enabled;
+                    self.theme_slug = new_slug;
+                    self.diff_bg = new_diff_bg;
+                    // If syntax was just turned off, drop any in-flight prewarm
+                    // receiver: it would otherwise linger as a dead channel, and
+                    // on re-enable a still-warming thread could leave the diff
+                    // plain (the Empty branch returns and the thread's single
+                    // request_repaint already fired). Re-enabling then takes the
+                    // synchronous build path.
+                    if !self.syntax_enabled {
+                        self.prewarm_rx = None;
                     }
-                    let new_enabled = cfg.diff.syntax;
-                    let new_slug = configured_theme_slug(&cfg);
-                    let (new_diff_bg, diff_bg_warnings) = resolve_diff_bg(&cfg.diff.bands);
-                    // Surface diff-background warnings (stderr now, toast below)
-                    // so config typos aren't silent on a headless desktop.
-                    for w in &diff_bg_warnings {
+                    // Refresh the theme-derived palette (used by the syntax-off
+                    // render and as the pre-highlighter fallback) and rebuild
+                    // the highlighter for the new theme. When a highlighter
+                    // exists, take the palette from its rebuild so the theme
+                    // blob is loaded once, not twice; a new Arc leaves any
+                    // in-flight worker holding the old one valid. Either way
+                    // surface a bad-slug warning, regardless of syntax mode.
+                    let dp_warn = if let Some(old_hl) = self.highlighter.take() {
+                        let (new_hl, w) = old_hl.with_theme(&self.theme_slug, self.diff_bg);
+                        self.diff_palette = new_hl.palette().clone();
+                        self.highlighter = Some(Arc::new(new_hl));
+                        w
+                    } else {
+                        let (palette, w) = highlight::palette_for(&self.theme_slug, self.diff_bg);
+                        self.diff_palette = palette;
+                        w
+                    };
+                    if let Some(w) = dp_warn {
                         log::warn!("{w}");
                         warned = true;
                     }
-                    if new_enabled != self.syntax_enabled
-                        || new_slug != self.theme_slug
-                        || new_diff_bg != self.diff_bg
-                    {
-                        self.syntax_enabled = new_enabled;
-                        self.theme_slug = new_slug;
-                        self.diff_bg = new_diff_bg;
-                        // If syntax was just turned off, drop any in-flight prewarm
-                        // receiver: it would otherwise linger as a dead channel, and
-                        // on re-enable a still-warming thread could leave the diff
-                        // plain (the Empty branch returns and the thread's single
-                        // request_repaint already fired). Re-enabling then takes the
-                        // synchronous build path.
-                        if !self.syntax_enabled {
-                            self.prewarm_rx = None;
-                        }
-                        // Refresh the theme-derived palette (used by the syntax-off
-                        // render and as the pre-highlighter fallback) and rebuild
-                        // the highlighter for the new theme. When a highlighter
-                        // exists, take the palette from its rebuild so the theme
-                        // blob is loaded once, not twice; a new Arc leaves any
-                        // in-flight worker holding the old one valid. Either way
-                        // surface a bad-slug warning, regardless of syntax mode.
-                        let dp_warn = if let Some(old_hl) = self.highlighter.take() {
-                            let (new_hl, w) = old_hl.with_theme(&self.theme_slug, self.diff_bg);
-                            self.diff_palette = new_hl.palette().clone();
-                            self.highlighter = Some(Arc::new(new_hl));
-                            w
-                        } else {
-                            let (palette, w) =
-                                highlight::palette_for(&self.theme_slug, self.diff_bg);
-                            self.diff_palette = palette;
-                            w
-                        };
-                        if let Some(w) = dp_warn {
-                            log::warn!("{w}");
-                            warned = true;
-                        }
-                        // Re-highlight the visible diff under the new settings.
-                        // Reset live spans to None so the worker re-colours every
-                        // file (the skip-done filter would otherwise keep the old
-                        // theme's colours), preserving the invariant that a `Some`
-                        // spans value always reflects the current (theme, enabled).
-                        for line in &mut self.diff_lines {
-                            line.spans = None;
-                        }
-                        // Re-key the live diff so its eventual stash lands under
-                        // the new theme/enabled, not the old key.
-                        let (rekey_theme, rekey_enabled) =
-                            (self.theme_slug.clone(), self.syntax_enabled);
-                        if let Some(key) = &mut self.current_diff_key {
-                            key.theme = rekey_theme;
-                            key.enabled = rekey_enabled;
-                        }
-                        // Bumps the generation so an in-flight old-theme worker's
-                        // queued spans are dropped, not applied for a frame.
-                        self.invalidate_diff_highlight();
+                    // Re-highlight the visible diff under the new settings.
+                    // Reset live spans to None so the worker re-colours every
+                    // file (the skip-done filter would otherwise keep the old
+                    // theme's colours), preserving the invariant that a `Some`
+                    // spans value always reflects the current (theme, enabled).
+                    for line in &mut self.diff_lines {
+                        line.spans = None;
                     }
-                    // show_stats and rename/copy detection all change the diff DATA
-                    // (stat lines appear/vanish; renamed files coalesce), so a change
-                    // to any needs a full rebuild, not just a re-highlight. Update the
-                    // fields first so the rebuild keys/builds under the new values; the
-                    // new cache key misses and rebuilds, stale entries evict. Config is
-                    // authoritative for the detection toggles — this re-asserts the
-                    // config value over any live toolbar toggle (a session override
-                    // that also resets on launch; config wins). Reload at most once,
-                    // even when several of these flip in the same save.
-                    // Config owns show_stats + rename/copy detection; context/ignore_ws are
-                    // toolbar-owned, so keep them (`..`). Comparing the whole DiffSettings
-                    // means a field added to it can't silently skip the reload.
-                    let new_settings = DiffSettings {
-                        show_stats: cfg.diff.show_stats,
-                        detect_renames: cfg.diff.detect_renames,
-                        detect_copies: cfg.diff.detect_copies,
-                        ..self.diff_settings
-                    };
-                    let reload_diff = new_settings != self.diff_settings;
-                    self.diff_settings = new_settings;
-                    // The file-list layout is render-only (it doesn't touch diff data).
-                    // Update it before any reload so the reload rebuilds the rows under
-                    // the new layout in one pass; if nothing reloads, rebuild the rows
-                    // here for a layout-only change.
-                    let layout_changed = self.file_list != cfg.diff.file_list;
-                    self.file_list = cfg.diff.file_list;
-                    if reload_diff {
-                        self.load_selected_diff();
-                    } else if layout_changed {
-                        self.rebuild_file_rows();
+                    // Re-key the live diff so its eventual stash lands under
+                    // the new theme/enabled, not the old key.
+                    let (rekey_theme, rekey_enabled) =
+                        (self.theme_slug.clone(), self.syntax_enabled);
+                    if let Some(key) = &mut self.current_diff_key {
+                        key.theme = rekey_theme;
+                        key.enabled = rekey_enabled;
                     }
-                    self.config_error_toast = warned.then(std::time::Instant::now);
+                    // Bumps the generation so an in-flight old-theme worker's
+                    // queued spans are dropped, not applied for a frame.
+                    self.invalidate_diff_highlight();
                 }
-                Err(e) => {
-                    log::warn!("{e}");
-                    self.config_error_toast = Some(std::time::Instant::now());
+                // show_stats and rename/copy detection all change the diff DATA
+                // (stat lines appear/vanish; renamed files coalesce), so a change
+                // to any needs a full rebuild, not just a re-highlight. Update the
+                // fields first so the rebuild keys/builds under the new values; the
+                // new cache key misses and rebuilds, stale entries evict. Config is
+                // authoritative for the detection toggles — this re-asserts the
+                // config value over any live toolbar toggle (a session override
+                // that also resets on launch; config wins). Reload at most once,
+                // even when several of these flip in the same save.
+                // Config owns show_stats + rename/copy detection; context/ignore_ws are
+                // toolbar-owned, so keep them (`..`). Comparing the whole DiffSettings
+                // means a field added to it can't silently skip the reload.
+                let new_settings = DiffSettings {
+                    show_stats: cfg.diff.show_stats,
+                    detect_renames: cfg.diff.detect_renames,
+                    detect_copies: cfg.diff.detect_copies,
+                    ..self.diff_settings
+                };
+                let reload_diff = new_settings != self.diff_settings;
+                self.diff_settings = new_settings;
+                // The file-list layout is render-only (it doesn't touch diff data).
+                // Update it before any reload so the reload rebuilds the rows under
+                // the new layout in one pass; if nothing reloads, rebuild the rows
+                // here for a layout-only change.
+                let layout_changed = self.file_list != cfg.diff.file_list;
+                self.file_list = cfg.diff.file_list;
+                if reload_diff {
+                    self.load_selected_diff();
+                } else if layout_changed {
+                    self.rebuild_file_rows();
                 }
+                self.config_error_toast = warned.then(std::time::Instant::now);
+            }
+            Err(e) => {
+                log::warn!("{e}");
+                self.config_error_toast = Some(std::time::Instant::now());
             }
         }
+    }
 
+    /// Drain the three worker channels: install a finished async diff load, apply
+    /// finished highlight batches, and cache prefetched neighbour diffs — then,
+    /// once the current diff is fully coloured, warm the visible commit window.
+    fn drain_worker_results(&mut self, ctx: &egui::Context) {
         // Install a finished async diff load (the selected commit's diff, computed off
         // the UI thread). Only the latest dispatch's result is displayed; an older one
         // (the user moved on) fails the epoch check — but if it computed successfully we
@@ -4918,11 +4844,10 @@ impl eframe::App for GitkApp {
                     // bloat the LRU. Virtual entries are skipped, their content-
                     // keyed result may already be stale.
                     if is_real_commit(key.oid)
-                        && key == self.diff_cache_key(key.oid)
+                        && self.key_is_current(&key)
                         && !self.diff_cache.contains(&key)
                     {
-                        let weight = data.lines.len();
-                        self.diff_cache.insert(key, data, weight);
+                        self.cache_diff(key, data);
                     }
                 }
                 None if current => {
@@ -4952,7 +4877,7 @@ impl eframe::App for GitkApp {
                 applied_highlight = true;
             }
         }
-        self.ensure_diff_highlighted(&ctx);
+        self.ensure_diff_highlighted(ctx);
 
         // Apply prefetched neighbour diffs into the cache. Skip one that became the
         // live diff in the meantime (load_selected_diff owns that key), and drop one
@@ -4961,9 +4886,8 @@ impl eframe::App for GitkApp {
         // it could never be hit again and would only bloat the LRU. (Settings unchanged
         // but selection moved still matches — those neighbour diffs stay useful.)
         while let Ok((key, data)) = self.prefetch_rx.try_recv() {
-            if key == self.diff_cache_key(key.oid) && self.current_diff_key.as_ref() != Some(&key) {
-                let weight = data.lines.len();
-                self.diff_cache.insert(key, data, weight);
+            if self.key_is_current(&key) && self.current_diff_key.as_ref() != Some(&key) {
+                self.cache_diff(key, data);
             }
         }
         // Once the current diff is fully coloured, warm the visible commit window
@@ -4979,13 +4903,16 @@ impl eframe::App for GitkApp {
                 self.last_highlight_check_gen = current_gen;
                 if diff_fully_highlighted(&self.diff_lines, &self.diff_files) {
                     self.prefetched_gen = current_gen;
-                    self.dispatch_prefetch(&ctx);
+                    self.dispatch_prefetch(ctx);
                 }
             }
         }
+    }
 
-        let search_id = egui::Id::new("search_field");
-
+    /// Global keyboard handling for the frame: focus-search-on-type, Up/Down
+    /// (match cycling or selection), PageUp/Down (file jumps), and Space /
+    /// Shift+Space (half-page diff scroll).
+    fn handle_keys(&mut self, ctx: &egui::Context, search_id: egui::Id) {
         // Any printable keypress when search bar is not focused → focus it. The literal
         // Space is the one exception: it's the diff page-scroll key, so it must not open
         // search (you'd never start a search with a leading space anyway). Only ' ' is
@@ -5082,6 +5009,57 @@ impl eframe::App for GitkApp {
             };
             self.diff_scroll_to = Some(new_top);
         }
+    }
+}
+
+impl eframe::App for GitkApp {
+    // Persist only the diff-panel splitter height (below), not the whole egui
+    // memory blob — persisting the blob would also restore scroll positions.
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, "commit_panel_height", &self.commit_panel_height);
+        eframe::set_value(storage, "file_list_width", &self.file_list_width);
+        eframe::set_value(storage, "diff_context", &self.diff_settings.context);
+        eframe::set_value(storage, "diff_ignore_ws", &self.diff_settings.ignore_ws);
+        eframe::set_value(storage, "word_diff", &self.word_diff);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 0.34 split App::update into ui/logic; we keep one body and take a cheap
+        // (Arc) clone of the Context so the existing ctx-based logic is unchanged,
+        // while the top-level panels attach to `ui` via show_inside.
+        let ctx = ui.ctx().clone();
+
+        // Deferred startup diff: paint the graph on the first frame, then compute the
+        // initial diff on the next one (load_selected_diff runs get_diff_data + arms
+        // async highlighting), so window creation isn't blocked on it. See StartupDiff.
+        match self.startup_diff {
+            StartupDiff::NeedsPaint => {
+                self.startup_diff = StartupDiff::NeedsLoad;
+                ctx.request_repaint(); // come back next frame to load the diff
+            }
+            StartupDiff::NeedsLoad => {
+                self.startup_diff = StartupDiff::Done;
+                let t = std::time::Instant::now();
+                self.load_selected_diff();
+                log::debug!(
+                    "perf: startup: deferred first diff loaded {:?}",
+                    t.elapsed()
+                );
+            }
+            StartupDiff::Done => {}
+        }
+
+        self.apply_pending_fonts(&ctx);
+        self.handle_git_reload(&ctx);
+        self.handle_config_reload(&ctx);
+        self.drain_worker_results(&ctx);
+
+        let search_id = egui::Id::new("search_field");
+        self.handle_keys(&ctx, search_id);
 
         // ── Top panel: search bar ──
         egui::Panel::top("search_panel")
@@ -5096,7 +5074,7 @@ impl eframe::App for GitkApp {
                             .id(search_id)
                             .desired_width(avail.max(100.0))
                             .hint_text("Search SHA, author, message...")
-                            .font(ui_font),
+                            .font(ui_font.clone()),
                     );
                     if resp.changed() {
                         self.search_cursor = 0;
@@ -5113,7 +5091,6 @@ impl eframe::App for GitkApp {
                         }
                         resp.request_focus();
                     }
-                    let ui_font = self.fonts.font_id(Role::Ui);
                     if !self.search_matches.is_empty() {
                         ui.label(
                             egui::RichText::new(format!(
@@ -5122,7 +5099,7 @@ impl eframe::App for GitkApp {
                                 self.search_matches.len()
                             ))
                             .color(SUBTEXT)
-                            .font(self.fonts.font_id(Role::Ui)),
+                            .font(ui_font.clone()),
                         );
                     }
                     // Copied toast
@@ -5286,15 +5263,15 @@ impl eframe::App for GitkApp {
                                         let top = self.diff_top_line.load(Ordering::Relaxed);
                                         let current_file =
                                             file_index_at_line_opt(&self.diff_files, top);
-                                        // Full mode draws full paths (elide from the front,
-                                        // keeping the filename); grouped/name draw basenames
-                                        // (elide from the back, keeping the name's start).
-                                        let elide_left = self.file_list == FileListLayout::Full;
+                                        // Shared by every row this frame — the metric
+                                        // lookup takes the font lock, so don't repeat
+                                        // it per row (this list isn't virtualized).
+                                        let row_h = self.file_row_h(ui);
                                         let mut scroll_to: Option<usize> = None;
                                         for row in &self.file_rows {
                                             match row {
                                                 FileListRow::Header { dir, dim_len } => {
-                                                    self.draw_dir_header(ui, dir, *dim_len);
+                                                    self.draw_dir_header(ui, dir, *dim_len, row_h);
                                                 }
                                                 FileListRow::File {
                                                     idx,
@@ -5308,8 +5285,8 @@ impl eframe::App for GitkApp {
                                                         *idx,
                                                         label,
                                                         indent,
-                                                        elide_left,
                                                         current_file,
+                                                        row_h,
                                                     ) {
                                                         scroll_to = Some(li);
                                                     }
@@ -5329,8 +5306,7 @@ impl eframe::App for GitkApp {
                                         }
                                         // Breathing room so the last file isn't flush
                                         // against the bottom edge.
-                                        let pad_h = self.file_row_h(ui);
-                                        ui.add_space(BOTTOM_PAD_ROWS as f32 * pad_h);
+                                        ui.add_space(BOTTOM_PAD_ROWS as f32 * row_h);
                                     });
                             });
                         persist_on_resize_drag(
@@ -5347,21 +5323,7 @@ impl eframe::App for GitkApp {
                 // Left: diff content fills the remaining width. Right padding keeps
                 // the diff scrollbar from crowding the file-list resize bar — only
                 // when that sidebar is actually shown.
-                let diff_right_pad = if self.diff_files.is_empty() || showing_placeholder {
-                    0
-                } else {
-                    10
-                };
-                // The diff palette is always derived from the active theme
-                // (self.diff_palette). With syntax on we prefer the highlighter's
-                // copy once built and fall back to the theme palette until then;
-                // with syntax off `palette` is None and the flat path uses
-                // self.diff_palette directly.
-                let palette = self.syntax_enabled.then(|| {
-                    self.highlighter
-                        .as_ref()
-                        .map_or_else(|| self.diff_palette.clone(), |h| h.palette().clone())
-                });
+                let diff_right_pad = if divider.is_some() { 10 } else { 0 };
                 let mut frame = egui::Frame::NONE.inner_margin(egui::Margin {
                     left: 0,
                     right: diff_right_pad,
@@ -5408,20 +5370,24 @@ impl eframe::App for GitkApp {
                             } else {
                                 self.diff_scroll_to.take()
                             },
-                            last_top_anchor: self
-                                .diff_files
-                                .iter()
-                                .filter_map(|f| f.diff_line_idx)
-                                .max(),
+                            last_top_anchor: self.diff_last_top_anchor,
                         };
                         // One render path for both modes. Syntax-on takes row colours from
                         // the theme's token spans plus an add/del tint; syntax-off uses one
                         // flat colour per LineKind with no spans and no row tint (diff_row_job
                         // returns row_bg = None when syntax is off, so passing it through
-                        // matches the old explicit `None`). The palette is the highlighter's
-                        // when built, else the theme palette.
+                        // matches the old explicit `None`). The palette is always derived
+                        // from the active theme: with syntax on prefer the highlighter's
+                        // copy once built, falling back to the theme palette until then;
+                        // with syntax off use the theme palette directly.
                         let syntax = self.syntax_enabled;
-                        let render_palette = palette.as_ref().unwrap_or(&self.diff_palette);
+                        let render_palette = if syntax {
+                            self.highlighter
+                                .as_ref()
+                                .map_or(&self.diff_palette, |h| h.palette())
+                        } else {
+                            &self.diff_palette
+                        };
                         let font_id = self.fonts.font_id(Role::Diff);
                         let lines = &self.diff_lines;
                         let files = &self.diff_files;
@@ -5493,11 +5459,11 @@ fn main() -> eframe::Result {
         }
     };
     if raw.help {
-        print_help();
+        cli::print_help();
         return Ok(());
     }
     if raw.version {
-        print_version();
+        cli::print_version();
         return Ok(());
     }
     let repo_path = raw.repo_dir.clone().unwrap_or_else(|| ".".to_string());
@@ -5521,7 +5487,7 @@ fn main() -> eframe::Result {
         .and_then(|(w, c)| {
             c.strip_prefix(&w)
                 .ok()
-                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                .map(|r| r.to_string_lossy().into_owned())
         })
         .unwrap_or_default();
 
@@ -5549,7 +5515,7 @@ fn main() -> eframe::Result {
     let paths: Vec<String> = match &workdir {
         Some(w) => raw_paths
             .iter()
-            .map(|p| token_to_pathspec(p, &prefix, w))
+            .map(|p| cli::token_to_pathspec(p, &prefix, w))
             .filter(|p| !p.is_empty())
             .collect(),
         None => raw_paths, // bare repo: no worktree to anchor paths against
@@ -5575,7 +5541,7 @@ fn main() -> eframe::Result {
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
             .unwrap_or("gitkay");
-        let suffix = scope_title_suffix(&scope);
+        let suffix = cli::scope_title_suffix(&scope);
         if suffix.is_empty() {
             format!("gitkay — {workdir}")
         } else {
@@ -5641,19 +5607,11 @@ fn main() -> eframe::Result {
     // window/GL init. The thread re-reads config (cheap) and runs build_fonts; the
     // main thread only does the Context-bound set_fonts. Default config names no
     // font, so build_fonts is near-free then — this hoists no wasted work. On spawn
-    // failure the sender drops and new() builds fonts inline.
-    let (font_tx, font_rx) = mpsc::channel();
-    if spawn_guarded("gitkay-fonts", "font prefetch thread panicked", move || {
-        let cfg = config::config_path()
-            .as_ref()
-            .and_then(|p| config::read_config(p).ok())
-            .unwrap_or_default();
-        let _ = font_tx.send(config::build_fonts(&cfg));
-    })
-    .is_err()
-    {
+    // failure the dead receiver's disconnect makes new() build fonts inline.
+    let font_rx = spawn_font_build(None).unwrap_or_else(|| {
         log::warn!("font prefetch thread spawn failed; building fonts inline");
-    }
+        mpsc::channel().1
+    });
 
     // Stable app id "gitkay" (not the per-repo title) so Wayland compositors can
     // match window rules on app_id, and so eframe uses a stable storage dir for
@@ -7328,51 +7286,6 @@ mod tests {
     }
 
     #[test]
-    fn normalize_rel_resolves_dot_and_dotdot() {
-        assert_eq!(normalize_rel("src/./foo"), "src/foo");
-        assert_eq!(normalize_rel("src/../foo"), "foo");
-        assert_eq!(normalize_rel("a//b"), "a/b");
-        assert_eq!(normalize_rel("src/.."), "");
-        assert_eq!(normalize_rel("./."), "");
-        assert_eq!(normalize_rel("/foo"), "foo"); // leading slash from an empty prefix
-    }
-
-    #[test]
-    fn token_to_pathspec_anchors_relative_to_prefix() {
-        let wd = std::path::Path::new("/repo"); // only consulted for absolute tokens
-        // In <repo>/src, `.` is the whole src dir.
-        assert_eq!(token_to_pathspec(".", "src", wd), "src");
-        assert_eq!(token_to_pathspec("foo.rs", "src", wd), "src/foo.rs");
-        assert_eq!(token_to_pathspec("../README", "src", wd), "README");
-        // At the repo root `.` is the whole repo → "" (dropped by the caller).
-        assert_eq!(token_to_pathspec(".", "", wd), "");
-        assert_eq!(token_to_pathspec("a/b", "", wd), "a/b");
-        // Absolute token under the worktree → made repo-root-relative.
-        assert_eq!(
-            token_to_pathspec("/repo/src/foo.rs", "src", wd),
-            "src/foo.rs"
-        );
-    }
-
-    #[test]
-    fn scope_title_suffix_formats() {
-        let s = |all: bool, revs: &[&str], paths: &[&str]| cli::Scope {
-            all,
-            revs: revs.iter().map(std::string::ToString::to_string).collect(),
-            paths: paths.iter().map(std::string::ToString::to_string).collect(),
-            ..Default::default()
-        };
-        assert_eq!(scope_title_suffix(&s(false, &[], &[])), "");
-        assert_eq!(scope_title_suffix(&s(true, &[], &[])), "--all");
-        assert_eq!(scope_title_suffix(&s(false, &["main"], &[])), "main");
-        assert_eq!(scope_title_suffix(&s(false, &[], &["src"])), "-- src");
-        assert_eq!(
-            scope_title_suffix(&s(false, &["a..b"], &["src", "x"])),
-            "a..b -- src x"
-        );
-    }
-
-    #[test]
     fn range_scope_excludes_base() {
         let (_d, repo) = temp_repo();
         commit_file(&repo, "a.txt", "1", "c1");
@@ -7515,7 +7428,8 @@ mod tests {
                 fp.map(String::from),
             )
         };
-        let commits = vec![mk(oid(2), Some("new.txt")), mk(oid(1), Some("old.txt"))];
+        let newer = mk(oid(2), Some("new.txt"));
+        let older = mk(oid(1), Some("old.txt"));
         let follow = cli::Scope {
             follow: true,
             paths: vec!["new.txt".to_string()],
@@ -7523,27 +7437,21 @@ mod tests {
         };
         // Each commit's diff follows the file's name at that commit.
         assert_eq!(
-            diff_paths_for(&follow, &commits, oid(1)),
+            diff_paths_for(&follow, Some(&older)),
             vec!["old.txt".to_string()]
         );
         assert_eq!(
-            diff_paths_for(&follow, &commits, oid(2)),
+            diff_paths_for(&follow, Some(&newer)),
             vec!["new.txt".to_string()]
         );
-        // Unknown oid (or no follow_path) falls back to the global path.
-        assert_eq!(
-            diff_paths_for(&follow, &commits, oid(9)),
-            vec!["new.txt".to_string()]
-        );
+        // Unknown commit (or no follow_path) falls back to the global path.
+        assert_eq!(diff_paths_for(&follow, None), vec!["new.txt".to_string()]);
         // Non-follow mode always uses the global path filter.
         let plain = cli::Scope {
             paths: vec!["x".to_string()],
             ..Default::default()
         };
-        assert_eq!(
-            diff_paths_for(&plain, &commits, oid(1)),
-            vec!["x".to_string()]
-        );
+        assert_eq!(diff_paths_for(&plain, Some(&older)), vec!["x".to_string()]);
     }
 
     #[test]
