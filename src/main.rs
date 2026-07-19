@@ -2522,6 +2522,17 @@ enum StartupDiff {
     Done,
 }
 
+/// Where a commit's diff was left: the diff pane's top row and the file-list
+/// sidebar's scroll offset. Kept per oid in `GitkApp::scroll_memory` (session-only)
+/// so revisiting a commit reopens both views where they were. The diff side is a
+/// row index, not pixels — it survives font-size changes and clamps cleanly when a
+/// settings change reshapes the diff.
+#[derive(Clone, Copy)]
+struct ScrollMemory {
+    diff_row: usize,
+    file_list_y: f32,
+}
+
 struct GitkApp {
     commits: Vec<CommitInfo>,
     graph_rows: Vec<GraphRow>,
@@ -2540,6 +2551,18 @@ struct GitkApp {
     diff_files: Vec<FileEntry>,
     file_rows: Vec<FileListRow>, // cached file-list rows; rebuilt when diff_files or file_list changes
     diff_scroll_to: Option<usize>,
+    /// Per-commit scroll positions, remembered for the session so re-selecting a
+    /// commit reopens the diff and file list where they were left (an unvisited
+    /// commit opens at the top). Saved by `stash_current_diff` when a displayed
+    /// diff is replaced; queued for restore by `load_selected_diff`.
+    scroll_memory: std::collections::HashMap<git2::Oid, ScrollMemory>,
+    /// One-shot file-list restore target — the sidebar's `diff_scroll_to`
+    /// analogue: set on selection, consumed by the sidebar render once no diff
+    /// load is in flight (mid-load the sidebar still shows the outgoing diff).
+    file_list_scroll_to: Option<f32>,
+    /// The sidebar's live scroll offset, recorded each frame it renders — what
+    /// `stash_current_diff` saves into `scroll_memory` for the outgoing commit.
+    file_list_scroll: f32,
     diff_top_line: Arc<AtomicUsize>, // first visible diff line (set each frame in on_visible) — for page-by-file nav
     diff_visible_rows: Arc<AtomicUsize>, // visible diff rows (set each frame in on_visible) — for Space page-scroll
     graph_scroll_to: Option<(usize, Option<egui::Align>)>, // (commit index, alignment) to scroll to in graph view
@@ -3051,6 +3074,9 @@ impl GitkApp {
             // Empty like diff_files — the deferred startup load rebuilds them together.
             file_rows: Vec::new(),
             diff_scroll_to: None,
+            scroll_memory: std::collections::HashMap::new(),
+            file_list_scroll_to: None,
+            file_list_scroll: 0.0,
             diff_top_line: Arc::new(AtomicUsize::new(0)),
             diff_visible_rows: Arc::new(AtomicUsize::new(1)),
             graph_scroll_to: None,
@@ -3219,7 +3245,8 @@ impl GitkApp {
         // can't replace what's on screen. A real commit's diff is immutable so skipping
         // the reload is safe; a virtual entry's stored key carries a content hash while
         // diff_cache_key leaves it 0 here, so its key never matches and it always
-        // refreshes. Return before touching scroll state so the user keeps their position.
+        // refreshes. Return without queueing any scroll restore so the user keeps
+        // their live position.
         let sel = self.selected.filter(|&s| s < self.commits.len());
         if let Some(s) = sel
             && self.current_diff_key.as_ref() == Some(&self.diff_cache_key(self.commits[s].oid))
@@ -3227,16 +3254,21 @@ impl GitkApp {
             if self.diff_load_started_at.take().is_some() {
                 self.diff_load_epoch.bump();
             }
+            // Drop any restore target queued for the abandoned navigation — left
+            // pending, it would fire against this diff once the load state clears
+            // and yank it to the *other* commit's remembered position.
+            self.diff_scroll_to = None;
+            self.file_list_scroll_to = None;
             return;
         }
 
-        // A new diff invalidates the page-by-file nav state: drop any stale scroll
-        // target a same-frame PageUp/Down queued against the outgoing diff. (Callers
-        // that want a specific scroll set diff_scroll_to after; it survives an in-flight
-        // load — see the render path — and applies to the new diff once it lands.) The
-        // recorded top is reset by apply_loaded_diff when the new content installs, so
-        // the outgoing diff keeps its scroll position while a fast load is in flight.
+        // A new diff invalidates any pending scroll targets: a same-frame PageUp/Down
+        // queued against the outgoing diff, or a superseded selection's restore. The
+        // incoming commit's own restore is queued below once its oid is known; the
+        // outgoing diff keeps its scroll position while a fast load is in flight (the
+        // render path doesn't consume targets mid-load).
         self.diff_scroll_to = None;
+        self.file_list_scroll_to = None;
 
         let Some(sel) = sel else {
             // No selection: supersede any in-flight load, stash the outgoing diff for a
@@ -3250,6 +3282,18 @@ impl GitkApp {
 
         let oid = self.commits[sel].oid;
         log::debug!("select: commit {oid} (#{sel})");
+        // Queue the scroll restore for the incoming commit: its remembered position
+        // (saved by stash_current_diff when it was last replaced), or the top for one
+        // not visited this session. Only on an actual commit switch — a same-oid
+        // re-diff (settings change, virtual-row refresh) keeps the live position via
+        // the untouched egui scroll offsets, and the remembered one is older than
+        // what's on screen. The targets survive an in-flight load (see the render
+        // path), so they apply once the new content lands.
+        if self.current_diff_key.as_ref().map(|k| k.oid) != Some(oid) {
+            let mem = self.scroll_memory.get(&oid);
+            self.diff_scroll_to = Some(mem.map_or(0, |m| m.diff_row));
+            self.file_list_scroll_to = Some(mem.map_or(0.0, |m| m.file_list_y));
+        }
         // Identical for the synchronous hit-install and the async miss-dispatch below, so
         // build the cache key once here.
         let key = self.diff_cache_key(oid);
@@ -3284,6 +3328,17 @@ impl GitkApp {
     /// entries by a content hash.
     fn stash_current_diff(&mut self) {
         if let Some(key) = self.current_diff_key.take() {
+            // Remember where the outgoing diff was left (top row + sidebar offset) so
+            // re-selecting this commit restores the position (see load_selected_diff).
+            // Keyed by oid alone: a settings change reshapes the content, but the
+            // remembered row then just clamps to the new length.
+            self.scroll_memory.insert(
+                key.oid,
+                ScrollMemory {
+                    diff_row: self.diff_top_line.load(Ordering::Relaxed),
+                    file_list_y: self.file_list_scroll,
+                },
+            );
             let data = DiffData {
                 lines: std::mem::take(&mut self.diff_lines),
                 files: std::mem::take(&mut self.diff_files),
@@ -3775,14 +3830,15 @@ impl GitkApp {
         }
     }
 
-    /// Select an already-loaded commit at `idx`, load its diff, and reset the diff
-    /// view to the top — no history reload / graph relayout (that's only needed to
-    /// jump to a not-yet-loaded commit). The caller sets `graph_scroll_to` itself
-    /// when it also needs to bring the row into view.
+    /// Select an already-loaded commit at `idx` and load its diff — no history
+    /// reload / graph relayout (that's only needed to jump to a not-yet-loaded
+    /// commit). The caller sets `graph_scroll_to` itself when it also needs to
+    /// bring the row into view. The diff and file list open at the commit's
+    /// remembered scroll position — the top for one not visited this session
+    /// (`load_selected_diff` queues the restore).
     fn select_loaded(&mut self, idx: usize) {
         self.set_selected(idx);
         self.load_selected_diff();
-        self.diff_scroll_to = Some(0); // new commit → reset diff view to top
     }
 
     /// Recompute the cached file-list rows. Call after `diff_files` or
@@ -4706,8 +4762,9 @@ impl GitkApp {
 
         // PageDown / PageUp: jump to the next / previous file in the diff. Handled
         // even while the search field is focused — a single-line field has no use for
-        // these keys. Skipped when a commit switch already queued a scroll reset this
-        // frame (diff_scroll_to set), so the new commit's diff still opens at the top.
+        // these keys. Skipped when a commit switch already queued a scroll restore this
+        // frame (diff_scroll_to set), so the new commit's diff still opens at its
+        // remembered position (or the top).
         let page_delta: isize = ctx.input_mut(|i| {
             consume_dir(
                 i,
@@ -4985,100 +5042,111 @@ impl eframe::App for GitkApp {
                 // Right: resizable file-list sidebar — draggable splitter, width
                 // persisted across runs (see App::save). Shown only when the selected
                 // commit touches files and we're not blanked to the placeholder.
-                let divider: Option<egui::Rect> =
-                    if !self.diff_files.is_empty() && !showing_placeholder {
-                        let saved_w = self.file_list_width;
-                        // Let the sidebar grow with the window — up to all but a readable
-                        // ~300px strip for the diff — so paths have room on wide screens.
-                        // Floor at the panel min (not 400) so the diff keeps its strip on
-                        // narrow windows too. `ui` here still spans the whole diff region
-                        // (the diff's central panel is carved out after this right panel).
-                        let max_w = (ui.available_width() - 300.0).max(FILE_LIST_MIN_W);
-                        let file_panel = egui::Panel::right("file_list_panel")
-                            .resizable(true)
-                            .default_size(saved_w)
-                            .min_size(FILE_LIST_MIN_W)
-                            .max_size(max_w)
-                            .frame(egui::Frame::NONE)
-                            .show_inside(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new(format!("{} files", self.diff_files.len()))
-                                        .color(SUBTEXT)
-                                        .font(self.fonts.font_id(Role::Ui)),
-                                );
-                                ui.add_space(4.0);
-                                egui::ScrollArea::vertical()
-                                    .id_salt("file_list")
-                                    .show(ui, |ui| {
-                                        // The file the diff is scrolled into (None while
-                                        // still in the commit header) — highlighted below
-                                        // with the same accent the commit list uses for the
-                                        // selected row, so the list tracks the diff view.
-                                        let top = self.diff_top_line.load(Ordering::Relaxed);
-                                        let current_file =
-                                            file_index_at_line_opt(&self.file_line_starts, top);
-                                        // Shared by every row this frame — the metric
-                                        // lookup takes the font lock, so don't repeat
-                                        // it per row (this list isn't virtualized).
-                                        let row_h = self.file_row_h(ui);
-                                        // Take the render cache out of self so the
-                                        // `&self` row draws can fill it while the
-                                        // row list is borrowed.
-                                        let mut cache = std::mem::take(&mut self.sidebar_cache);
-                                        cache.ensure(self.diff_files.len(), ui.available_width());
-                                        let mut frame = SidebarFrame {
-                                            row_h,
-                                            current_file,
-                                            cache: &mut cache,
-                                        };
-                                        let mut scroll_to: Option<usize> = None;
-                                        for row in &self.file_rows {
-                                            match row {
-                                                FileListRow::Header { dir, dim_len } => {
-                                                    self.draw_dir_header(ui, dir, *dim_len, row_h);
-                                                }
-                                                FileListRow::File {
-                                                    idx,
-                                                    label,
-                                                    indented,
-                                                } => {
-                                                    let indent =
-                                                        if *indented { FILE_INDENT } else { 0.0 };
-                                                    if let Some(li) = self.draw_file_row(
-                                                        ui, *idx, label, indent, &mut frame,
-                                                    ) {
-                                                        scroll_to = Some(li);
-                                                    }
-                                                }
+                let divider: Option<egui::Rect> = if !self.diff_files.is_empty()
+                    && !showing_placeholder
+                {
+                    let saved_w = self.file_list_width;
+                    // Let the sidebar grow with the window — up to all but a readable
+                    // ~300px strip for the diff — so paths have room on wide screens.
+                    // Floor at the panel min (not 400) so the diff keeps its strip on
+                    // narrow windows too. `ui` here still spans the whole diff region
+                    // (the diff's central panel is carved out after this right panel).
+                    let max_w = (ui.available_width() - 300.0).max(FILE_LIST_MIN_W);
+                    let file_panel = egui::Panel::right("file_list_panel")
+                        .resizable(true)
+                        .default_size(saved_w)
+                        .min_size(FILE_LIST_MIN_W)
+                        .max_size(max_w)
+                        .frame(egui::Frame::NONE)
+                        .show_inside(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{} files", self.diff_files.len()))
+                                    .color(SUBTEXT)
+                                    .font(self.fonts.font_id(Role::Ui)),
+                            );
+                            ui.add_space(4.0);
+                            let mut file_scroll = egui::ScrollArea::vertical().id_salt("file_list");
+                            // Apply a queued per-commit restore (see
+                            // load_selected_diff) only once the sidebar shows the
+                            // diff it was queued for — never mid-load, when the
+                            // rows on screen still belong to the outgoing diff.
+                            if self.diff_load_started_at.is_none()
+                                && let Some(y) = self.file_list_scroll_to.take()
+                            {
+                                file_scroll = file_scroll.vertical_scroll_offset(y);
+                            }
+                            let file_scroll_out = file_scroll.show(ui, |ui| {
+                                // The file the diff is scrolled into (None while
+                                // still in the commit header) — highlighted below
+                                // with the same accent the commit list uses for the
+                                // selected row, so the list tracks the diff view.
+                                let top = self.diff_top_line.load(Ordering::Relaxed);
+                                let current_file =
+                                    file_index_at_line_opt(&self.file_line_starts, top);
+                                // Shared by every row this frame — the metric
+                                // lookup takes the font lock, so don't repeat
+                                // it per row (this list isn't virtualized).
+                                let row_h = self.file_row_h(ui);
+                                // Take the render cache out of self so the
+                                // `&self` row draws can fill it while the
+                                // row list is borrowed.
+                                let mut cache = std::mem::take(&mut self.sidebar_cache);
+                                cache.ensure(self.diff_files.len(), ui.available_width());
+                                let mut frame = SidebarFrame {
+                                    row_h,
+                                    current_file,
+                                    cache: &mut cache,
+                                };
+                                let mut scroll_to: Option<usize> = None;
+                                for row in &self.file_rows {
+                                    match row {
+                                        FileListRow::Header { dir, dim_len } => {
+                                            self.draw_dir_header(ui, dir, *dim_len, row_h);
+                                        }
+                                        FileListRow::File {
+                                            idx,
+                                            label,
+                                            indented,
+                                        } => {
+                                            let indent = if *indented { FILE_INDENT } else { 0.0 };
+                                            if let Some(li) = self
+                                                .draw_file_row(ui, *idx, label, indent, &mut frame)
+                                            {
+                                                scroll_to = Some(li);
                                             }
                                         }
-                                        self.sidebar_cache = cache;
-                                        // Ignore a click while a diff load is in flight:
-                                        // the sidebar still shows the OUTGOING diff, so
-                                        // the clicked line index is in its coordinates —
-                                        // the render deliberately preserves diff_scroll_to
-                                        // across the load, so the stale target would jump
-                                        // the INCOMING diff to an arbitrary line.
-                                        if let Some(li) = scroll_to
-                                            && self.diff_load_started_at.is_none()
-                                        {
-                                            self.diff_scroll_to = Some(li);
-                                        }
-                                        // Breathing room so the last file isn't flush
-                                        // against the bottom edge.
-                                        ui.add_space(BOTTOM_PAD_ROWS as f32 * row_h);
-                                    });
+                                    }
+                                }
+                                self.sidebar_cache = cache;
+                                // Ignore a click while a diff load is in flight:
+                                // the sidebar still shows the OUTGOING diff, so
+                                // the clicked line index is in its coordinates —
+                                // the render deliberately preserves diff_scroll_to
+                                // across the load, so the stale target would jump
+                                // the INCOMING diff to an arbitrary line.
+                                if let Some(li) = scroll_to
+                                    && self.diff_load_started_at.is_none()
+                                {
+                                    self.diff_scroll_to = Some(li);
+                                }
+                                // Breathing room so the last file isn't flush
+                                // against the bottom edge.
+                                ui.add_space(BOTTOM_PAD_ROWS as f32 * row_h);
                             });
-                        persist_on_resize_drag(
-                            &ctx,
-                            "file_list_panel",
-                            &mut self.file_list_width,
-                            file_panel.response.rect.width(),
-                        );
-                        Some(file_panel.response.rect)
-                    } else {
-                        None
-                    };
+                            // Live offset — what stash_current_diff remembers
+                            // for this commit when its diff is replaced.
+                            self.file_list_scroll = file_scroll_out.state.offset.y;
+                        });
+                    persist_on_resize_drag(
+                        &ctx,
+                        "file_list_panel",
+                        &mut self.file_list_width,
+                        file_panel.response.rect.width(),
+                    );
+                    Some(file_panel.response.rect)
+                } else {
+                    None
+                };
 
                 // Left: diff content fills the remaining width. Right padding keeps
                 // the diff scrollbar from crowding the file-list resize bar — only
