@@ -85,6 +85,9 @@ jobs:
           tar xzf "gitkay-${REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" -C gitkay-${VERSION}
           cp LICENSE README.md gitkay-${VERSION}/
           tar czf rpmbuild/SOURCES/gitkay-${VERSION}.tar.gz gitkay-${VERSION}
+          # This is the BINARY-repack spec (prebuilt tarball, no cargo build) —
+          # distinct from the source-build packaging/gitkay.spec by design, but
+          # keep the shared metadata (Summary, description) in sync with it.
           cat > rpmbuild/SPECS/gitkay.spec << 'SPEC'
           Name:           gitkay
           Version:        VERSION_PLACEHOLDER
@@ -97,6 +100,9 @@ jobs:
 
           %description
           gitkay is a native Wayland git history viewer — gitk, but okay.
+          Features a commit graph with colored branch lanes, syntax-highlighted
+          diffs, file list sidebar, search, and Catppuccin Mocha dark theme.
+          Built with Rust + egui for fast startup and smooth scrolling.
 
           %prep
           %autosetup
@@ -142,17 +148,20 @@ jobs:
           mkdir -p pkg/usr/bin
           tar xzf "gitkay-${REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" -C pkg/usr/bin/
           chmod 755 pkg/usr/bin/gitkay
+          # This is the BINARY control (dpkg-deb repack) — distinct from the
+          # source-build packaging/debian/control by design, but keep the shared
+          # metadata (Section, Maintainer, Description) in sync with it.
           cat > pkg/DEBIAN/control << EOF
           Package: gitkay
           Version: ${VERSION}
-          Section: vcs
+          Section: devel
           Priority: optional
           Architecture: amd64
           Maintainer: Marenz <marenz@supradigital.org>
-          Description: A fast, native Wayland git history viewer
-           gitkay is a native Wayland git history viewer — gitk, but okay.
-           Features commit graph, syntax-highlighted diffs, search, and
-           Catppuccin Mocha dark theme. Built with Rust + egui.
+          Description: Fast, native Wayland git history viewer
+           gitkay is a gitk replacement built with Rust + egui. Features a commit
+           graph with colored branch lanes, syntax-highlighted diffs, file list
+           sidebar, search, and Catppuccin Mocha dark theme. Starts in under 200ms.
           EOF
           dpkg-deb --build pkg gitkay_${VERSION}_amd64.deb
 
