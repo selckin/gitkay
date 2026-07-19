@@ -1990,12 +1990,15 @@ fn tokenize_range(
     end: usize,
 ) -> Vec<(usize, Vec<highlight::Span>)> {
     let mut updates = Vec::new();
+    // One scratch buffer for the whole range — tokenize_line would otherwise
+    // allocate a newline-terminated copy of every single line.
+    let mut buf = String::new();
     for (i, line) in lines.iter().enumerate().take(end).skip(start) {
         // Only code lines are tokenized; structural lines keep no spans.
         if !line.kind.is_code() {
             continue;
         }
-        updates.push((i, hl.tokenize_line(state, line.body())));
+        updates.push((i, hl.tokenize_line(state, line.body(), &mut buf)));
     }
     updates
 }
