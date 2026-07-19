@@ -69,6 +69,13 @@ The big picture, ahead of the detail sections below:
 
 ### Data Layer
 - `load_commits()` — revwalk via `git2`, topological + time order, precomputed ref map
+- `load_commits_tail()` — incremental extension for the plain (no path filter,
+  non-reflog) scope: re-runs the same deterministic walk (`history_revwalk` is the
+  single walk config — both walks must order identically for the resume to be sound),
+  skips the loaded prefix cheaply (oid iteration only, anchored on the last loaded
+  real commit's oid), and builds only the new tail. Returns `None` for scopes whose
+  parent rewrite / `@{n}` numbering are whole-list computations, or when the anchor
+  moved (repo changed) — callers then do a full walk
 - `build_ref_map()` — single pass over all refs, O(refs) instead of O(commits × refs)
 - `get_diff_data()` — diff lines with syntax classification + file list with per-file stats and line offsets
 
@@ -126,7 +133,7 @@ parts run off the window-creation critical path:
 
 ### UI (egui immediate mode)
 - **Top panel**: search bar (SHA/author/message/ref), Enter cycles matches, any keypress focuses search, graph auto-scrolls to match
-- **Central panel**: commit graph + list (`show_commit_list`), virtualized with egui `show_rows` (same mechanism as the diff pane). Lazy loading (200 initial, +500 on scroll-near-bottom)
+- **Central panel**: commit graph + list (`show_commit_list`), virtualized with egui `show_rows` (same mechanism as the diff pane). Lazy loading: 200 initial, +500 on scroll-near-bottom — computed on a `gitkay-history-load` worker (never the frame loop), appended incrementally via `load_commits_tail` in the common plain scope, full background rebuild otherwise. The debounced git-watcher reload takes the same worker path. `history_epoch` supersedes stale results; both land in `drain_history_results`, which re-syncs derived state through `resync_commits` (a pure append re-anchors to the same index, so selection and scroll don't move)
 - **Bottom panel**: diff view (left, syntax-highlighted) + file list sidebar (right, dynamic width)
 - **Rename/copy detection**: `detect_similar` (`git2::Diff::find_similar`) post-passes
   `get_diff_data`/`get_working_tree_diff`/`get_staged_diff`, coalescing an add+delete pair

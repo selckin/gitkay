@@ -118,7 +118,7 @@ impl CommitInfo {
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 enum RefKind {
     Head,
     Branch,
@@ -784,6 +784,69 @@ fn persist_on_resize_drag(ctx: &egui::Context, panel_id: &str, dst: &mut f32, va
     }
 }
 
+/// The revwalk `load_commits` and `load_commits_tail` share: TIME|TOPOLOGICAL
+/// sorting plus the scope's pushes. One constructor so the two walks can't diverge
+/// in ordering config — the tail resume is only sound if both produce the same
+/// deterministic order over the same repo state.
+fn history_revwalk<'r>(repo: &'r Repository, scope: &cli::Scope) -> Option<git2::Revwalk<'r>> {
+    let Ok(mut revwalk) = repo.revwalk() else {
+        return None;
+    };
+    if let Err(e) = revwalk.set_sorting(Sort::TIME | Sort::TOPOLOGICAL) {
+        log::warn!("gitkay: cannot set commit sort order: {e}");
+    }
+    if scope.all {
+        // Everything: branches, remotes, tags — plus HEAD, like `git rev-list
+        // --all`: a detached HEAD's commits aren't under refs/ and would
+        // otherwise vanish (leaving the virtual rows' parent dangling).
+        for glob in ["refs/heads/*", "refs/remotes/*", "refs/tags/*"] {
+            if let Err(e) = revwalk.push_glob(glob) {
+                log::warn!("gitkay: cannot walk {glob}: {e}");
+            }
+        }
+        if let Err(e) = revwalk.push_head() {
+            log::warn!("gitkay: cannot walk HEAD: {e}");
+        }
+    } else if scope.revs.is_empty() {
+        // default: the current branch only
+        if let Err(e) = revwalk.push_head() {
+            log::warn!("gitkay: cannot walk HEAD: {e}");
+        }
+    } else {
+        for tok in &scope.revs {
+            push_rev_token(&mut revwalk, repo, tok);
+        }
+    }
+    Some(revwalk)
+}
+
+/// Build one real commit's `CommitInfo`. Lossy conversions: legacy repos carry
+/// Latin-1 summaries/names, and a blank cell (plus an unsearchable commit) is worse
+/// than a replacement char. The AUTHOR date matches `git log`/gitk; `commit.time()`
+/// is the committer timestamp, which shifts on every rebase/cherry-pick/amend.
+fn build_commit_info(
+    oid: git2::Oid,
+    commit: &git2::Commit,
+    parents: Vec<git2::Oid>,
+    ref_map: &std::collections::HashMap<git2::Oid, Vec<(String, RefKind)>>,
+) -> CommitInfo {
+    let author = commit.author();
+    let when = author.when();
+    CommitInfo::new(
+        oid,
+        commit
+            .summary_bytes()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default(),
+        String::from_utf8_lossy(author.name_bytes()).into_owned(),
+        when.seconds(),
+        when.offset_minutes(),
+        parents,
+        ref_map.get(&oid).cloned().unwrap_or_default(),
+        None,
+    )
+}
+
 fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitInfo> {
     let t = std::time::Instant::now();
     let ref_map = build_ref_map(repo);
@@ -862,54 +925,11 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
 
     // Load real commits
     let t = std::time::Instant::now();
-    let Ok(mut revwalk) = repo.revwalk() else {
+    let Some(revwalk) = history_revwalk(repo, scope) else {
         return commits;
     };
-    if let Err(e) = revwalk.set_sorting(Sort::TIME | Sort::TOPOLOGICAL) {
-        log::warn!("gitkay: cannot set commit sort order: {e}");
-    }
-    if scope.all {
-        // Everything: branches, remotes, tags — plus HEAD, like `git rev-list
-        // --all`: a detached HEAD's commits aren't under refs/ and would
-        // otherwise vanish (leaving the virtual rows' parent dangling).
-        for glob in ["refs/heads/*", "refs/remotes/*", "refs/tags/*"] {
-            if let Err(e) = revwalk.push_glob(glob) {
-                log::warn!("gitkay: cannot walk {glob}: {e}");
-            }
-        }
-        if let Err(e) = revwalk.push_head() {
-            log::warn!("gitkay: cannot walk HEAD: {e}");
-        }
-    } else if scope.revs.is_empty() {
-        // default: the current branch only
-        if let Err(e) = revwalk.push_head() {
-            log::warn!("gitkay: cannot walk HEAD: {e}");
-        }
-    } else {
-        for tok in &scope.revs {
-            push_rev_token(&mut revwalk, repo, tok);
-        }
-    }
     let build_info = |oid: git2::Oid, commit: &git2::Commit, parents: Vec<git2::Oid>| {
-        // Lossy conversions: legacy repos carry Latin-1 summaries/names, and a
-        // blank cell (plus an unsearchable commit) is worse than a replacement
-        // char. The AUTHOR date matches `git log`/gitk; `commit.time()` is the
-        // committer timestamp, which shifts on every rebase/cherry-pick/amend.
-        let author = commit.author();
-        let when = author.when();
-        CommitInfo::new(
-            oid,
-            commit
-                .summary_bytes()
-                .map(|b| String::from_utf8_lossy(b).into_owned())
-                .unwrap_or_default(),
-            String::from_utf8_lossy(author.name_bytes()).into_owned(),
-            when.seconds(),
-            when.offset_minutes(),
-            parents,
-            ref_map.get(&oid).cloned().unwrap_or_default(),
-            None,
-        )
+        build_commit_info(oid, commit, parents, &ref_map)
     };
 
     let mut seen = HashSet::new();
@@ -1001,6 +1021,71 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
         t.elapsed()
     );
     commits
+}
+
+/// Incremental history extension for the plain (no path filter, non-reflog) scope:
+/// re-run the same deterministic revwalk, skip the `skip` already-loaded commits —
+/// verifying the walk still lines up via `expect_last`, the oid of the last
+/// already-loaded real commit — and build `CommitInfo`s only for the next `max_new`.
+/// Returns `None` when the scope can't extend incrementally (a path filter's parent
+/// rewrite and the reflog's `@{n}` numbering are whole-list computations) or when the
+/// walk no longer matches (the repo changed underneath) — the caller falls back to a
+/// full walk. A short (or empty) return means the walk is exhausted.
+fn load_commits_tail(
+    repo: &Repository,
+    scope: &cli::Scope,
+    skip: usize,
+    expect_last: git2::Oid,
+    max_new: usize,
+) -> Option<Vec<CommitInfo>> {
+    if scope.reflog || !scope.paths.is_empty() {
+        return None;
+    }
+    let t = std::time::Instant::now();
+    let mut iter = history_revwalk(repo, scope)?.flatten();
+    // Skip the already-loaded prefix — oid iteration only, none of the
+    // find_commit/CommitInfo work — counting like load_commits counts (`seen`
+    // dedup is defensive parity; git2's revwalk doesn't emit duplicates).
+    let mut seen = HashSet::new();
+    let mut last = None;
+    let mut skipped = 0;
+    while skipped < skip {
+        let oid = iter.next()?; // walk shorter than the prefix ⇒ repo changed
+        if seen.insert(oid) {
+            last = Some(oid);
+            skipped += 1;
+        }
+    }
+    // The resume is only sound if this walk reproduces the one the prefix came
+    // from; a moved anchor means the repo changed underneath (the debounced
+    // watcher reload will follow with a full rebuild anyway).
+    if last != Some(expect_last) {
+        return None;
+    }
+    let ref_map = build_ref_map(repo);
+    let mut commits = Vec::new();
+    for oid in iter {
+        if !seen.insert(oid) {
+            continue;
+        }
+        if let Ok(commit) = repo.find_commit(oid) {
+            commits.push(build_commit_info(
+                oid,
+                &commit,
+                commit.parent_ids().collect(),
+                &ref_map,
+            ));
+            if commits.len() >= max_new {
+                break;
+            }
+        }
+    }
+    log::debug!(
+        "perf: load_commits_tail: +{} commits (skipped {skip}) {:?}",
+        commits.len(),
+        t.elapsed()
+    );
+    Some(commits)
 }
 
 /// Pathspec to scope a commit's diff to. In --follow mode it's the file's name *at
@@ -2376,6 +2461,113 @@ fn diff_load_worker(job: DiffLoadJob) {
     ctx.request_repaint();
 }
 
+/// What a background history load should produce.
+#[derive(Clone, Copy)]
+enum HistoryJobKind {
+    /// Append up to `max_new` commits after the `skip`-long loaded prefix
+    /// (anchored at `expect_last`, the last loaded real commit). Falls back to
+    /// a full `requested`-sized rebuild when the incremental resume isn't
+    /// possible (path filter, reflog, or the walk no longer lines up).
+    Extend {
+        skip: usize,
+        expect_last: git2::Oid,
+        max_new: usize,
+        requested: usize,
+    },
+    /// Rebuild the whole list at `count` commits (the watcher reload).
+    Rebuild { count: usize },
+}
+
+/// Everything a background history load owns for one dispatch.
+struct HistoryJob {
+    repo_path: String,
+    scope: cli::Scope,
+    kind: HistoryJobKind,
+    epoch: u64,
+    current_epoch: Epoch,
+    tx: mpsc::Sender<HistoryResult>,
+    ctx: egui::Context,
+}
+
+/// A finished background history load handed back to the UI, with the epoch it
+/// was dispatched under so a superseded result is dropped on arrival.
+struct HistoryResult {
+    epoch: u64,
+    /// `None` when the worker failed (repo momentarily unavailable) — still
+    /// delivered so the UI clears the in-flight state.
+    load: Option<HistoryLoad>,
+}
+
+enum HistoryLoad {
+    /// New commits to append after the current last row.
+    Extend {
+        new: Vec<CommitInfo>,
+        max_new: usize,
+    },
+    /// A fully rebuilt list replacing the current one.
+    Rebuild {
+        commits: Vec<CommitInfo>,
+        count: usize,
+    },
+}
+
+/// Compute one history load off the UI thread — the walk costs a `find_commit`
+/// per commit, and per-commit tree diffs under a path filter, so on a long-loaded
+/// history it is far too slow for the frame loop. Bails without a result as soon
+/// as a newer dispatch supersedes it.
+fn history_worker(job: HistoryJob) {
+    let HistoryJob {
+        repo_path,
+        scope,
+        kind,
+        epoch,
+        current_epoch,
+        tx,
+        ctx,
+    } = job;
+    if !current_epoch.is_current(epoch) {
+        return;
+    }
+    let repo = match Repository::discover(&repo_path) {
+        Ok(r) => r,
+        Err(e) => {
+            // Report the failure so the UI clears the in-flight state; the epoch
+            // check on the UI side ignores it if a newer dispatch superseded us.
+            log::debug!("history-load: repo discover failed: {e}");
+            let _ = tx.send(HistoryResult { epoch, load: None });
+            ctx.request_repaint();
+            return;
+        }
+    };
+    let load = match kind {
+        HistoryJobKind::Extend {
+            skip,
+            expect_last,
+            max_new,
+            requested,
+        } => load_commits_tail(&repo, &scope, skip, expect_last, max_new).map_or_else(
+            || HistoryLoad::Rebuild {
+                commits: load_history(&repo, requested, &scope),
+                count: requested,
+            },
+            |new| HistoryLoad::Extend { new, max_new },
+        ),
+        HistoryJobKind::Rebuild { count } => HistoryLoad::Rebuild {
+            commits: load_history(&repo, count, &scope),
+            count,
+        },
+    };
+    if tx
+        .send(HistoryResult {
+            epoch,
+            load: Some(load),
+        })
+        .is_ok()
+    {
+        ctx.request_repaint();
+    }
+}
+
 /// The configured diff theme slug, falling back to the built-in default when
 /// `[diff] theme` is unset. Shared by the startup and live-reload config paths.
 fn configured_theme_slug(cfg: &config::Config) -> String {
@@ -2999,6 +3191,13 @@ struct GitkApp {
     diff_load_tx: mpsc::Sender<DiffLoadResult>, // worker → UI: the selected commit's finished diff
     diff_load_rx: mpsc::Receiver<DiffLoadResult>,
     diff_load_epoch: Epoch, // bumped per selection; supersedes older diff-load workers + results
+    /// Background history loads (lazy-load extension + watcher rebuild). Results
+    /// return over this channel; `history_epoch` supersedes stale ones; the
+    /// in-flight flag stops the scroll trigger from re-dispatching every frame.
+    history_load_tx: mpsc::Sender<HistoryResult>,
+    history_load_rx: mpsc::Receiver<HistoryResult>,
+    history_epoch: Epoch,
+    history_inflight: bool,
     // A diff-load worker is in flight iff this is `Some` — the single source of truth
     // (no separate bool to keep in sync). Holds when the current load began, so the
     // "Loading diff…" placeholder can be delayed past DIFF_PLACEHOLDER_DELAY. Preserved
@@ -3356,6 +3555,7 @@ impl GitkApp {
         let (highlight_tx, highlight_rx) = mpsc::channel();
         let (prefetch_tx, prefetch_rx) = mpsc::channel();
         let (diff_load_tx, diff_load_rx) = mpsc::channel();
+        let (history_load_tx, history_load_rx) = mpsc::channel();
         let egui_ctx = cc.egui_ctx.clone();
         let diff_max_chars = max_line_chars(&diff_lines);
 
@@ -3465,6 +3665,10 @@ impl GitkApp {
             diff_load_rx,
             diff_load_epoch: Epoch::default(),
             diff_load_started_at: None,
+            history_load_tx,
+            history_load_rx,
+            history_epoch: Epoch::default(),
+            history_inflight: false,
             egui_ctx,
         })
     }
@@ -3983,29 +4187,100 @@ impl GitkApp {
         }
     }
 
-    fn reload_commits(&mut self, repo: &Repository, preferred_oid: Option<git2::Oid>) {
-        let count = real_commit_count(&self.commits).max(200);
-        self.reload_to_count(repo, count, preferred_oid);
+    /// Spawn a background history load (lazy-load extension or watcher rebuild) —
+    /// the walk costs a `find_commit` per commit (and per-commit tree diffs under a
+    /// path filter), far too slow for the frame loop on a long-loaded history. A new
+    /// dispatch supersedes any in-flight one via `history_epoch`; the result lands in
+    /// `drain_history_results`. On thread-spawn failure, fall back to the old
+    /// synchronous reload so the feature still works (accepting the UI stall).
+    fn dispatch_history_load(&mut self, kind: HistoryJobKind) {
+        let epoch = self.history_epoch.bump();
+        self.history_inflight = true;
+        // Not spawn_guarded: a panic must still deliver a result (`load: None`),
+        // or `history_inflight` sticks and the extension is dead for the session.
+        let spawn = std::thread::Builder::new()
+            .name("gitkay-history-load".into())
+            .spawn({
+                let job = HistoryJob {
+                    repo_path: self.repo_path.clone(),
+                    scope: self.scope.clone(),
+                    kind,
+                    epoch,
+                    current_epoch: self.history_epoch.clone(),
+                    tx: self.history_load_tx.clone(),
+                    ctx: self.egui_ctx.clone(),
+                };
+                move || {
+                    let fail = (job.tx.clone(), job.ctx.clone());
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        history_worker(job);
+                    }))
+                    .is_err()
+                    {
+                        log::warn!("history-load worker panicked; reporting the load as failed");
+                        let (tx, ctx) = fail;
+                        let _ = tx.send(HistoryResult { epoch, load: None });
+                        ctx.request_repaint();
+                    }
+                }
+            });
+        if spawn.is_err() {
+            log::warn!("history-load thread spawn failed; loading synchronously");
+            self.history_inflight = false;
+            let count = match kind {
+                HistoryJobKind::Extend { requested, .. } => requested,
+                HistoryJobKind::Rebuild { count } => count,
+            };
+            if let Ok(repo) = Repository::discover(&self.repo_path) {
+                let previous_oid = self
+                    .selected
+                    .and_then(|sel| self.commits.get(sel))
+                    .map(|commit| commit.oid);
+                let previous_index = self.selected;
+                self.commits = load_history(&repo, count, &self.scope);
+                self.resync_commits(count, None, previous_oid, previous_index);
+                self.load_selected_diff();
+            }
+        }
     }
 
-    /// Reload history to `count` real commits and re-sync all derived state,
-    /// snapshotting then re-anchoring the selection (to `preferred_oid`, else the
-    /// previously-selected commit). The shared core of a full reload and the
-    /// lazy-load tail-extension.
-    fn reload_to_count(
-        &mut self,
-        repo: &Repository,
-        count: usize,
-        preferred_oid: Option<git2::Oid>,
-    ) {
-        let previous_oid = self
-            .selected
-            .and_then(|sel| self.commits.get(sel))
-            .map(|commit| commit.oid);
-        let previous_index = self.selected;
-
-        self.commits = load_history(repo, count, &self.scope);
-        self.resync_commits(count, preferred_oid, previous_oid, previous_index);
+    /// Install a finished background history load: splice an extension tail after
+    /// the current last row, or swap in a rebuilt list — in both cases re-syncing
+    /// derived state and re-anchoring the selection through `resync_commits`,
+    /// exactly like the old synchronous reload (for a pure append the re-anchor
+    /// resolves to the same index, so selection and scroll don't move). Results
+    /// superseded by a newer dispatch are dropped.
+    fn drain_history_results(&mut self) {
+        while let Ok(result) = self.history_load_rx.try_recv() {
+            if !self.history_epoch.is_current(result.epoch) {
+                continue; // superseded; the newer dispatch is still in flight
+            }
+            self.history_inflight = false;
+            let Some(load) = result.load else {
+                continue; // worker failed (logged there); a scroll re-triggers
+            };
+            let previous_oid = self
+                .selected
+                .and_then(|sel| self.commits.get(sel))
+                .map(|commit| commit.oid);
+            let previous_index = self.selected;
+            let count = match load {
+                HistoryLoad::Extend { new, max_new } => {
+                    let requested = real_commit_count(&self.commits) + max_new;
+                    self.commits.extend(new);
+                    requested
+                }
+                HistoryLoad::Rebuild { commits, count } => {
+                    self.commits = commits;
+                    count
+                }
+            };
+            self.resync_commits(count, None, previous_oid, previous_index);
+            // Refresh the displayed diff: after a rebuild the selected row may
+            // mean something else (rewritten history, changed virtual rows); after
+            // a pure append the current-key check makes this a no-op.
+            self.load_selected_diff();
+        }
     }
 
     /// Rebuild everything derived from a freshly-(re)assigned `self.commits`: the
@@ -4593,26 +4868,27 @@ impl GitkApp {
                             ui.scroll_to_rect(target_rect, align);
                         }
 
-                        // Lazy load: when near the bottom, grow the window. Routes
-                        // through reload_to_count (same as a full reload) so search
-                        // matches, the selection, and branch highlight track the new
-                        // list — the load is normally a superset, but virtual rows /
-                        // ref changes can shift or shrink it, so the indices must be
-                        // re-anchored rather than carried over blindly. all_loaded is
-                        // set inside resync (fewer than asked ⇒ source exhausted).
+                        // Lazy load: when near the bottom, grow the window — on a
+                        // worker thread, so scrolling never stalls the frame loop.
+                        // The common (plain-scope) case appends incrementally via
+                        // load_commits_tail; path-filtered/reflog scopes (whose
+                        // parent rewrite / numbering are whole-list computations)
+                        // fall back to a full background rebuild. The in-flight
+                        // flag keeps this from re-dispatching every frame; the
+                        // result lands in drain_history_results.
                         if !self.all_loaded
                             && last_row + 50 >= num_commits
-                            && let Ok(repo) = Repository::discover(&self.repo_path)
+                            && !self.history_inflight
+                            && let Some(last_real) =
+                                self.commits.iter().rev().find(|c| is_real_commit(c.oid))
                         {
-                            let requested = real_commit_count(&self.commits) + 500;
-                            self.reload_to_count(&repo, requested, None);
-                            // Track the (possibly re-anchored) selection, like the
-                            // watcher-reload path: if the selected oid vanished
-                            // (history rewritten) resync falls back to row 0, and
-                            // without this the pane would keep showing the vanished
-                            // commit's diff. A no-op when the selection kept its
-                            // commit (the current-key check returns early).
-                            self.load_selected_diff();
+                            let real = real_commit_count(&self.commits);
+                            self.dispatch_history_load(HistoryJobKind::Extend {
+                                skip: real,
+                                expect_last: last_real.oid,
+                                max_new: 500,
+                                requested: real + 500,
+                            });
                         }
                     });
             });
@@ -4659,10 +4935,11 @@ impl GitkApp {
             let elapsed = armed.elapsed();
             if elapsed >= RELOAD_DEBOUNCE {
                 self.reload_armed_at = None;
-                if let Ok(repo) = Repository::discover(&self.repo_path) {
-                    self.reload_commits(&repo, None);
-                    self.load_selected_diff();
-                }
+                // Rebuild on a worker (the walk stalls the frame loop on a
+                // long-loaded history); the result lands in drain_history_results,
+                // which re-anchors the selection and refreshes the diff.
+                let count = real_commit_count(&self.commits).max(200);
+                self.dispatch_history_load(HistoryJobKind::Rebuild { count });
             } else {
                 // Wake up when the debounce window closes to run the reload.
                 ctx.request_repaint_after(RELOAD_DEBOUNCE.saturating_sub(elapsed));
@@ -5056,6 +5333,7 @@ impl eframe::App for GitkApp {
         self.apply_pending_fonts(&ctx);
         self.handle_git_reload(&ctx);
         self.handle_config_reload(&ctx);
+        self.drain_history_results();
         self.drain_worker_results(&ctx);
 
         let search_id = egui::Id::new("search_field");
@@ -6857,6 +7135,115 @@ mod tests {
             .filter(|c| is_real_commit(c.oid))
             .map(|c| c.summary.clone())
             .collect()
+    }
+
+    /// The real commits of a full `load_commits` under `sc` (virtual rows dropped).
+    fn real_commits(repo: &git2::Repository, max: usize, sc: &cli::Scope) -> Vec<CommitInfo> {
+        load_commits(repo, max, sc)
+            .into_iter()
+            .filter(|c| is_real_commit(c.oid))
+            .collect()
+    }
+
+    #[test]
+    fn tail_extension_matches_full_walk() {
+        let (_d, repo) = temp_repo();
+        let c1 = commit_file(&repo, "a.txt", "1", "c1");
+        commit_file(&repo, "a.txt", "2", "c2");
+        // A side branch merged back in, so the walk order is genuinely topological
+        // (not just linear) across the prefix/tail boundary.
+        let sig = repo.signature().unwrap();
+        let c1c = repo.find_commit(c1).unwrap();
+        let side = repo
+            .commit(
+                Some("refs/heads/side"),
+                &sig,
+                &sig,
+                "side",
+                &c1c.tree().unwrap(),
+                &[&c1c],
+            )
+            .unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        let sidec = repo.find_commit(side).unwrap();
+        repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            "merge",
+            &head.tree().unwrap(),
+            &[&head, &sidec],
+        )
+        .unwrap();
+        for i in 0..4 {
+            commit_file(&repo, "a.txt", &format!("t{i}"), &format!("top{i}"));
+        }
+        let sc = scope(false, &[]);
+
+        let full = real_commits(&repo, 100, &sc);
+        assert_eq!(full.len(), 8, "c1 c2 side merge top0..3");
+        let prefix = real_commits(&repo, 3, &sc);
+        assert_eq!(prefix.len(), 3);
+
+        let tail = load_commits_tail(&repo, &sc, 3, prefix.last().unwrap().oid, 100)
+            .expect("a plain scope must extend incrementally");
+        assert_eq!(prefix.len() + tail.len(), full.len());
+        for (got, want) in prefix.iter().chain(tail.iter()).zip(full.iter()) {
+            assert_eq!(got.oid, want.oid);
+            assert_eq!(got.parents, want.parents);
+            assert_eq!(got.summary, want.summary);
+            assert_eq!(got.refs, want.refs, "ref chips for {}", want.summary);
+        }
+    }
+
+    #[test]
+    fn tail_at_end_of_history_is_empty() {
+        let (_d, repo) = temp_repo();
+        for i in 0..3 {
+            commit_file(&repo, "a.txt", &format!("{i}"), &format!("c{i}"));
+        }
+        let sc = scope(false, &[]);
+        let all = real_commits(&repo, 100, &sc);
+        let tail = load_commits_tail(&repo, &sc, all.len(), all.last().unwrap().oid, 10)
+            .expect("exhausted walk still resumes, yielding nothing");
+        assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn tail_walk_mismatch_falls_back() {
+        let (_d, repo) = temp_repo();
+        for i in 0..5 {
+            commit_file(&repo, "a.txt", &format!("{i}"), &format!("c{i}"));
+        }
+        let sc = scope(false, &[]);
+        let prefix = real_commits(&repo, 2, &sc);
+        // Wrong anchor (the newest commit instead of the last loaded one): the walk
+        // no longer lines up, so the caller must fall back to a full walk.
+        assert!(load_commits_tail(&repo, &sc, 2, prefix[0].oid, 10).is_none());
+        // A skip past the end of the walk can't be verified either.
+        assert!(load_commits_tail(&repo, &sc, 99, prefix[0].oid, 10).is_none());
+    }
+
+    #[test]
+    fn tail_refuses_filtered_and_reflog_scopes() {
+        let (_d, repo) = temp_repo();
+        for i in 0..3 {
+            commit_file(&repo, "a.txt", &format!("{i}"), &format!("c{i}"));
+        }
+        let plain = scope(false, &[]);
+        let anchor = real_commits(&repo, 1, &plain)[0].oid;
+        // Path filter: parent rewriting is a whole-list computation.
+        let filtered = cli::Scope {
+            paths: vec!["a.txt".to_string()],
+            ..scope(false, &[])
+        };
+        assert!(load_commits_tail(&repo, &filtered, 1, anchor, 10).is_none());
+        // Reflog: `@{n}` numbering is index-based over the whole list.
+        let reflog = cli::Scope {
+            reflog: true,
+            ..scope(false, &[])
+        };
+        assert!(load_commits_tail(&repo, &reflog, 1, anchor, 10).is_none());
     }
 
     #[test]
