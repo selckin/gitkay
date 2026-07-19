@@ -170,6 +170,13 @@ const LOAD_BATCH: usize = 500;
 /// checkout still feels immediate.
 const RELOAD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// Debounce for search-keystroke diff loads: each changed keystroke selects and
+/// centers its match instantly, but the diff load fires only once typing has
+/// paused this long — typing "fix bug" selects seven transient matches without
+/// spawning a diff worker (and a full `get_diff_data`) for each. Short enough
+/// that the diff still feels immediate when typing stops.
+const SEARCH_DIFF_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
+
 /// How long an async diff load may run before the "Loading diff…" placeholder is
 /// shown. A load that resolves faster than this (a small uncached diff) never flashes
 /// the placeholder — the pane just swaps straight to the new diff, so quick jumps
@@ -708,6 +715,16 @@ fn rewrite_parents(
 /// Number of real (non-virtual) commits in a loaded list. `max`/`count` budgets
 /// these, so the 0-2 virtual uncommitted/staged rows never shrink the window or
 /// skew the `all_loaded` check.
+/// Whether a commit matches the (already lowercased) search query — the one
+/// predicate shared by the full rescan (`refresh_search_matches`) and the
+/// append-only extension in `append_commits`.
+fn commit_matches(c: &CommitInfo, q: &str) -> bool {
+    c.summary_lc.contains(q)
+        || c.author_lc.contains(q)
+        || oid_hex_starts_with(c.oid, q)
+        || c.refs_lc.iter().any(|r| r.contains(q))
+}
+
 fn real_commit_count(commits: &[CommitInfo]) -> usize {
     commits.iter().filter(|c| is_real_commit(c.oid)).count()
 }
@@ -2046,16 +2063,33 @@ struct HistoryResult {
 }
 
 enum HistoryLoad {
-    /// New commits to append after the current last row.
+    /// New commits to append after the current last row. The UI extends its
+    /// derived state incrementally (`append_commits`), so no derive ships here.
     Extend {
         new: Vec<CommitInfo>,
         max_new: usize,
     },
-    /// A fully rebuilt list replacing the current one.
+    /// A fully rebuilt list replacing the current one, with its derived state
+    /// already computed on the worker — a rebuild's full relayout is O(loaded
+    /// history) and would otherwise stall the frame loop. Boxed to keep the
+    /// enum (and the Extend results flowing through it) small.
     Rebuild {
         commits: Vec<CommitInfo>,
         count: usize,
+        derived: Box<DerivedHistory>,
     },
+}
+
+/// Package a rebuilt commit list as a `HistoryLoad::Rebuild`, deriving the graph
+/// layout and lookup maps here on the worker — a rebuild relays the whole loaded
+/// history, which would stall the frame loop if left to the install.
+fn rebuild_load(commits: Vec<CommitInfo>, count: usize) -> HistoryLoad {
+    let derived = Box::new(derive_from_commits(&commits));
+    HistoryLoad::Rebuild {
+        commits,
+        count,
+        derived,
+    }
 }
 
 /// Compute one history load off the UI thread — the walk costs a `find_commit`
@@ -2096,17 +2130,13 @@ fn history_worker(job: HistoryJob) {
             || {
                 // Full-rebuild fallback: everything requested so far, in one walk.
                 let requested = skip + max_new;
-                HistoryLoad::Rebuild {
-                    commits: load_history(&repo, requested, &scope),
-                    count: requested,
-                }
+                rebuild_load(load_history(&repo, requested, &scope), requested)
             },
             |new| HistoryLoad::Extend { new, max_new },
         ),
-        HistoryJobKind::Rebuild { count } => HistoryLoad::Rebuild {
-            commits: load_history(&repo, count, &scope),
-            count,
-        },
+        HistoryJobKind::Rebuild { count } => {
+            rebuild_load(load_history(&repo, count, &scope), count)
+        }
     };
     // Completion log with shape + duration, like the diff-load/prefetch/highlight
     // workers — without it a wasted walk (superseded, duplicated) is invisible in
@@ -2396,22 +2426,51 @@ fn build_commit_indexes(
     (index_by_oid, first_child_of)
 }
 
-/// Everything derived from a `commits` list: the graph rows, the max lane count
-/// across them, and the (oid→index, oid→first-child) lookup maps. Shared by
-/// `GitkApp::new` and `resync_commits` so a freshly-(re)assigned `commits` always
-/// rebuilds all three the same way.
-fn derive_from_commits(
-    commits: &[CommitInfo],
-) -> (
-    Vec<GraphRow>,
-    usize,
-    std::collections::HashMap<git2::Oid, usize>,
-    std::collections::HashMap<git2::Oid, usize>,
+/// Extend the two lookup maps for `new` rows appended at index `base` — the same
+/// fold `build_commit_indexes` runs, continued (plain insert for the index map,
+/// `or_insert` for first-child), so an appended list carries exactly the maps a
+/// fresh build would produce.
+fn extend_commit_indexes(
+    index_by_oid: &mut std::collections::HashMap<git2::Oid, usize>,
+    first_child_of: &mut std::collections::HashMap<git2::Oid, usize>,
+    new: &[CommitInfo],
+    base: usize,
 ) {
-    let graph_rows = layout_graph(commits);
+    for (j, c) in new.iter().enumerate() {
+        index_by_oid.insert(c.oid, base + j);
+        if let Some(first_parent) = c.parents.first() {
+            first_child_of.entry(*first_parent).or_insert(base + j);
+        }
+    }
+}
+
+/// Everything derived from a `commits` list: the graph rows, the max lane count
+/// across them, the (oid→index, oid→first-child) lookup maps, and the layout's
+/// end-of-list resume state (what `append_commits` continues from). Built by
+/// `derive_from_commits` — on the history worker for a rebuild, on the UI thread
+/// otherwise — and installed atomically via `install_derived` so the pieces
+/// can't go out of sync with each other.
+struct DerivedHistory {
+    graph_rows: Vec<GraphRow>,
+    graph_max_cols: usize,
+    commit_index_by_oid: std::collections::HashMap<git2::Oid, usize>,
+    first_child_of: std::collections::HashMap<git2::Oid, usize>,
+    layout_state: GraphLayoutState,
+}
+
+fn derive_from_commits(commits: &[CommitInfo]) -> DerivedHistory {
+    let oid_set: HashSet<git2::Oid> = commits.iter().map(|c| c.oid).collect();
+    let mut layout_state = GraphLayoutState::default();
+    let graph_rows = layout_graph_rows(commits, &oid_set, &mut layout_state);
     let graph_max_cols = graph_rows.iter().map(|r| r.num_cols).max().unwrap_or(1);
-    let (index_by_oid, first_child_of) = build_commit_indexes(commits);
-    (graph_rows, graph_max_cols, index_by_oid, first_child_of)
+    let (commit_index_by_oid, first_child_of) = build_commit_indexes(commits);
+    DerivedHistory {
+        graph_rows,
+        graph_max_cols,
+        commit_index_by_oid,
+        first_child_of,
+        layout_state,
+    }
 }
 
 fn compute_branch_highlight(
@@ -2447,12 +2506,28 @@ fn compute_branch_highlight(
 
 // ── Graph layout ─────────────────────────────────────────────────────────
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 struct GraphRow {
     node_col: usize,
     node_color: usize,
     lines: Vec<(usize, usize, usize)>,
     num_cols: usize,
+}
+
+/// The graph layout's fold state after some prefix of rows, letting a later
+/// append lay out only its tail (`layout_graph_rows` resumes from it) instead of
+/// relaying the whole list. `Default` is the before-any-rows state.
+#[derive(Clone, Default)]
+struct GraphLayoutState {
+    /// Each pipe tracks `(oid, color_index)`. `None` = empty slot.
+    pipes: Vec<Option<(git2::Oid, usize)>>,
+    next_color: usize,
+    /// Second+ merge parents skipped because they were beyond the laid-out
+    /// window (no lane to draw the merge diagonal to). If a later extension
+    /// loads one of these, the full layout would give its merge row the
+    /// diagonal a pure resume can't add retroactively — the resume is unsound
+    /// then and the caller must relayout from scratch (see `append_commits`).
+    deferred_parents: HashSet<git2::Oid>,
 }
 
 /// Place `slot` in the first empty pipe (reusing a freed lane) or append a new one,
@@ -2467,12 +2542,33 @@ fn alloc_lane(pipes: &mut Vec<Option<(git2::Oid, usize)>>, slot: (git2::Oid, usi
     }
 }
 
+/// `layout_graph_rows` over the whole list from a fresh state. Test-suite entry
+/// point — production goes through `derive_from_commits` (full layout, keeping
+/// the resume state) or `append_commits` (tail resume).
+#[cfg(test)]
 fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
-    // Each pipe tracks (oid, color_index). None = empty slot.
-    let mut pipes: Vec<Option<(git2::Oid, usize)>> = Vec::new();
-    let mut next_color: usize = 0;
-    let mut rows = Vec::new();
     let oid_set: HashSet<git2::Oid> = commits.iter().map(|c| c.oid).collect();
+    layout_graph_rows(commits, &oid_set, &mut GraphLayoutState::default())
+}
+
+/// Lay out `commits` as the rows following whatever `state` already describes —
+/// the whole list when `state` is fresh (`layout_graph`), or an appended tail
+/// resuming from the stored end-of-list state. `oid_set` is the in-scope set for
+/// THESE commits only: the walk is topological (a parent never precedes a child),
+/// so a tail commit's parent can never be in the already-laid-out prefix, and the
+/// tail's own oids answer "will this parent get a row?" exactly like the full
+/// list's set would.
+fn layout_graph_rows(
+    commits: &[CommitInfo],
+    oid_set: &HashSet<git2::Oid>,
+    state: &mut GraphLayoutState,
+) -> Vec<GraphRow> {
+    let GraphLayoutState {
+        pipes,
+        next_color,
+        deferred_parents,
+    } = state;
+    let mut rows = Vec::new();
 
     for commit in commits {
         // Find which column this commit is in. If multiple lanes point
@@ -2487,9 +2583,9 @@ fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
 
         let node_col = if matching_cols.is_empty() {
             // New commit — find an empty slot or append
-            let color = next_color;
-            next_color += 1;
-            alloc_lane(&mut pipes, (commit.oid, color))
+            let color = *next_color;
+            *next_color += 1;
+            alloc_lane(pipes, (commit.oid, color))
         } else {
             matching_cols[0]
         };
@@ -2552,14 +2648,19 @@ fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
                 if let Some(existing_col) = existing {
                     lines.push((node_col, existing_col, node_color));
                 } else {
-                    let color = next_color;
-                    next_color += 1;
-                    let col = alloc_lane(&mut pipes, (*parent_oid, color));
+                    let color = *next_color;
+                    *next_color += 1;
+                    let col = alloc_lane(pipes, (*parent_oid, color));
                     lines.push((node_col, col, color));
                     new_lanes.push(col);
                 }
+            } else {
+                // Second+ parent out of scope: skip (can't draw a merge to an
+                // unloaded row) — but remember it, so a later append that loads
+                // this parent knows a pure resume would miss this row's merge
+                // diagonal and falls back to a full relayout.
+                deferred_parents.insert(*parent_oid);
             }
-            // Second+ parent out of scope: skip (can't draw merge to unknown)
         }
 
         // All other active lanes continue straight — but skip:
@@ -2713,6 +2814,10 @@ struct GitkApp {
     /// doesn't rescan all commits on each arrow-key step. See `build_commit_indexes`.
     commit_index_by_oid: std::collections::HashMap<git2::Oid, usize>,
     first_child_of: std::collections::HashMap<git2::Oid, usize>,
+    /// The graph layout's end-of-list resume state, kept in lockstep with
+    /// `graph_rows` (installed by `install_derived`, advanced by `append_commits`)
+    /// so a lazy-load append lays out only its tail.
+    graph_layout_state: GraphLayoutState,
     selected: Option<usize>,
     startup_diff: StartupDiff, // one-time: defer the first diff off the window-creation path
 
@@ -2744,6 +2849,10 @@ struct GitkApp {
     all_loaded: bool,
     needs_reload: Arc<AtomicBool>,
     reload_armed_at: Option<std::time::Instant>, // debounce timer for watcher reloads
+    /// Debounce timer for search-keystroke diff loads: armed by
+    /// `jump_to_current_match_deferred`, fired by `handle_search_debounce`,
+    /// cancelled by any direct `load_selected_diff`.
+    search_diff_armed_at: Option<std::time::Instant>,
     _watcher: Option<RecommendedWatcher>,
     branch_highlight: HashSet<usize>, // indices of commits on the same branch as selected
     commit_panel_height: f32,         // persisted commit-list panel height (see App::save)
@@ -2828,17 +2937,6 @@ struct GitkApp {
     // threshold; cleared to None when a load applies, fails, or is cancelled.
     diff_load_started_at: Option<std::time::Instant>,
     egui_ctx: egui::Context, // stored Context handle so workers can request a repaint
-}
-
-/// Widest diff line in characters — used to size the horizontal scroll content
-/// when rows are virtualized (only visible rows are laid out, so egui can't
-/// otherwise know an off-screen line is wide). Assumes a monospace diff font.
-fn max_line_chars(lines: &[DiffLine]) -> usize {
-    lines
-        .iter()
-        .map(|l| l.text.chars().count())
-        .max()
-        .unwrap_or(0)
 }
 
 /// The file paths a config-file event must match, and the directories to watch for
@@ -3173,8 +3271,13 @@ impl GitkApp {
             );
         }
         let t_layout = std::time::Instant::now();
-        let (graph_rows, graph_max_cols, commit_index_by_oid, first_child_of) =
-            derive_from_commits(&commits);
+        let DerivedHistory {
+            graph_rows,
+            graph_max_cols,
+            commit_index_by_oid,
+            first_child_of,
+            layout_state,
+        } = derive_from_commits(&commits);
         log::debug!(
             "perf: startup: derive_from_commits {:?}",
             t_layout.elapsed()
@@ -3216,7 +3319,7 @@ impl GitkApp {
         let (diff_load_tx, diff_load_rx) = mpsc::channel();
         let (history_load_tx, history_load_rx) = mpsc::channel();
         let egui_ctx = cc.egui_ctx.clone();
-        let diff_max_chars = max_line_chars(&diff_lines);
+        let diff_max_chars = 0; // no diff yet — set_diff_content installs the real width
 
         // The prewarmed highlighter (spawned in main(), overlapped with window init,
         // like the history/font prefetches). With syntax off, drop the receiver —
@@ -3234,6 +3337,7 @@ impl GitkApp {
             graph_max_cols,
             commit_index_by_oid,
             first_child_of,
+            graph_layout_state: layout_state,
             selected: Some(0),
             startup_diff,
             diff_lines,
@@ -3256,6 +3360,7 @@ impl GitkApp {
             all_loaded,
             needs_reload,
             reload_armed_at: None,
+            search_diff_armed_at: None,
             _watcher: watcher,
             branch_highlight: HashSet::new(),
             commit_panel_height,
@@ -3322,12 +3427,7 @@ impl GitkApp {
             .commits
             .iter()
             .enumerate()
-            .filter(|(_, c)| {
-                c.summary_lc.contains(&q)
-                    || c.author_lc.contains(&q)
-                    || oid_hex_starts_with(c.oid, &q)
-                    || c.refs_lc.iter().any(|r| r.contains(&q))
-            })
+            .filter(|(_, c)| commit_matches(c, &q))
             .map(|(i, _)| i)
             .collect();
         if self.search_cursor >= self.search_matches.len() {
@@ -3343,6 +3443,25 @@ impl GitkApp {
         if let Some(&idx) = self.search_matches.get(self.search_cursor) {
             self.select_loaded(idx);
             self.graph_scroll_to = Some((idx, Some(egui::Align::Center)));
+        }
+    }
+
+    /// `jump_to_current_match` with the diff load deferred behind
+    /// `SEARCH_DIFF_DEBOUNCE`: selection and graph scroll track the keystroke
+    /// instantly, but the diff (a worker spawn + full `get_diff_data` per
+    /// dispatch) loads only once typing pauses — the pane keeps showing the
+    /// previous diff meanwhile, exactly as during an in-flight async load.
+    /// `handle_search_debounce` fires the load; a direct `load_selected_diff`
+    /// (click, arrow key, Enter) cancels the pending one.
+    fn jump_to_current_match_deferred(&mut self) {
+        if let Some(&idx) = self.search_matches.get(self.search_cursor) {
+            self.set_selected(idx);
+            self.graph_scroll_to = Some((idx, Some(egui::Align::Center)));
+            self.search_diff_armed_at = Some(std::time::Instant::now());
+            // This runs mid-frame, after handle_search_debounce already ran —
+            // schedule the wake here so a typing pause still fires the load
+            // promptly even with no further input.
+            self.egui_ctx.request_repaint_after(SEARCH_DIFF_DEBOUNCE);
         }
     }
 
@@ -3407,6 +3526,11 @@ impl GitkApp {
     /// repo: the common paths (cache hit, worker dispatch) don't need one, and the rare
     /// synchronous fallback discovers it lazily — so navigation costs no `discover`.
     fn load_selected_diff(&mut self) {
+        // A directly-requested load supersedes any debounced search load still
+        // pending — left armed, the timer would fire after e.g. a click and
+        // re-enter here for the same selection, cancelling that click's
+        // in-flight load through the early-return path's epoch bump.
+        self.search_diff_armed_at = None;
         // Already showing this exact diff (same commit + options)? Then there's nothing
         // to load. Two cases converge here: a reload/refresh of the unchanged current
         // commit (e.g. a fetch/rebase debounce), and navigating back to the on-screen
@@ -3509,9 +3633,12 @@ impl GitkApp {
                     file_list_y: self.file_list_scroll,
                 },
             );
-            let data = DiffData::new(
+            // The displayed diff's width is already known — reassemble without
+            // rescanning every line (DiffData::new would).
+            let data = DiffData::with_max_chars(
                 std::mem::take(&mut self.diff_lines),
                 std::mem::take(&mut self.diff_files),
+                self.diff_max_chars,
             );
             // A virtual entry is content-keyed, so each working-tree edit produces a
             // fresh hash and the previous content would linger under the same sentinel
@@ -3593,12 +3720,13 @@ impl GitkApp {
         if self.word_diff && !data.lines.is_empty() {
             self.egui_ctx.request_repaint();
         }
+        // Precomputed at build time (on the worker) — no per-line rescan here.
+        self.diff_max_chars = data.max_chars;
         self.diff_lines = data.lines;
         self.diff_files = data.files;
         self.current_diff_key = key;
         self.diff_top_line.store(0, Ordering::Relaxed);
         self.rebuild_file_rows();
-        self.diff_max_chars = max_line_chars(&self.diff_lines);
         self.file_line_starts = file_line_starts(&self.diff_files);
         // Sorted by start, so the last entry is the largest file start.
         self.diff_last_top_anchor = self.file_line_starts.last().map(|&(s, _)| s);
@@ -3816,9 +3944,10 @@ impl GitkApp {
             return;
         }
         // Cache hit: a diff restored from the cache (or warmed by prefetch) already
-        // carries its spans, so there's nothing to tokenize. Skip before the
-        // multi-MB clone of diff_lines/diff_files + a worker that would scan every
-        // line and colour nothing — paid on every revisit of a cached commit.
+        // carries its spans, so there's nothing to tokenize. Skip before cloning
+        // the diff for a worker that would scan every line and colour nothing —
+        // paid on every revisit of a cached commit. (The clone itself is cheap
+        // now — line text is Arc-shared — but the worker's scan isn't.)
         if diff_fully_highlighted(&self.diff_lines, &self.diff_files) {
             self.highlight_priority = None;
             return;
@@ -3972,12 +4101,10 @@ impl GitkApp {
         }
     }
 
-    /// Install a finished background history load: splice an extension tail after
-    /// the current last row, or swap in a rebuilt list — in both cases re-syncing
-    /// derived state and re-anchoring the selection through `resync_commits`,
-    /// exactly like the old synchronous reload (for a pure append the re-anchor
-    /// resolves to the same index, so selection and scroll don't move). Results
-    /// superseded by a newer dispatch are dropped.
+    /// Install a finished background history load: append an extension tail
+    /// incrementally (`append_commits` — O(tail), no full relayout on the frame
+    /// loop), or swap in a rebuilt list whose derived state the worker already
+    /// computed. Results superseded by a newer dispatch are dropped.
     fn drain_history_results(&mut self) {
         while let Ok(result) = self.history_load_rx.try_recv() {
             if !self.history_epoch.is_current(result.epoch) {
@@ -3990,20 +4117,23 @@ impl GitkApp {
             let Some(load) = result.load else {
                 continue; // worker failed (logged there); a scroll re-triggers
             };
-            let previous_oid = self.selected_oid();
-            let previous_index = self.selected;
-            let count = match load {
+            match load {
                 HistoryLoad::Extend { new, max_new } => {
                     let requested = real_commit_count(&self.commits) + max_new;
-                    self.commits.extend(new);
-                    requested
+                    self.append_commits(new, requested);
                 }
-                HistoryLoad::Rebuild { commits, count } => {
+                HistoryLoad::Rebuild {
+                    commits,
+                    count,
+                    derived,
+                } => {
+                    let previous_oid = self.selected_oid();
+                    let previous_index = self.selected;
                     self.commits = commits;
-                    count
+                    self.install_derived(*derived);
+                    self.finish_resync(count, None, previous_oid, previous_index);
                 }
-            };
-            self.resync_commits(count, None, previous_oid, previous_index);
+            }
             // Refresh the displayed diff: after a rebuild the selected row may
             // mean something else (rewritten history, changed virtual rows); after
             // a pure append the current-key check makes this a no-op.
@@ -4011,12 +4141,78 @@ impl GitkApp {
         }
     }
 
-    /// Rebuild everything derived from a freshly-(re)assigned `self.commits`: the
-    /// graph layout, the `all_loaded` flag (vs the requested `count`), search
-    /// matches, and the restored selection + branch highlight. Selection re-anchors
-    /// to `preferred_oid`, else the previously-selected commit (by oid for normal
-    /// history; by index for reflog, where oids repeat), else row 0. Shared by the
-    /// full reload and the lazy-load tail-extension so both stay in sync.
+    /// Install a `DerivedHistory` for the current `self.commits` — the one place
+    /// the four derived fields and the layout resume state change together.
+    fn install_derived(&mut self, derived: DerivedHistory) {
+        self.graph_rows = derived.graph_rows;
+        self.graph_max_cols = derived.graph_max_cols;
+        self.commit_index_by_oid = derived.commit_index_by_oid;
+        self.first_child_of = derived.first_child_of;
+        self.graph_layout_state = derived.layout_state;
+    }
+
+    /// Append `new` rows and extend the derived state incrementally — resume the
+    /// graph layout from the stored end-of-list state, extend the lookup maps and
+    /// search matches, leave the selection untouched (a pure append moves no row,
+    /// so scroll and selection stay put). O(tail) except the branch-highlight
+    /// recompute. Falls back to a full `resync_commits` when the resume would be
+    /// unsound: a previously out-of-scope merge parent landing in this tail gives
+    /// its (already laid-out) merge row a diagonal only a relayout can add.
+    fn append_commits(&mut self, new: Vec<CommitInfo>, requested: usize) {
+        if new
+            .iter()
+            .any(|c| self.graph_layout_state.deferred_parents.contains(&c.oid))
+        {
+            let previous_oid = self.selected_oid();
+            let previous_index = self.selected;
+            self.commits.extend(new);
+            self.resync_commits(requested, None, previous_oid, previous_index);
+            return;
+        }
+
+        let base = self.commits.len();
+        // The tail's own oids are the correct in-scope set: the walk is
+        // topological, so a tail commit's parent is never in the prefix (see
+        // layout_graph_rows).
+        let tail_oids: HashSet<git2::Oid> = new.iter().map(|c| c.oid).collect();
+        let rows = layout_graph_rows(&new, &tail_oids, &mut self.graph_layout_state);
+        self.graph_max_cols = self
+            .graph_max_cols
+            .max(rows.iter().map(|r| r.num_cols).max().unwrap_or(1));
+        self.graph_rows.extend(rows);
+        extend_commit_indexes(
+            &mut self.commit_index_by_oid,
+            &mut self.first_child_of,
+            &new,
+            base,
+        );
+        // Appending can only add matches, so extend instead of rescanning (the
+        // cursor stays valid — no match moved or vanished).
+        if !self.search_text.is_empty() {
+            let q = self.search_text.to_lowercase();
+            self.search_matches.extend(
+                new.iter()
+                    .enumerate()
+                    .filter(|(_, c)| commit_matches(c, &q))
+                    .map(|(j, _)| base + j),
+            );
+        }
+        self.commits.extend(new);
+        self.all_loaded = real_commit_count(&self.commits) < requested;
+        // The tail can extend the selected branch's ancestry — recompute the
+        // highlight through the same path a selection takes (mirroring
+        // finish_resync, including its select-row-0 fallback).
+        if let Some(sel) = self.selected {
+            self.set_selected(sel);
+        } else if !self.commits.is_empty() {
+            self.set_selected(0);
+        }
+    }
+
+    /// Rebuild everything derived from a freshly-(re)assigned `self.commits` (on
+    /// the UI thread — the watcher-reload path gets its derive from the worker and
+    /// calls `install_derived` + `finish_resync` directly), then restore the
+    /// selection. Used by `append_commits`' relayout fallback.
     fn resync_commits(
         &mut self,
         count: usize,
@@ -4024,12 +4220,24 @@ impl GitkApp {
         previous_oid: Option<git2::Oid>,
         previous_index: Option<usize>,
     ) {
-        (
-            self.graph_rows,
-            self.graph_max_cols,
-            self.commit_index_by_oid,
-            self.first_child_of,
-        ) = derive_from_commits(&self.commits);
+        let derived = derive_from_commits(&self.commits);
+        self.install_derived(derived);
+        self.finish_resync(count, preferred_oid, previous_oid, previous_index);
+    }
+
+    /// The non-derive tail of a resync: the `all_loaded` flag (vs the requested
+    /// `count`), search matches, and the restored selection + branch highlight.
+    /// Selection re-anchors to `preferred_oid`, else the previously-selected
+    /// commit (by oid for normal history; by index for reflog, where oids
+    /// repeat), else row 0. Requires the derived state for the current
+    /// `self.commits` to be installed already.
+    fn finish_resync(
+        &mut self,
+        count: usize,
+        preferred_oid: Option<git2::Oid>,
+        previous_oid: Option<git2::Oid>,
+        previous_index: Option<usize>,
+    ) {
         // `count` budgets real commits; compare against the real count so the virtual
         // rows don't make a fully-loaded history read as "more available".
         self.all_loaded = real_commit_count(&self.commits) < count;
@@ -4932,6 +5140,22 @@ impl GitkApp {
         }
     }
 
+    /// Fire the debounced search diff load once typing has paused (see
+    /// `jump_to_current_match_deferred`) — the same arm/expire shape as
+    /// `handle_git_reload`.
+    fn handle_search_debounce(&mut self, ctx: &egui::Context) {
+        if let Some(armed) = self.search_diff_armed_at {
+            let elapsed = armed.elapsed();
+            if elapsed >= SEARCH_DIFF_DEBOUNCE {
+                self.search_diff_armed_at = None;
+                self.load_selected_diff();
+            } else {
+                // Wake up when the debounce window closes to run the load.
+                ctx.request_repaint_after(SEARCH_DIFF_DEBOUNCE.saturating_sub(elapsed));
+            }
+        }
+    }
+
     /// Live-reload the config when its file changes: fonts (off-thread rebuild),
     /// theme/syntax/bands (re-palette + re-highlight), and the diff-shaping and
     /// layout settings (re-diff / row rebuild as needed). On a parse error, keep
@@ -5353,6 +5577,7 @@ impl eframe::App for GitkApp {
 
         self.apply_pending_fonts(&ctx);
         self.handle_git_reload(&ctx);
+        self.handle_search_debounce(&ctx);
         self.handle_config_reload(&ctx);
         self.drain_history_results();
         self.drain_worker_results(&ctx);
@@ -5383,8 +5608,9 @@ impl eframe::App for GitkApp {
                     if resp.changed() {
                         self.search_cursor = 0;
                         self.refresh_search_matches();
-                        // Jump to the first match (cursor just reset to 0).
-                        self.jump_to_current_match();
+                        // Jump to the first match (cursor just reset to 0) —
+                        // selection and scroll now, the diff after the debounce.
+                        self.jump_to_current_match_deferred();
                     }
                     // Enter cycles through matches
                     if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -5821,6 +6047,101 @@ mod tests {
             vec![],
             None,
         )
+    }
+
+    /// The incremental append (`append_commits`) is only sound because resuming
+    /// `layout_graph_rows` from the prefix's end state reproduces exactly what a
+    /// full relayout would produce — unless a previously out-of-scope merge
+    /// parent lands in the tail, which `deferred_parents` must flag. Pin both
+    /// halves of that contract over every split point of several topologies.
+    #[test]
+    fn layout_resume_matches_full_layout() {
+        let fixtures: &[Vec<CommitInfo>] = &[
+            // Linear chain.
+            vec![
+                commit(5, &[4]),
+                commit(4, &[3]),
+                commit(3, &[2]),
+                commit(2, &[1]),
+                commit(1, &[]),
+            ],
+            // Merge at the top whose second parent sits several rows down: splits
+            // before row 3 loads must flag the resume unsound.
+            vec![
+                commit(6, &[5, 3]),
+                commit(5, &[4]),
+                commit(4, &[3]),
+                commit(3, &[2]),
+                commit(2, &[1]),
+                commit(1, &[]),
+            ],
+            // Two branches converging on a shared parent (no merges — every
+            // split resumes cleanly).
+            vec![
+                commit(4, &[2]),
+                commit(3, &[2]),
+                commit(2, &[1]),
+                commit(1, &[]),
+            ],
+        ];
+        let mut saw_unsound = false;
+        for commits in fixtures {
+            let full = layout_graph(commits);
+            for split in 1..commits.len() {
+                let (prefix, tail) = commits.split_at(split);
+                let prefix_oids: HashSet<git2::Oid> = prefix.iter().map(|c| c.oid).collect();
+                let mut state = GraphLayoutState::default();
+                let prefix_rows = layout_graph_rows(prefix, &prefix_oids, &mut state);
+                // The same check append_commits performs.
+                if tail.iter().any(|c| state.deferred_parents.contains(&c.oid)) {
+                    saw_unsound = true;
+                    continue;
+                }
+                let tail_oids: HashSet<git2::Oid> = tail.iter().map(|c| c.oid).collect();
+                let tail_rows = layout_graph_rows(tail, &tail_oids, &mut state);
+                assert_eq!(
+                    prefix_rows,
+                    full[..split].to_vec(),
+                    "sound split {split}: prefix layout must match the full layout's prefix"
+                );
+                assert_eq!(
+                    tail_rows,
+                    full[split..].to_vec(),
+                    "sound split {split}: resumed tail must match the full layout's tail"
+                );
+            }
+        }
+        assert!(
+            saw_unsound,
+            "the merge fixture must flag at least one split as unsound, or the guard is dead"
+        );
+    }
+
+    /// `extend_commit_indexes` continues `build_commit_indexes`' fold: extending
+    /// a prefix's maps with the tail must equal building from the full list.
+    #[test]
+    fn extend_commit_indexes_matches_full_build() {
+        // Includes a shared first parent (3 and 4 both point at 2) so the
+        // first-wins `or_insert` semantics are exercised across the split.
+        let commits = vec![
+            commit(6, &[5, 3]),
+            commit(5, &[4]),
+            commit(4, &[2]),
+            commit(3, &[2]),
+            commit(2, &[1]),
+            commit(1, &[]),
+        ];
+        let (full_index, full_first_child) = build_commit_indexes(&commits);
+        for split in 1..commits.len() {
+            let (prefix, tail) = commits.split_at(split);
+            let (mut index, mut first_child) = build_commit_indexes(prefix);
+            extend_commit_indexes(&mut index, &mut first_child, tail, split);
+            assert_eq!(index, full_index, "index map diverged at split {split}");
+            assert_eq!(
+                first_child, full_first_child,
+                "first-child map diverged at split {split}"
+            );
+        }
     }
 
     /// The shared in-flight claim set: one claim per key at a time, released on
