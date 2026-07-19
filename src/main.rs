@@ -4014,15 +4014,39 @@ impl GitkApp {
             ui.painter().galley(egui::pos2(sx, sy), g, RED);
         }
 
-        if resp.hovered() {
+        if resp.hovered() && !ui.input(egui::InputState::is_scrolling) {
             // Show the full path(s). For a rename/copy the row label is the elided
             // `{old ⇒ new}` brace form, so spell both sides out in full here —
             // otherwise the source path is never visible anywhere.
+            //
+            // Hand-rolled on a NON-interactable Area instead of show_tooltip_text: a
+            // Popup tooltip is an interactable layer, and with the sidebar hugging
+            // the window's right edge a wide full-path tooltip gets flipped over the
+            // pointer — that layer then wins the hit-test, the ScrollArea beneath no
+            // longer counts as hovered, and wheel input is silently discarded (the
+            // list freezes until the mouse moves). Non-interactable, the tooltip can
+            // never steal input no matter where it lands. The is_scrolling guard
+            // keeps it from popping up at all mid-wheel (row churn under a still
+            // pointer); it reappears ~150ms after the last wheel event.
             let f = &self.diff_files[idx];
-            match &f.old_path {
-                Some(old) => resp.show_tooltip_text(format!("{old} ⇒ {}", f.path)),
-                None => resp.show_tooltip_text(&f.path),
-            }
+            let text = f
+                .old_path
+                .as_ref()
+                .map_or_else(|| f.path.clone(), |old| format!("{old} ⇒ {}", f.path));
+            // Top-right pivot at the row's bottom-right: the tooltip opens below the
+            // row and grows leftward, so it stays inside the window despite the
+            // right-edge position (the Area additionally constrains to the screen).
+            egui::Area::new(resp.id.with("path_tip"))
+                .order(egui::Order::Tooltip)
+                .interactable(false)
+                .pivot(egui::Align2::RIGHT_TOP)
+                .fixed_pos(rect.right_bottom() + egui::vec2(0.0, 4.0))
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_max_width(ui.spacing().tooltip_width);
+                        ui.label(text);
+                    });
+                });
         }
         if resp.clicked() { line_idx } else { None }
     }
