@@ -121,7 +121,14 @@ parts run off the window-creation critical path:
   monotonic `diff_load_epoch` (bumped per selection and by every synchronous install)
   supersedes stale workers; a superseded result is still **cached** (real commits only —
   immutable). A worker whose `Repository::discover` fails reports `data: None` so the
-  loading state clears. Highlighting stays a separate downstream step
+  loading state clears. Diff workers (prefetch and diff-load) dedupe through a shared
+  in-flight claim set (`InflightKeys` / RAII `InflightClaim`): a prefetch skips any key
+  another worker already claimed, and the diff-load claims its key so later prefetch
+  dispatches skip it — without this, overlapping prefetch batches recompute the same
+  large diff concurrently. (A diff-load does NOT wait on a prefetch that beat it to the
+  claim: that prefetch may sit behind other queue targets, so the load always computes —
+  bounded duplicate work instead of unbounded latency.) Highlighting stays a separate
+  downstream step
   (`ensure_diff_highlighted`); an arriving result prefers an existing cache entry (a
   prefetch may have highlighted the same commit meanwhile). Selecting the already-shown
   key early-returns and cancels any in-flight load — no re-dispatch or placeholder flash

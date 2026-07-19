@@ -3,9 +3,9 @@ use eframe::egui;
 use git2::{Repository, Sort};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 
 mod cli;
 mod config;
@@ -1667,6 +1667,50 @@ fn prewarm_highlighter(
     );
 }
 
+/// Cache keys currently being computed by some worker (prefetch or diff-load),
+/// shared across all of them. A worker claims a key before computing and the claim
+/// releases on drop (so a panic can't leak it); a prefetch finding a key already
+/// claimed skips it. Without this, overlapping prefetch dispatches — and a
+/// selection landing on a commit whose prefetch is mid-flight — compute the same
+/// diff concurrently (observed: one 30k-line diff diffed + highlighted three times
+/// at once, every pass slower for the contention). Best-effort by design: a claim
+/// releases when the result is sent, a frame before the drain caches it, so an
+/// exactly-raced dispatch can still duplicate — harmless, the cache insert is
+/// idempotent.
+type InflightKeys = Arc<Mutex<HashSet<DiffCacheKey>>>;
+
+/// RAII claim on one `DiffCacheKey` in an `InflightKeys` set.
+struct InflightClaim {
+    set: InflightKeys,
+    key: DiffCacheKey,
+}
+
+impl InflightClaim {
+    /// Claim `key`, or `None` when another worker already holds it. The set is
+    /// never poisoned in practice (holders only insert/remove), but recover the
+    /// guard anyway — a poisoned dedupe set must degrade to duplicate work, not
+    /// panic every worker.
+    fn try_claim(set: &InflightKeys, key: DiffCacheKey) -> Option<Self> {
+        let claimed = set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.clone());
+        claimed.then(|| Self {
+            set: Arc::clone(set),
+            key,
+        })
+    }
+}
+
+impl Drop for InflightClaim {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
+    }
+}
+
 /// Everything the background prefetch worker owns for one dispatch.
 struct PrefetchJob {
     repo_path: String,
@@ -1678,6 +1722,8 @@ struct PrefetchJob {
     /// This dispatch's epoch; the worker bails once `current_epoch` moves past it.
     epoch: u64,
     current_epoch: Epoch,
+    /// The shared claim set — targets another worker is already computing are skipped.
+    inflight: InflightKeys,
     tx: mpsc::Sender<(DiffCacheKey, DiffData)>,
     ctx: egui::Context,
 }
@@ -1739,6 +1785,7 @@ fn prefetch_worker(job: PrefetchJob) {
         word_diff,
         epoch,
         current_epoch,
+        inflight,
         tx,
         ctx,
     } = job;
@@ -1757,6 +1804,13 @@ fn prefetch_worker(job: PrefetchJob) {
         if !current_epoch.is_current(epoch) {
             return; // user moved on
         }
+        // Claim the key for the duration of the compute (released on drop, after
+        // the send). Already claimed ⇒ another worker is on it and its result will
+        // be cached when it lands — recomputing here would be pure duplicate work.
+        let Some(_claim) = InflightClaim::try_claim(&inflight, key.clone()) else {
+            log::debug!("prefetch: skip {} — already being computed", key.oid);
+            continue;
+        };
         let t = std::time::Instant::now();
         log::debug!("prefetch: start {}", key.oid);
         let mut data = get_diff_data(
@@ -2630,6 +2684,10 @@ struct GitkApp {
     prefetch_rx: mpsc::Receiver<(DiffCacheKey, DiffData)>,
     prefetch_epoch: Epoch, // bumped per dispatch; supersedes older prefetch workers
     prefetched_gen: u64,   // diff_generation we last dispatched prefetch for
+    /// Diff keys some worker (prefetch or diff-load) is computing right now — the
+    /// shared claim set that stops overlapping dispatches from recomputing the
+    /// same diff concurrently. See `InflightKeys`.
+    inflight_diffs: InflightKeys,
     last_highlight_check_gen: u64, // diff_generation we last ran diff_fully_highlighted for
     commit_view_range: std::ops::Range<usize>, // visible commit-list rows (set each frame)
     // A cache miss (or virtual entry) computes get_diff_data on a worker so a large
@@ -3132,6 +3190,7 @@ impl GitkApp {
             prefetch_rx,
             prefetch_epoch: Epoch::default(),
             prefetched_gen: 0,
+            inflight_diffs: Arc::default(),
             last_highlight_check_gen: 0,
             // A generous first-frame estimate so a diff that settles before the
             // commit panel has rendered once still warms the top commits; the panel
@@ -3457,6 +3516,12 @@ impl GitkApp {
         // fallback re-resolves them instead.
         let repo_path = self.repo_path.clone();
         let word_diff = self.word_diff;
+        // Claim the key so a prefetch dispatched while this load runs skips it. The
+        // reverse — loading a key a prefetch already claimed — still proceeds: the
+        // user is waiting on THIS result now, and the prefetch may sit behind other
+        // queue targets, so blocking on it would trade bounded duplicate work for
+        // unbounded latency.
+        let claim = InflightClaim::try_claim(&self.inflight_diffs, key.clone());
         // Not spawn_guarded: a panic here must do more than log — it has to report a
         // failed load so the drain's `data: None` arm clears the loading state,
         // otherwise the pane sticks on "Loading diff…" forever (the retained tx clone
@@ -3470,6 +3535,10 @@ impl GitkApp {
                     self.egui_ctx.clone(),
                 );
                 move || {
+                    // Hold the claim for the worker's lifetime; a panic still
+                    // releases it on unwind. (On spawn failure the unspawned
+                    // closure is dropped, releasing it before the sync fallback.)
+                    let _claim = claim;
                     let fail = (tx.clone(), key.clone(), ctx.clone());
                     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         diff_load_worker(DiffLoadJob {
@@ -3653,14 +3722,24 @@ impl GitkApp {
         // oid-keyed cache can't be poisoned by a wrong-path prefetch.
         let view = self.commit_view_range.start.saturating_sub(PREFETCH_MARGIN)
             ..self.commit_view_range.end + PREFETCH_MARGIN;
-        let jobs: Vec<(DiffCacheKey, Vec<String>)> =
+        let jobs: Vec<(DiffCacheKey, Vec<String>)> = {
+            // Also drop targets some worker is already computing — their results
+            // arrive regardless, so queueing them would only burn PREFETCH_MAX slots
+            // (the worker re-checks at start time; this filter is just the early cut).
+            let inflight = self
+                .inflight_diffs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             prefetch_targets(&self.commits, sel, view, PREFETCH_MAX)
                 .into_iter()
                 .map(|oid| (self.diff_cache_key(oid), self.diff_paths_for_oid(oid)))
                 .filter(|(k, _)| {
-                    !self.diff_cache.contains(k) && self.current_diff_key.as_ref() != Some(k)
+                    !self.diff_cache.contains(k)
+                        && self.current_diff_key.as_ref() != Some(k)
+                        && !inflight.contains(k)
                 })
-                .collect();
+                .collect()
+        };
         if jobs.is_empty() {
             log::debug!("prefetch: skip — visible commits already cached (or none)");
             return;
@@ -3677,6 +3756,7 @@ impl GitkApp {
             word_diff: self.word_diff,
             epoch,
             current_epoch: self.prefetch_epoch.clone(),
+            inflight: Arc::clone(&self.inflight_diffs),
             tx: self.prefetch_tx.clone(),
             ctx: ctx.clone(),
         };
@@ -5539,6 +5619,54 @@ mod tests {
             vec![],
             None,
         )
+    }
+
+    /// The shared in-flight claim set: one claim per key at a time, released on
+    /// drop — including a panicking worker's unwind — so overlapping prefetch /
+    /// diff-load dispatches dedupe without ever leaking a claim.
+    #[test]
+    fn inflight_claim_excludes_duplicates_and_releases_on_drop() {
+        let test_key = |n| DiffCacheKey {
+            oid: oid(n),
+            settings: DiffSettings {
+                context: 3,
+                ignore_ws: false,
+                show_stats: true,
+                detect_renames: true,
+                detect_copies: false,
+            },
+            theme: highlight::DEFAULT_THEME,
+            enabled: true,
+            content: 0,
+        };
+        let set: InflightKeys = Arc::default();
+
+        let claim = InflightClaim::try_claim(&set, test_key(1)).expect("first claim wins");
+        assert!(
+            InflightClaim::try_claim(&set, test_key(1)).is_none(),
+            "second claim on the same key must be refused"
+        );
+        assert!(
+            InflightClaim::try_claim(&set, test_key(2)).is_some(),
+            "a different key is independent"
+        );
+        drop(claim);
+        assert!(
+            InflightClaim::try_claim(&set, test_key(1)).is_some(),
+            "dropping the claim must release the key"
+        );
+
+        // A worker that panics mid-compute still releases its claim on unwind.
+        let panicked: InflightKeys = Arc::default();
+        let inner = Arc::clone(&panicked);
+        let _ = std::panic::catch_unwind(move || {
+            let _claim = InflightClaim::try_claim(&inner, test_key(1)).unwrap();
+            panic!("worker died");
+        });
+        assert!(
+            InflightClaim::try_claim(&panicked, test_key(1)).is_some(),
+            "a panicked holder must not leak its claim"
+        );
     }
 
     /// Assert that a specific commit's node stays in the same column as
