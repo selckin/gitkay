@@ -1932,18 +1932,31 @@ fn file_line_ranges(files: &[FileEntry], total_lines: usize) -> Vec<(usize, usiz
         .collect()
 }
 
-/// Index of the file whose patch region contains `line` (the last file starting at or
-/// before it), or `None` when `line` is in the pre-file header region.
-fn file_index_at_line_opt(files: &[FileEntry], line: usize) -> Option<usize> {
-    files
+/// Sorted `(patch start line, file index)` pairs for every file with a patch body —
+/// the binary-search structure behind `file_index_at_line*`. Derived once per diff
+/// at install; the lookups run several times per frame.
+fn file_line_starts(files: &[FileEntry]) -> Vec<(usize, usize)> {
+    let mut starts: Vec<(usize, usize)> = files
         .iter()
-        .rposition(|f| f.diff_line_idx.is_some_and(|idx| idx <= line))
+        .enumerate()
+        .filter_map(|(i, f)| f.diff_line_idx.map(|s| (s, i)))
+        .collect();
+    starts.sort_unstable_by_key(|&(s, _)| s);
+    starts
+}
+
+/// Index of the file whose patch region contains `line` (the last start at or
+/// before it), or `None` when `line` is in the pre-file header region. A binary
+/// search over the per-diff `file_line_starts`.
+fn file_index_at_line_opt(starts: &[(usize, usize)], line: usize) -> Option<usize> {
+    let k = starts.partition_point(|&(s, _)| s <= line);
+    k.checked_sub(1).map(|k| starts[k].1)
 }
 
 /// Like `file_index_at_line_opt` but defaults to 0 (the first file) in the header
 /// region — for callers that always want a file index.
-fn file_index_at_line(files: &[FileEntry], line: usize) -> usize {
-    file_index_at_line_opt(files, line).unwrap_or(0)
+fn file_index_at_line(starts: &[(usize, usize)], line: usize) -> usize {
+    file_index_at_line_opt(starts, line).unwrap_or(0)
 }
 
 /// The diff line to scroll to for a page-by-file step, given `top` (the first visible
@@ -3246,6 +3259,9 @@ struct GitkApp {
     diff_word_emphasized: bool,
     /// Cached per-row galleys for the (un-virtualized) file-list sidebar.
     sidebar_cache: SidebarCache,
+    /// Sorted `(patch start line, file index)` for the current diff — the
+    /// binary-search structure behind the per-frame `file_index_at_line*` lookups.
+    file_line_starts: Vec<(usize, usize)>,
     /// Lazily-created arboard connection for the primary selection, kept for the
     /// session instead of reconnecting to the display server on every SHA click.
     clipboard: Option<arboard::Clipboard>,
@@ -3712,6 +3728,7 @@ impl GitkApp {
             diff_last_top_anchor: None,
             diff_word_emphasized: true, // empty startup diff — vacuously computed
             sidebar_cache: SidebarCache::default(),
+            file_line_starts: Vec::new(),
             clipboard: None,
             highlighter: None,
             syntax_enabled,
@@ -3961,6 +3978,7 @@ impl GitkApp {
         self.rebuild_file_rows();
         self.diff_max_chars = max_line_chars(&self.diff_lines);
         self.diff_last_top_anchor = self.diff_files.iter().filter_map(|f| f.diff_line_idx).max();
+        self.file_line_starts = file_line_starts(&self.diff_files);
         self.invalidate_diff_highlight();
     }
 
@@ -5639,7 +5657,7 @@ impl eframe::App for GitkApp {
                                         // selected row, so the list tracks the diff view.
                                         let top = self.diff_top_line.load(Ordering::Relaxed);
                                         let current_file =
-                                            file_index_at_line_opt(&self.diff_files, top);
+                                            file_index_at_line_opt(&self.file_line_starts, top);
                                         // Shared by every row this frame — the metric
                                         // lookup takes the font lock, so don't repeat
                                         // it per row (this list isn't virtualized).
@@ -5773,7 +5791,7 @@ impl eframe::App for GitkApp {
                         };
                         let font_id = self.fonts.font_id(Role::Diff);
                         let lines = &self.diff_lines;
-                        let files = &self.diff_files;
+                        let starts = &self.file_line_starts;
                         let priority = self.highlight_priority.as_ref();
                         let word_diff = self.word_diff;
                         let diff_top = Arc::clone(&self.diff_top_line);
@@ -5793,11 +5811,11 @@ impl eframe::App for GitkApp {
                                     && rows.start < rows.end
                                 {
                                     let vh = rows.end - rows.start;
-                                    let lo = file_index_at_line(files, rows.start);
-                                    let hi = file_index_at_line(files, rows.end - 1);
+                                    let lo = file_index_at_line(starts, rows.start);
+                                    let hi = file_index_at_line(starts, rows.end - 1);
                                     let page_lo =
-                                        file_index_at_line(files, rows.start.saturating_sub(vh));
-                                    let page_hi = file_index_at_line(files, rows.end - 1 + vh);
+                                        file_index_at_line(starts, rows.start.saturating_sub(vh));
+                                    let page_hi = file_index_at_line(starts, rows.end - 1 + vh);
                                     p.lo.store(lo, Ordering::Relaxed);
                                     p.hi.store(hi, Ordering::Relaxed);
                                     p.page_lo.store(page_lo, Ordering::Relaxed);
@@ -6711,18 +6729,26 @@ mod tests {
         // Ranges: ordered by start, no-patch skipped, end = next start / total.
         assert_eq!(file_line_ranges(&files, 9), vec![(0, 2, 5), (2, 5, 9)]);
 
-        // Line → containing file (header region maps to 0).
-        assert_eq!(file_index_at_line(&files, 0), 0); // header, before any file
-        assert_eq!(file_index_at_line(&files, 2), 0); // inclusive left edge of "a"
-        assert_eq!(file_index_at_line(&files, 3), 0); // inside "a"
-        assert_eq!(file_index_at_line(&files, 5), 2); // first line of "b"
-        assert_eq!(file_index_at_line(&files, 8), 2); // inside "b"
-        assert_eq!(file_index_at_line(&files, 999), 2); // past the last file → last file
+        // Line → containing file, via the per-diff search structure (header
+        // region maps to 0).
+        let starts = file_line_starts(&files);
+        assert_eq!(file_index_at_line(&starts, 0), 0); // header, before any file
+        assert_eq!(file_index_at_line(&starts, 2), 0); // inclusive left edge of "a"
+        assert_eq!(file_index_at_line(&starts, 3), 0); // inside "a"
+        assert_eq!(file_index_at_line(&starts, 5), 2); // first line of "b"
+        assert_eq!(file_index_at_line(&starts, 8), 2); // inside "b"
+        assert_eq!(file_index_at_line(&starts, 999), 2); // past the last file → last file
 
         // The _opt variant distinguishes the header region (no current file) from 0.
-        assert_eq!(file_index_at_line_opt(&files, 0), None); // header → no file
-        assert_eq!(file_index_at_line_opt(&files, 3), Some(0)); // inside "a"
-        assert_eq!(file_index_at_line_opt(&files, 8), Some(2)); // inside "b"
+        assert_eq!(file_index_at_line_opt(&starts, 0), None); // header → no file
+        assert_eq!(file_index_at_line_opt(&starts, 3), Some(0)); // inside "a"
+        assert_eq!(file_index_at_line_opt(&starts, 8), Some(2)); // inside "b"
+
+        // Out-of-order entries (with a bodyless file interleaved): the lookup
+        // follows line order, not entry order.
+        let ooo = file_line_starts(&[fe("x", Some(5)), fe("y", None), fe("z", Some(2))]);
+        assert_eq!(file_index_at_line_opt(&ooo, 3), Some(2)); // inside "z"
+        assert_eq!(file_index_at_line_opt(&ooo, 6), Some(0)); // inside "x"
     }
 
     #[test]
