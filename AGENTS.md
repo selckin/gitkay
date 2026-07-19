@@ -10,7 +10,7 @@ the same change.
 
 ```sh
 cargo build                       # debug; release: cargo build --release
-cargo test                        # all tests (main/config/highlight/cli/diff_cache/word_diff modules)
+cargo test                        # all tests (main/diff/config/highlight/cli/diff_cache/word_diff modules)
 cargo test test_pr_merge_pattern  # one test by name (substring match)
 cargo test config::               # one module's suite
 cargo clippy -- -D warnings       # CI gate: any warning fails CI — keep it clean
@@ -44,15 +44,20 @@ cp target/release/gitkay ~/.local/bin/   # install
 ## Architecture
 
 One egui/eframe immediate-mode app — all app state lives in the `GitkApp`
-struct. `src/main.rs` (data layer via `git2`, graph layout, and the UI) plus
-extracted modules: `src/config.rs`
+struct. `src/main.rs` (commit history/graph layout, the workers, and the UI)
+plus extracted modules: `src/diff.rs` (the diff **data** layer: `DiffLine` /
+`DiffData` / `FileEntry` / `DiffSettings`, `CommitKind` + the sentinel oids,
+`get_diff_data` and the staged/worktree builders, the diff-shaping
+`DiffOptions` helpers, the word-diff emphasis driver, the content hash, and
+the pure line/file lookups — git2-facing and egui-free; cache keying,
+highlight orchestration, and rendering stay in `main.rs`), `src/config.rs`
 (`[fonts]`/`[text]`/`[diff]` config: TOML parsing, fontdb resolution + cache,
 role→FontId map), `src/highlight.rs` (syntect highlighter, theme/palette
 resolution, per-line tokenization), `src/diff_cache.rs` (line-budget LRU cache),
 `src/cli.rs` (pure argv parser, rev-vs-path classification, pathspec
 resolution, window-title suffix, help/version text), and
 `src/word_diff.rs` (pure intra-line word diff: tokenizer + LCS alignment; the
-`DiffLine`-aware driver `compute_word_emphasis` stays in `main.rs`, and is
+`DiffLine`-aware driver `compute_word_emphasis` lives in `src/diff.rs`, and is
 **deferred**: `DiffData` carries a `word_emphasized` flag, the diff/prefetch
 workers run the pass off-thread only when the word-diff toggle is on, and
 `set_diff_content` backstops at install — so the default toggle-off path never
@@ -161,8 +166,10 @@ parts run off the window-creation critical path:
 
 Each module carries its own `#[cfg(test)]` suite: `config` (TOML parsing +
 clamping), `highlight` (theme/palette resolution), `cli` (rev-vs-path
-classification + pathspec/title helpers), `diff_cache` (LRU eviction),
-`word_diff` (LCS word alignment), and `main` (graph layout and diff/UI helpers). The graph-layout suite uses fake
+classification + pathspec/title helpers), `diff` (line/file lookups, word-diff
+deferral, content hashing), `diff_cache` (LRU eviction), `word_diff` (LCS word
+alignment), and `main` (graph layout, diff integration over temp repos, and UI
+helpers). The graph-layout suite uses fake
 OIDs via `oid(n)` — no real repo needed — and pins the layout invariants (lane
 stability, merge diagonals, convergence, out-of-scope-parent continuation
 lines; `grep 'fn test_' src/main.rs` for the list). Change `layout_graph` only
