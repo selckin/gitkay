@@ -5,7 +5,10 @@ use std::sync::Arc;
 
 use eframe::egui;
 use two_face::re_exports::syntect;
-use two_face::theme::EmbeddedThemeName;
+// Re-exported: the app carries the validated theme as this Copy enum (fields,
+// cache keys, worker jobs) — `resolve_theme` at the config boundary is the only
+// place a slug string is interpreted.
+pub use two_face::theme::EmbeddedThemeName;
 
 pub use syntect::easy::HighlightLines;
 use syntect::highlighting::{Color as SynColor, Highlighter as SynHighlighter, Theme};
@@ -15,7 +18,7 @@ use syntect::parsing::{Scope, SyntaxSet};
 pub const DEFAULT_THEME_SLUG: &str = "catppuccin-mocha";
 /// The theme `DEFAULT_THEME_SLUG` names. `THEMES` lists the pair as its first entry,
 /// so the slug and the enum variant can't drift apart.
-const DEFAULT_THEME: EmbeddedThemeName = EmbeddedThemeName::CatppuccinMocha;
+pub const DEFAULT_THEME: EmbeddedThemeName = EmbeddedThemeName::CatppuccinMocha;
 
 /// Clean kebab-case slug → two-face theme. This is the full selectable set
 /// (light and dark); it doubles as the validation list and the documented set
@@ -94,7 +97,7 @@ pub const FIXED_DEFAULT_BANDS: DiffBg = DiffBg::Fixed {
 };
 #[cfg(test)]
 pub fn test_highlighter() -> Highlighter {
-    Highlighter::new(DEFAULT_THEME_SLUG, FIXED_DEFAULT_BANDS).0
+    Highlighter::new(DEFAULT_THEME, FIXED_DEFAULT_BANDS)
 }
 
 /// A run of text sharing one foreground color: the color plus the byte range
@@ -303,72 +306,66 @@ pub struct Highlighter {
     palette: DiffPalette,
 }
 
-fn load_theme(slug: &str) -> (Theme, Option<String>) {
-    let set = two_face::theme::extra();
-    theme_for_slug(slug).map_or_else(
-        || {
-            (
-                // Index the default variant directly — no runtime unwrap in the
-                // error-recovery path.
-                set[DEFAULT_THEME].clone(),
-                Some(format!(
-                    "unknown syntax theme {slug:?}; using {DEFAULT_THEME_SLUG}"
-                )),
-            )
-        },
-        |name| (set[name].clone(), None),
-    )
+/// Resolve a configured theme slug to a theme, defaulting (with the one warning)
+/// on an unknown slug. The single validation point — everything downstream of the
+/// config boundary carries the `Copy` enum, so no other layer re-validates or
+/// re-warns.
+pub fn resolve_theme(slug: Option<&str>) -> (EmbeddedThemeName, Option<String>) {
+    slug.map_or((DEFAULT_THEME, None), |s| {
+        theme_for_slug(s).map_or_else(
+            || {
+                (
+                    DEFAULT_THEME,
+                    Some(format!(
+                        "unknown syntax theme {s:?}; using {DEFAULT_THEME_SLUG}"
+                    )),
+                )
+            },
+            |t| (t, None),
+        )
+    })
 }
 
-/// Load the theme blob for `slug` and derive its palette in one step — the
-/// single place a slug + `diff_bg` maps to a `DiffPalette`. Loads only the theme
-/// blob (NOT the multi-MB syntax set). Returns a warning if the slug was unknown
-/// (defaulted).
-fn theme_and_palette(slug: &str, diff_bg: DiffBg) -> (Theme, DiffPalette, Option<String>) {
-    let (theme, warning) = load_theme(slug);
+/// Load the theme blob for an (already-validated) theme and derive its palette —
+/// the single place a theme + `diff_bg` maps to a `DiffPalette`. Loads only the
+/// theme blob (NOT the multi-MB syntax set).
+fn theme_and_palette(name: EmbeddedThemeName, diff_bg: DiffBg) -> (Theme, DiffPalette) {
+    let theme = two_face::theme::extra()[name].clone();
     let palette = DiffPalette::from_theme(&theme, diff_bg);
-    (theme, palette, warning)
+    (theme, palette)
 }
 
-/// Derive just the diff palette for `slug` + `diff_bg`. Loads only the theme blob
+/// Derive just the diff palette for a theme + `diff_bg`. Loads only the theme blob
 /// (NOT the multi-MB syntax set), so it's cheap enough for the syntax-off render
 /// and the pre-highlighter fallback — both colour from the theme without
-/// tokenizing. Returns a warning if the slug was unknown (defaulted).
-pub fn palette_for(slug: &str, diff_bg: DiffBg) -> (DiffPalette, Option<String>) {
-    let (_theme, palette, warning) = theme_and_palette(slug, diff_bg);
-    (palette, warning)
+/// tokenizing.
+pub fn palette_for(name: EmbeddedThemeName, diff_bg: DiffBg) -> DiffPalette {
+    theme_and_palette(name, diff_bg).1
 }
 
 impl Highlighter {
-    /// Build the highlighter for `slug`. Deserializes the bundled syntax set
+    /// Build the highlighter for a theme. Deserializes the bundled syntax set
     /// (multi-MB) once — call this lazily, not at startup.
-    pub fn new(slug: &str, diff_bg: DiffBg) -> (Self, Option<String>) {
+    pub fn new(name: EmbeddedThemeName, diff_bg: DiffBg) -> Self {
         let syntaxes = Arc::new(two_face::syntax::extra_newlines());
-        let (theme, palette, warning) = theme_and_palette(slug, diff_bg);
-        (
-            Self {
-                syntaxes,
-                theme,
-                palette,
-            },
-            warning,
-        )
+        let (theme, palette) = theme_and_palette(name, diff_bg);
+        Self {
+            syntaxes,
+            theme,
+            palette,
+        }
     }
 
     /// A new highlighter with a different theme and/or diff-background mode,
-    /// reusing this one's syntax set (a cheap `Arc` clone — no reload). Returns
-    /// a warning if the slug was unknown. The old instance stays valid for any
-    /// in-flight worker still holding it.
-    pub fn with_theme(&self, slug: &str, diff_bg: DiffBg) -> (Self, Option<String>) {
-        let (theme, palette, warning) = theme_and_palette(slug, diff_bg);
-        (
-            Self {
-                syntaxes: Arc::clone(&self.syntaxes),
-                theme,
-                palette,
-            },
-            warning,
-        )
+    /// reusing this one's syntax set (a cheap `Arc` clone — no reload). The old
+    /// instance stays valid for any in-flight worker still holding it.
+    pub fn with_theme(&self, name: EmbeddedThemeName, diff_bg: DiffBg) -> Self {
+        let (theme, palette) = theme_and_palette(name, diff_bg);
+        Self {
+            syntaxes: Arc::clone(&self.syntaxes),
+            theme,
+            palette,
+        }
     }
 
     pub const fn palette(&self) -> &DiffPalette {
@@ -451,6 +448,21 @@ mod tests {
     }
 
     #[test]
+    fn resolve_theme_validates_once() {
+        // Unset ⇒ default, no warning.
+        assert_eq!(resolve_theme(None), (DEFAULT_THEME, None));
+        // Known slug ⇒ its theme, no warning.
+        assert_eq!(
+            resolve_theme(Some("dracula")),
+            (EmbeddedThemeName::Dracula, None)
+        );
+        // Unknown slug ⇒ default plus the one warning naming it.
+        let (theme, warn) = resolve_theme(Some("no-such-theme"));
+        assert_eq!(theme, DEFAULT_THEME);
+        assert!(warn.unwrap().contains("no-such-theme"));
+    }
+
+    #[test]
     fn known_slug_resolves() {
         use two_face::theme::EmbeddedThemeName;
         assert_eq!(
@@ -472,8 +484,7 @@ mod tests {
 
     #[test]
     fn tokenizes_rust_into_multiple_spans() {
-        let (hl, warn) = Highlighter::new("catppuccin-mocha", FIXED_DEFAULT_BANDS);
-        assert!(warn.is_none());
+        let hl = Highlighter::new(EmbeddedThemeName::CatppuccinMocha, FIXED_DEFAULT_BANDS);
         let mut state = hl.new_file_state("x.rs");
         let code = "fn main() {}";
         let spans = hl.tokenize_line(&mut state, code);
@@ -528,9 +539,10 @@ mod tests {
 
     #[test]
     fn unknown_slug_warns_and_falls_back() {
-        let (hl, warn) = Highlighter::new("no-such-theme", FIXED_DEFAULT_BANDS);
+        // The config boundary defaults + warns; a palette is still derived.
+        let (theme, warn) = resolve_theme(Some("no-such-theme"));
         assert!(warn.is_some());
-        // Falls back to the (dark) default, so a palette is still derived.
+        let hl = Highlighter::new(theme, FIXED_DEFAULT_BANDS);
         assert!(luminance(hl.palette().background) < 0.5);
     }
 
@@ -583,8 +595,7 @@ mod tests {
         // must follow (dark → light).
         let hl = test_highlighter();
         assert!(luminance(hl.palette().background) < 0.5);
-        let (hl2, warn) = hl.with_theme("catppuccin-latte", FIXED_DEFAULT_BANDS);
-        assert!(warn.is_none());
+        let hl2 = hl.with_theme(EmbeddedThemeName::CatppuccinLatte, FIXED_DEFAULT_BANDS);
         assert!(luminance(hl2.palette().background) > 0.5);
     }
 
