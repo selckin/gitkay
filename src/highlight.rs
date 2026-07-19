@@ -399,23 +399,34 @@ impl Highlighter {
     /// hot path.
     pub fn warm_extension(&self, ext: &str) {
         let mut state = self.new_file_state(&format!("warm.{ext}"));
+        let mut buf = String::new();
         for line in ["let x = 1; // s", "\"text\""] {
-            self.tokenize_line(&mut state, line);
+            self.tokenize_line(&mut state, line, &mut buf);
         }
     }
 
     /// Tokenize one line of code (without its diff marker) into colored spans.
-    /// `state` carries multi-line parser state within the current file.
-    pub fn tokenize_line(&self, state: &mut HighlightLines, code: &str) -> Vec<Span> {
+    /// `state` carries multi-line parser state within the current file. `buf` is
+    /// the caller's scratch (cleared here): the highlight loops tokenize hundreds
+    /// of thousands of lines, so the newline-terminated copy syntect needs is
+    /// built in one reused allocation instead of a fresh `String` per line.
+    pub fn tokenize_line(
+        &self,
+        state: &mut HighlightLines,
+        code: &str,
+        buf: &mut String,
+    ) -> Vec<Span> {
         // syntect needs a trailing newline; it returns each token as a `&str`
-        // slice of `line`, so a token's byte offset within `line` equals its
+        // slice of the buffer, so a token's byte offset within it equals its
         // offset within `code` (the '\n' is appended last). We record that range
         // rather than copying the text — the range indexes into `code`, which is
         // exactly `DiffLine::body()` at render time.
-        let line = format!("{code}\n");
-        let base = line.as_ptr() as usize;
+        buf.clear();
+        buf.push_str(code);
+        buf.push('\n');
+        let base = buf.as_ptr() as usize;
         let code_len = code.len();
-        state.highlight_line(&line, &self.syntaxes).map_or_else(
+        state.highlight_line(buf, &self.syntaxes).map_or_else(
             // A grammar hiccup must never drop the line: render it plain.
             |_| vec![(self.palette.foreground, 0..code_len)],
             |ranges| {
@@ -487,7 +498,7 @@ mod tests {
         let hl = Highlighter::new(EmbeddedThemeName::CatppuccinMocha, FIXED_DEFAULT_BANDS);
         let mut state = hl.new_file_state("x.rs");
         let code = "fn main() {}";
-        let spans = hl.tokenize_line(&mut state, code);
+        let spans = hl.tokenize_line(&mut state, code, &mut String::new());
         assert!(spans.len() >= 2, "expected multiple tokens, got {spans:?}");
         // Reassembled ranges cover the input exactly (no chars dropped).
         let joined: String = spans.iter().map(|(_, r)| &code[r.start..r.end]).collect();
@@ -499,7 +510,7 @@ mod tests {
         let hl = test_highlighter();
         let mut state = hl.new_file_state("file.unknownext");
         let code = "just some text";
-        let spans = hl.tokenize_line(&mut state, code);
+        let spans = hl.tokenize_line(&mut state, code, &mut String::new());
         let joined: String = spans.iter().map(|(_, r)| &code[r.start..r.end]).collect();
         assert_eq!(joined, code);
     }
@@ -514,7 +525,7 @@ mod tests {
         // — every produced range must land on a UTF-8 char boundary, or the
         // re-slice below panics mid-codepoint.
         let code = "let s = \"café→λ 🦀\"; // δ";
-        let spans = hl.tokenize_line(&mut state, code);
+        let spans = hl.tokenize_line(&mut state, code, &mut String::new());
         let joined: String = spans.iter().map(|(_, r)| &code[r.start..r.end]).collect();
         assert_eq!(
             joined, code,
@@ -525,12 +536,29 @@ mod tests {
     }
 
     #[test]
+    fn tokenize_line_reuses_buffer_without_leaking() {
+        // A long line followed by a short one through the SAME scratch buffer:
+        // stale content must not leak into the short line's spans (pins the
+        // buf.clear() the reuse depends on).
+        let hl = test_highlighter();
+        let mut state = hl.new_file_state("x.rs");
+        let mut buf = String::new();
+        let long = "let abcdefghijklmnop = 12345; // trailing comment";
+        let _ = hl.tokenize_line(&mut state, long, &mut buf);
+        let short = "x";
+        let spans = hl.tokenize_line(&mut state, short, &mut buf);
+        let joined: String = spans.iter().map(|(_, r)| &short[r.clone()]).collect();
+        assert_eq!(joined, short);
+        assert!(spans.iter().all(|(_, r)| r.end <= short.len()));
+    }
+
+    #[test]
     fn empty_line_yields_no_spans() {
         let hl = test_highlighter();
         let mut state = hl.new_file_state("x.rs");
         // code_len == 0: every span's end clamps to 0, so the `start < end` guard
         // drops them all. Must yield no spans (and not panic), not a span for '\n'.
-        let spans = hl.tokenize_line(&mut state, "");
+        let spans = hl.tokenize_line(&mut state, "", &mut String::new());
         assert!(
             spans.is_empty(),
             "empty line should yield no spans, got {spans:?}"
@@ -636,7 +664,7 @@ mod tests {
         hl.warm_extension("rs"); // must not panic
         // After warming, tokenizing Rust still works (keywords → multiple spans).
         let mut state = hl.new_file_state("after.rs");
-        let spans = hl.tokenize_line(&mut state, "fn main() {}");
+        let spans = hl.tokenize_line(&mut state, "fn main() {}", &mut String::new());
         assert!(
             spans.len() >= 2,
             "rust line should tokenize into multiple spans"
