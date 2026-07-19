@@ -106,9 +106,11 @@ pub struct DiffLine {
 }
 
 impl DiffLine {
-    pub fn new(text: &str, kind: LineKind) -> Self {
+    /// `impl Into<String>` so a caller's `format!` result is moved in, not copied —
+    /// the diff build allocates one of these per patch line.
+    pub fn new(text: impl Into<String>, kind: LineKind) -> Self {
         Self {
-            text: text.to_string(),
+            text: text.into(),
             kind,
             spans: None,
             emphasis: None,
@@ -352,32 +354,12 @@ pub fn get_diff_data(
             return DiffData::empty();
         }
     };
-    let tree = match commit.tree() {
-        Ok(t) => t,
-        Err(e) => {
-            log::warn!("gitkay: cannot read tree for {oid}: {e}");
-            return DiffData::empty();
-        }
-    };
-    let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
-
-    let mut opts = scoped_diff_opts(settings, paths);
-    let mut diff = match repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))
-    {
-        Ok(d) => d,
-        Err(e) => {
-            log::warn!("gitkay: cannot diff commit {oid}: {e}");
-            return DiffData::empty();
-        }
-    };
-
-    let mut lines = Vec::new();
-    let mut files = Vec::new();
 
     // Header
-    lines.push(DiffLine::new(&format!("commit {oid}"), LineKind::Meta));
-    lines.push(DiffLine::new(
-        &format!("Author: {}", commit.author()),
+    let mut header = Vec::new();
+    header.push(DiffLine::new(format!("commit {oid}"), LineKind::Meta));
+    header.push(DiffLine::new(
+        format!("Author: {}", commit.author()),
         LineKind::Meta,
     ));
     // Author date, like `git log`/`git show` — commit.time() is the committer
@@ -385,22 +367,27 @@ pub fn get_diff_data(
     let t = commit.author().when();
     let date = format_commit_time(t.seconds(), t.offset_minutes(), true);
     if !date.is_empty() {
-        lines.push(DiffLine::new(&format!("Date:   {date}"), LineKind::Meta));
+        header.push(DiffLine::new(format!("Date:   {date}"), LineKind::Meta));
     }
-    lines.push(DiffLine::new("", LineKind::Blank));
+    header.push(DiffLine::new("", LineKind::Blank));
     // Lossy: a legacy-encoded message should render with replacement chars,
     // not vanish (message() errs on non-UTF-8).
     let msg = String::from_utf8_lossy(commit.message_bytes());
     for l in msg.lines() {
-        lines.push(DiffLine::new(&format!("    {l}"), LineKind::Meta));
+        header.push(DiffLine::new(format!("    {l}"), LineKind::Meta));
     }
     // The blank above (after the commit message) stays, so the message flows
     // straight into the diffstat/patch produced below.
-    lines.push(DiffLine::new("", LineKind::Blank));
+    header.push(DiffLine::new("", LineKind::Blank));
 
-    detect_similar(&mut diff, settings);
-    append_diff_body(&mut lines, &mut files, &diff, settings.show_stats);
-    DiffData::new(lines, files)
+    build_diff_data(
+        repo,
+        settings,
+        paths,
+        header,
+        &format!("commit {oid}"),
+        |repo, opts| commit_parent_diff(repo, &commit, Some(opts)),
+    )
 }
 
 /// The path for a diff delta as raw bytes — the new side, falling back to the old
@@ -472,7 +459,15 @@ pub fn append_diff_body(
             .and_then(|i| byte_paths.get(i))
             .is_some_and(|p| p.as_slice() == path);
         if !on_current_file {
-            current_file_idx = byte_paths.iter().position(|p| p.as_slice() == path);
+            // Deltas print in order, so the boundary is almost always the next
+            // entry — check it first; the full scan is a fallback so a surprise
+            // ordering degrades to a rescan, not a mis-attributed file.
+            let next = current_file_idx.map_or(0, |i| i + 1);
+            current_file_idx = byte_paths
+                .get(next)
+                .is_some_and(|p| p.as_slice() == path)
+                .then_some(next)
+                .or_else(|| byte_paths.iter().position(|p| p.as_slice() == path));
             if let Some(fi) = current_file_idx {
                 files[fi].diff_line_idx = Some(lines.len());
             }
@@ -523,22 +518,24 @@ pub fn append_diff_body(
             } else {
                 kind
             };
-            lines.push(DiffLine::new(&format!("{prefix}{piece}"), piece_kind));
+            lines.push(DiffLine::new(format!("{prefix}{piece}"), piece_kind));
         }
         true
     })
     .unwrap_or_else(|e| log::warn!("gitkay: error rendering diff patch: {e}"));
 }
 
-/// Shared pipeline for the virtual (working-tree / staged) diffs: build the pathspec- and
-/// settings-scoped `DiffOptions`, run `build` to produce the git diff, coalesce
-/// renames/copies, and convert to `DiffData` under `title`. A diff error is logged (with
-/// `what`) and yields an empty `DiffData` so a transient failure never aborts the view.
-pub fn virtual_diff<'r>(
+/// Shared pipeline tail for every diff build (commit, working-tree, staged): build the
+/// pathspec- and settings-scoped `DiffOptions`, run `build` to produce the git diff,
+/// coalesce renames/copies, and append the stats + patch body under the caller's
+/// `header` lines. A diff error is logged (with `what`) and yields an empty `DiffData`
+/// so a transient failure never aborts the view. A new pipeline stage (like
+/// `detect_similar` was) lands in all three builders by construction.
+pub fn build_diff_data<'r>(
     repo: &'r Repository,
     settings: DiffSettings,
     paths: &[String],
-    title: &str,
+    header: Vec<DiffLine>,
     what: &str,
     build: impl FnOnce(&'r Repository, &mut DiffOptions) -> Result<git2::Diff<'r>, git2::Error>,
 ) -> DiffData {
@@ -551,7 +548,27 @@ pub fn virtual_diff<'r>(
         }
     };
     detect_similar(&mut diff, settings);
-    diff_to_data(&diff, title, settings.show_stats)
+    let mut lines = header;
+    let mut files = Vec::new();
+    append_diff_body(&mut lines, &mut files, &diff, settings.show_stats);
+    DiffData::new(lines, files)
+}
+
+/// `build_diff_data` under a single title line — the header shape the two virtual
+/// (working-tree / staged) diffs share.
+pub fn virtual_diff<'r>(
+    repo: &'r Repository,
+    settings: DiffSettings,
+    paths: &[String],
+    title: &str,
+    what: &str,
+    build: impl FnOnce(&'r Repository, &mut DiffOptions) -> Result<git2::Diff<'r>, git2::Error>,
+) -> DiffData {
+    let header = vec![
+        DiffLine::new(title, LineKind::Meta),
+        DiffLine::new("", LineKind::Blank),
+    ];
+    build_diff_data(repo, settings, paths, header, what, build)
 }
 
 /// The HEAD commit's tree, or `None` on an unborn HEAD (fresh `git init`) — a staged
@@ -612,16 +629,20 @@ pub fn get_staged_diff(repo: &Repository, settings: DiffSettings, paths: &[Strin
     )
 }
 
-/// Convert a `git2::Diff` into our `DiffData` format, under a single title line.
-pub fn diff_to_data(diff: &git2::Diff, title: &str, show_stats: bool) -> DiffData {
-    let mut lines = Vec::new();
-    let mut files = Vec::new();
-
-    lines.push(DiffLine::new(title, LineKind::Meta));
-    lines.push(DiffLine::new("", LineKind::Blank));
-
-    append_diff_body(&mut lines, &mut files, diff, show_stats);
-    DiffData::new(lines, files)
+/// The git diff that defines a real commit's changes: its tree against its first
+/// parent's, or against the empty tree for a root commit (or an unreadable parent
+/// tree — degrade to "everything added", matching the unborn-HEAD staged diff).
+/// The single definition shared by the diff pane (`get_diff_data`), the
+/// `-- <path>` commit filter, and the `--follow` rename tracer, so what "a
+/// commit's diff" means can't drift between the graph filter and the pane.
+pub fn commit_parent_diff<'r>(
+    repo: &'r Repository,
+    commit: &git2::Commit<'_>,
+    opts: Option<&mut DiffOptions>,
+) -> Result<git2::Diff<'r>, git2::Error> {
+    let tree = commit.tree()?;
+    let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+    repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), opts)
 }
 
 /// Each file's `(file index, start, end)` line range, ordered by start. File
@@ -765,7 +786,7 @@ mod tests {
             DiffData::new(
                 texts
                     .iter()
-                    .map(|t| DiffLine::new(t, LineKind::Add))
+                    .map(|t| DiffLine::new(*t, LineKind::Add))
                     .collect(),
                 Vec::new(),
             )

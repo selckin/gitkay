@@ -15,8 +15,8 @@ mod highlight;
 mod word_diff;
 use config::{FileListLayout, Fonts, Role};
 use diff::{
-    CommitKind, DiffData, DiffLine, DiffSettings, FileEntry, LineKind, emphasize_rows,
-    file_index_at_line, file_index_at_line_opt, file_line_ranges, file_line_starts,
+    CommitKind, DiffData, DiffLine, DiffSettings, FileEntry, LineKind, commit_parent_diff,
+    emphasize_rows, file_index_at_line, file_index_at_line_opt, file_line_ranges, file_line_starts,
     format_commit_time, get_diff_data, hash_diff_content, is_real_commit, local_tz_offset_min,
     next_file_line, oid_staged, oid_uncommitted, pathspec_opts, staged_git_diff, worktree_git_diff,
 };
@@ -155,6 +155,14 @@ const PREFETCH_MAX: usize = 24;
 /// Prefetch: rows warmed beyond each visible edge, so arrow-key navigation off a
 /// view edge (the next Up/Down target is just off-screen) still hits a warm cache.
 const PREFETCH_MARGIN: usize = 8;
+
+/// Real commits loaded by the startup walk. The `all_loaded` derivation compares
+/// the loaded count against this same constant (and the watcher-reload floor
+/// reuses it), so the initial window, the fallback load, and the "is there more?"
+/// check can't drift apart.
+const INITIAL_COMMITS: usize = 200;
+/// Real commits appended per lazy-load extension when scrolling near the bottom.
+const LOAD_BATCH: usize = 500;
 
 /// Debounce window for watcher-triggered reloads: a burst of `.git` writes
 /// (rebase, fetch) coalesces into one reload after it settles, instead of a
@@ -601,16 +609,8 @@ fn warn_bad_rev(rev: &str, result: &Result<git2::Oid, git2::Error>) {
 /// Whether `commit`'s diff against its first parent (or the empty tree for a root
 /// commit) touches any of `paths`. Used for the `-- <path>` commit filter.
 fn commit_touches_paths(repo: &Repository, commit: &git2::Commit, paths: &[String]) -> bool {
-    let tree = match commit.tree() {
-        Ok(t) => t,
-        Err(e) => {
-            log::warn!("gitkay: cannot read tree for {}: {e}", commit.id());
-            return false;
-        }
-    };
-    let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
     let mut opts = pathspec_opts(paths);
-    match repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts)) {
+    match commit_parent_diff(repo, commit, Some(&mut opts)) {
         Ok(d) => d.deltas().len() > 0,
         Err(e) => {
             // Treat as "doesn't touch the path" but say so: otherwise a transient
@@ -644,12 +644,13 @@ fn file_added(commit: &git2::Commit, path: &str) -> bool {
 /// git2 rename detection over the whole commit-vs-parent diff (the old name can be
 /// anywhere), so `--follow` can keep tracing the file backwards across the rename.
 fn rename_source(repo: &Repository, commit: &git2::Commit, new_path: &str) -> Option<String> {
-    // No parent (a root commit) → nothing to rename from, quietly.
-    let parent = commit.parent(0).ok()?;
+    // No parent (a root commit) → nothing to rename from, quietly (the diff below
+    // would run against the empty tree — all adds, never a rename — so skip it).
+    if commit.parent_count() == 0 {
+        return None;
+    }
     let detect = || -> Result<Option<String>, git2::Error> {
-        let tree = commit.tree()?;
-        let parent_tree = parent.tree()?;
-        let mut diff = repo.diff_tree_to_tree(Some(&parent_tree), Some(&tree), None)?;
+        let mut diff = commit_parent_diff(repo, commit, None)?;
         let mut opts = git2::DiffFindOptions::new();
         opts.renames(true);
         diff.find_similar(Some(&mut opts))?;
@@ -819,6 +820,38 @@ fn build_commit_info(
     )
 }
 
+/// Build `CommitInfo`s from a revwalk's oid stream: dedupe through `seen`, skip
+/// unloadable commits, stop once `max` are built. The one walk-consuming loop shared
+/// by `load_commits` (plain scope) and `load_commits_tail` — the tail resume is only
+/// sound while both dedupe and count identically, so that parity is by construction
+/// here rather than by keeping two hand-copied loops in sync.
+fn build_commits_from_walk(
+    repo: &Repository,
+    walk: impl Iterator<Item = git2::Oid>,
+    seen: &mut HashSet<git2::Oid>,
+    ref_map: &std::collections::HashMap<git2::Oid, Vec<(String, RefKind)>>,
+    max: usize,
+) -> Vec<CommitInfo> {
+    let mut commits = Vec::new();
+    for oid in walk {
+        if !seen.insert(oid) {
+            continue;
+        }
+        if let Ok(commit) = repo.find_commit(oid) {
+            commits.push(build_commit_info(
+                oid,
+                &commit,
+                commit.parent_ids().collect(),
+                ref_map,
+            ));
+            if commits.len() >= max {
+                break;
+            }
+        }
+    }
+    commits
+}
+
 fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitInfo> {
     let t = std::time::Instant::now();
     let ref_map = build_ref_map(repo);
@@ -838,60 +871,66 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
     // `gitkay foobar`, is "a different branch than checked out" and hides them.
     let show_local = scope.all || scope.revs.is_empty();
 
-    // Staged = index vs HEAD tree. Scoped to the active `-- <path>` filter, so a
-    // staged change outside the path doesn't add a virtual row on its own lane.
-    let t = std::time::Instant::now();
-    let has_staged = show_local && {
-        let mut opts = pathspec_opts(&scope.paths);
-        staged_git_diff(repo, &mut opts)
-            .ok()
-            .is_some_and(|diff| diff.deltas().len() > 0)
+    // The staged/uncommitted probes and rows are symmetric — one probe and one row
+    // builder keep the pair in lockstep (same pathspec scoping, same timestamp
+    // source), so a change to one can't silently miss the other.
+    // Probes are scoped to the active `-- <path>` filter, so a change outside the
+    // path doesn't add a virtual row on its own lane.
+    let probe = |label: &str,
+                 build: for<'r> fn(
+        &'r Repository,
+        &mut git2::DiffOptions,
+    ) -> Result<git2::Diff<'r>, git2::Error>| {
+        let t = std::time::Instant::now();
+        let hit = show_local && {
+            let mut opts = pathspec_opts(&scope.paths);
+            build(repo, &mut opts)
+                .ok()
+                .is_some_and(|diff| diff.deltas().len() > 0)
+        };
+        log::debug!(
+            "perf: load_commits: {label} probe -> {hit} {:?}",
+            t.elapsed()
+        );
+        hit
     };
-    log::debug!(
-        "perf: load_commits: staged probe (diff_tree_to_index) -> {has_staged} {:?}",
-        t.elapsed()
-    );
+    // Staged = index vs HEAD tree; uncommitted = workdir vs index.
+    let has_staged = probe("staged (diff_tree_to_index)", staged_git_diff);
+    let has_uncommitted = probe("uncommitted (diff_index_to_workdir)", worktree_git_diff);
 
-    // Uncommitted = workdir vs index, scoped to the same path filter.
-    let t = std::time::Instant::now();
-    let has_uncommitted = show_local && {
-        let mut opts = pathspec_opts(&scope.paths);
-        worktree_git_diff(repo, &mut opts)
-            .ok()
-            .is_some_and(|diff| diff.deltas().len() > 0)
-    };
-    log::debug!(
-        "perf: load_commits: uncommitted probe (diff_index_to_workdir) -> {has_uncommitted} {:?}",
-        t.elapsed()
-    );
+    let virtual_row =
+        |oid: git2::Oid, title: &str, parents: Vec<git2::Oid>, chip: (&str, RefKind)| {
+            CommitInfo::new(
+                oid,
+                title.to_string(),
+                String::new(),
+                chrono::Utc::now().timestamp(),
+                local_tz_offset_min(),
+                parents,
+                vec![(chip.0.to_string(), chip.1)],
+                None,
+            )
+        };
 
     // Add virtual entries at the top
     if has_uncommitted {
-        commits.push(CommitInfo::new(
+        commits.push(virtual_row(
             oid_uncommitted(),
-            "Uncommitted changes".to_string(),
-            String::new(),
-            chrono::Utc::now().timestamp(),
-            local_tz_offset_min(),
+            "Uncommitted changes",
             if has_staged {
                 vec![oid_staged()]
             } else {
                 head_oid.into_iter().collect()
             },
-            vec![("working tree".to_string(), RefKind::WorkingTree)],
-            None,
+            ("working tree", RefKind::WorkingTree),
         ));
     }
     if has_staged {
-        commits.push(CommitInfo::new(
+        commits.push(virtual_row(
             oid_staged(),
-            "Staged changes".to_string(),
-            String::new(),
-            chrono::Utc::now().timestamp(),
-            local_tz_offset_min(),
+            "Staged changes",
             head_oid.into_iter().collect(),
-            vec![("index".to_string(), RefKind::Index)],
-            None,
+            ("index", RefKind::Index),
         ));
     }
 
@@ -900,9 +939,6 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
     let Some(revwalk) = history_revwalk(repo, scope) else {
         return commits;
     };
-    let build_info = |oid: git2::Oid, commit: &git2::Commit, parents: Vec<git2::Oid>| {
-        build_commit_info(oid, commit, parents, &ref_map)
-    };
 
     let mut seen = HashSet::new();
     // Virtual uncommitted/staged rows are already pushed; `max` budgets real commits
@@ -910,17 +946,13 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
     // shrink by the virtual count.
     let virtual_count = commits.len();
     if scope.paths.is_empty() {
-        for oid in revwalk.flatten() {
-            if !seen.insert(oid) {
-                continue;
-            }
-            if let Ok(commit) = repo.find_commit(oid) {
-                commits.push(build_info(oid, &commit, commit.parent_ids().collect()));
-                if commits.len() - virtual_count >= max {
-                    break;
-                }
-            }
-        }
+        commits.extend(build_commits_from_walk(
+            repo,
+            revwalk.flatten(),
+            &mut seen,
+            &ref_map,
+            max,
+        ));
     } else {
         // Path filter: drop commits that don't touch the pathspec, then rewrite each
         // surviving commit's parents to its nearest surviving ancestor — git's history
@@ -950,7 +982,7 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
             );
             if touched {
                 kept_set.insert(oid);
-                let mut info = build_info(oid, &commit, parents);
+                let mut info = build_commit_info(oid, &commit, parents, &ref_map);
                 if let Some(p) = follow_path.clone() {
                     info.follow_path = Some(p.clone());
                     // If the file was renamed into `p` at this commit, follow the
@@ -1035,23 +1067,7 @@ fn load_commits_tail(
         return None;
     }
     let ref_map = build_ref_map(repo);
-    let mut commits = Vec::new();
-    for oid in iter {
-        if !seen.insert(oid) {
-            continue;
-        }
-        if let Ok(commit) = repo.find_commit(oid) {
-            commits.push(build_commit_info(
-                oid,
-                &commit,
-                commit.parent_ids().collect(),
-                &ref_map,
-            ));
-            if commits.len() >= max_new {
-                break;
-            }
-        }
-    }
+    let commits = build_commits_from_walk(repo, iter, &mut seen, &ref_map, max_new);
     log::debug!(
         "perf: load_commits_tail: +{} commits (skipped {skip}) {:?}",
         commits.len(),
@@ -1223,6 +1239,11 @@ const FILE_INDENT: f32 = 12.0;
 /// narrow window can't let the sidebar starve the diff strip.
 const FILE_LIST_MIN_W: f32 = 140.0;
 
+/// Width of one commit-graph lane column, in points.
+const GRAPH_COL_W: f32 = 12.0;
+/// Radius of a commit's graph dot; lines touching the node split around it.
+const GRAPH_DOT_R: f32 = 3.5;
+
 /// Bottom-padding rows for the diff so the deepest file (`last_top_anchor`, its start
 /// line) can scroll to the top of a `viewport_rows`-tall viewport: only the rows that
 /// file leaves short of a screenful, so a last file that already fills the viewport gets
@@ -1242,8 +1263,8 @@ fn diff_pad_rows(n_lines: usize, last_top_anchor: Option<usize>, viewport_rows: 
 /// on screen (the flat path ignores it), the height drives the Space page-scroll and is
 /// the true screenful even when bottom-padding rows clamp the real range short.
 /// `build_row` produces each row's job, an optional background tint, and the galley
-/// fallback colour. Shared by both render paths so the scroll/offset/width scaffold
-/// lives in one place.
+/// fallback colour. The callbacks keep the scroll/offset/width scaffold here separate
+/// from the row-building policy in the (single) caller.
 fn show_virtualized_diff(
     ui: &mut egui::Ui,
     font_id: &egui::FontId,
@@ -1575,19 +1596,19 @@ fn highlight_worker(job: HighlightJob) {
     ctx.request_repaint();
 }
 
-/// Collect blob (file) names from `tree`, recursing into subtrees, until `out`
-/// reaches `max` entries or `depth` reaches `MAX_TREE_DEPTH`. Names only — no blob
-/// reads. Best-effort: unreadable subtrees are skipped.
-fn collect_tree_blob_names(
-    repo: &git2::Repository,
-    tree: &git2::Tree,
-    max: usize,
-    depth: usize,
-    out: &mut Vec<String>,
-) {
-    for entry in tree {
+/// Collect blob (file) names from `tree`, descending into subtrees, until `out`
+/// reaches `max` entries or `MAX_TREE_DEPTH`. Names only — no blob reads.
+/// Best-effort: unreadable names are skipped.
+fn collect_tree_blob_names(tree: &git2::Tree, max: usize, out: &mut Vec<String>) {
+    // git2's own pre-order walk. `Abort` ends the walk once `max` names are
+    // collected (the Err it makes `walk` return is expected — ignore it); `Skip`
+    // stops descending past the depth cap so a pathologically deep tree can't
+    // overflow the stack (the entry cap bounds total work, not depth — deeply
+    // nested empty dirs would otherwise walk freely). `root` is the entry's
+    // parent path ("" at the top, "a/b/" below), so its '/' count is the depth.
+    let _ = tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
         if out.len() >= max {
-            return;
+            return git2::TreeWalkResult::Abort;
         }
         match entry.kind() {
             Some(git2::ObjectType::Blob) => {
@@ -1595,17 +1616,13 @@ fn collect_tree_blob_names(
                     out.push(name.to_string());
                 }
             }
-            // Stop recursing past the depth cap so a pathologically deep tree
-            // can't overflow this thread's stack (the entry cap bounds total work,
-            // not recursion depth — deeply nested empty dirs would recurse freely).
-            Some(git2::ObjectType::Tree) if depth < MAX_TREE_DEPTH => {
-                if let Ok(subtree) = repo.find_tree(entry.id()) {
-                    collect_tree_blob_names(repo, &subtree, max, depth + 1, out);
-                }
+            Some(git2::ObjectType::Tree) if root.matches('/').count() >= MAX_TREE_DEPTH => {
+                return git2::TreeWalkResult::Skip;
             }
             _ => {}
         }
-    }
+        git2::TreeWalkResult::Ok
+    });
 }
 
 /// The repo's most common languages (by file extension) in the HEAD tree, capped.
@@ -1623,7 +1640,7 @@ fn repo_head_extensions(
         return Vec::new();
     };
     let mut names = Vec::new();
-    collect_tree_blob_names(repo, &tree, max_entries, 0, &mut names);
+    collect_tree_blob_names(&tree, max_entries, &mut names);
     // Only count extensions syntect can actually highlight — png/pdf/binary
     // extensions have no grammar and would waste a slot in the warm set.
     top_extensions(names.into_iter(), cap, |ext| hl.has_syntax(ext))
@@ -1632,13 +1649,13 @@ fn repo_head_extensions(
 /// Background prewarm: build the highlighter off the UI thread, hand it to the UI
 /// at once, then compile the regexes for the repo's most common languages through
 /// the shared `SyntaxSet` so the first diff in each is already coloured. Pure
-/// optimization — any failure simply warms fewer or no languages.
+/// optimization — any failure simply warms fewer or no languages. No Context here
+/// (it runs before the window exists); `ensure_diff_highlighted` polls the channel.
 fn prewarm_highlighter(
     repo_path: &str,
     theme: highlight::EmbeddedThemeName,
     diff_bg: DiffBg,
     tx: &mpsc::Sender<Arc<Highlighter>>,
-    ctx: &egui::Context,
 ) {
     let t = std::time::Instant::now();
     let hl = Arc::new(Highlighter::new(theme, diff_bg));
@@ -1648,7 +1665,6 @@ fn prewarm_highlighter(
     if tx.send(Arc::clone(&hl)).is_err() {
         return; // UI gone
     }
-    ctx.request_repaint();
 
     let exts = match git2::Repository::discover(repo_path) {
         Ok(repo) => repo_head_extensions(&repo, MAX_TREE_ENTRIES, MAX_WARM_LANGS, &hl),
@@ -1787,6 +1803,43 @@ fn spawn_font_build(
             let _ = tx.send(config::build_fonts(&cfg));
         },
     )
+    .ok()
+    .map(|_| rx)
+}
+
+/// Spawn the `gitkay-prewarm` thread: read the config off-thread and — when syntax
+/// highlighting is on — build the `Highlighter` (a multi-MB syntect `SyntaxSet`
+/// deserialize, ~50–150ms), send it, then warm the repo's most common languages
+/// through its shared `SyntaxSet`. Spawned from `main()` (like the history/font
+/// prefetches) so the build overlaps window/GL init and the deferred first diff
+/// usually installs already coloured instead of flashing plain → highlighted.
+/// The thread resolves theme/bands silently — warning is `GitkApp::new`'s job, and
+/// the install re-themes via `with_theme` anyway. Returns `None` on spawn failure
+/// (the first diff then builds the highlighter synchronously).
+fn spawn_prewarm(repo_path: String) -> Option<mpsc::Receiver<Arc<Highlighter>>> {
+    let (tx, rx) = mpsc::channel();
+    // Catch a panic in the (detached) thread so it's logged rather than a silent
+    // stderr message — e.g. if warm_extension panics after the highlighter was
+    // already sent and installed.
+    spawn_guarded(
+        "gitkay-prewarm",
+        "prewarm thread panicked; highlighting falls back to the installed or synchronous highlighter",
+        move || {
+            let cfg = config::config_path()
+                .as_ref()
+                .and_then(|p| config::read_config(p).ok())
+                .unwrap_or_default();
+            if !cfg.diff.syntax {
+                return; // syntax off: nothing to build (new() drops the rx too)
+            }
+            let (theme, _) = highlight::resolve_theme(cfg.diff.theme.as_deref());
+            let (diff_bg, _) = config::resolve_diff_bg(&cfg.diff.bands);
+            prewarm_highlighter(&repo_path, theme, diff_bg, &tx);
+        },
+    )
+    .map_err(|e| {
+        log::warn!("prewarm thread spawn failed: {e}; first diff builds the highlighter synchronously");
+    })
     .ok()
     .map(|_| rx)
 }
@@ -2085,42 +2138,45 @@ fn history_worker(job: HistoryJob) {
     }
 }
 
-/// The configured diff theme, resolved (and warned about) exactly once at the
-/// config boundary — everything downstream carries the `Copy` enum. Shared by the
-/// startup and live-reload config paths; the caller surfaces the warning.
-fn configured_theme(cfg: &config::Config) -> (highlight::EmbeddedThemeName, Option<String>) {
-    highlight::resolve_theme(cfg.diff.theme.as_deref())
-}
-
-/// Resolve the `[diff.bands]` config into a `DiffBg`, plus any warnings (unparseable
-/// hex falls back to a default). The `source` is a typed enum, so an invalid value is
-/// already a parse error — no mode warning to emit here. The caller surfaces the
-/// warnings (stderr + the in-UI toast).
-fn resolve_diff_bg(bands: &config::BandsSection) -> (DiffBg, Vec<String>) {
-    let mut warnings = Vec::new();
-    // Validate any explicitly-set band hex even in Theme mode (where the parsed
-    // colours are unused), so a malformed value is never silently swallowed.
-    let added = parse_bg_hex("added", bands.added.as_deref(), &mut warnings);
-    let deleted = parse_bg_hex("deleted", bands.deleted.as_deref(), &mut warnings);
-
-    let bg = match bands.source {
-        config::BandSource::Theme => DiffBg::Theme,
-        config::BandSource::Fixed => DiffBg::Fixed { added, deleted },
-    };
-    (bg, warnings)
-}
-
-/// Parse an optional `"#rrggbb"` background color, pushing a warning if it is
-/// set but invalid.
-fn parse_bg_hex(label: &str, v: Option<&str>, warnings: &mut Vec<String>) -> Option<egui::Color32> {
-    let h = v?;
-    let c = highlight::parse_hex(h);
-    if c.is_none() {
-        warnings.push(format!(
-            "invalid diff.bands.{label} color {h:?}; using default"
-        ));
+/// Resolve the visual config — the diff theme slug and the `[diff.bands]`
+/// background — logging any warnings and reporting whether one fired (the caller
+/// flashes the config-error toast). The single resolve-and-warn point, shared by
+/// startup and the live config reload so the two boundaries can't drift in what
+/// they validate and surface; everything downstream carries the already-valid
+/// `Copy` values.
+fn resolve_config_visuals(cfg: &config::Config) -> (highlight::EmbeddedThemeName, DiffBg, bool) {
+    let mut warned = false;
+    let (theme, theme_warn) = highlight::resolve_theme(cfg.diff.theme.as_deref());
+    if let Some(w) = theme_warn {
+        log::warn!("{w}");
+        warned = true;
     }
-    c
+    let (diff_bg, bg_warnings) = config::resolve_diff_bg(&cfg.diff.bands);
+    for w in &bg_warnings {
+        log::warn!("{w}");
+        warned = true;
+    }
+    (theme, diff_bg, warned)
+}
+
+/// Build the app's `DiffSettings` from the `[diff]` config section plus the two
+/// toolbar-owned fields (persisted `context`/`ignore_ws`). The single site listing
+/// which fields config owns — startup and the live reload both build through it, so
+/// a config-owned field can't be wired into one path and silently miss the other
+/// (and a new `DiffSettings` field fails to compile here until someone decides who
+/// owns it).
+const fn config_diff_settings(
+    diff: &config::DiffSection,
+    context: u32,
+    ignore_ws: bool,
+) -> DiffSettings {
+    DiffSettings {
+        context,
+        ignore_ws,
+        show_stats: diff.show_stats,
+        detect_renames: diff.detect_renames,
+        detect_copies: diff.detect_copies,
+    }
 }
 
 /// Word-diff highlight colour for a changed run on a `kind` line: `backdrop` pushed
@@ -2598,8 +2654,15 @@ const GREEN: egui::Color32 = egui::Color32::from_rgb(166, 227, 161);
 const RED: egui::Color32 = egui::Color32::from_rgb(243, 139, 168);
 const YELLOW: egui::Color32 = egui::Color32::from_rgb(249, 226, 175);
 
-/// The mauve accent (`GRAPH_COLORS[0]`) at a given alpha. A fn (not a const)
-/// because `from_rgba_unmultiplied` is gamma-correct and not const-constructible.
+/// `c` at a given alpha — for translucent tints derived from the named palette
+/// constants, so a palette retune can't leave a tint behind on the old colour.
+/// A fn (not a const) because `from_rgba_unmultiplied` is gamma-correct and not
+/// const-constructible.
+fn tinted(c: egui::Color32, alpha: u8) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
+}
+
+/// The mauve accent (`GRAPH_COLORS[0]`) at a given alpha.
 fn mauve(alpha: u8) -> egui::Color32 {
     let (r, g, b) = GRAPH_COLORS[0];
     egui::Color32::from_rgba_unmultiplied(r, g, b, alpha)
@@ -2865,6 +2928,103 @@ fn make_watcher(
     .ok()
 }
 
+/// Start the config-file live-reload watcher: watch the parent dir(s) from
+/// `config_watch_targets` (non-recursive) so edits via atomic rename (temp file +
+/// rename, as many editors do) are still seen, then filter events to the file.
+/// An atomic rename shows up as a Create (not Modify) event, which is why both
+/// kinds are matched. If the config path is a symlink, the resolved target's dir
+/// is watched too, so editing the real file (e.g. in a dotfiles repo) fires.
+/// Returns `None` when the watcher can't start or no target dir could be watched.
+fn make_config_watcher(
+    ctx: &egui::Context,
+    flag: Arc<AtomicBool>,
+    cfg_file: &std::path::Path,
+) -> Option<RecommendedWatcher> {
+    let canonical = std::fs::canonicalize(cfg_file).ok();
+    let (files, dirs) = config_watch_targets(cfg_file, canonical);
+    let mut w = make_watcher(ctx, flag, move |event| {
+        matches!(
+            event.kind,
+            notify::EventKind::Create(_) | notify::EventKind::Modify(_)
+        ) && event.paths.iter().any(|p| files.contains(p))
+    })?;
+    // Watch every target dir; succeed if at least one took. (A symlinked
+    // config has two; a regular file has one.)
+    let mut watched_any = false;
+    for dir in &dirs {
+        match w.watch(dir, RecursiveMode::NonRecursive) {
+            Ok(()) => watched_any = true,
+            Err(e) => {
+                log::warn!("config watcher: cannot watch {}: {e}", dir.display());
+            }
+        }
+    }
+    watched_any.then_some(w)
+}
+
+/// Start the `.git` watcher (refs, HEAD, index). Watch the *directories*, not the
+/// files: git replaces HEAD/index/packed-refs via lock-file + rename, and an
+/// inotify watch on the file itself dies with the old inode (`IN_IGNORED`) after the
+/// first such update — the second `git add` or `git checkout` of a session would
+/// go unseen. Same technique as `make_config_watcher`; events are filtered to the
+/// reload-relevant paths. Also returns whether coverage is degraded (a target
+/// failed to watch — surfaced as a startup issue).
+fn make_git_watcher(
+    ctx: &egui::Context,
+    flag: Arc<AtomicBool>,
+    git_dir: &std::path::Path,
+) -> (Option<RecommendedWatcher>, bool) {
+    // A worktree's commondir file names the main repo's .git dir (where
+    // refs and the shared HEAD/packed-refs live); a failed read means
+    // this isn't a worktree and everything lives in git_dir itself.
+    let commondir = std::fs::read_to_string(git_dir.join("commondir")).ok();
+    let GitWatchTargets {
+        refs_dir,
+        refs_root,
+        interesting,
+    } = git_watch_targets(git_dir, commondir.as_deref());
+    let mut watcher = make_watcher(ctx, flag, {
+        let refs_root = refs_root.clone();
+        move |event| {
+            matches!(
+                event.kind,
+                notify::EventKind::Create(_)
+                    | notify::EventKind::Modify(_)
+                    | notify::EventKind::Remove(_)
+            ) && event
+                .paths
+                .iter()
+                .any(|p| p.starts_with(&refs_root) || interesting.contains(p))
+        }
+    });
+    let mut degraded = false;
+    if let Some(ref mut w) = watcher {
+        let mut failed: Vec<String> = Vec::new();
+        // The non-recursive dir watch covers HEAD + index (+ packed-refs
+        // when this is not a worktree) surviving their atomic renames.
+        if let Err(e) = w.watch(git_dir, RecursiveMode::NonRecursive) {
+            failed.push(format!("{} ({e})", git_dir.display()));
+        }
+        if let Err(e) = w.watch(&refs_root, RecursiveMode::Recursive) {
+            failed.push(format!("refs ({e})"));
+        }
+        if refs_dir != git_dir
+            && let Err(e) = w.watch(&refs_dir, RecursiveMode::NonRecursive)
+        {
+            failed.push(format!("commondir {} ({e})", refs_dir.display()));
+        }
+
+        if !failed.is_empty() {
+            log::warn!(
+                "live-reload degraded (could not watch .git: {})",
+                failed.join(", ")
+            );
+            degraded = true;
+        }
+    }
+    (watcher, degraded)
+}
+
 fn show_toast(
     ui: &mut egui::Ui,
     toast: &mut Option<std::time::Instant>,
@@ -2894,6 +3054,7 @@ impl GitkApp {
         scope: cli::Scope,
         history_rx: &mpsc::Receiver<Vec<CommitInfo>>,
         font_rx: mpsc::Receiver<(egui::FontDefinitions, Vec<String>)>,
+        prewarm_rx: Option<mpsc::Receiver<Arc<Highlighter>>>,
     ) -> Result<Self, String> {
         let startup_t0 = std::time::Instant::now();
         let mut style = (*cc.egui_ctx.global_style()).clone();
@@ -2928,19 +3089,11 @@ impl GitkApp {
             })
             .unwrap_or_default();
         let syntax_enabled = cfg.diff.syntax;
-        // The one place a configured theme slug is validated: a typo'd theme warns
-        // here, at startup, regardless of syntax mode — everything downstream
-        // (palette, prewarm, cache keys) carries the already-valid enum.
-        let (theme, theme_warn) = configured_theme(&cfg);
-        if let Some(w) = theme_warn {
-            log::warn!("{w}");
-            startup_issue = true;
-        }
-        let (diff_bg, diff_bg_warnings) = resolve_diff_bg(&cfg.diff.bands);
-        for w in &diff_bg_warnings {
-            log::warn!("{w}");
-            startup_issue = true;
-        }
+        // Theme + band validation happens here at startup regardless of syntax
+        // mode — everything downstream (palette, prewarm, cache keys) carries the
+        // already-valid values (see resolve_config_visuals).
+        let (theme, diff_bg, visuals_warned) = resolve_config_visuals(&cfg);
+        startup_issue |= visuals_warned;
         // The diff palette is always derived from the configured theme (cheap —
         // theme blob only, no grammars).
         let diff_palette = highlight::palette_for(theme, diff_bg);
@@ -2976,36 +3129,11 @@ impl GitkApp {
             }
         };
 
-        // Watch the config file for live reload. Watch the *parent dir(s)*
-        // (non-recursive) so edits via atomic rename (temp file + rename, as
-        // many editors do) are still seen, then filter events to the file.
-        // Note: an atomic rename shows up as a Create (not Modify) event,
-        // which is why both EventKind::Create and EventKind::Modify are matched.
-        // If the config path is a symlink, config_watch_targets adds the resolved
-        // target's dir too, so editing the real file (e.g. in a dotfiles repo) fires.
+        // Watch the config file for live reload (see make_config_watcher).
         let needs_config_reload = Arc::new(AtomicBool::new(false));
-        let config_watcher = config_path.as_ref().and_then(|cfg_file| {
-            let canonical = std::fs::canonicalize(cfg_file).ok();
-            let (files, dirs) = config_watch_targets(cfg_file, canonical);
-            let mut w = make_watcher(&cc.egui_ctx, needs_config_reload.clone(), move |event| {
-                matches!(
-                    event.kind,
-                    notify::EventKind::Create(_) | notify::EventKind::Modify(_)
-                ) && event.paths.iter().any(|p| files.contains(p))
-            })?;
-            // Watch every target dir; succeed if at least one took. (A symlinked
-            // config has two; a regular file has one.)
-            let mut watched_any = false;
-            for dir in &dirs {
-                match w.watch(dir, RecursiveMode::NonRecursive) {
-                    Ok(()) => watched_any = true,
-                    Err(e) => {
-                        log::warn!("config watcher: cannot watch {}: {e}", dir.display());
-                    }
-                }
-            }
-            watched_any.then_some(w)
-        });
+        let config_watcher = config_path
+            .as_ref()
+            .and_then(|p| make_config_watcher(&cc.egui_ctx, needs_config_reload.clone(), p));
 
         if config_path.is_some() && config_watcher.is_none() {
             log::warn!("live-reload disabled (config watcher failed to start)");
@@ -3023,7 +3151,7 @@ impl GitkApp {
         let t_history = std::time::Instant::now();
         let commits = history_rx
             .recv()
-            .unwrap_or_else(|_| load_history(&repo, 200, &scope));
+            .unwrap_or_else(|_| load_history(&repo, INITIAL_COMMITS, &scope));
         log::debug!(
             "perf: startup: history ready ({} rows, new() waited {:?})",
             commits.len(),
@@ -3071,66 +3199,13 @@ impl GitkApp {
         } else {
             StartupDiff::NeedsPaint
         };
-        let all_loaded = real_commit_count(&commits) < 200;
+        let all_loaded = real_commit_count(&commits) < INITIAL_COMMITS;
 
-        // Watch .git for changes (refs, HEAD, index). Watch the *directories*,
-        // not the files: git replaces HEAD/index/packed-refs via lock-file +
-        // rename, and an inotify watch on the file itself dies with the old
-        // inode (IN_IGNORED) after the first such update — the second `git add`
-        // or `git checkout` of a session would go unseen. Same technique as the
-        // config watcher; events are filtered to the reload-relevant paths.
+        // Watch .git for changes — refs, HEAD, index (see make_git_watcher).
         let needs_reload = Arc::new(AtomicBool::new(false));
-        let watcher = {
-            let git_dir = repo.path().to_path_buf();
-            // A worktree's commondir file names the main repo's .git dir (where
-            // refs and the shared HEAD/packed-refs live); a failed read means
-            // this isn't a worktree and everything lives in git_dir itself.
-            let commondir = std::fs::read_to_string(git_dir.join("commondir")).ok();
-            let GitWatchTargets {
-                refs_dir,
-                refs_root,
-                interesting,
-            } = git_watch_targets(&git_dir, commondir.as_deref());
-            let mut watcher = make_watcher(&cc.egui_ctx, needs_reload.clone(), {
-                let refs_root = refs_root.clone();
-                move |event| {
-                    matches!(
-                        event.kind,
-                        notify::EventKind::Create(_)
-                            | notify::EventKind::Modify(_)
-                            | notify::EventKind::Remove(_)
-                    ) && event
-                        .paths
-                        .iter()
-                        .any(|p| p.starts_with(&refs_root) || interesting.contains(p))
-                }
-            });
-            if let Some(ref mut w) = watcher {
-                let mut failed: Vec<String> = Vec::new();
-                // The non-recursive dir watch covers HEAD + index (+ packed-refs
-                // when this is not a worktree) surviving their atomic renames.
-                if let Err(e) = w.watch(&git_dir, RecursiveMode::NonRecursive) {
-                    failed.push(format!("{} ({e})", git_dir.display()));
-                }
-                if let Err(e) = w.watch(&refs_root, RecursiveMode::Recursive) {
-                    failed.push(format!("refs ({e})"));
-                }
-                if refs_dir != git_dir
-                    && let Err(e) = w.watch(&refs_dir, RecursiveMode::NonRecursive)
-                {
-                    failed.push(format!("commondir {} ({e})", refs_dir.display()));
-                }
-
-                if !failed.is_empty() {
-                    log::warn!(
-                        "live-reload degraded (could not watch .git: {})",
-                        failed.join(", ")
-                    );
-                    startup_issue = true;
-                }
-            }
-            watcher
-        };
+        let (watcher, watch_degraded) =
+            make_git_watcher(&cc.egui_ctx, needs_reload.clone(), repo.path());
+        startup_issue |= watch_degraded;
 
         // Restore the persisted layout sizes (written in App::save).
         let commit_panel_height: f32 = stored(cc.storage, "commit_panel_height", 300.0);
@@ -3143,32 +3218,11 @@ impl GitkApp {
         let egui_ctx = cc.egui_ctx.clone();
         let diff_max_chars = max_line_chars(&diff_lines);
 
-        // Eagerly warm the highlighter off-thread so the first cross-language diff
-        // is already coloured. Only when syntax is on; on spawn failure, fall back
-        // to the lazy/synchronous build (prewarm_rx = None).
-        let prewarm_rx = if syntax_enabled {
-            let (tx, rx) = mpsc::channel();
-            let ctx = cc.egui_ctx.clone();
-            let repo_path_pw = repo_path.clone();
-            // Catch a panic in the (detached) prewarm thread so it's logged rather than a
-            // silent stderr message — e.g. if warm_extension panics after the highlighter
-            // was already sent and installed.
-            match spawn_guarded(
-                "gitkay-prewarm",
-                "prewarm thread panicked; highlighting falls back to the installed or synchronous highlighter",
-                move || prewarm_highlighter(&repo_path_pw, theme, diff_bg, &tx, &ctx),
-            ) {
-                Ok(_) => Some(rx),
-                Err(e) => {
-                    log::warn!(
-                        "prewarm thread spawn failed: {e}; first diff builds the highlighter synchronously"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        // The prewarmed highlighter (spawned in main(), overlapped with window init,
+        // like the history/font prefetches). With syntax off, drop the receiver —
+        // the thread bailed without building anyway — so the disabled mode stays
+        // cost-free and a mid-session enable takes the synchronous build path.
+        let prewarm_rx = if syntax_enabled { prewarm_rx } else { None };
 
         log::debug!(
             "perf: startup: GitkApp::new total {:?}",
@@ -3206,13 +3260,7 @@ impl GitkApp {
             branch_highlight: HashSet::new(),
             commit_panel_height,
             file_list_width,
-            diff_settings: DiffSettings {
-                context: diff_context,
-                ignore_ws: diff_ignore_ws,
-                show_stats: cfg.diff.show_stats,
-                detect_renames: cfg.diff.detect_renames,
-                detect_copies: cfg.diff.detect_copies,
-            },
+            diff_settings: config_diff_settings(&cfg.diff, diff_context, diff_ignore_ws),
             word_diff,
             file_list: cfg.diff.file_list,
             diff_toolbar_rect: None,
@@ -3319,6 +3367,14 @@ impl GitkApp {
         };
     }
 
+    /// The selected commit's oid, when a selection exists and is in bounds — the
+    /// single bounds-checked `selected → commits → oid` lookup.
+    fn selected_oid(&self) -> Option<git2::Oid> {
+        self.selected
+            .and_then(|s| self.commits.get(s))
+            .map(|c| c.oid)
+    }
+
     /// Pathspec to scope a commit's diff to (delegates to the pure `diff_paths_for`).
     /// Both diff entry points — the selected diff and the prefetch worker — call this,
     /// so neither can drift from the --follow path resolution.
@@ -3362,8 +3418,8 @@ impl GitkApp {
         // refreshes. Return without queueing any scroll restore so the user keeps
         // their live position.
         let sel = self.selected.filter(|&s| s < self.commits.len());
-        if let Some(s) = sel
-            && self.current_diff_key.as_ref() == Some(&self.diff_cache_key(self.commits[s].oid))
+        if let Some(oid) = self.selected_oid()
+            && self.current_diff_key.as_ref() == Some(&self.diff_cache_key(oid))
         {
             if self.diff_load_started_at.take().is_some() {
                 self.diff_load_epoch.bump();
@@ -3522,11 +3578,7 @@ impl GitkApp {
     fn awaiting(&self, key: &DiffCacheKey) -> bool {
         self.diff_load_started_at.is_some()
             && is_real_commit(key.oid)
-            && self
-                .selected
-                .and_then(|s| self.commits.get(s))
-                .map(|c| c.oid)
-                == Some(key.oid)
+            && self.selected_oid() == Some(key.oid)
             && self.key_is_current(key)
     }
 
@@ -3731,10 +3783,15 @@ impl GitkApp {
                         Some(Arc::new(prewarmed.with_theme(self.theme, self.diff_bg)));
                     self.prewarm_rx = None;
                 }
-                // Still building off-thread: render plain this frame and retry next
-                // — leave diff_needs_highlight set. The prewarm thread calls
-                // request_repaint when it sends, so a next frame happens.
-                Some(Err(mpsc::TryRecvError::Empty)) => return,
+                // Still building off-thread: render plain this frame and retry —
+                // leave diff_needs_highlight set. The prewarm thread has no
+                // Context to wake us (it starts in main(), before the window
+                // exists), so poll at a modest cadence like apply_pending_fonts;
+                // this only runs during the brief warm-up window.
+                Some(Err(mpsc::TryRecvError::Empty)) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(33));
+                    return;
+                }
                 // No prewarm (syntax toggled on mid-session) or the thread died:
                 // build synchronously, as before.
                 Some(Err(mpsc::TryRecvError::Disconnected)) | None => {
@@ -3933,10 +3990,7 @@ impl GitkApp {
             let Some(load) = result.load else {
                 continue; // worker failed (logged there); a scroll re-triggers
             };
-            let previous_oid = self
-                .selected
-                .and_then(|sel| self.commits.get(sel))
-                .map(|commit| commit.oid);
+            let previous_oid = self.selected_oid();
             let previous_index = self.selected;
             let count = match load {
                 HistoryLoad::Extend { new, max_new } => {
@@ -4028,11 +4082,6 @@ impl GitkApp {
         self.sidebar_cache = SidebarCache::default();
     }
 
-    /// Draw one grouped directory header, breadcrumb-style. `dim_len` is the byte
-    /// length of the leading path this header shares with the header above it
-    /// (`common_dir_prefix_len`); that repeated ancestor is drawn dimmed
-    /// (`SUBTEXT_DIM`) and the distinguishing tail in `SUBTEXT`, so a deep tree reads
-    /// like an indented breadcrumb instead of a wall of repeated path.
     /// File-list row height: `FILE_ROW_H` as the floor, growing with the configured
     /// `file_list` font so larger sizes don't overlap (mirrors the commit list).
     fn file_row_h(&self, ui: &egui::Ui) -> f32 {
@@ -4040,6 +4089,11 @@ impl GitkApp {
         FILE_ROW_H.max(ui.fonts_mut(|f| f.row_height(&font)) + 4.0)
     }
 
+    /// Draw one grouped directory header, breadcrumb-style. `dim_len` is the byte
+    /// length of the leading path this header shares with the header above it
+    /// (`common_dir_prefix_len`); that repeated ancestor is drawn dimmed
+    /// (`SUBTEXT_DIM`) and the distinguishing tail in `SUBTEXT`, so a deep tree reads
+    /// like an indented breadcrumb instead of a wall of repeated path.
     fn draw_dir_header(&self, ui: &mut egui::Ui, dir: &str, dim_len: usize, row_h: f32) {
         let (rect, _) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), row_h),
@@ -4219,6 +4273,226 @@ impl GitkApp {
         if resp.clicked() { line_idx } else { None }
     }
 
+    /// Draw one commit's graph cell: its lane lines (edges to/from the rows above
+    /// and below, split around the dot) and the commit dot itself. `left_x` is the
+    /// graph area's left edge; the row spans `y_center ± row_height / 2`.
+    fn draw_graph_cell(
+        &self,
+        painter: &egui::Painter,
+        idx: usize,
+        left_x: f32,
+        y_center: f32,
+        row_height: f32,
+    ) {
+        let gr = &self.graph_rows[idx];
+        let y_top = y_center - row_height / 2.0;
+        let y_bottom = y_center + row_height / 2.0;
+        let gx = |col: usize| -> f32 { left_x + col as f32 * GRAPH_COL_W + GRAPH_COL_W / 2.0 };
+
+        // Whether this node has an incoming line from the row above is
+        // loop-invariant — compute it once per row, not once per graph line.
+        let has_incoming = idx > 0
+            && self.graph_rows[idx - 1]
+                .lines
+                .iter()
+                .any(|&(_, to, _)| to == gr.node_col);
+
+        for &(from, to, color_col) in &gr.lines {
+            let c = graph_color(color_col).linear_multiply(if from == to { 0.5 } else { 0.7 });
+            let stroke = egui::Stroke::new(2.0_f32, c);
+            let x_top = gx(from);
+            let x_bot = gx(to);
+
+            // Check if this line passes through the node
+            let touches_node = from == gr.node_col || to == gr.node_col;
+
+            if !touches_node {
+                // Straight or diagonal, doesn't touch the node
+                painter.line_segment(
+                    [egui::pos2(x_top, y_top), egui::pos2(x_bot, y_bottom)],
+                    stroke,
+                );
+            } else if from == to && from == gr.node_col {
+                // Node's own lane continuation: split around dot
+                if has_incoming {
+                    painter.line_segment(
+                        [
+                            egui::pos2(x_top, y_top),
+                            egui::pos2(x_top, y_center - GRAPH_DOT_R - 1.0),
+                        ],
+                        stroke,
+                    );
+                }
+                painter.line_segment(
+                    [
+                        egui::pos2(x_bot, y_center + GRAPH_DOT_R + 1.0),
+                        egui::pos2(x_bot, y_bottom),
+                    ],
+                    stroke,
+                );
+            } else if from == gr.node_col {
+                // Outgoing from node: dot center → target column bottom
+                painter.line_segment(
+                    [
+                        egui::pos2(gx(gr.node_col), y_center),
+                        egui::pos2(x_bot, y_bottom),
+                    ],
+                    stroke,
+                );
+            } else if to == gr.node_col {
+                // Incoming to node: source column top → dot center
+                painter.line_segment(
+                    [
+                        egui::pos2(x_top, y_top),
+                        egui::pos2(gx(gr.node_col), y_center),
+                    ],
+                    stroke,
+                );
+            }
+        }
+
+        // Commit dot
+        painter.circle_filled(
+            egui::pos2(gx(gr.node_col), y_center),
+            GRAPH_DOT_R,
+            graph_color(gr.node_color),
+        );
+    }
+
+    /// Draw a commit's ref-label chips (branch/tag/HEAD/…) left-to-right from
+    /// `start_x`, one coloured pill per ref, returning the x where the summary
+    /// text should start.
+    fn draw_ref_chips(
+        &self,
+        painter: &egui::Painter,
+        refs: &[(String, RefKind)],
+        start_x: f32,
+        y_center: f32,
+    ) -> f32 {
+        let mut cursor_x = start_x;
+        for (ref_name, kind) in refs {
+            let (bg, fg) = match kind {
+                RefKind::Head => (egui::Color32::from_rgb(80, 40, 50), RED),
+                RefKind::Tag => (egui::Color32::from_rgb(60, 55, 30), YELLOW),
+                RefKind::Reflog => (SURFACE0, SUBTEXT),
+                // The virtual rows keep the same styling they had
+                // when they borrowed Head/Tag, but as their own
+                // kinds — restyling real HEAD/tag chips can no
+                // longer silently restyle these.
+                #[allow(clippy::match_same_arms)]
+                RefKind::WorkingTree => (egui::Color32::from_rgb(80, 40, 50), RED),
+                #[allow(clippy::match_same_arms)]
+                // deliberately identical to Tag, not merged (see above)
+                RefKind::Index => (egui::Color32::from_rgb(60, 55, 30), YELLOW),
+                RefKind::Branch | RefKind::Remote => {
+                    // Unique color per branch/remote name
+                    let color = ref_color(ref_name);
+                    let bg = egui::Color32::from_rgba_unmultiplied(
+                        (color.r() / 4).max(20),
+                        (color.g() / 4).max(20),
+                        (color.b() / 4).max(20),
+                        200,
+                    );
+                    (bg, color)
+                }
+            };
+            let font = self.fonts.font_id(Role::Refs);
+            let galley = painter.layout_no_wrap(ref_name.clone(), font, fg);
+            let label_w = galley.size().x + 10.0;
+            // Chip height/centering follow the galley so a
+            // configured refs font size still fits its pill.
+            let label_h = galley.size().y + 3.0;
+            let galley_h = galley.size().y;
+            let label_rect = egui::Rect::from_min_size(
+                egui::pos2(cursor_x, y_center - label_h / 2.0),
+                egui::vec2(label_w, label_h),
+            );
+            painter.rect_filled(label_rect, 4.0, bg);
+            painter.galley(
+                egui::pos2(cursor_x + 5.0, y_center - galley_h / 2.0),
+                galley,
+                fg,
+            );
+            cursor_x += label_w + 4.0;
+        }
+        cursor_x
+    }
+
+    /// Draw a commit row's text: the summary (clipped so it can't overflow into the
+    /// right-aligned block) plus short SHA, author, and date. `cursor_x` is where
+    /// the ref chips ended; `is_branch_member` drives the branch-highlight dimming.
+    fn draw_row_text(
+        &self,
+        painter: &egui::Painter,
+        commit: &CommitInfo,
+        row_rect: egui::Rect,
+        cursor_x: f32,
+        is_branch_member: bool,
+    ) {
+        let y_center = row_rect.center().y;
+
+        // Author + date (right-aligned) — compute first to know where
+        // summary must stop. date_str / short_sha are precomputed per
+        // commit (see CommitInfo::new), so this per-frame path only lays
+        // them out, never re-formats.
+        let right_x = row_rect.max.x;
+        let date_font = self.fonts.font_id(Role::CommitMeta);
+        let date_galley =
+            painter.layout_no_wrap(commit.date_str.clone(), date_font.clone(), SUBTEXT);
+        let date_w = date_galley.size().x;
+
+        // Short SHA
+        let sha_galley =
+            painter.layout_no_wrap(commit.short_sha.clone(), date_font.clone(), SUBTEXT);
+        let sha_w = sha_galley.size().x;
+
+        let a_color = author_color(&commit.author);
+        let author_galley = painter.layout_no_wrap(commit.author.clone(), date_font, a_color);
+        let author_w = author_galley.size().x;
+
+        let author_date_x = right_x - date_w - author_w - sha_w - 40.0;
+
+        // Summary — truncate to available space before author
+        let summary_max_w = (author_date_x - cursor_x - 12.0).max(20.0);
+        let has_highlight = !self.branch_highlight.is_empty();
+        let search_active = !self.search_matches.is_empty();
+        let summary_color = if search_active || !has_highlight || is_branch_member {
+            TEXT
+        } else {
+            SUBTEXT // dim non-branch commits
+        };
+        let summary_font = self.fonts.font_id(Role::CommitSummary);
+        let summary_galley =
+            painter.layout_no_wrap(commit.summary.clone(), summary_font, summary_color);
+        // Clip to not overflow into author/date
+        let summary_clip = egui::Rect::from_min_max(
+            egui::pos2(cursor_x + 4.0, row_rect.min.y),
+            egui::pos2(cursor_x + 4.0 + summary_max_w, row_rect.max.y),
+        );
+        // Center each galley on the row so configured font
+        // sizes stay vertically centred instead of clipping.
+        let summary_y = y_center - summary_galley.size().y / 2.0;
+        painter.with_clip_rect(summary_clip).galley(
+            egui::pos2(cursor_x + 4.0, summary_y),
+            summary_galley,
+            TEXT,
+        );
+
+        // Draw SHA, author, date (right-aligned)
+        let meta_y = y_center - date_galley.size().y / 2.0;
+        let mut rx = author_date_x;
+        if sha_w > 0.0 {
+            painter.galley(egui::pos2(rx, meta_y), sha_galley, SUBTEXT);
+            rx += sha_w + 8.0;
+        }
+        painter.galley(egui::pos2(rx, meta_y), author_galley, a_color);
+        painter.galley(
+            egui::pos2(right_x - date_w - 8.0, meta_y),
+            date_galley,
+            SUBTEXT,
+        );
+    }
+
     fn show_commit_list(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         // Row height follows the largest configured row font (summary/meta) so
         // `[text]` sizes beyond the default don't overlap or clip; today's 20px
@@ -4228,8 +4502,6 @@ impl GitkApp {
                 .max(f.row_height(&self.fonts.font_id(Role::CommitMeta)))
         });
         let row_height = 20.0f32.max(text_h + 4.0);
-        let col_width = 12.0;
-        let dot_radius = 3.5;
         let max_graph_cols = 20;
 
         // ── Commit list: a resizable top panel. egui remembers its height
@@ -4248,7 +4520,7 @@ impl GitkApp {
                 let graph_width = if reflog_mode {
                     4.0
                 } else {
-                    (self.graph_max_cols.min(max_graph_cols) as f32) * col_width + 8.0
+                    (self.graph_max_cols.min(max_graph_cols) as f32) * GRAPH_COL_W + 8.0
                 };
 
                 let graph_scroll_to = self.graph_scroll_to.take();
@@ -4310,11 +4582,9 @@ impl GitkApp {
 
                         for idx in row_range.clone() {
                             let commit = &self.commits[idx];
-                            let gr = &self.graph_rows[idx];
                             let row_offset = (idx - row_range.start) as f32;
                             let y_center = top_left.y + row_offset * row_height + row_height / 2.0;
                             let y_top = y_center - row_height / 2.0;
-                            let y_bottom = y_center + row_height / 2.0;
 
                             // Row background
                             let row_rect = egui::Rect::from_min_size(
@@ -4331,18 +4601,10 @@ impl GitkApp {
                             // (handled via brighter text below).
                             match kind {
                                 CommitKind::Uncommitted => {
-                                    painter.rect_filled(
-                                        row_rect,
-                                        0.0,
-                                        egui::Color32::from_rgba_unmultiplied(243, 139, 168, 18),
-                                    );
+                                    painter.rect_filled(row_rect, 0.0, tinted(RED, 18));
                                 }
                                 CommitKind::Staged => {
-                                    painter.rect_filled(
-                                        row_rect,
-                                        0.0,
-                                        egui::Color32::from_rgba_unmultiplied(166, 227, 161, 18),
-                                    );
+                                    painter.rect_filled(row_rect, 0.0, tinted(GREEN, 18));
                                 }
                                 CommitKind::Real => {}
                             }
@@ -4367,207 +4629,21 @@ impl GitkApp {
                             }
 
                             if !reflog_mode {
-                                let gx = |col: usize| -> f32 {
-                                    top_left.x + col as f32 * col_width + col_width / 2.0
-                                };
-
-                                // Whether this node has an incoming line from the row
-                                // above is loop-invariant — compute it once per row, not
-                                // once per graph line.
-                                let has_incoming = idx > 0
-                                    && self.graph_rows[idx - 1]
-                                        .lines
-                                        .iter()
-                                        .any(|&(_, to, _)| to == gr.node_col);
-
-                                // ── Graph ──
-                                for &(from, to, color_col) in &gr.lines {
-                                    let c = graph_color(color_col).linear_multiply(if from == to {
-                                        0.5
-                                    } else {
-                                        0.7
-                                    });
-                                    let stroke = egui::Stroke::new(2.0_f32, c);
-                                    let x_top = gx(from);
-                                    let x_bot = gx(to);
-
-                                    // Check if this line passes through the node
-                                    let touches_node = from == gr.node_col || to == gr.node_col;
-
-                                    if !touches_node {
-                                        // Straight or diagonal, doesn't touch the node
-                                        painter.line_segment(
-                                            [egui::pos2(x_top, y_top), egui::pos2(x_bot, y_bottom)],
-                                            stroke,
-                                        );
-                                    } else if from == to && from == gr.node_col {
-                                        // Node's own lane continuation: split around dot
-                                        if has_incoming {
-                                            painter.line_segment(
-                                                [
-                                                    egui::pos2(x_top, y_top),
-                                                    egui::pos2(x_top, y_center - dot_radius - 1.0),
-                                                ],
-                                                stroke,
-                                            );
-                                        }
-                                        painter.line_segment(
-                                            [
-                                                egui::pos2(x_bot, y_center + dot_radius + 1.0),
-                                                egui::pos2(x_bot, y_bottom),
-                                            ],
-                                            stroke,
-                                        );
-                                    } else if from == gr.node_col {
-                                        // Outgoing from node: dot center → target column bottom
-                                        painter.line_segment(
-                                            [
-                                                egui::pos2(gx(gr.node_col), y_center),
-                                                egui::pos2(x_bot, y_bottom),
-                                            ],
-                                            stroke,
-                                        );
-                                    } else if to == gr.node_col {
-                                        // Incoming to node: source column top → dot center
-                                        painter.line_segment(
-                                            [
-                                                egui::pos2(x_top, y_top),
-                                                egui::pos2(gx(gr.node_col), y_center),
-                                            ],
-                                            stroke,
-                                        );
-                                    }
-                                }
-
-                                // Commit dot
-                                painter.circle_filled(
-                                    egui::pos2(gx(gr.node_col), y_center),
-                                    dot_radius,
-                                    graph_color(gr.node_color),
+                                self.draw_graph_cell(
+                                    &painter, idx, top_left.x, y_center, row_height,
                                 );
                             }
-                            // ── Text ──
+
+                            // ── Text: ref chips, then summary + right-aligned meta ──
                             let text_x = top_left.x + graph_width;
-                            let mut cursor_x = text_x;
-
-                            // Ref labels — unique color per ref name
-                            for (ref_name, kind) in &commit.refs {
-                                let (bg, fg) = match kind {
-                                    RefKind::Head => (egui::Color32::from_rgb(80, 40, 50), RED),
-                                    RefKind::Tag => (egui::Color32::from_rgb(60, 55, 30), YELLOW),
-                                    RefKind::Reflog => (SURFACE0, SUBTEXT),
-                                    // The virtual rows keep the same styling they had
-                                    // when they borrowed Head/Tag, but as their own
-                                    // kinds — restyling real HEAD/tag chips can no
-                                    // longer silently restyle these.
-                                    RefKind::WorkingTree => {
-                                        (egui::Color32::from_rgb(80, 40, 50), RED)
-                                    }
-                                    #[allow(clippy::match_same_arms)]
-                                    // deliberately identical to Tag, not merged (see above)
-                                    RefKind::Index => (egui::Color32::from_rgb(60, 55, 30), YELLOW),
-                                    RefKind::Branch | RefKind::Remote => {
-                                        // Unique color per branch/remote name
-                                        let color = ref_color(ref_name);
-                                        let bg = egui::Color32::from_rgba_unmultiplied(
-                                            (color.r() / 4).max(20),
-                                            (color.g() / 4).max(20),
-                                            (color.b() / 4).max(20),
-                                            200,
-                                        );
-                                        (bg, color)
-                                    }
-                                };
-                                let font = self.fonts.font_id(Role::Refs);
-                                let galley = painter.layout_no_wrap(ref_name.clone(), font, fg);
-                                let label_w = galley.size().x + 10.0;
-                                // Chip height/centering follow the galley so a
-                                // configured refs font size still fits its pill.
-                                let label_h = galley.size().y + 3.0;
-                                let galley_h = galley.size().y;
-                                let label_rect = egui::Rect::from_min_size(
-                                    egui::pos2(cursor_x, y_center - label_h / 2.0),
-                                    egui::vec2(label_w, label_h),
-                                );
-                                painter.rect_filled(label_rect, 4.0, bg);
-                                painter.galley(
-                                    egui::pos2(cursor_x + 5.0, y_center - galley_h / 2.0),
-                                    galley,
-                                    fg,
-                                );
-                                cursor_x += label_w + 4.0;
-                            }
-
-                            // Author + date (right-aligned) — compute first to know where
-                            // summary must stop. date_str / short_sha are precomputed per
-                            // commit (see CommitInfo::new), so this per-frame path only lays
-                            // them out, never re-formats.
-                            let right_x = row_rect.max.x;
-                            let date_font = self.fonts.font_id(Role::CommitMeta);
-                            let date_galley = painter.layout_no_wrap(
-                                commit.date_str.clone(),
-                                date_font.clone(),
-                                SUBTEXT,
-                            );
-                            let date_w = date_galley.size().x;
-
-                            // Short SHA
-                            let sha_galley = painter.layout_no_wrap(
-                                commit.short_sha.clone(),
-                                date_font.clone(),
-                                SUBTEXT,
-                            );
-                            let sha_w = sha_galley.size().x;
-
-                            let a_color = author_color(&commit.author);
-                            let author_galley =
-                                painter.layout_no_wrap(commit.author.clone(), date_font, a_color);
-                            let author_w = author_galley.size().x;
-
-                            let author_date_x = right_x - date_w - author_w - sha_w - 40.0;
-
-                            // Summary — truncate to available space before author
-                            let summary_max_w = (author_date_x - cursor_x - 12.0).max(20.0);
-                            let has_highlight = !self.branch_highlight.is_empty();
-                            let search_active = !self.search_matches.is_empty();
-                            let summary_color =
-                                if search_active || !has_highlight || is_branch_member {
-                                    TEXT
-                                } else {
-                                    SUBTEXT // dim non-branch commits
-                                };
-                            let summary_font = self.fonts.font_id(Role::CommitSummary);
-                            let summary_galley = painter.layout_no_wrap(
-                                commit.summary.clone(),
-                                summary_font,
-                                summary_color,
-                            );
-                            // Clip to not overflow into author/date
-                            let summary_clip = egui::Rect::from_min_max(
-                                egui::pos2(cursor_x + 4.0, y_top),
-                                egui::pos2(cursor_x + 4.0 + summary_max_w, y_bottom),
-                            );
-                            // Center each galley on the row so configured font
-                            // sizes stay vertically centred instead of clipping.
-                            let summary_y = y_center - summary_galley.size().y / 2.0;
-                            painter.with_clip_rect(summary_clip).galley(
-                                egui::pos2(cursor_x + 4.0, summary_y),
-                                summary_galley,
-                                TEXT,
-                            );
-
-                            // Draw SHA, author, date (right-aligned)
-                            let meta_y = y_center - date_galley.size().y / 2.0;
-                            let mut rx = author_date_x;
-                            if sha_w > 0.0 {
-                                painter.galley(egui::pos2(rx, meta_y), sha_galley, SUBTEXT);
-                                rx += sha_w + 8.0;
-                            }
-                            painter.galley(egui::pos2(rx, meta_y), author_galley, a_color);
-                            painter.galley(
-                                egui::pos2(right_x - date_w - 8.0, meta_y),
-                                date_galley,
-                                SUBTEXT,
+                            let cursor_x =
+                                self.draw_ref_chips(&painter, &commit.refs, text_x, y_center);
+                            self.draw_row_text(
+                                &painter,
+                                commit,
+                                row_rect,
+                                cursor_x,
+                                is_branch_member,
                             );
                         }
 
@@ -4602,7 +4678,7 @@ impl GitkApp {
                             self.dispatch_history_load(HistoryJobKind::Extend {
                                 skip: real_commit_count(&self.commits),
                                 expect_last: last_real.oid,
-                                max_new: 500,
+                                max_new: LOAD_BATCH,
                             });
                         }
                     });
@@ -4613,6 +4689,197 @@ impl GitkApp {
             &mut self.commit_panel_height,
             commit_panel.response.rect.height(),
         );
+    }
+
+    /// The diff-options hover toolbar: hidden until the pointer is near the top of
+    /// the diff panel (`panel_rect`), then shown as a floating overlay so it never
+    /// takes vertical space from the diff. A changed option re-diffs immediately.
+    fn show_diff_toolbar(&mut self, panel_rect: egui::Rect, ctx: &egui::Context) {
+        // Anchor the overlay just below the panel's resize-grab strip so it
+        // doesn't sit on top of (and steal drags from) the splitter handle.
+        let toolbar_pos = egui::pos2(panel_rect.min.x, panel_rect.min.y + 8.0);
+        // Hover zone starts below the resize edge and is tall enough to
+        // cover the whole toolbar (avoids flicker at the toolbar's bottom edge).
+        let hover_zone = egui::Rect::from_min_max(
+            egui::pos2(panel_rect.min.x, panel_rect.min.y + 6.0),
+            egui::pos2(panel_rect.max.x, panel_rect.min.y + 46.0),
+        );
+        // Reveal when the pointer is over the top strip OR still over the
+        // toolbar itself. Use the raw pointer position rather than
+        // rect_contains_pointer, which is occlusion-aware and flickers
+        // once the foreground overlay slides under the cursor.
+        let show_toolbar = ctx.pointer_hover_pos().is_some_and(|p| {
+            hover_zone.contains(p)
+                || self
+                    .diff_toolbar_rect
+                    .is_some_and(|r| r.expand(2.0).contains(p))
+        });
+        let mut diff_opts_changed = false;
+        if show_toolbar {
+            let area = egui::Area::new(egui::Id::new("diff_opts_toolbar"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(toolbar_pos)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Context:");
+                            if ui.small_button("-").clicked() {
+                                self.diff_settings.context =
+                                    self.diff_settings.context.saturating_sub(1);
+                                diff_opts_changed = true;
+                            }
+                            ui.label(
+                                egui::RichText::new(self.diff_settings.context.to_string())
+                                    .font(self.fonts.font_id(Role::Ui)),
+                            );
+                            if ui.small_button("+").clicked() {
+                                self.diff_settings.context =
+                                    self.diff_settings.context.saturating_add(1).min(99);
+                                diff_opts_changed = true;
+                            }
+                            ui.add_space(12.0);
+                            diff_opts_changed |= ui
+                                .checkbox(&mut self.diff_settings.ignore_ws, "Ignore whitespace")
+                                .changed();
+                            diff_opts_changed |= ui
+                                .checkbox(&mut self.diff_settings.detect_renames, "Detect renames")
+                                .changed();
+                            diff_opts_changed |= ui
+                                .checkbox(&mut self.diff_settings.detect_copies, "Detect copies")
+                                .changed();
+                            // Word-diff only changes the render, so no diff
+                            // reload. Emphasis fills lazily per viewport
+                            // (ensure_visible_word_emphasis) at the top of
+                            // the next frame — nudge one so an enable with
+                            // no further input still emphasizes.
+                            if ui.checkbox(&mut self.word_diff, "Word diff").changed()
+                                && self.word_diff
+                            {
+                                ui.ctx().request_repaint();
+                            }
+                        });
+                    });
+                });
+            self.diff_toolbar_rect = Some(area.response.rect);
+        } else {
+            self.diff_toolbar_rect = None;
+        }
+        if diff_opts_changed {
+            self.load_selected_diff();
+        }
+    }
+
+    /// The resizable file-list sidebar (right panel): draggable splitter, width
+    /// persisted across runs (see `App::save`). Shown only when the selected commit
+    /// touches files and the pane isn't blanked to the loading placeholder; returns
+    /// the panel rect (for the divider line) when shown.
+    fn show_file_sidebar(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        showing_placeholder: bool,
+    ) -> Option<egui::Rect> {
+        if self.diff_files.is_empty() || showing_placeholder {
+            return None;
+        }
+        let saved_w = self.file_list_width;
+        // Let the sidebar grow with the window — up to all but a readable
+        // ~300px strip for the diff — so paths have room on wide screens.
+        // Floor at the panel min (not 400) so the diff keeps its strip on
+        // narrow windows too. `ui` here still spans the whole diff region
+        // (the diff's central panel is carved out after this right panel).
+        let max_w = (ui.available_width() - 300.0).max(FILE_LIST_MIN_W);
+        let file_panel = egui::Panel::right("file_list_panel")
+            .resizable(true)
+            .default_size(saved_w)
+            .min_size(FILE_LIST_MIN_W)
+            .max_size(max_w)
+            .frame(egui::Frame::NONE)
+            .show_inside(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(format!("{} files", self.diff_files.len()))
+                        .color(SUBTEXT)
+                        .font(self.fonts.font_id(Role::Ui)),
+                );
+                ui.add_space(4.0);
+                let mut file_scroll = egui::ScrollArea::vertical().id_salt("file_list");
+                // Apply a queued per-commit restore (see
+                // load_selected_diff) only once the sidebar shows the
+                // diff it was queued for — never mid-load, when the
+                // rows on screen still belong to the outgoing diff.
+                if self.diff_load_started_at.is_none()
+                    && let Some(y) = self.file_list_scroll_to.take()
+                {
+                    file_scroll = file_scroll.vertical_scroll_offset(y);
+                }
+                let file_scroll_out = file_scroll.show(ui, |ui| {
+                    // The file the diff is scrolled into (None while
+                    // still in the commit header) — highlighted below
+                    // with the same accent the commit list uses for the
+                    // selected row, so the list tracks the diff view.
+                    let top = self.diff_top_line.load(Ordering::Relaxed);
+                    let current_file = file_index_at_line_opt(&self.file_line_starts, top);
+                    // Shared by every row this frame — the metric
+                    // lookup takes the font lock, so don't repeat
+                    // it per row (this list isn't virtualized).
+                    let row_h = self.file_row_h(ui);
+                    // Take the render cache out of self so the
+                    // `&self` row draws can fill it while the
+                    // row list is borrowed.
+                    let mut cache = std::mem::take(&mut self.sidebar_cache);
+                    cache.ensure(self.diff_files.len(), ui.available_width());
+                    let mut frame = SidebarFrame {
+                        row_h,
+                        current_file,
+                        cache: &mut cache,
+                    };
+                    let mut scroll_to: Option<usize> = None;
+                    for row in &self.file_rows {
+                        match row {
+                            FileListRow::Header { dir, dim_len } => {
+                                self.draw_dir_header(ui, dir, *dim_len, row_h);
+                            }
+                            FileListRow::File {
+                                idx,
+                                label,
+                                indented,
+                            } => {
+                                let indent = if *indented { FILE_INDENT } else { 0.0 };
+                                if let Some(li) =
+                                    self.draw_file_row(ui, *idx, label, indent, &mut frame)
+                                {
+                                    scroll_to = Some(li);
+                                }
+                            }
+                        }
+                    }
+                    self.sidebar_cache = cache;
+                    // Ignore a click while a diff load is in flight:
+                    // the sidebar still shows the OUTGOING diff, so
+                    // the clicked line index is in its coordinates —
+                    // the render deliberately preserves diff_scroll_to
+                    // across the load, so the stale target would jump
+                    // the INCOMING diff to an arbitrary line.
+                    if let Some(li) = scroll_to
+                        && self.diff_load_started_at.is_none()
+                    {
+                        self.diff_scroll_to = Some(li);
+                    }
+                    // Breathing room so the last file isn't flush
+                    // against the bottom edge.
+                    ui.add_space(BOTTOM_PAD_ROWS as f32 * row_h);
+                });
+                // Live offset — what stash_current_diff remembers
+                // for this commit when its diff is replaced.
+                self.file_list_scroll = file_scroll_out.state.offset.y;
+            });
+        persist_on_resize_drag(
+            ctx,
+            "file_list_panel",
+            &mut self.file_list_width,
+            file_panel.response.rect.width(),
+        );
+        Some(file_panel.response.rect)
     }
 
     /// Apply deferred fonts once an off-thread build finishes — the startup
@@ -4656,7 +4923,7 @@ impl GitkApp {
                 // Rebuild on a worker (the walk stalls the frame loop on a
                 // long-loaded history); the result lands in drain_history_results,
                 // which re-anchors the selection and refreshes the diff.
-                let count = real_commit_count(&self.commits).max(200);
+                let count = real_commit_count(&self.commits).max(INITIAL_COMMITS);
                 self.dispatch_history_load(HistoryJobKind::Rebuild { count });
             } else {
                 // Wake up when the debounce window closes to run the reload.
@@ -4700,19 +4967,10 @@ impl GitkApp {
                     warned |= !warns.is_empty();
                 }
                 let new_enabled = cfg.diff.syntax;
-                // The reload's one theme-validation point (mirrors startup).
-                let (new_theme, theme_warn) = configured_theme(&cfg);
-                if let Some(w) = theme_warn {
-                    log::warn!("{w}");
-                    warned = true;
-                }
-                let (new_diff_bg, diff_bg_warnings) = resolve_diff_bg(&cfg.diff.bands);
-                // Surface diff-background warnings (stderr now, toast below)
+                // Same resolve-and-warn path as startup (stderr now, toast below),
                 // so config typos aren't silent on a headless desktop.
-                for w in &diff_bg_warnings {
-                    log::warn!("{w}");
-                    warned = true;
-                }
+                let (new_theme, new_diff_bg, visuals_warned) = resolve_config_visuals(&cfg);
+                warned |= visuals_warned;
                 if new_enabled != self.syntax_enabled
                     || new_theme != self.theme
                     || new_diff_bg != self.diff_bg
@@ -4750,12 +5008,16 @@ impl GitkApp {
                     for line in &mut self.diff_lines {
                         line.spans = None;
                     }
-                    // Re-key the live diff so its eventual stash lands under
-                    // the new theme/enabled, not the old key.
-                    if let Some(key) = &mut self.current_diff_key {
-                        key.theme = new_theme;
-                        key.enabled = new_enabled;
-                    }
+                    // Re-key the live diff so its eventual stash lands under the
+                    // new theme/enabled, not the old key. Rebuilt through
+                    // diff_cache_key (settings are still the pre-reload ones the
+                    // displayed diff was built with) rather than patched
+                    // member-wise, so a future key field can't be left stale
+                    // here; only the virtual entries' content hash carries over.
+                    self.current_diff_key = self.current_diff_key.take().map(|k| DiffCacheKey {
+                        content: k.content,
+                        ..self.diff_cache_key(k.oid)
+                    });
                     // Bumps the generation so an in-flight old-theme worker's
                     // queued spans are dropped, not applied for a frame.
                     self.invalidate_diff_highlight();
@@ -4770,14 +5032,14 @@ impl GitkApp {
                 // that also resets on launch; config wins). Reload at most once,
                 // even when several of these flip in the same save.
                 // Config owns show_stats + rename/copy detection; context/ignore_ws are
-                // toolbar-owned, so keep them (`..`). Comparing the whole DiffSettings
-                // means a field added to it can't silently skip the reload.
-                let new_settings = DiffSettings {
-                    show_stats: cfg.diff.show_stats,
-                    detect_renames: cfg.diff.detect_renames,
-                    detect_copies: cfg.diff.detect_copies,
-                    ..self.diff_settings
-                };
+                // toolbar-owned, so the current values pass through (the ownership split
+                // lives in config_diff_settings). Comparing the whole DiffSettings means
+                // a field added to it can't silently skip the reload.
+                let new_settings = config_diff_settings(
+                    &cfg.diff,
+                    self.diff_settings.context,
+                    self.diff_settings.ignore_ws,
+                );
                 let reload_diff = new_settings != self.diff_settings;
                 self.diff_settings = new_settings;
                 // The file-list layout is render-only (it doesn't touch diff data).
@@ -5182,91 +5444,9 @@ impl eframe::App for GitkApp {
                 ui.separator();
                 ui.add_space(2.0);
 
-                // Diff options toolbar — hidden until the pointer is near the top
-                // of the diff panel, then shown as a floating overlay so it never
-                // takes vertical space from the diff.
-                let panel_rect = ui.max_rect();
-                // Anchor the overlay just below the panel's resize-grab strip so it
-                // doesn't sit on top of (and steal drags from) the splitter handle.
-                let toolbar_pos = egui::pos2(panel_rect.min.x, panel_rect.min.y + 8.0);
-                // Hover zone starts below the resize edge and is tall enough to
-                // cover the whole toolbar (avoids flicker at the toolbar's bottom edge).
-                let hover_zone = egui::Rect::from_min_max(
-                    egui::pos2(panel_rect.min.x, panel_rect.min.y + 6.0),
-                    egui::pos2(panel_rect.max.x, panel_rect.min.y + 46.0),
-                );
-                // Reveal when the pointer is over the top strip OR still over the
-                // toolbar itself. Use the raw pointer position rather than
-                // rect_contains_pointer, which is occlusion-aware and flickers
-                // once the foreground overlay slides under the cursor.
-                let show_toolbar = ctx.pointer_hover_pos().is_some_and(|p| {
-                    hover_zone.contains(p)
-                        || self
-                            .diff_toolbar_rect
-                            .is_some_and(|r| r.expand(2.0).contains(p))
-                });
-                let mut diff_opts_changed = false;
-                if show_toolbar {
-                    let area = egui::Area::new(egui::Id::new("diff_opts_toolbar"))
-                        .order(egui::Order::Foreground)
-                        .fixed_pos(toolbar_pos)
-                        .show(&ctx, |ui| {
-                            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label("Context:");
-                                    if ui.small_button("-").clicked() {
-                                        self.diff_settings.context =
-                                            self.diff_settings.context.saturating_sub(1);
-                                        diff_opts_changed = true;
-                                    }
-                                    ui.label(
-                                        egui::RichText::new(self.diff_settings.context.to_string())
-                                            .font(self.fonts.font_id(Role::Ui)),
-                                    );
-                                    if ui.small_button("+").clicked() {
-                                        self.diff_settings.context =
-                                            self.diff_settings.context.saturating_add(1).min(99);
-                                        diff_opts_changed = true;
-                                    }
-                                    ui.add_space(12.0);
-                                    diff_opts_changed |= ui
-                                        .checkbox(
-                                            &mut self.diff_settings.ignore_ws,
-                                            "Ignore whitespace",
-                                        )
-                                        .changed();
-                                    diff_opts_changed |= ui
-                                        .checkbox(
-                                            &mut self.diff_settings.detect_renames,
-                                            "Detect renames",
-                                        )
-                                        .changed();
-                                    diff_opts_changed |= ui
-                                        .checkbox(
-                                            &mut self.diff_settings.detect_copies,
-                                            "Detect copies",
-                                        )
-                                        .changed();
-                                    // Word-diff only changes the render, so no diff
-                                    // reload. Emphasis fills lazily per viewport
-                                    // (ensure_visible_word_emphasis) at the top of
-                                    // the next frame — nudge one so an enable with
-                                    // no further input still emphasizes.
-                                    if ui.checkbox(&mut self.word_diff, "Word diff").changed()
-                                        && self.word_diff
-                                    {
-                                        ui.ctx().request_repaint();
-                                    }
-                                });
-                            });
-                        });
-                    self.diff_toolbar_rect = Some(area.response.rect);
-                } else {
-                    self.diff_toolbar_rect = None;
-                }
-                if diff_opts_changed {
-                    self.load_selected_diff();
-                }
+                // Diff options toolbar — a floating hover overlay (see
+                // show_diff_toolbar).
+                self.show_diff_toolbar(ui.max_rect(), &ctx);
 
                 // A diff-load worker is computing the selected commit's diff. Until it
                 // lands we keep the previous diff (and its sidebar) on screen so fast
@@ -5278,114 +5458,8 @@ impl eframe::App for GitkApp {
                 let showing_placeholder =
                     diff_load_elapsed.is_some_and(|e| e >= DIFF_PLACEHOLDER_DELAY);
 
-                // Right: resizable file-list sidebar — draggable splitter, width
-                // persisted across runs (see App::save). Shown only when the selected
-                // commit touches files and we're not blanked to the placeholder.
-                let divider: Option<egui::Rect> = if !self.diff_files.is_empty()
-                    && !showing_placeholder
-                {
-                    let saved_w = self.file_list_width;
-                    // Let the sidebar grow with the window — up to all but a readable
-                    // ~300px strip for the diff — so paths have room on wide screens.
-                    // Floor at the panel min (not 400) so the diff keeps its strip on
-                    // narrow windows too. `ui` here still spans the whole diff region
-                    // (the diff's central panel is carved out after this right panel).
-                    let max_w = (ui.available_width() - 300.0).max(FILE_LIST_MIN_W);
-                    let file_panel = egui::Panel::right("file_list_panel")
-                        .resizable(true)
-                        .default_size(saved_w)
-                        .min_size(FILE_LIST_MIN_W)
-                        .max_size(max_w)
-                        .frame(egui::Frame::NONE)
-                        .show_inside(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(format!("{} files", self.diff_files.len()))
-                                    .color(SUBTEXT)
-                                    .font(self.fonts.font_id(Role::Ui)),
-                            );
-                            ui.add_space(4.0);
-                            let mut file_scroll = egui::ScrollArea::vertical().id_salt("file_list");
-                            // Apply a queued per-commit restore (see
-                            // load_selected_diff) only once the sidebar shows the
-                            // diff it was queued for — never mid-load, when the
-                            // rows on screen still belong to the outgoing diff.
-                            if self.diff_load_started_at.is_none()
-                                && let Some(y) = self.file_list_scroll_to.take()
-                            {
-                                file_scroll = file_scroll.vertical_scroll_offset(y);
-                            }
-                            let file_scroll_out = file_scroll.show(ui, |ui| {
-                                // The file the diff is scrolled into (None while
-                                // still in the commit header) — highlighted below
-                                // with the same accent the commit list uses for the
-                                // selected row, so the list tracks the diff view.
-                                let top = self.diff_top_line.load(Ordering::Relaxed);
-                                let current_file =
-                                    file_index_at_line_opt(&self.file_line_starts, top);
-                                // Shared by every row this frame — the metric
-                                // lookup takes the font lock, so don't repeat
-                                // it per row (this list isn't virtualized).
-                                let row_h = self.file_row_h(ui);
-                                // Take the render cache out of self so the
-                                // `&self` row draws can fill it while the
-                                // row list is borrowed.
-                                let mut cache = std::mem::take(&mut self.sidebar_cache);
-                                cache.ensure(self.diff_files.len(), ui.available_width());
-                                let mut frame = SidebarFrame {
-                                    row_h,
-                                    current_file,
-                                    cache: &mut cache,
-                                };
-                                let mut scroll_to: Option<usize> = None;
-                                for row in &self.file_rows {
-                                    match row {
-                                        FileListRow::Header { dir, dim_len } => {
-                                            self.draw_dir_header(ui, dir, *dim_len, row_h);
-                                        }
-                                        FileListRow::File {
-                                            idx,
-                                            label,
-                                            indented,
-                                        } => {
-                                            let indent = if *indented { FILE_INDENT } else { 0.0 };
-                                            if let Some(li) = self
-                                                .draw_file_row(ui, *idx, label, indent, &mut frame)
-                                            {
-                                                scroll_to = Some(li);
-                                            }
-                                        }
-                                    }
-                                }
-                                self.sidebar_cache = cache;
-                                // Ignore a click while a diff load is in flight:
-                                // the sidebar still shows the OUTGOING diff, so
-                                // the clicked line index is in its coordinates —
-                                // the render deliberately preserves diff_scroll_to
-                                // across the load, so the stale target would jump
-                                // the INCOMING diff to an arbitrary line.
-                                if let Some(li) = scroll_to
-                                    && self.diff_load_started_at.is_none()
-                                {
-                                    self.diff_scroll_to = Some(li);
-                                }
-                                // Breathing room so the last file isn't flush
-                                // against the bottom edge.
-                                ui.add_space(BOTTOM_PAD_ROWS as f32 * row_h);
-                            });
-                            // Live offset — what stash_current_diff remembers
-                            // for this commit when its diff is replaced.
-                            self.file_list_scroll = file_scroll_out.state.offset.y;
-                        });
-                    persist_on_resize_drag(
-                        &ctx,
-                        "file_list_panel",
-                        &mut self.file_list_width,
-                        file_panel.response.rect.width(),
-                    );
-                    Some(file_panel.response.rect)
-                } else {
-                    None
-                };
+                // Right: resizable file-list sidebar (see show_file_sidebar).
+                let divider = self.show_file_sidebar(ui, &ctx, showing_placeholder);
 
                 // Left: diff content fills the remaining width. Right padding keeps
                 // the diff scrollbar from crowding the file-list resize bar — only
@@ -5667,7 +5741,7 @@ fn main() -> eframe::Result {
             move || {
                 if let Ok(repo) = Repository::discover(&repo_path) {
                     let t = std::time::Instant::now();
-                    let commits = load_history(&repo, 200, &scope);
+                    let commits = load_history(&repo, INITIAL_COMMITS, &scope);
                     log::debug!(
                         "perf: startup: history prefetch (off-thread) {:?}",
                         t.elapsed()
@@ -5693,6 +5767,11 @@ fn main() -> eframe::Result {
         mpsc::channel().1
     });
 
+    // And the syntax highlighter: the multi-MB syntect SyntaxSet deserialize also
+    // overlaps window/GL init, so the deferred first diff usually finds it already
+    // built and installs coloured — no plain → highlighted flash.
+    let prewarm_rx = spawn_prewarm(repo_path.clone());
+
     // Stable app id "gitkay" (not the per-repo title) so Wayland compositors can
     // match window rules on app_id, and so eframe uses a stable storage dir for
     // the persisted layout regardless of which repo is open. (egui-winit 0.31
@@ -5708,7 +5787,7 @@ fn main() -> eframe::Result {
             log::debug!("perf: startup: window + GL init {:?}", startup_t0.elapsed());
             // …and this end-to-end figure covers the whole path from process start
             // to a built app: pre-eframe work, window/GL init, and GitkApp::new.
-            let app = GitkApp::new(cc, repo_path, scope, &history_rx, font_rx)?;
+            let app = GitkApp::new(cc, repo_path, scope, &history_rx, font_rx, prewarm_rx)?;
             log::debug!(
                 "perf: startup: ready (process start -> app built) {:?}",
                 startup_t0.elapsed()
@@ -6316,66 +6395,6 @@ mod tests {
             .map(|(_, r)| &body4[r.start..r.end])
             .collect();
         assert_eq!(deleted, "let old = 0;");
-    }
-
-    #[test]
-    fn resolve_diff_bg_theme_mode_still_validates_band_hex() {
-        use config::{BandSource, BandsSection};
-        // In theme mode the band colours come from the theme and are ignored, but
-        // a malformed value is still a config error and must be surfaced (the
-        // function's doc promises a warning on unparseable hex).
-        let (bg, warns) = resolve_diff_bg(&BandsSection {
-            source: BandSource::Theme,
-            added: Some("nothex".to_string()),
-            ..Default::default()
-        });
-        assert_eq!(bg, DiffBg::Theme);
-        assert_eq!(
-            warns.len(),
-            1,
-            "malformed band hex must warn even in theme mode"
-        );
-    }
-
-    #[test]
-    fn resolve_diff_bg_interprets_config() {
-        use config::{BandSource, BandsSection};
-        // Default → fixed mode, no explicit colors, no warnings.
-        let (bg, warns) = resolve_diff_bg(&BandsSection::default());
-        assert_eq!(bg, highlight::FIXED_DEFAULT_BANDS);
-        assert!(warns.is_empty());
-
-        // Theme mode.
-        let (bg, warns) = resolve_diff_bg(&BandsSection {
-            source: BandSource::Theme,
-            ..Default::default()
-        });
-        assert_eq!(bg, DiffBg::Theme);
-        assert!(warns.is_empty());
-
-        // Explicit valid hex in fixed mode.
-        let (bg, warns) = resolve_diff_bg(&BandsSection {
-            source: BandSource::Fixed,
-            added: Some("#0a300a".to_string()),
-            deleted: Some("#400c0e".to_string()),
-        });
-        assert_eq!(
-            bg,
-            DiffBg::Fixed {
-                added: Some(egui::Color32::from_rgb(10, 48, 10)),
-                deleted: Some(egui::Color32::from_rgb(64, 12, 14)),
-            }
-        );
-        assert!(warns.is_empty());
-
-        // Invalid hex → ignored (None) + one warning. (An invalid `source` can't
-        // reach here — it's a parse error; see config::invalid_band_source_*.)
-        let (bg, warns) = resolve_diff_bg(&BandsSection {
-            added: Some("nothex".to_string()),
-            ..Default::default()
-        });
-        assert_eq!(bg, highlight::FIXED_DEFAULT_BANDS);
-        assert_eq!(warns.len(), 1);
     }
 
     #[test]
