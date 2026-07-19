@@ -164,7 +164,7 @@ gitkay -- src/
 Rust app (~7200 lines in `src/main.rs`, plus `src/config.rs` for fonts + syntax
 config, `src/highlight.rs` for syntect highlighting, `src/diff_cache.rs` for the
 line-budget LRU diff cache, `src/cli.rs` for argument parsing, and
-`src/word_diff.rs` for intra-line word diffing) with 157 unit tests:
+`src/word_diff.rs` for intra-line word diffing) with 162 unit tests:
 
 - **egui** + **eframe** — native Wayland window with OpenGL (glow) rendering
 - **git2** (libgit2) — repository access, revwalk, diff

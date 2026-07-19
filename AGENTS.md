@@ -6,7 +6,7 @@ Native Wayland git history viewer — gitk, but okay. Built with Rust + egui.
 
 ```sh
 cargo build --release
-cargo test                # 157 tests (main + config + highlight + cli + diff-cache + word-diff modules)
+cargo test                # 162 tests (main + config + highlight + cli + diff-cache + word-diff modules)
 cargo clippy -- -D warnings  # CI gate — any warning fails CI
 cp target/release/gitkay ~/.local/bin/
 ```
@@ -134,7 +134,7 @@ parts run off the window-creation critical path:
 
 ## Tests
 
-157 tests total (split across the main/config/highlight/cli/diff-cache/word-diff
+162 tests total (split across the main/config/highlight/cli/diff-cache/word-diff
 modules). The graph-layout tests listed below live in `main.rs` and all use fake
 OIDs via `oid(n)` — no real git repo needed; the `config`, `highlight`, `cli`,
 `diff_cache`, and `word_diff` modules each carry their own `#[cfg(test)]` suite
