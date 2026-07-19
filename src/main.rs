@@ -3565,11 +3565,15 @@ impl GitkApp {
             let weight = data.lines.len();
             // A virtual entry is content-keyed, so each working-tree edit produces a
             // fresh hash and the previous content would linger under the same sentinel
-            // oid as unreachable dead weight. Only the current working-tree version is
-            // ever reachable, so drop any stale same-oid entry before re-inserting.
+            // oid as unreachable dead weight. Drop superseded same-oid entries before
+            // re-inserting — but only those sharing this key's settings/theme: an
+            // entry stashed under OTHER settings (e.g. a different context width) is
+            // still reachable by flipping the toolbar back, and a stale-content one
+            // is never served anyway (the fresh content hash just misses).
             if !is_real_commit(key.oid) {
-                let oid = key.oid;
-                self.diff_cache.retain_keys(|k| k.oid != oid);
+                let probe = DiffCacheKey { content: 0, ..key.clone() };
+                self.diff_cache
+                    .retain_keys(|k| k.oid != key.oid || DiffCacheKey { content: 0, ..k.clone() } != probe);
             }
             self.diff_cache.insert(key, data, weight);
         }
@@ -3607,11 +3611,19 @@ impl GitkApp {
         self.invalidate_diff_highlight();
     }
 
-    /// Install a freshly computed diff, but prefer an already-cached copy under the same
-    /// key over the fresh one — a neighbour prefetch may have warmed (and highlighted)
-    /// the same commit while the worker ran, or an unchanged virtual entry may still be
-    /// cached — so its highlighting is reused instead of re-tokenized.
+    /// Install a freshly computed diff, but prefer an already-available copy of the
+    /// same key over the fresh one — the LIVE diff (a virtual-row reload recomputed
+    /// identical content while it was on screen), or a cache entry (a neighbour
+    /// prefetch warmed the same commit while the worker ran) — so its highlighting
+    /// is reused instead of re-tokenized.
     fn install_preferring_cache(&mut self, key: DiffCacheKey, data: DiffData) {
+        // Same key ⇒ same content (real commits are oid+settings-keyed; virtual
+        // entries carry a content hash), so keep the on-screen copy — spans and
+        // scroll position included — and just clear the loading state.
+        if self.current_diff_key.as_ref() == Some(&key) {
+            self.diff_load_started_at = None;
+            return;
+        }
         let data = self.diff_cache.remove(&key).unwrap_or(data);
         self.apply_loaded_diff(key, data);
     }
@@ -3652,9 +3664,23 @@ impl GitkApp {
                 self.egui_ctx.clone(),
             );
             move || {
-                diff_load_worker(DiffLoadJob {
-                    repo_path, oid, settings, paths, key, kind, epoch, current_epoch, tx, ctx,
-                })
+                // A panic mid-compute must still report a failed load: the drain's
+                // `data: None` arm clears the loading state, otherwise the pane
+                // sticks on "Loading diff…" forever (the retained tx clone means
+                // the channel never disconnects to signal the death).
+                let fail = (tx.clone(), key.clone(), ctx.clone());
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    diff_load_worker(DiffLoadJob {
+                        repo_path, oid, settings, paths, key, kind, epoch, current_epoch, tx, ctx,
+                    })
+                }))
+                .is_err()
+                {
+                    log::warn!("diff-load worker panicked; reporting the load as failed");
+                    let (tx, key, ctx) = fail;
+                    let _ = tx.send(DiffLoadResult { epoch, key, data: None });
+                    ctx.request_repaint();
+                }
             }
         });
         if spawn.is_err() {
@@ -4658,14 +4684,30 @@ impl eframe::App for GitkApp {
             let current = self.diff_load_epoch.is_current(epoch);
             match data {
                 Some(data) if current => {
-                    self.install_preferring_cache(key, data);
+                    // Re-key from CURRENT state before installing: the diff data
+                    // itself is theme-independent, but the dispatch-time key pins
+                    // theme/enabled — a config theme change while the load ran
+                    // (which bumps only the highlight generation, not this epoch)
+                    // would otherwise install (and later stash) under the stale
+                    // key, serving wrong-theme spans on a later revisit. Data-
+                    // affecting settings changes always re-dispatch (bumping the
+                    // epoch), so a current-epoch result's data is always valid.
+                    let fresh =
+                        finalize_diff_key(self.diff_cache_key(key.oid), CommitKind::of(key.oid), &data);
+                    self.install_preferring_cache(fresh, data);
                 }
                 Some(data) => {
-                    // Superseded but successfully computed. Cache real commits (immutable,
-                    // so always valid) without clobbering an existing (possibly already
-                    // highlighted) entry; skip virtual entries, whose content-keyed result
-                    // may already be stale.
-                    if is_real_commit(key.oid) && !self.diff_cache.contains(&key) {
+                    // Superseded but successfully computed. Cache real commits
+                    // (immutable) without clobbering an existing (possibly already
+                    // highlighted) entry — but only when the key still matches the
+                    // current settings/theme (same rule as the prefetch drain): a
+                    // stale-settings key could never be hit again and would only
+                    // bloat the LRU. Virtual entries are skipped, their content-
+                    // keyed result may already be stale.
+                    if is_real_commit(key.oid)
+                        && key == self.diff_cache_key(key.oid)
+                        && !self.diff_cache.contains(&key)
+                    {
                         let weight = data.lines.len();
                         self.diff_cache.insert(key, data, weight);
                     }
@@ -5055,7 +5097,15 @@ impl eframe::App for GitkApp {
                                             }
                                         }
                                     }
-                                    if let Some(li) = scroll_to {
+                                    // Ignore a click while a diff load is in flight:
+                                    // the sidebar still shows the OUTGOING diff, so
+                                    // the clicked line index is in its coordinates —
+                                    // the render deliberately preserves diff_scroll_to
+                                    // across the load, so the stale target would jump
+                                    // the INCOMING diff to an arbitrary line.
+                                    if let Some(li) = scroll_to
+                                        && self.diff_load_started_at.is_none()
+                                    {
                                         self.diff_scroll_to = Some(li);
                                     }
                                     // Breathing room so the last file isn't flush
