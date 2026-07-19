@@ -15,6 +15,7 @@ cargo test test_pr_merge_pattern  # one test by name (substring match)
 cargo test config::               # one module's suite
 cargo clippy -- -D warnings       # CI gate: any warning fails CI — keep it clean
                                   # (clippy::pedantic + nursery are on via [lints] in Cargo.toml, minus commented allows)
+cargo fmt                         # CI gate: cargo fmt --check must pass (default rustfmt, no rustfmt.toml)
 RUST_LOG=gitkay=debug cargo run   # run with per-phase startup/perf timing logs
 cp target/release/gitkay ~/.local/bin/   # install
 ```

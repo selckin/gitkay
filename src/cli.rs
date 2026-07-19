@@ -54,9 +54,15 @@ pub fn parse_flags(args: impl Iterator<Item = String>) -> Result<RawArgs, String
             after_dashdash = true;
         } else if arg == "--help" || arg == "-h" {
             // Short-circuit so help wins even alongside other (or invalid) args.
-            return Ok(RawArgs { help: true, ..Default::default() });
+            return Ok(RawArgs {
+                help: true,
+                ..Default::default()
+            });
         } else if arg == "--version" || arg == "-V" {
-            return Ok(RawArgs { version: true, ..Default::default() });
+            return Ok(RawArgs {
+                version: true,
+                ..Default::default()
+            });
         } else if arg == "--all" {
             all = true;
         } else if arg == "--reflog" {
@@ -73,7 +79,15 @@ pub fn parse_flags(args: impl Iterator<Item = String>) -> Result<RawArgs, String
             pre.push(arg);
         }
     }
-    Ok(RawArgs { repo_dir, all, reflog, follow, pre, post, ..Default::default() })
+    Ok(RawArgs {
+        repo_dir,
+        all,
+        reflog,
+        follow,
+        pre,
+        post,
+        ..Default::default()
+    })
 }
 
 /// Split positional tokens into revs and paths. Revs come first; the first token
@@ -109,7 +123,9 @@ pub fn classify(
             in_paths = true;
             paths.push(tok.clone());
         } else {
-            return Err(format!("unknown revision or path not in the working tree: {tok}"));
+            return Err(format!(
+                "unknown revision or path not in the working tree: {tok}"
+            ));
         }
     }
     for tok in post {
@@ -143,7 +159,13 @@ pub fn rev_token_kind(tok: &str) -> RevTokenKind {
         if a.is_empty() && b.is_empty() {
             (String::new(), String::new())
         } else {
-            let fill = |s: &str| if s.is_empty() { "HEAD".to_string() } else { s.to_string() };
+            let fill = |s: &str| {
+                if s.is_empty() {
+                    "HEAD".to_string()
+                } else {
+                    s.to_string()
+                }
+            };
             (fill(a), fill(b))
         }
     };
@@ -219,7 +241,11 @@ mod tests {
         assert!(parse_flags(v(&["--version"]).into_iter()).unwrap().version);
         assert!(parse_flags(v(&["-V"]).into_iter()).unwrap().version);
         // help wins even alongside an arg that would otherwise error
-        assert!(parse_flags(v(&["--help", "--bogus"]).into_iter()).unwrap().help);
+        assert!(
+            parse_flags(v(&["--help", "--bogus"]).into_iter())
+                .unwrap()
+                .help
+        );
         // after `--`, `--help` is a path, not the flag
         let r = parse_flags(v(&["--", "--help"]).into_iter()).unwrap();
         assert!(!r.help);
@@ -264,8 +290,14 @@ mod tests {
     #[test]
     fn rev_token_kind_shapes() {
         assert_eq!(rev_token_kind("main"), RevTokenKind::Single("main".into()));
-        assert_eq!(rev_token_kind("^main"), RevTokenKind::Exclude("main".into()));
-        assert_eq!(rev_token_kind("a..b"), RevTokenKind::Range("a".into(), "b".into()));
+        assert_eq!(
+            rev_token_kind("^main"),
+            RevTokenKind::Exclude("main".into())
+        );
+        assert_eq!(
+            rev_token_kind("a..b"),
+            RevTokenKind::Range("a".into(), "b".into())
+        );
         assert_eq!(
             rev_token_kind("a...b"),
             RevTokenKind::Symmetric("a".into(), "b".into())
@@ -275,14 +307,23 @@ mod tests {
     #[test]
     fn rev_token_kind_open_ranges_default_to_head() {
         // git accepts `main..` / `..main` as `main..HEAD` / `HEAD..main`.
-        assert_eq!(rev_token_kind("main.."), RevTokenKind::Range("main".into(), "HEAD".into()));
-        assert_eq!(rev_token_kind("..main"), RevTokenKind::Range("HEAD".into(), "main".into()));
+        assert_eq!(
+            rev_token_kind("main.."),
+            RevTokenKind::Range("main".into(), "HEAD".into())
+        );
+        assert_eq!(
+            rev_token_kind("..main"),
+            RevTokenKind::Range("HEAD".into(), "main".into())
+        );
         assert_eq!(
             rev_token_kind("main..."),
             RevTokenKind::Symmetric("main".into(), "HEAD".into())
         );
         // A bare `..` stays empty-endpointed so classify() can still treat the
         // token as the parent-directory path.
-        assert_eq!(rev_token_kind(".."), RevTokenKind::Range(String::new(), String::new()));
+        assert_eq!(
+            rev_token_kind(".."),
+            RevTokenKind::Range(String::new(), String::new())
+        );
     }
 }

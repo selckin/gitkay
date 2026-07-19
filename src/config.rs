@@ -211,7 +211,10 @@ impl Fonts {
             let style = cfg.text.style(role);
             let size = style.size.unwrap_or(def_size);
             let size = (if size.is_nan() { def_size } else { size }).clamp(MIN_SIZE, MAX_SIZE);
-            ResolvedStyle { size, family: style.font.unwrap_or(def_family) }
+            ResolvedStyle {
+                size,
+                family: style.font.unwrap_or(def_family),
+            }
         };
         Self {
             diff: resolve(Role::Diff),
@@ -531,9 +534,13 @@ pub fn build_fonts(cfg: &Config) -> (egui::FontDefinitions, Fonts, Vec<String>) 
             egui::FontFamily::Proportional,
         ),
     ] {
-        let Some(path) =
-            family_source(name.as_deref(), path_override.as_deref(), &mut cache, &exists, &mut scan)
-        else {
+        let Some(path) = family_source(
+            name.as_deref(),
+            path_override.as_deref(),
+            &mut cache,
+            &exists,
+            &mut scan,
+        ) else {
             continue;
         };
         match std::fs::read(&path) {

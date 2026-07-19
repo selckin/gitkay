@@ -376,7 +376,8 @@ enum FileListRow {
 /// Split a path into (directory-with-trailing-slash, basename). The directory is
 /// "" for a root-level file. Slices only at an ASCII `/`, so multibyte-safe.
 fn split_dir(path: &str) -> (&str, &str) {
-    path.rfind('/').map_or(("", path), |i| (&path[..=i], &path[i + 1..]))
+    path.rfind('/')
+        .map_or(("", path), |i| (&path[..=i], &path[i + 1..]))
 }
 
 /// Byte length of the leading directory segments that `a` and `b` share, ending at a
@@ -437,7 +438,10 @@ fn rename_brace(old: &str, new: &str) -> (String, String) {
     let a_mid = &old[pfx..pfx + la.saturating_sub(pfx + sfx)];
     let b_mid = &new[pfx..pfx + lb.saturating_sub(pfx + sfx)];
     let suffix = &old[la - sfx..];
-    (old[..pfx].to_string(), format!("{{{a_mid} ⇒ {b_mid}}}{suffix}"))
+    (
+        old[..pfx].to_string(),
+        format!("{{{a_mid} ⇒ {b_mid}}}{suffix}"),
+    )
 }
 
 /// Turn the diff's files (new path + optional rename/copy source) into render rows
@@ -464,13 +468,28 @@ fn build_file_rows(files: &[(&str, Option<&str>)], layout: FileListLayout) -> Ve
             old.filter(|o| *o != new).map_or_else(
                 || {
                     let (dir, base) = split_dir(new);
-                    let label = if full { new.to_string() } else { base.to_string() };
-                    (if grouped { dir.to_string() } else { String::new() }, label)
+                    let label = if full {
+                        new.to_string()
+                    } else {
+                        base.to_string()
+                    };
+                    (
+                        if grouped {
+                            dir.to_string()
+                        } else {
+                            String::new()
+                        },
+                        label,
+                    )
                 },
                 |old| {
                     let (prefix, brace) = rename_brace(old, new);
                     // Grouped/Name show the compact brace; Full prepends the full prefix.
-                    let label = if full { format!("{prefix}{brace}") } else { brace };
+                    let label = if full {
+                        format!("{prefix}{brace}")
+                    } else {
+                        brace
+                    };
                     (if grouped { prefix } else { String::new() }, label)
                 },
             )
@@ -507,7 +526,11 @@ fn build_file_rows(files: &[(&str, Option<&str>)], layout: FileListLayout) -> Ve
             let push_files = |rows: &mut Vec<FileListRow>, mut idxs: Vec<usize>, indented: bool| {
                 idxs.sort_by(|&a, &b| computed[a].1.cmp(&computed[b].1));
                 for idx in idxs {
-                    rows.push(FileListRow::File { idx, label: computed[idx].1.clone(), indented });
+                    rows.push(FileListRow::File {
+                        idx,
+                        label: computed[idx].1.clone(),
+                        indented,
+                    });
                 }
             };
             let mut prev_dir = "";
@@ -718,7 +741,11 @@ fn commit_touches_paths(repo: &Repository, commit: &git2::Commit, paths: &[Strin
 /// the (more expensive) rename detection in `rename_source`.
 fn file_added(commit: &git2::Commit, path: &str) -> bool {
     let p = std::path::Path::new(path);
-    let in_commit = commit.tree().ok().and_then(|t| t.get_path(p).ok()).is_some();
+    let in_commit = commit
+        .tree()
+        .ok()
+        .and_then(|t| t.get_path(p).ok())
+        .is_some();
     let in_parent = commit
         .parent(0)
         .ok()
@@ -747,7 +774,12 @@ fn rename_source(repo: &Repository, commit: &git2::Commit, new_path: &str) -> Op
                 d.status() == git2::Delta::Renamed
                     && d.new_file().path().and_then(|p| p.to_str()) == Some(new_path)
             })
-            .and_then(|d| d.old_file().path().and_then(|p| p.to_str()).map(String::from)))
+            .and_then(|d| {
+                d.old_file()
+                    .path()
+                    .and_then(|p| p.to_str())
+                    .map(String::from)
+            }))
     };
     match detect() {
         Ok(old) => old,
@@ -806,7 +838,9 @@ fn stored<T: serde::de::DeserializeOwned>(
     key: &str,
     default: T,
 ) -> T {
-    storage.and_then(|s| eframe::get_value(s, key)).unwrap_or(default)
+    storage
+        .and_then(|s| eframe::get_value(s, key))
+        .unwrap_or(default)
 }
 
 /// Consume a directional key pair, returning +1 for `down`, -1 for `up`, or 0 if
@@ -1099,7 +1133,10 @@ fn load_reflog(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitI
     } else if let Some(name) = repo
         .resolve_reference_from_short_name(refname)
         .ok()
-        .and_then(|r| r.name().map(str::to_string).ok()) { name } else {
+        .and_then(|r| r.name().map(str::to_string).ok())
+    {
+        name
+    } else {
         // Don't fall through silently to a guaranteed-empty reflog read —
         // a typo'd ref is otherwise indistinguishable from an empty reflog.
         log::warn!("gitkay: --reflog: unknown ref {refname:?}");
@@ -1357,7 +1394,12 @@ fn show_virtualized_diff(
     mut on_visible: impl FnMut(std::ops::Range<usize>, usize),
     mut build_row: impl FnMut(usize) -> (egui::text::LayoutJob, Option<egui::Color32>, egui::Color32),
 ) {
-    let DiffView { n_lines, content_chars, scroll_target, last_top_anchor } = view;
+    let DiffView {
+        n_lines,
+        content_chars,
+        scroll_target,
+        last_top_anchor,
+    } = view;
     let row_h = ui.fonts_mut(|f| f.row_height(font_id));
     ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
     // Bottom padding: empty rows below the diff so the deepest file's start can scroll
@@ -1497,7 +1539,11 @@ fn detect_similar(diff: &mut git2::Diff, settings: DiffSettings) {
 /// `git log` shows. Returns "" if the timestamp or offset is out of range. (A valid
 /// time never formats empty, so callers can treat "" as "no date".)
 fn format_commit_time(secs: i64, tz_offset_min: i32, with_seconds: bool) -> String {
-    let fmt = if with_seconds { "%Y-%m-%d %H:%M:%S" } else { "%Y-%m-%d %H:%M" };
+    let fmt = if with_seconds {
+        "%Y-%m-%d %H:%M:%S"
+    } else {
+        "%Y-%m-%d %H:%M"
+    };
     match (
         chrono::DateTime::from_timestamp(secs, 0),
         chrono::FixedOffset::east_opt(tz_offset_min * 60),
@@ -1545,7 +1591,8 @@ fn get_diff_data(
     let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
 
     let mut opts = scoped_diff_opts(settings, paths);
-    let mut diff = match repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts)) {
+    let mut diff = match repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))
+    {
         Ok(d) => d,
         Err(e) => {
             log::warn!("gitkay: cannot diff commit {oid}: {e}");
@@ -1829,8 +1876,15 @@ fn file_index_at_line(files: &[FileEntry], line: usize) -> usize {
 /// nearest file start strictly above `top` (so paging up from inside a file lands on
 /// its own header first, then the previous file's). None when there's no file in that
 /// direction. File starts come from `file_line_ranges` (sorted, body-bearing files).
-fn next_file_line(files: &[FileEntry], total_lines: usize, top: usize, down: bool) -> Option<usize> {
-    let starts = file_line_ranges(files, total_lines).into_iter().map(|(_, s, _)| s);
+fn next_file_line(
+    files: &[FileEntry],
+    total_lines: usize,
+    top: usize,
+    down: bool,
+) -> Option<usize> {
+    let starts = file_line_ranges(files, total_lines)
+        .into_iter()
+        .map(|(_, s, _)| s);
     if down {
         starts.filter(|&s| s > top).min()
     } else {
@@ -2233,7 +2287,15 @@ fn spawn_guarded(
 /// cache. Bails as soon as a newer dispatch supersedes it (`epoch`). Pure
 /// optimization — any failure just warms fewer neighbours.
 fn prefetch_worker(job: PrefetchJob) {
-    let PrefetchJob { repo_path, targets, hl, epoch, current_epoch, tx, ctx } = job;
+    let PrefetchJob {
+        repo_path,
+        targets,
+        hl,
+        epoch,
+        current_epoch,
+        tx,
+        ctx,
+    } = job;
     // Superseded before we even ran — don't open the repo.
     if !current_epoch.is_current(epoch) {
         return;
@@ -2301,7 +2363,16 @@ struct DiffLoadJob {
 /// the placeholder forever.
 fn diff_load_worker(job: DiffLoadJob) {
     let DiffLoadJob {
-        repo_path, oid, settings, paths, key, kind, epoch, current_epoch, tx, ctx,
+        repo_path,
+        oid,
+        settings,
+        paths,
+        key,
+        kind,
+        epoch,
+        current_epoch,
+        tx,
+        ctx,
     } = job;
     // Superseded before we even ran — don't open the repo.
     if !current_epoch.is_current(epoch) {
@@ -2314,7 +2385,11 @@ fn diff_load_worker(job: DiffLoadJob) {
             // the UI side ignores it if the user has since moved on); a send error just
             // means the UI is gone. Without this the pane sticks on the placeholder.
             log::debug!("diff-load: repo discover failed: {e}");
-            let _ = tx.send(DiffLoadResult { epoch, key, data: None });
+            let _ = tx.send(DiffLoadResult {
+                epoch,
+                key,
+                data: None,
+            });
             ctx.request_repaint();
             return;
         }
@@ -2327,8 +2402,19 @@ fn diff_load_worker(job: DiffLoadJob) {
     // Content-key a virtual row off-thread here so an unchanged working tree hits the
     // cache and reuses its highlighting.
     let key = finalize_diff_key(key, kind, &data);
-    log::debug!("diff-load: {oid} ({} lines) in {:?}", data.lines.len(), t.elapsed());
-    if tx.send(DiffLoadResult { epoch, key, data: Some(data) }).is_err() {
+    log::debug!(
+        "diff-load: {oid} ({} lines) in {:?}",
+        data.lines.len(),
+        t.elapsed()
+    );
+    if tx
+        .send(DiffLoadResult {
+            epoch,
+            key,
+            data: Some(data),
+        })
+        .is_err()
+    {
         return; // UI gone
     }
     ctx.request_repaint();
@@ -2367,7 +2453,9 @@ fn parse_bg_hex(label: &str, v: Option<&str>, warnings: &mut Vec<String>) -> Opt
     let h = v?;
     let c = highlight::parse_hex(h);
     if c.is_none() {
-        warnings.push(format!("invalid diff.bands.{label} color {h:?}; using default"));
+        warnings.push(format!(
+            "invalid diff.bands.{label} color {h:?}; using default"
+        ));
     }
     c
 }
@@ -2509,7 +2597,11 @@ fn diff_row_job(
         // Keep the literal marker bytes (only Add/Del carry one) in the flat colour.
         let marker_len = line.text.len() - line.body().len();
         if marker_len > 0 {
-            job.append(&line.text[..marker_len], 0.0, fmt(kind_color(line.kind, palette)));
+            job.append(
+                &line.text[..marker_len],
+                0.0,
+                fmt(kind_color(line.kind, palette)),
+            );
         }
     }
 
@@ -2522,13 +2614,25 @@ fn diff_row_job(
             _ => palette.added_bg,
         };
         // Spans hold byte ranges into body(); a None/empty span set renders plain.
-        (palette.foreground, line.spans.as_deref().unwrap_or(&[]), tint)
+        (
+            palette.foreground,
+            line.spans.as_deref().unwrap_or(&[]),
+            tint,
+        )
     } else {
         (kind_color(line.kind, palette), &[], palette.background)
     };
-    let emph_bg = (word_diff && !line.emphasis.is_empty())
-        .then(|| emphasis_bg(line.kind, palette, backdrop));
-    append_body(&mut job, font_id, line.body(), spans, base_color, &line.emphasis, emph_bg);
+    let emph_bg =
+        (word_diff && !line.emphasis.is_empty()).then(|| emphasis_bg(line.kind, palette, backdrop));
+    append_body(
+        &mut job,
+        font_id,
+        line.body(),
+        spans,
+        base_color,
+        &line.emphasis,
+        emph_bg,
+    );
 
     let row_bg = match line.kind {
         LineKind::Add if syntax => Some(palette.added_bg),
@@ -2551,7 +2655,11 @@ fn build_commit_indexes(
     std::collections::HashMap<git2::Oid, usize>,
     std::collections::HashMap<git2::Oid, usize>,
 ) {
-    let index_by_oid = commits.iter().enumerate().map(|(i, c)| (c.oid, i)).collect();
+    let index_by_oid = commits
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.oid, i))
+        .collect();
     let mut first_child_of: std::collections::HashMap<git2::Oid, usize> =
         std::collections::HashMap::new();
     for (i, c) in commits.iter().enumerate() {
@@ -2663,7 +2771,10 @@ fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
 
         // node_col was just assigned a pipe (or matched an existing one), so this
         // is always Some; fall back to colour 0 rather than panic if it ever isn't.
-        debug_assert!(pipes[node_col].is_some(), "node column {node_col} has no pipe");
+        debug_assert!(
+            pipes[node_col].is_some(),
+            "node column {node_col} has no pipe"
+        );
         let node_color = pipes[node_col].map_or(0, |p| p.1);
 
         // Extra lanes that also pointed to this commit — they converge here.
@@ -2894,16 +3005,16 @@ struct GitkApp {
     // bucket to keep in sync. context/ignore_ws are toolbar-owned + persisted;
     // show_stats/detect_* come from config.
     diff_settings: DiffSettings,
-    word_diff: bool,                  // highlight changed words within +/- lines (persisted)
-    file_list: FileListLayout,        // file-list sidebar layout (config [diff].file_list)
+    word_diff: bool,           // highlight changed words within +/- lines (persisted)
+    file_list: FileListLayout, // file-list sidebar layout (config [diff].file_list)
     diff_toolbar_rect: Option<egui::Rect>, // last shown hover-toolbar bounds (flicker guard)
-    fonts: Fonts, // resolved, clamped font settings; call .font_id(role) for a FontId
+    fonts: Fonts,              // resolved, clamped font settings; call .font_id(role) for a FontId
     // Deferred FontDefinitions from the off-thread build: Some until applied. Set when a
     // cold fontdb scan outlives window-init, so the window paints in default fonts and
     // swaps to the configured ones once the scan lands (polled in ui()). None once applied.
     pending_fonts: Option<mpsc::Receiver<(egui::FontDefinitions, Fonts, Vec<String>)>>,
     config_path: Option<std::path::PathBuf>, // ~/.config/gitkay/config.toml (for live reload)
-    needs_config_reload: Arc<AtomicBool>, // set by the config-file watcher
+    needs_config_reload: Arc<AtomicBool>,    // set by the config-file watcher
     _config_watcher: Option<RecommendedWatcher>, // watches the config's parent dir so atomic-rename saves are caught
     config_error_toast: Option<std::time::Instant>, // transient parse-error notice
     highlighter: Option<Arc<Highlighter>>,       // built lazily on the first diff (when syntax on)
@@ -2923,8 +3034,8 @@ struct GitkApp {
     prefetch_tx: mpsc::Sender<(DiffCacheKey, DiffData)>,
     prefetch_rx: mpsc::Receiver<(DiffCacheKey, DiffData)>,
     prefetch_epoch: Epoch, // bumped per dispatch; supersedes older prefetch workers
-    prefetched_gen: u64,            // diff_generation we last dispatched prefetch for
-    last_highlight_check_gen: u64,  // diff_generation we last ran diff_fully_highlighted for
+    prefetched_gen: u64,   // diff_generation we last dispatched prefetch for
+    last_highlight_check_gen: u64, // diff_generation we last ran diff_fully_highlighted for
     commit_view_range: std::ops::Range<usize>, // visible commit-list rows (set each frame)
     // A cache miss (or virtual entry) computes get_diff_data on a worker so a large
     // diff / rename+copy detection can't freeze the window; the pane shows a
@@ -2938,7 +3049,7 @@ struct GitkApp {
     // across rapid re-dispatch (get_or_insert) so continuous loading still crosses the
     // threshold; cleared to None when a load applies, fails, or is cancelled.
     diff_load_started_at: Option<std::time::Instant>,
-    egui_ctx: egui::Context,         // stored Context handle so workers can request a repaint
+    egui_ctx: egui::Context, // stored Context handle so workers can request a repaint
 }
 
 /// Widest diff line in characters — used to size the horizontal scroll content
@@ -3099,7 +3210,9 @@ impl GitkApp {
                 None
             }
             Err(mpsc::TryRecvError::Empty) => {
-                log::debug!("perf: startup: fonts not ready (cold scan); window paints with defaults");
+                log::debug!(
+                    "perf: startup: fonts not ready (cold scan); window paints with defaults"
+                );
                 Some(font_rx)
             }
             Err(mpsc::TryRecvError::Disconnected) => {
@@ -3182,7 +3295,10 @@ impl GitkApp {
         let t_layout = std::time::Instant::now();
         let (graph_rows, graph_max_cols, commit_index_by_oid, first_child_of) =
             derive_from_commits(&commits);
-        log::debug!("perf: startup: derive_from_commits {:?}", t_layout.elapsed());
+        log::debug!(
+            "perf: startup: derive_from_commits {:?}",
+            t_layout.elapsed()
+        );
 
         // Restore persisted diff options. The first commit is auto-selected, but its
         // diff is generated lazily on the first update() frame (see StartupDiff) — not
@@ -3309,7 +3425,9 @@ impl GitkApp {
             ) {
                 Ok(_) => Some(rx),
                 Err(e) => {
-                    log::warn!("prewarm thread spawn failed: {e}; first diff builds the highlighter synchronously");
+                    log::warn!(
+                        "prewarm thread spawn failed: {e}; first diff builds the highlighter synchronously"
+                    );
                     None
                 }
             }
@@ -3325,7 +3443,10 @@ impl GitkApp {
             file_list,
         );
 
-        log::debug!("perf: startup: GitkApp::new total {:?}", startup_t0.elapsed());
+        log::debug!(
+            "perf: startup: GitkApp::new total {:?}",
+            startup_t0.elapsed()
+        );
         Ok(Self {
             commits,
             graph_rows,
@@ -3533,7 +3654,10 @@ impl GitkApp {
         if is_real_commit(oid)
             && let Some(data) = self.diff_cache.remove(&key)
         {
-            log::debug!("perf: diff cache hit ({} lines) for {oid}", data.lines.len());
+            log::debug!(
+                "perf: diff cache hit ({} lines) for {oid}",
+                data.lines.len()
+            );
             // Supersede any in-flight worker so its (now stale) result is dropped.
             self.diff_load_epoch.bump();
             self.apply_loaded_diff(key, data);
@@ -3568,9 +3692,17 @@ impl GitkApp {
             // still reachable by flipping the toolbar back, and a stale-content one
             // is never served anyway (the fresh content hash just misses).
             if !is_real_commit(key.oid) {
-                let probe = DiffCacheKey { content: 0, ..key.clone() };
-                self.diff_cache
-                    .retain_keys(|k| k.oid != key.oid || DiffCacheKey { content: 0, ..k.clone() } != probe);
+                let probe = DiffCacheKey {
+                    content: 0,
+                    ..key.clone()
+                };
+                self.diff_cache.retain_keys(|k| {
+                    k.oid != key.oid
+                        || DiffCacheKey {
+                            content: 0,
+                            ..k.clone()
+                        } != probe
+                });
             }
             self.diff_cache.insert(key, data, weight);
         }
@@ -3668,14 +3800,27 @@ impl GitkApp {
                 let fail = (tx.clone(), key.clone(), ctx.clone());
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     diff_load_worker(DiffLoadJob {
-                        repo_path, oid, settings, paths, key, kind, epoch, current_epoch, tx, ctx,
+                        repo_path,
+                        oid,
+                        settings,
+                        paths,
+                        key,
+                        kind,
+                        epoch,
+                        current_epoch,
+                        tx,
+                        ctx,
                     });
                 }))
                 .is_err()
                 {
                     log::warn!("diff-load worker panicked; reporting the load as failed");
                     let (tx, key, ctx) = fail;
-                    let _ = tx.send(DiffLoadResult { epoch, key, data: None });
+                    let _ = tx.send(DiffLoadResult {
+                        epoch,
+                        key,
+                        data: None,
+                    });
                     ctx.request_repaint();
                 }
             }
@@ -3738,7 +3883,11 @@ impl GitkApp {
             return;
         }
         if self.highlighter.is_none() {
-            match self.prewarm_rx.as_ref().map(std::sync::mpsc::Receiver::try_recv) {
+            match self
+                .prewarm_rx
+                .as_ref()
+                .map(std::sync::mpsc::Receiver::try_recv)
+            {
                 // Prewarmed highlighter ready: install it, re-deriving the palette
                 // for the current theme (it may have changed since startup) — this
                 // reuses the warm SyntaxSet.
@@ -3855,7 +4004,10 @@ impl GitkApp {
             return;
         }
         let epoch = self.prefetch_epoch.bump();
-        log::debug!("prefetch: dispatched {} visible around commit #{sel}", jobs.len());
+        log::debug!(
+            "prefetch: dispatched {} visible around commit #{sel}",
+            jobs.len()
+        );
         let job = PrefetchJob {
             repo_path: self.repo_path.clone(),
             targets: jobs,
@@ -3883,7 +4035,12 @@ impl GitkApp {
     /// snapshotting then re-anchoring the selection (to `preferred_oid`, else the
     /// previously-selected commit). The shared core of a full reload and the
     /// lazy-load tail-extension.
-    fn reload_to_count(&mut self, repo: &Repository, count: usize, preferred_oid: Option<git2::Oid>) {
+    fn reload_to_count(
+        &mut self,
+        repo: &Repository,
+        count: usize,
+        preferred_oid: Option<git2::Oid>,
+    ) {
         let previous_oid = self
             .selected
             .and_then(|sel| self.commits.get(sel))
@@ -4082,7 +4239,9 @@ impl GitkApp {
         } else {
             right_elide(label, label_max, measure)
         };
-        let g = ui.painter().layout_no_wrap(elided, name_font.clone(), name_color);
+        let g = ui
+            .painter()
+            .layout_no_wrap(elided, name_font.clone(), name_color);
         let gy = cy - g.size().y / 2.0;
         ui.painter().galley(egui::pos2(left, gy), g, name_color);
 
@@ -4332,7 +4491,6 @@ impl GitkApp {
                                     dot_radius,
                                     graph_color(gr.node_color),
                                 );
-
                             }
                             // ── Text ──
                             let text_x = top_left.x + graph_width;
@@ -4351,7 +4509,8 @@ impl GitkApp {
                                     RefKind::WorkingTree => {
                                         (egui::Color32::from_rgb(80, 40, 50), RED)
                                     }
-                                    #[allow(clippy::match_same_arms)] // deliberately identical to Tag, not merged (see above)
+                                    #[allow(clippy::match_same_arms)]
+                                    // deliberately identical to Tag, not merged (see above)
                                     RefKind::Index => (egui::Color32::from_rgb(60, 55, 30), YELLOW),
                                     RefKind::Branch | RefKind::Remote => {
                                         // Unique color per branch/remote name
@@ -4391,8 +4550,11 @@ impl GitkApp {
                             // them out, never re-formats.
                             let right_x = row_rect.max.x;
                             let date_font = self.fonts.font_id(Role::CommitMeta);
-                            let date_galley =
-                                painter.layout_no_wrap(commit.date_str.clone(), date_font.clone(), SUBTEXT);
+                            let date_galley = painter.layout_no_wrap(
+                                commit.date_str.clone(),
+                                date_font.clone(),
+                                SUBTEXT,
+                            );
                             let date_w = date_galley.size().x;
 
                             // Short SHA
@@ -4414,11 +4576,12 @@ impl GitkApp {
                             let summary_max_w = (author_date_x - cursor_x - 12.0).max(20.0);
                             let has_highlight = !self.branch_highlight.is_empty();
                             let search_active = !self.search_matches.is_empty();
-                            let summary_color = if search_active || !has_highlight || is_branch_member {
-                                TEXT
-                            } else {
-                                SUBTEXT // dim non-branch commits
-                            };
+                            let summary_color =
+                                if search_active || !has_highlight || is_branch_member {
+                                    TEXT
+                                } else {
+                                    SUBTEXT // dim non-branch commits
+                                };
                             let summary_font = self.fonts.font_id(Role::CommitSummary);
                             let summary_galley = painter.layout_no_wrap(
                                 commit.summary.clone(),
@@ -4533,7 +4696,10 @@ impl eframe::App for GitkApp {
                 self.startup_diff = StartupDiff::Done;
                 let t = std::time::Instant::now();
                 self.load_selected_diff();
-                log::debug!("perf: startup: deferred first diff loaded {:?}", t.elapsed());
+                log::debug!(
+                    "perf: startup: deferred first diff loaded {:?}",
+                    t.elapsed()
+                );
             }
             StartupDiff::Done => {}
         }
@@ -4645,8 +4811,7 @@ impl eframe::App for GitkApp {
                         // in-flight worker holding the old one valid. Either way
                         // surface a bad-slug warning, regardless of syntax mode.
                         let dp_warn = if let Some(old_hl) = self.highlighter.take() {
-                            let (new_hl, w) =
-                                old_hl.with_theme(&self.theme_slug, self.diff_bg);
+                            let (new_hl, w) = old_hl.with_theme(&self.theme_slug, self.diff_bg);
                             self.diff_palette = new_hl.palette().clone();
                             self.highlighter = Some(Arc::new(new_hl));
                             w
@@ -4737,8 +4902,11 @@ impl eframe::App for GitkApp {
                     // key, serving wrong-theme spans on a later revisit. Data-
                     // affecting settings changes always re-dispatch (bumping the
                     // epoch), so a current-epoch result's data is always valid.
-                    let fresh =
-                        finalize_diff_key(self.diff_cache_key(key.oid), CommitKind::of(key.oid), &data);
+                    let fresh = finalize_diff_key(
+                        self.diff_cache_key(key.oid),
+                        CommitKind::of(key.oid),
+                        &data,
+                    );
                     self.install_preferring_cache(fresh, data);
                 }
                 Some(data) => {
@@ -4806,8 +4974,7 @@ impl eframe::App for GitkApp {
             // spans arrive (a batch was applied) or a fresh diff loaded. Skipping
             // the scan on the other repaints during the highlight window (scroll,
             // hover) avoids re-scanning the whole diff for nothing.
-            let maybe_settled =
-                applied_highlight || self.last_highlight_check_gen != current_gen;
+            let maybe_settled = applied_highlight || self.last_highlight_check_gen != current_gen;
             if self.prefetched_gen != current_gen && maybe_settled {
                 self.last_highlight_check_gen = current_gen;
                 if diff_fully_highlighted(&self.diff_lines, &self.diff_files) {
@@ -4816,7 +4983,6 @@ impl eframe::App for GitkApp {
                 }
             }
         }
-
 
         let search_id = egui::Id::new("search_field");
 
@@ -4827,9 +4993,9 @@ impl eframe::App for GitkApp {
         let mut search_has_focus = ctx.memory(|m| m.has_focus(search_id));
         if !search_has_focus {
             let has_text_event = ctx.input(|i| {
-                i.events
-                    .iter()
-                    .any(|e| matches!(e, egui::Event::Text(t) if !t.is_empty() && t.as_str() != " "))
+                i.events.iter().any(
+                    |e| matches!(e, egui::Event::Text(t) if !t.is_empty() && t.as_str() != " "),
+                )
             });
             if has_text_event {
                 ctx.memory_mut(|m| m.request_focus(search_id));
@@ -5044,13 +5210,22 @@ impl eframe::App for GitkApp {
                                     }
                                     ui.add_space(12.0);
                                     diff_opts_changed |= ui
-                                        .checkbox(&mut self.diff_settings.ignore_ws, "Ignore whitespace")
+                                        .checkbox(
+                                            &mut self.diff_settings.ignore_ws,
+                                            "Ignore whitespace",
+                                        )
                                         .changed();
                                     diff_opts_changed |= ui
-                                        .checkbox(&mut self.diff_settings.detect_renames, "Detect renames")
+                                        .checkbox(
+                                            &mut self.diff_settings.detect_renames,
+                                            "Detect renames",
+                                        )
                                         .changed();
                                     diff_opts_changed |= ui
-                                        .checkbox(&mut self.diff_settings.detect_copies, "Detect copies")
+                                        .checkbox(
+                                            &mut self.diff_settings.detect_copies,
+                                            "Detect copies",
+                                        )
                                         .changed();
                                     // Word-diff only changes the render (emphasis is
                                     // precomputed), so no diff reload — toggling is instant.
@@ -5079,96 +5254,95 @@ impl eframe::App for GitkApp {
                 // Right: resizable file-list sidebar — draggable splitter, width
                 // persisted across runs (see App::save). Shown only when the selected
                 // commit touches files and we're not blanked to the placeholder.
-                let divider: Option<egui::Rect> = if !self.diff_files.is_empty()
-                    && !showing_placeholder
-                {
-                    let saved_w = self.file_list_width;
-                    // Let the sidebar grow with the window — up to all but a readable
-                    // ~300px strip for the diff — so paths have room on wide screens.
-                    // Floor at the panel min (not 400) so the diff keeps its strip on
-                    // narrow windows too. `ui` here still spans the whole diff region
-                    // (the diff's central panel is carved out after this right panel).
-                    let max_w = (ui.available_width() - 300.0).max(FILE_LIST_MIN_W);
-                    let file_panel = egui::Panel::right("file_list_panel")
-                        .resizable(true)
-                        .default_size(saved_w)
-                        .min_size(FILE_LIST_MIN_W)
-                        .max_size(max_w)
-                        .frame(egui::Frame::NONE)
-                        .show_inside(ui, |ui| {
-                            ui.label(
-                                egui::RichText::new(format!("{} files", self.diff_files.len()))
-                                    .color(SUBTEXT)
-                                    .font(self.fonts.font_id(Role::Ui)),
-                            );
-                            ui.add_space(4.0);
-                            egui::ScrollArea::vertical()
-                                .id_salt("file_list")
-                                .show(ui, |ui| {
-                                    // The file the diff is scrolled into (None while
-                                    // still in the commit header) — highlighted below
-                                    // with the same accent the commit list uses for the
-                                    // selected row, so the list tracks the diff view.
-                                    let top = self.diff_top_line.load(Ordering::Relaxed);
-                                    let current_file =
-                                        file_index_at_line_opt(&self.diff_files, top);
-                                    // Full mode draws full paths (elide from the front,
-                                    // keeping the filename); grouped/name draw basenames
-                                    // (elide from the back, keeping the name's start).
-                                    let elide_left = self.file_list == FileListLayout::Full;
-                                    let mut scroll_to: Option<usize> = None;
-                                    for row in &self.file_rows {
-                                        match row {
-                                            FileListRow::Header { dir, dim_len } => {
-                                                self.draw_dir_header(ui, dir, *dim_len);
-                                            }
-                                            FileListRow::File {
-                                                idx,
-                                                label,
-                                                indented,
-                                            } => {
-                                                let indent =
-                                                    if *indented { FILE_INDENT } else { 0.0 };
-                                                if let Some(li) = self.draw_file_row(
-                                                    ui,
-                                                    *idx,
+                let divider: Option<egui::Rect> =
+                    if !self.diff_files.is_empty() && !showing_placeholder {
+                        let saved_w = self.file_list_width;
+                        // Let the sidebar grow with the window — up to all but a readable
+                        // ~300px strip for the diff — so paths have room on wide screens.
+                        // Floor at the panel min (not 400) so the diff keeps its strip on
+                        // narrow windows too. `ui` here still spans the whole diff region
+                        // (the diff's central panel is carved out after this right panel).
+                        let max_w = (ui.available_width() - 300.0).max(FILE_LIST_MIN_W);
+                        let file_panel = egui::Panel::right("file_list_panel")
+                            .resizable(true)
+                            .default_size(saved_w)
+                            .min_size(FILE_LIST_MIN_W)
+                            .max_size(max_w)
+                            .frame(egui::Frame::NONE)
+                            .show_inside(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("{} files", self.diff_files.len()))
+                                        .color(SUBTEXT)
+                                        .font(self.fonts.font_id(Role::Ui)),
+                                );
+                                ui.add_space(4.0);
+                                egui::ScrollArea::vertical()
+                                    .id_salt("file_list")
+                                    .show(ui, |ui| {
+                                        // The file the diff is scrolled into (None while
+                                        // still in the commit header) — highlighted below
+                                        // with the same accent the commit list uses for the
+                                        // selected row, so the list tracks the diff view.
+                                        let top = self.diff_top_line.load(Ordering::Relaxed);
+                                        let current_file =
+                                            file_index_at_line_opt(&self.diff_files, top);
+                                        // Full mode draws full paths (elide from the front,
+                                        // keeping the filename); grouped/name draw basenames
+                                        // (elide from the back, keeping the name's start).
+                                        let elide_left = self.file_list == FileListLayout::Full;
+                                        let mut scroll_to: Option<usize> = None;
+                                        for row in &self.file_rows {
+                                            match row {
+                                                FileListRow::Header { dir, dim_len } => {
+                                                    self.draw_dir_header(ui, dir, *dim_len);
+                                                }
+                                                FileListRow::File {
+                                                    idx,
                                                     label,
-                                                    indent,
-                                                    elide_left,
-                                                    current_file,
-                                                ) {
-                                                    scroll_to = Some(li);
+                                                    indented,
+                                                } => {
+                                                    let indent =
+                                                        if *indented { FILE_INDENT } else { 0.0 };
+                                                    if let Some(li) = self.draw_file_row(
+                                                        ui,
+                                                        *idx,
+                                                        label,
+                                                        indent,
+                                                        elide_left,
+                                                        current_file,
+                                                    ) {
+                                                        scroll_to = Some(li);
+                                                    }
                                                 }
                                             }
                                         }
-                                    }
-                                    // Ignore a click while a diff load is in flight:
-                                    // the sidebar still shows the OUTGOING diff, so
-                                    // the clicked line index is in its coordinates —
-                                    // the render deliberately preserves diff_scroll_to
-                                    // across the load, so the stale target would jump
-                                    // the INCOMING diff to an arbitrary line.
-                                    if let Some(li) = scroll_to
-                                        && self.diff_load_started_at.is_none()
-                                    {
-                                        self.diff_scroll_to = Some(li);
-                                    }
-                                    // Breathing room so the last file isn't flush
-                                    // against the bottom edge.
-                                    let pad_h = self.file_row_h(ui);
-                                    ui.add_space(BOTTOM_PAD_ROWS as f32 * pad_h);
-                                });
-                        });
-                    persist_on_resize_drag(
-                        &ctx,
-                        "file_list_panel",
-                        &mut self.file_list_width,
-                        file_panel.response.rect.width(),
-                    );
-                    Some(file_panel.response.rect)
-                } else {
-                    None
-                };
+                                        // Ignore a click while a diff load is in flight:
+                                        // the sidebar still shows the OUTGOING diff, so
+                                        // the clicked line index is in its coordinates —
+                                        // the render deliberately preserves diff_scroll_to
+                                        // across the load, so the stale target would jump
+                                        // the INCOMING diff to an arbitrary line.
+                                        if let Some(li) = scroll_to
+                                            && self.diff_load_started_at.is_none()
+                                        {
+                                            self.diff_scroll_to = Some(li);
+                                        }
+                                        // Breathing room so the last file isn't flush
+                                        // against the bottom edge.
+                                        let pad_h = self.file_row_h(ui);
+                                        ui.add_space(BOTTOM_PAD_ROWS as f32 * pad_h);
+                                    });
+                            });
+                        persist_on_resize_drag(
+                            &ctx,
+                            "file_list_panel",
+                            &mut self.file_list_width,
+                            file_panel.response.rect.width(),
+                        );
+                        Some(file_panel.response.rect)
+                    } else {
+                        None
+                    };
 
                 // Left: diff content fills the remaining width. Right padding keeps
                 // the diff scrollbar from crowding the file-list resize bar — only
@@ -5214,8 +5388,9 @@ impl eframe::App for GitkApp {
                                 });
                                 return;
                             }
-                            ui.ctx()
-                                .request_repaint_after(DIFF_PLACEHOLDER_DELAY.saturating_sub(elapsed));
+                            ui.ctx().request_repaint_after(
+                                DIFF_PLACEHOLDER_DELAY.saturating_sub(elapsed),
+                            );
                             // fall through: keep rendering the previous diff below
                         }
                         // Layout inputs are identical for both render branches (only the
@@ -5233,7 +5408,11 @@ impl eframe::App for GitkApp {
                             } else {
                                 self.diff_scroll_to.take()
                             },
-                            last_top_anchor: self.diff_files.iter().filter_map(|f| f.diff_line_idx).max(),
+                            last_top_anchor: self
+                                .diff_files
+                                .iter()
+                                .filter_map(|f| f.diff_line_idx)
+                                .max(),
                         };
                         // One render path for both modes. Syntax-on takes row colours from
                         // the theme's token spans plus an add/del tint; syntax-off uses one
@@ -5277,8 +5456,13 @@ impl eframe::App for GitkApp {
                                 }
                             },
                             |i| {
-                                let (job, row_bg) =
-                                    diff_row_job(&lines[i], render_palette, &font_id, word_diff, syntax);
+                                let (job, row_bg) = diff_row_job(
+                                    &lines[i],
+                                    render_palette,
+                                    &font_id,
+                                    word_diff,
+                                    syntax,
+                                );
                                 (job, row_bg, render_palette.foreground)
                             },
                         );
@@ -5375,7 +5559,13 @@ fn main() -> eframe::Result {
         eprintln!("gitkay: {e}");
         std::process::exit(2);
     }
-    let scope = cli::Scope { all: raw.all, revs, paths, reflog: raw.reflog, follow: raw.follow };
+    let scope = cli::Scope {
+        all: raw.all,
+        revs,
+        paths,
+        reflog: raw.reflog,
+        follow: raw.follow,
+    };
 
     // Build the window title from the repo we already discovered, before dropping
     // it — re-discovering here and unwrapping would panic on a TOCTOU removal.
@@ -5425,14 +5615,21 @@ fn main() -> eframe::Result {
     {
         let repo_path = repo_path.clone();
         let scope = scope.clone();
-        if spawn_guarded("gitkay-history", "history prefetch thread panicked", move || {
-            if let Ok(repo) = Repository::discover(&repo_path) {
-                let t = std::time::Instant::now();
-                let commits = load_history(&repo, 200, &scope);
-                log::debug!("perf: startup: history prefetch (off-thread) {:?}", t.elapsed());
-                let _ = history_tx.send(commits);
-            }
-        })
+        if spawn_guarded(
+            "gitkay-history",
+            "history prefetch thread panicked",
+            move || {
+                if let Ok(repo) = Repository::discover(&repo_path) {
+                    let t = std::time::Instant::now();
+                    let commits = load_history(&repo, 200, &scope);
+                    log::debug!(
+                        "perf: startup: history prefetch (off-thread) {:?}",
+                        t.elapsed()
+                    );
+                    let _ = history_tx.send(commits);
+                }
+            },
+        )
         .is_err()
         {
             log::warn!("history prefetch thread spawn failed; loading synchronously");
@@ -5470,10 +5667,7 @@ fn main() -> eframe::Result {
             // time this creator runs, so the elapsed-so-far here isolates the
             // window/GL init cost (everything between the pre-eframe work above and
             // GitkApp::new) — typically a large, mostly-uncontrollable chunk.
-            log::debug!(
-                "perf: startup: window + GL init {:?}",
-                startup_t0.elapsed()
-            );
+            log::debug!("perf: startup: window + GL init {:?}", startup_t0.elapsed());
             // …and this end-to-end figure covers the whole path from process start
             // to a built app: pre-eframe work, window/GL init, and GitkApp::new.
             let app = GitkApp::new(cc, repo_path, scope, &history_rx, font_rx)?;
@@ -6298,8 +6492,8 @@ mod tests {
             DiffLine::new("+fn foo() {}", LineKind::Add),      // index 1 — real file patch
         ];
         let files = vec![
-            fe("bin.dat", None),     // no patch body
-            fe("foo.rs", Some(1)),   // real file starts here
+            fe("bin.dat", None),   // no patch body
+            fe("foo.rs", Some(1)), // real file starts here
         ];
 
         highlight_diff(&mut lines, &files, &hl);
@@ -6437,40 +6631,85 @@ mod tests {
         };
         let mut c: DiffCache<DiffCacheKey, u32> = DiffCache::new(100);
         c.insert(key("dark", true, true, 0), 1, 1);
-        assert_eq!(c.remove(&key("light", true, true, 0)), None, "different theme ⇒ miss");
-        assert_eq!(c.remove(&key("dark", false, true, 0)), None, "different enabled ⇒ miss");
-        assert_eq!(c.remove(&key("dark", true, false, 0)), None, "different show_stats ⇒ miss");
+        assert_eq!(
+            c.remove(&key("light", true, true, 0)),
+            None,
+            "different theme ⇒ miss"
+        );
+        assert_eq!(
+            c.remove(&key("dark", false, true, 0)),
+            None,
+            "different enabled ⇒ miss"
+        );
+        assert_eq!(
+            c.remove(&key("dark", true, false, 0)),
+            None,
+            "different show_stats ⇒ miss"
+        );
         // content distinguishes virtual diffs whose working-tree content changed.
-        assert_eq!(c.remove(&key("dark", true, true, 7)), None, "different content ⇒ miss");
-        assert_eq!(c.remove(&key("dark", true, true, 0)), Some(1), "same key ⇒ hit");
+        assert_eq!(
+            c.remove(&key("dark", true, true, 7)),
+            None,
+            "different content ⇒ miss"
+        );
+        assert_eq!(
+            c.remove(&key("dark", true, true, 0)),
+            Some(1),
+            "same key ⇒ hit"
+        );
     }
 
     #[test]
     fn diff_cache_key_includes_detect_toggles() {
         let key = |detect_renames: bool, detect_copies: bool| DiffCacheKey {
             oid: git2::Oid::ZERO_SHA1,
-            settings: DiffSettings { show_stats: true, detect_renames, detect_copies, ..ds() },
+            settings: DiffSettings {
+                show_stats: true,
+                detect_renames,
+                detect_copies,
+                ..ds()
+            },
             theme: "dark".to_string(),
             enabled: true,
             content: 0,
         };
         let mut c: DiffCache<DiffCacheKey, u32> = DiffCache::new(100);
         c.insert(key(false, false), 1, 1);
-        assert_eq!(c.remove(&key(true, false)), None, "different detect_renames ⇒ miss");
-        assert_eq!(c.remove(&key(false, true)), None, "different detect_copies ⇒ miss");
+        assert_eq!(
+            c.remove(&key(true, false)),
+            None,
+            "different detect_renames ⇒ miss"
+        );
+        assert_eq!(
+            c.remove(&key(false, true)),
+            None,
+            "different detect_copies ⇒ miss"
+        );
         assert_eq!(c.remove(&key(false, false)), Some(1), "same key ⇒ hit");
     }
 
     #[test]
     fn hash_diff_content_tracks_text_changes() {
         let mk = |texts: &[&str]| DiffData {
-            lines: texts.iter().map(|t| DiffLine::new(t, LineKind::Add)).collect(),
+            lines: texts
+                .iter()
+                .map(|t| DiffLine::new(t, LineKind::Add))
+                .collect(),
             files: Vec::new(),
         };
         let a = mk(&["fn main() {}", "let x = 1;"]);
-        assert_eq!(hash_diff_content(&a), hash_diff_content(&mk(&["fn main() {}", "let x = 1;"])));
-        assert_ne!(hash_diff_content(&a), hash_diff_content(&mk(&["fn main() {}", "let x = 2;"])));
-        assert_ne!(hash_diff_content(&a), hash_diff_content(&mk(&["fn main() {}"]))); // length differs
+        assert_eq!(
+            hash_diff_content(&a),
+            hash_diff_content(&mk(&["fn main() {}", "let x = 1;"]))
+        );
+        assert_ne!(
+            hash_diff_content(&a),
+            hash_diff_content(&mk(&["fn main() {}", "let x = 2;"]))
+        );
+        assert_ne!(
+            hash_diff_content(&a),
+            hash_diff_content(&mk(&["fn main() {}"]))
+        ); // length differs
     }
 
     #[test]
@@ -6492,10 +6731,15 @@ mod tests {
     #[test]
     fn top_extensions_ranks_dedups_and_caps() {
         let paths = [
-            "src/main.rs", "src/lib.rs", "a/b.rs", "UPPER.RS", // rs ×4 (case-insensitive)
-            "x.py", "y.py",                                    // py ×2
-            "z.md",                                            // md ×1
-            "Makefile", ".gitignore",                          // no extension → skipped
+            "src/main.rs",
+            "src/lib.rs",
+            "a/b.rs",
+            "UPPER.RS", // rs ×4 (case-insensitive)
+            "x.py",
+            "y.py", // py ×2
+            "z.md", // md ×1
+            "Makefile",
+            ".gitignore", // no extension → skipped
         ]
         .into_iter()
         .map(String::from);
@@ -6525,16 +6769,24 @@ mod tests {
         assert!(!oid_hex_starts_with(oid, "xyz")); // non-hex never matches
         assert!(!oid_hex_starts_with(oid, &format!("{oid}0"))); // longer than the hex
         // Matches String::starts_with over the real hex for a mixed oid.
-        let mixed = git2::Oid::from_bytes(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        let mixed = git2::Oid::from_bytes(&[
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ])
+        .unwrap();
         let hex = mixed.to_string();
         for k in 0..=hex.len() {
-            assert_eq!(oid_hex_starts_with(mixed, &hex[..k]), hex.starts_with(&hex[..k]));
+            assert_eq!(
+                oid_hex_starts_with(mixed, &hex[..k]),
+                hex.starts_with(&hex[..k])
+            );
         }
     }
 
     #[test]
     fn top_extensions_skips_extensionless_and_lowercases() {
-        let paths = ["Makefile", "README", "X.TXT"].into_iter().map(String::from);
+        let paths = ["Makefile", "README", "X.TXT"]
+            .into_iter()
+            .map(String::from);
         assert_eq!(top_extensions(paths, 10, |_| true), vec!["txt".to_string()]);
     }
 
@@ -6576,7 +6828,10 @@ mod tests {
             vec![oid(5), oid(3), oid(6), oid(2)]
         );
         // Only the rows in `view` are eligible — a narrow window excludes the rest.
-        assert_eq!(prefetch_targets(&commits, 4, 3..6, 10), vec![oid(5), oid(3)]);
+        assert_eq!(
+            prefetch_targets(&commits, 4, 3..6, 10),
+            vec![oid(5), oid(3)]
+        );
     }
 
     #[test]
@@ -6657,8 +6912,7 @@ mod tests {
         // FontDefinitions::default() (build_fonts only adds user fonts on top).
         let ctx = egui::Context::default();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-            let h =
-                |size: f32| ui.fonts_mut(|f| f.row_height(&egui::FontId::monospace(size)));
+            let h = |size: f32| ui.fonts_mut(|f| f.row_height(&egui::FontId::monospace(size)));
             assert!(
                 h(13.0).max(h(12.0)) + 4.0 <= 20.0,
                 "default commit-row fonts must fit the 20px floor (got {})",
@@ -6687,7 +6941,9 @@ mod tests {
         let sig = repo.signature().unwrap();
         repo.tag("v1", &obj, &sig, "release v1", false).unwrap();
         let map = build_ref_map(&repo);
-        let refs = map.get(&c1).expect("annotated tag must map to the tagged commit");
+        let refs = map
+            .get(&c1)
+            .expect("annotated tag must map to the tagged commit");
         assert!(refs.iter().any(|(n, k)| n == "v1" && *k == RefKind::Tag));
     }
 
@@ -6741,7 +6997,14 @@ mod tests {
         let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
         let parent = repo.head().unwrap().peel_to_commit().unwrap();
         let oid = repo
-            .commit(Some("HEAD"), &author, &committer, "rebased", &tree, &[&parent])
+            .commit(
+                Some("HEAD"),
+                &author,
+                &committer,
+                "rebased",
+                &tree,
+                &[&parent],
+            )
             .unwrap();
         let commits = load_commits(&repo, 10, &scope(false, &[]));
         let info = commits.iter().find(|c| c.oid == oid).unwrap();
@@ -6779,11 +7042,17 @@ mod tests {
         // Default (HEAD only): no "on-side".
         let def = summaries(&load_commits(&repo, 100, &scope(false, &[])));
         assert!(def.contains(&"on-main".to_string()));
-        assert!(!def.contains(&"on-side".to_string()), "default must not show other branches");
+        assert!(
+            !def.contains(&"on-side".to_string()),
+            "default must not show other branches"
+        );
 
         // --all: includes "on-side".
         let all = summaries(&load_commits(&repo, 100, &scope(true, &[])));
-        assert!(all.contains(&"on-side".to_string()), "--all must show all branches");
+        assert!(
+            all.contains(&"on-side".to_string()),
+            "--all must show all branches"
+        );
     }
 
     #[test]
@@ -6801,7 +7070,10 @@ mod tests {
         };
         // Commit graph: only commits touching a.txt.
         let got = summaries(&load_commits(&repo, 100, &s));
-        assert_eq!(got, vec!["touch-a-again".to_string(), "touch-a".to_string()]);
+        assert_eq!(
+            got,
+            vec!["touch-a-again".to_string(), "touch-a".to_string()]
+        );
         assert!(!got.contains(&"touch-b".to_string()));
 
         // Diff of c3 is scoped to a.txt: its file list is exactly [a.txt].
@@ -6809,7 +7081,10 @@ mod tests {
             &repo,
             c3,
             CommitKind::Real,
-            DiffSettings { show_stats: true, ..ds() },
+            DiffSettings {
+                show_stats: true,
+                ..ds()
+            },
             &s.paths,
         );
         let files: Vec<&str> = data.files.iter().map(|f| f.path.as_str()).collect();
@@ -6830,7 +7105,10 @@ mod tests {
             &repo,
             c2,
             CommitKind::Real,
-            DiffSettings { show_stats: true, ..ds() },
+            DiffSettings {
+                show_stats: true,
+                ..ds()
+            },
             &[],
         );
         assert!(
@@ -6862,13 +7140,26 @@ mod tests {
         .unwrap();
         let oid = commit_rename(&repo, "old.txt", "new.txt", "rename");
 
-        let on = DiffSettings { detect_renames: true, ..ds() };
-        let files: Vec<String> =
-            get_diff_data(&repo, oid, CommitKind::Real, on, &[]).files.iter().map(|f| f.path.clone()).collect();
-        assert_eq!(files, vec!["new.txt".to_string()], "rename detected ⇒ one entry");
+        let on = DiffSettings {
+            detect_renames: true,
+            ..ds()
+        };
+        let files: Vec<String> = get_diff_data(&repo, oid, CommitKind::Real, on, &[])
+            .files
+            .iter()
+            .map(|f| f.path.clone())
+            .collect();
+        assert_eq!(
+            files,
+            vec!["new.txt".to_string()],
+            "rename detected ⇒ one entry"
+        );
 
-        let mut files: Vec<String> =
-            get_diff_data(&repo, oid, CommitKind::Real, ds(), &[]).files.iter().map(|f| f.path.clone()).collect();
+        let mut files: Vec<String> = get_diff_data(&repo, oid, CommitKind::Real, ds(), &[])
+            .files
+            .iter()
+            .map(|f| f.path.clone())
+            .collect();
         files.sort();
         assert_eq!(
             files,
@@ -6888,15 +7179,29 @@ mod tests {
         .unwrap();
         let oid = commit_rename(&repo, "old.txt", "new.txt", "rename");
 
-        let s = DiffSettings { detect_renames: true, ..ds() };
+        let s = DiffSettings {
+            detect_renames: true,
+            ..ds()
+        };
         let data = get_diff_data(&repo, oid, CommitKind::Real, s, &[]);
         assert_eq!(data.files.len(), 1);
         assert_eq!(data.files[0].path, "new.txt");
         assert_eq!(data.files[0].old_path.as_deref(), Some("old.txt"));
 
-        let body = data.lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
-        assert!(body.contains("rename from old.txt"), "header shows rename from: {body}");
-        assert!(body.contains("rename to new.txt"), "header shows rename to: {body}");
+        let body = data
+            .lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("rename from old.txt"),
+            "header shows rename from: {body}"
+        );
+        assert!(
+            body.contains("rename to new.txt"),
+            "header shows rename to: {body}"
+        );
     }
 
     #[test]
@@ -6913,10 +7218,22 @@ mod tests {
         index.add_path(std::path::Path::new("b.txt")).unwrap();
         let oid = commit_index(&repo, &mut index, "copy a->b");
 
-        let s = DiffSettings { detect_renames: true, detect_copies: true, ..ds() };
+        let s = DiffSettings {
+            detect_renames: true,
+            detect_copies: true,
+            ..ds()
+        };
         let data = get_diff_data(&repo, oid, CommitKind::Real, s, &[]);
-        let b = data.files.iter().find(|f| f.path == "b.txt").expect("b.txt present");
-        assert_eq!(b.old_path.as_deref(), Some("a.txt"), "b.txt detected as copy of a.txt");
+        let b = data
+            .files
+            .iter()
+            .find(|f| f.path == "b.txt")
+            .expect("b.txt present");
+        assert_eq!(
+            b.old_path.as_deref(),
+            Some("a.txt"),
+            "b.txt detected as copy of a.txt"
+        );
     }
 
     #[test]
@@ -6958,13 +7275,17 @@ mod tests {
         // Uncommitted modification to a tracked file, b.txt only.
         std::fs::write(repo.workdir().unwrap().join("b.txt"), "dirty").unwrap();
 
-        let has_uncommitted_row =
-            |paths: Vec<String>| -> bool {
-                let s = cli::Scope { all: false, revs: Vec::new(), paths, ..Default::default() };
-                load_commits(&repo, 100, &s)
-                    .iter()
-                    .any(|c| c.oid == oid_uncommitted())
+        let has_uncommitted_row = |paths: Vec<String>| -> bool {
+            let s = cli::Scope {
+                all: false,
+                revs: Vec::new(),
+                paths,
+                ..Default::default()
             };
+            load_commits(&repo, 100, &s)
+                .iter()
+                .any(|c| c.oid == oid_uncommitted())
+        };
 
         // Filter on a.txt: the b.txt change is outside the path → no virtual row.
         assert!(
@@ -7027,7 +7348,10 @@ mod tests {
         assert_eq!(token_to_pathspec(".", "", wd), "");
         assert_eq!(token_to_pathspec("a/b", "", wd), "a/b");
         // Absolute token under the worktree → made repo-root-relative.
-        assert_eq!(token_to_pathspec("/repo/src/foo.rs", "src", wd), "src/foo.rs");
+        assert_eq!(
+            token_to_pathspec("/repo/src/foo.rs", "src", wd),
+            "src/foo.rs"
+        );
     }
 
     #[test]
@@ -7065,9 +7389,16 @@ mod tests {
         let (_d, repo) = temp_repo();
         let c1 = commit_file(&repo, "a.txt", "1", "first");
         let c2 = commit_file(&repo, "a.txt", "2", "second");
-        let scope = cli::Scope { reflog: true, ..Default::default() };
+        let scope = cli::Scope {
+            reflog: true,
+            ..Default::default()
+        };
         let rows = load_reflog(&repo, 100, &scope);
-        assert!(rows.len() >= 2, "expected >=2 reflog rows, got {}", rows.len());
+        assert!(
+            rows.len() >= 2,
+            "expected >=2 reflog rows, got {}",
+            rows.len()
+        );
         // Newest first: HEAD@{0} is the latest commit.
         assert_eq!(rows[0].oid, c2);
         assert_eq!(rows[1].oid, c1);
@@ -7156,8 +7487,7 @@ mod tests {
             (egui::Color32::RED, 0..mid),
             (egui::Color32::BLUE, mid..body.len()),
         ];
-        let emphasis: Vec<std::ops::Range<usize>> =
-            std::iter::once(nv..body.len()).collect();
+        let emphasis: Vec<std::ops::Range<usize>> = std::iter::once(nv..body.len()).collect();
         let segs = body_sections(body, &spans, egui::Color32::WHITE, &emphasis);
         // Segments reconstruct the body byte-for-byte (no gaps, no overlaps).
         let rebuilt: String = segs.iter().map(|(r, _, _)| &body[r.clone()]).collect();
@@ -7174,7 +7504,16 @@ mod tests {
     #[test]
     fn diff_paths_for_follows_per_commit_name() {
         let mk = |o: git2::Oid, fp: Option<&str>| {
-            CommitInfo::new(o, String::new(), String::new(), 0, 0, Vec::new(), Vec::new(), fp.map(String::from))
+            CommitInfo::new(
+                o,
+                String::new(),
+                String::new(),
+                0,
+                0,
+                Vec::new(),
+                Vec::new(),
+                fp.map(String::from),
+            )
         };
         let commits = vec![mk(oid(2), Some("new.txt")), mk(oid(1), Some("old.txt"))];
         let follow = cli::Scope {
@@ -7183,13 +7522,28 @@ mod tests {
             ..Default::default()
         };
         // Each commit's diff follows the file's name at that commit.
-        assert_eq!(diff_paths_for(&follow, &commits, oid(1)), vec!["old.txt".to_string()]);
-        assert_eq!(diff_paths_for(&follow, &commits, oid(2)), vec!["new.txt".to_string()]);
+        assert_eq!(
+            diff_paths_for(&follow, &commits, oid(1)),
+            vec!["old.txt".to_string()]
+        );
+        assert_eq!(
+            diff_paths_for(&follow, &commits, oid(2)),
+            vec!["new.txt".to_string()]
+        );
         // Unknown oid (or no follow_path) falls back to the global path.
-        assert_eq!(diff_paths_for(&follow, &commits, oid(9)), vec!["new.txt".to_string()]);
+        assert_eq!(
+            diff_paths_for(&follow, &commits, oid(9)),
+            vec!["new.txt".to_string()]
+        );
         // Non-follow mode always uses the global path filter.
-        let plain = cli::Scope { paths: vec!["x".to_string()], ..Default::default() };
-        assert_eq!(diff_paths_for(&plain, &commits, oid(1)), vec!["x".to_string()]);
+        let plain = cli::Scope {
+            paths: vec!["x".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            diff_paths_for(&plain, &commits, oid(1)),
+            vec!["x".to_string()]
+        );
     }
 
     #[test]
@@ -7207,7 +7561,10 @@ mod tests {
             ..Default::default()
         };
         let rows = load_reflog(&repo, 100, &scope);
-        assert!(!rows.is_empty(), "named-ref reflog should resolve and list entries");
+        assert!(
+            !rows.is_empty(),
+            "named-ref reflog should resolve and list entries"
+        );
         assert_eq!(rows[0].oid, c2);
         assert_eq!(rows[0].refs[0].0, "feature@{0}");
     }
@@ -7223,7 +7580,10 @@ mod tests {
         let c = |o| repo.find_commit(o).unwrap();
         // The rename commit adds new.txt (renamed from old.txt).
         assert!(file_added(&c(renamed), "new.txt"));
-        assert_eq!(rename_source(&repo, &c(renamed), "new.txt").as_deref(), Some("old.txt"));
+        assert_eq!(
+            rename_source(&repo, &c(renamed), "new.txt").as_deref(),
+            Some("old.txt")
+        );
         // The edit commit did NOT add new.txt (it already existed) → no rename.
         assert!(!file_added(&c(edit), "new.txt"));
         assert_eq!(rename_source(&repo, &c(edit), "new.txt"), None);
@@ -7257,11 +7617,11 @@ mod tests {
         // Diff order is unsorted; grouped groups by directory (alphabetical,
         // parents before children) with root files last.
         let files = [
-            ("src/main/java/com/acme/Foo.java", None), // 0
-            ("src/main/java/com/acme/Bar.java", None), // 1
+            ("src/main/java/com/acme/Foo.java", None),     // 0
+            ("src/main/java/com/acme/Bar.java", None),     // 1
             ("src/test/java/com/acme/FooTest.java", None), // 2
-            ("docs/guide.md", None), // 3
-            ("README.md", None), // 4
+            ("docs/guide.md", None),                       // 3
+            ("README.md", None),                           // 4
         ];
         let rows = build_file_rows(&files, FileListLayout::Grouped);
         let desc: Vec<String> = rows.iter().map(row_desc).collect();
@@ -7271,11 +7631,11 @@ mod tests {
                 "H:docs/",
                 "F:3:guide.md:true",
                 "H:src/main/java/com/acme/",
-                "F:1:Bar.java:true",    // Bar sorts before Foo
+                "F:1:Bar.java:true", // Bar sorts before Foo
                 "F:0:Foo.java:true",
                 "H:src/test/java/com/acme/",
                 "F:2:FooTest.java:true",
-                "F:4:README.md:false",  // root, no header, last
+                "F:4:README.md:false", // root, no header, last
             ]
         );
     }
@@ -7373,7 +7733,10 @@ mod tests {
     #[test]
     fn common_dir_prefix_len_cases() {
         // Sibling directories under a shared ancestor: dim the shared "x/wm/".
-        assert_eq!(common_dir_prefix_len("x/wm/actions/", "x/wm/activematch/"), 5);
+        assert_eq!(
+            common_dir_prefix_len("x/wm/actions/", "x/wm/activematch/"),
+            5
+        );
         // A child of the header above shares the whole parent.
         assert_eq!(common_dir_prefix_len("a/", "a/b/"), 2);
         // Nothing shared.
@@ -7392,9 +7755,15 @@ mod tests {
         // Moved up out of a subdirectory (empty new-mid).
         assert_eq!(rename_brace("a/b/x.c", "a/x.c"), (s("a/"), s("{b ⇒ }/x.c")));
         // Sibling-directory move.
-        assert_eq!(rename_brace("p/foo/x.c", "p/baz/x.c"), (s("p/"), s("{foo ⇒ baz}/x.c")));
+        assert_eq!(
+            rename_brace("p/foo/x.c", "p/baz/x.c"),
+            (s("p/"), s("{foo ⇒ baz}/x.c"))
+        );
         // Same-directory rename: filename parts aren't factored (suffix snaps to '/').
-        assert_eq!(rename_brace("d/Old.java", "d/New.java"), (s("d/"), s("{Old.java ⇒ New.java}")));
+        assert_eq!(
+            rename_brace("d/Old.java", "d/New.java"),
+            (s("d/"), s("{Old.java ⇒ New.java}"))
+        );
         // Deep shared prefix.
         assert_eq!(
             rename_brace("a/b/c/foo/F.java", "a/b/c/baz/F.java"),
@@ -7403,14 +7772,21 @@ mod tests {
         // Nothing shared ⇒ no braces, empty prefix.
         assert_eq!(rename_brace("x.c", "y.c"), (String::new(), s("x.c ⇒ y.c")));
         // Multibyte directory segments.
-        assert_eq!(rename_brace("α/foo/x", "α/bar/x"), (s("α/"), s("{foo ⇒ bar}/x")));
+        assert_eq!(
+            rename_brace("α/foo/x", "α/bar/x"),
+            (s("α/"), s("{foo ⇒ bar}/x"))
+        );
     }
 
     /// Compact one row to a string for assertions.
     fn row_desc(r: &FileListRow) -> String {
         match r {
             FileListRow::Header { dir, .. } => format!("H:{dir}"),
-            FileListRow::File { idx, label, indented } => {
+            FileListRow::File {
+                idx,
+                label,
+                indented,
+            } => {
                 format!("F:{idx}:{label}:{indented}")
             }
         }
