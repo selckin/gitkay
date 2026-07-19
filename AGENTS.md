@@ -179,6 +179,7 @@ with that suite green.
 
 - Both scrolled lists (commit list + diff pane) virtualize with egui `show_rows`. An early-egui bottom-gap bug once forced manual pre/post spacers on the commit list; that's fixed as of 0.34 (verified — no gap at end-of-list / few commits / on resize), so `show_rows` is used throughout. Don't reintroduce manual spacers.
 - `layout_no_wrap` + `with_clip_rect` for text truncation (egui `layout()` wraps)
+- egui tooltips (`show_tooltip_text` / `on_hover_*`) live on an **interactable** layer: if one lands over the pointer (likely at the right window edge, where a wide tooltip flips across the cursor), it wins the hit-test and the ScrollArea underneath silently drops wheel input until the mouse moves. The file-list path tooltip is therefore a hand-rolled `Area` with `.interactable(false)` (plus an `is_scrolling` guard so it doesn't churn mid-wheel) — don't swap it back to the convenience API
 - Lane colors: track per-pipe, not per-column, or colors change on shifts
 - Two branches → same parent: both keep lanes, convergence at parent row
 - New merge lanes: skip vertical (diagonal already connects, no source above)
