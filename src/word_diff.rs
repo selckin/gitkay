@@ -88,7 +88,7 @@ fn merge_token_ranges(tokens: &[(Range<usize>, &str)], changed: &[usize]) -> Vec
 }
 
 /// Word-level changed ranges for a `-`/`+` line pair, in each body's coordinates.
-pub(crate) fn line_emphasis(del: &str, add: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+pub fn line_emphasis(del: &str, add: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
     let dt = word_tokens(del);
     let at = word_tokens(add);
     let ds: Vec<&str> = dt.iter().map(|(_, s)| *s).collect();

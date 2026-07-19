@@ -1,6 +1,6 @@
 //! User font/size configuration: parses ~/.config/gitkay/config.toml, resolves
 //! named font families to files (cached), and maps the app's text roles to
-//! egui FontIds.
+//! egui `FontIds`.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -32,7 +32,7 @@ pub enum Family {
 /// The two font sources every text role draws from: `[fonts] monospace = "..."`.
 /// A named family resolves from system fonts; a `*_path` is an explicit file that
 /// skips the name lookup.
-#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct FontsSection {
     pub(crate) monospace: Option<String>,
@@ -43,7 +43,7 @@ pub struct FontsSection {
 
 /// One text role's overrides: `{ size = .., font = .. }`. Each unset field falls
 /// back to that role's built-in default (see `role_default`), so e.g.
-/// `commit_meta = { font = "proportional" }` keeps commit_meta's own default size.
+/// `commit_meta = { font = "proportional" }` keeps `commit_meta`'s own default size.
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct TextStyle {
@@ -64,7 +64,7 @@ pub struct TextSection {
 }
 
 impl TextSection {
-    fn style(&self, role: Role) -> &TextStyle {
+    const fn style(&self, role: Role) -> &TextStyle {
         match role {
             Role::Diff => &self.diff,
             Role::CommitSummary => &self.commit_summary,
@@ -77,14 +77,11 @@ impl TextSection {
 }
 
 /// Built-in (size, family) for each role, before any `[text]` override.
-fn role_default(role: Role) -> (f32, Family) {
+const fn role_default(role: Role) -> (f32, Family) {
     match role {
-        Role::Diff => (13.0, Family::Monospace),
-        Role::CommitSummary => (13.0, Family::Monospace),
-        Role::CommitMeta => (12.0, Family::Monospace),
+        Role::Diff | Role::CommitSummary | Role::Ui => (13.0, Family::Monospace),
+        Role::CommitMeta | Role::FileList => (12.0, Family::Monospace),
         Role::Refs => (11.0, Family::Monospace),
-        Role::FileList => (12.0, Family::Monospace),
-        Role::Ui => (13.0, Family::Monospace),
     }
 }
 
@@ -101,7 +98,7 @@ pub enum BandSource {
 }
 
 /// `[diff.bands]` — add/remove row band colours for syntax-on diffs.
-#[derive(Deserialize, Clone, Debug, PartialEq, Default)]
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct BandsSection {
     pub(crate) source: BandSource,
@@ -125,7 +122,7 @@ pub enum FileListLayout {
 }
 
 /// `[diff]` — diff-pane rendering options.
-#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DiffSection {
     /// Syntax-highlight diffs. `false` ⇒ the original flat per-role colouring (no
@@ -177,12 +174,12 @@ pub fn read_config(path: &Path) -> Result<Config, String> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
-        Err(e) => return Err(format!("cannot read {path:?}: {e}")),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
     };
-    toml::from_str(&text).map_err(|e| format!("invalid config {path:?}: {e}"))
+    toml::from_str(&text).map_err(|e| format!("invalid config {}: {e}", path.display()))
 }
 
-fn egui_family(f: Family) -> egui::FontFamily {
+const fn egui_family(f: Family) -> egui::FontFamily {
     match f {
         Family::Monospace => egui::FontFamily::Monospace,
         Family::Proportional => egui::FontFamily::Proportional,
@@ -190,7 +187,7 @@ fn egui_family(f: Family) -> egui::FontFamily {
 }
 
 /// One role's resolved size + family: config override applied over `role_default`,
-/// size NaN-guarded and clamped to [MIN_SIZE, MAX_SIZE].
+/// size NaN-guarded and clamped to [`MIN_SIZE`, `MAX_SIZE`].
 #[derive(Clone, Copy)]
 struct ResolvedStyle {
     size: f32,
@@ -208,7 +205,7 @@ pub struct Fonts {
 }
 
 impl Fonts {
-    pub fn from_config(cfg: &Config) -> Fonts {
+    pub fn from_config(cfg: &Config) -> Self {
         let resolve = |role: Role| -> ResolvedStyle {
             let (def_size, def_family) = role_default(role);
             let style = cfg.text.style(role);
@@ -216,7 +213,7 @@ impl Fonts {
             let size = (if size.is_nan() { def_size } else { size }).clamp(MIN_SIZE, MAX_SIZE);
             ResolvedStyle { size, family: style.font.unwrap_or(def_family) }
         };
-        Fonts {
+        Self {
             diff: resolve(Role::Diff),
             commit_summary: resolve(Role::CommitSummary),
             commit_meta: resolve(Role::CommitMeta),
@@ -226,7 +223,7 @@ impl Fonts {
         }
     }
 
-    fn style(&self, role: Role) -> ResolvedStyle {
+    const fn style(&self, role: Role) -> ResolvedStyle {
         match role {
             Role::Diff => self.diff,
             Role::CommitSummary => self.commit_summary,
@@ -237,7 +234,7 @@ impl Fonts {
         }
     }
 
-    pub fn font_id(&self, role: Role) -> egui::FontId {
+    pub const fn font_id(&self, role: Role) -> egui::FontId {
         let s = self.style(role);
         egui::FontId::new(s.size, egui_family(s.family))
     }
@@ -388,36 +385,38 @@ fn resolve_font_path(
     if let Some(cached) = cache.get(name).cloned() {
         let pb = PathBuf::from(cached);
         if exists(&pb) {
-            log::debug!("build_fonts: font '{name}' resolved from cache -> {pb:?}");
+            log::debug!(
+                "build_fonts: font '{name}' resolved from cache -> {}",
+                pb.display()
+            );
             return Some(pb);
         }
         cache.remove(name); // stale entry — evict so a failed rescan doesn't leave it behind
     }
-    match scan(name) {
-        Some(found) => {
-            log::debug!("build_fonts: font '{name}' resolved by scan -> {found:?}");
-            cache.insert(name.to_owned(), found.to_string_lossy().into_owned());
-            Some(found)
-        }
-        None => {
-            // A named font fontdb can't match: gitkay falls back to its bundled fonts,
-            // and because nothing is cached the (~150ms) system scan re-runs on EVERY
-            // launch. Surfaced at warn so a typo'd or uninstalled name is visible
-            // instead of being a silent, permanent startup tax.
-            log::warn!(
-                "font '{name}' not found by fontdb; using bundled fallback \
-                 (this re-scans every launch — install the font, set *_path, or remove it)"
-            );
-            None
-        }
-    }
+    let Some(found) = scan(name) else {
+        // A named font fontdb can't match: gitkay falls back to its bundled fonts,
+        // and because nothing is cached the (~150ms) system scan re-runs on EVERY
+        // launch. Surfaced at warn so a typo'd or uninstalled name is visible
+        // instead of being a silent, permanent startup tax.
+        log::warn!(
+            "font '{name}' not found by fontdb; using bundled fallback \
+             (this re-scans every launch — install the font, set *_path, or remove it)"
+        );
+        return None;
+    };
+    log::debug!(
+        "build_fonts: font '{name}' resolved by scan -> {}",
+        found.display()
+    );
+    cache.insert(name.to_owned(), found.to_string_lossy().into_owned());
+    Some(found)
 }
 
 /// Pick a font source for one family: an explicit path wins outright; otherwise
 /// resolve the name (cache + scan). Returns `None` when neither is configured.
 fn family_source(
-    name: &Option<String>,
-    path: &Option<String>,
+    name: Option<&str>,
+    path: Option<&str>,
     cache: &mut BTreeMap<String, String>,
     exists: &impl Fn(&Path) -> bool,
     scan: &mut impl FnMut(&str) -> Option<PathBuf>,
@@ -425,8 +424,7 @@ fn family_source(
     if let Some(p) = path {
         return Some(PathBuf::from(p));
     }
-    let name = name.as_ref()?;
-    resolve_font_path(name, cache, exists, scan)
+    resolve_font_path(name?, cache, exists, scan)
 }
 
 fn load_cache(path: &Path) -> BTreeMap<String, String> {
@@ -474,8 +472,7 @@ fn fontdb_scan(db: &fontdb::Database, name: &str) -> Option<PathBuf> {
     let id = db.query(&query)?;
     let (source, _index) = db.face_source(id)?;
     match source {
-        fontdb::Source::File(path) => Some(path),
-        fontdb::Source::SharedFile(path, _) => Some(path),
+        fontdb::Source::File(path) | fontdb::Source::SharedFile(path, _) => Some(path),
         // In-memory font (no file path) — can't load it as a user override; treat as not found.
         fontdb::Source::Binary(_) => None,
     }
@@ -534,13 +531,15 @@ pub fn build_fonts(cfg: &Config) -> (egui::FontDefinitions, Fonts, Vec<String>) 
             egui::FontFamily::Proportional,
         ),
     ] {
-        let Some(path) = family_source(name, path_override, &mut cache, &exists, &mut scan) else {
+        let Some(path) =
+            family_source(name.as_deref(), path_override.as_deref(), &mut cache, &exists, &mut scan)
+        else {
             continue;
         };
         match std::fs::read(&path) {
             Ok(bytes) => apply_family(&mut defs, key, family, bytes),
             Err(e) => {
-                let msg = format!("failed to read font {path:?}: {e}");
+                let msg = format!("failed to read font {}: {e}", path.display());
                 log::warn!("{msg}");
                 warnings.push(msg);
             }
@@ -826,8 +825,8 @@ mod tests {
         let exists = |_: &Path| true;
         let mut scan = |_: &str| -> Option<PathBuf> { panic!("must not scan when path is set") };
         let got = family_source(
-            &Some("Whatever".to_owned()),
-            &Some("/explicit.ttf".to_owned()),
+            Some("Whatever"),
+            Some("/explicit.ttf"),
             &mut cache,
             &exists,
             &mut scan,
@@ -949,13 +948,7 @@ mod tests {
         let mut cache = BTreeMap::new();
         let exists = |_: &Path| true;
         let mut scan = |_: &str| -> Option<PathBuf> { None };
-        let got = family_source(
-            &Some("UnknownFont".to_owned()),
-            &None,
-            &mut cache,
-            &exists,
-            &mut scan,
-        );
+        let got = family_source(Some("UnknownFont"), None, &mut cache, &exists, &mut scan);
         assert_eq!(got, None);
         assert!(cache.is_empty());
     }

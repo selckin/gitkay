@@ -25,3 +25,27 @@ env_logger = "0.11.10"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Full opt-in lint groups, minus the categories that don't fit this codebase
+# (each allow states why). Note: group-level enables mean a stable toolchain
+# bump can surface new lints and fail CI's -D warnings gate — fix or allow then.
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# f32-heavy egui layout code converts usize/i32 <-> f32 constantly.
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+cast_lossless = "allow"
+cast_possible_wrap = "allow"
+cast_possible_truncation = "allow"
+# Exact float comparison against known config-default literals is deliberate.
+float_cmp = "allow"
+# mul_add micro-optimizations don't matter for UI layout math.
+suboptimal_flops = "allow"
+# Immediate-mode UI functions are naturally long.
+too_many_lines = "allow"
+# Config/scope structs legitimately carry independent bool flags.
+struct_excessive_bools = "allow"
+# Layout math uses short/similar coordinate names (x/y/w/h, x0/x1).
+similar_names = "allow"
+many_single_char_names = "allow"

@@ -35,21 +35,18 @@ impl<K: Clone + Eq + Hash, V> DiffCache<K, V> {
     /// the value and is expected to re-`insert` it when done — the cache never
     /// retains the value the caller is actively using.
     pub fn remove(&mut self, key: &K) -> Option<V> {
-        match self.entries.remove(key) {
-            Some(entry) => {
-                self.total -= entry.weight;
-                log::debug!(
-                    "diff cache: remove HIT ({} lines) → {} entries / {} lines",
-                    entry.weight,
-                    self.entries.len(),
-                    self.total
-                );
-                Some(entry.value)
-            }
-            None => {
-                log::debug!("diff cache: remove MISS → {} entries", self.entries.len());
-                None
-            }
+        if let Some(entry) = self.entries.remove(key) {
+            self.total -= entry.weight;
+            log::debug!(
+                "diff cache: remove HIT ({} lines) → {} entries / {} lines",
+                entry.weight,
+                self.entries.len(),
+                self.total
+            );
+            Some(entry.value)
+        } else {
+            log::debug!("diff cache: remove MISS → {} entries", self.entries.len());
+            None
         }
     }
 
