@@ -6488,6 +6488,10 @@ mod tests {
     fn default_scope_is_current_branch_only() {
         let (_d, repo) = temp_repo();
         commit_file(&repo, "a.txt", "1", "base");
+        // Remember the initial branch by name — init.defaultBranch varies by
+        // machine, and set_head() on a guessed nonexistent branch would silently
+        // succeed (attached-unborn HEAD) rather than fail over to the other name.
+        let base_branch = repo.head().unwrap().name().unwrap().to_string();
         // a side branch with a unique commit, while HEAD stays on the base branch
         let base = repo.head().unwrap().peel_to_commit().unwrap();
         repo.branch("side", &base, false).unwrap();
@@ -6498,7 +6502,7 @@ mod tests {
         repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
             .unwrap();
         commit_file(&repo, "b.txt", "x", "on-side");
-        repo.set_head("refs/heads/master").unwrap_or_else(|_| repo.set_head("refs/heads/main").unwrap());
+        repo.set_head(&base_branch).unwrap();
         repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
             .unwrap();
 

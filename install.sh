@@ -6,6 +6,8 @@
 # Requires the build dependencies listed in the README
 # (libgtk-4, libgraphene, libssl, pkg-config, cmake).
 
-cd "$(dirname "$0")"
+die() { echo "$*" >&2; exit 1; }
+
+cd "$(dirname "$0")" || die "cannot cd to the script's directory"
 
 exec cargo install --path . --locked --force "$@"

@@ -6,7 +6,7 @@ Native Wayland git history viewer — gitk, but okay. Built with Rust + egui.
 
 ```sh
 cargo build --release
-cargo test                # 149 tests (main + config + highlight + cli + diff-cache modules)
+cargo test                # 157 tests (main + config + highlight + cli + diff-cache + word-diff modules)
 cargo clippy -- -D warnings  # CI gate — any warning fails CI
 cp target/release/gitkay ~/.local/bin/
 ```
@@ -18,12 +18,14 @@ Rust deps of note: `fontdb` (system-font name → file lookup), `dirs` (XDG path
 
 ## Architecture
 
-App at `src/main.rs` (~6500 lines) plus extracted modules: `src/config.rs`
+App at `src/main.rs` (~7200 lines) plus extracted modules: `src/config.rs`
 (`[fonts]`/`[text]`/`[diff]` config: TOML parsing, fontdb resolution + cache,
 role→FontId map), `src/highlight.rs` (syntect highlighter, theme/palette
 resolution, per-line tokenization), `src/diff_cache.rs` (line-budget LRU cache),
-and `src/cli.rs` (pure argv parser, rev-vs-path classification). `main.rs` has
-three sections:
+`src/cli.rs` (pure argv parser, rev-vs-path classification), and
+`src/word_diff.rs` (pure intra-line word diff: tokenizer + LCS alignment; the
+`DiffLine`-aware driver `compute_word_emphasis` stays in `main.rs`). `main.rs`
+has three sections:
 
 ### Data Layer
 - `load_commits()` — revwalk via `git2`, topological + time order, precomputed ref map
@@ -132,11 +134,12 @@ parts run off the window-creation critical path:
 
 ## Tests
 
-149 tests total (split across the main/config/highlight/cli/diff-cache modules). The graph-layout
-tests listed below live in `main.rs` and all use fake OIDs via `oid(n)` — no real
-git repo needed; the `config`, `highlight`, `cli`, and `diff_cache` modules each
-carry their own `#[cfg(test)]` suite (TOML parsing + clamping, theme/palette
-resolution, rev-vs-path classification, LRU eviction).
+157 tests total (split across the main/config/highlight/cli/diff-cache/word-diff
+modules). The graph-layout tests listed below live in `main.rs` and all use fake
+OIDs via `oid(n)` — no real git repo needed; the `config`, `highlight`, `cli`,
+`diff_cache`, and `word_diff` modules each carry their own `#[cfg(test)]` suite
+(TOML parsing + clamping, theme/palette resolution, rev-vs-path classification,
+LRU eviction, LCS word alignment).
 
 - `test_linear_history` — 4 commits, col 0, no diagonals
 - `test_simple_branch_and_merge` — merge diagonal, first parent col 0
@@ -145,10 +148,7 @@ resolution, rev-vs-path classification, LRU eviction).
 - `test_pr_merge_pattern` — GitHub PR: main col 0, PR col 1
 - `test_sequential_merges` — multiple PRs, main stays col 0
 - `test_branch_after_merge_stays_stable` — convergence drawn correctly
-- `test_merge_commit_has_diagonal` — merge has at least one diagonal
-- `test_merge_new_lane_no_vertical` — new merge lane: no vertical stub
-- `test_merge_new_lane_no_vertical_but_diagonal` — diagonal present, no vertical
-- `test_merge_new_lane_no_vertical_even_with_pending_commit` — even with future commit
+- `test_merge_new_lane_no_vertical_but_diagonal` — merge diagonal present, no vertical stub on the new lane
 - `test_merge_into_feature_main_continues` — main vertical persists after merge-into
 - `test_convergence_no_vertical_on_consumed_lane` — consumed lanes: no vertical
 - `test_many_linear_commits_stay_in_column` — 10 linear commits, all col 0

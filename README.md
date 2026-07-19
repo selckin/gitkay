@@ -109,14 +109,23 @@ sudo dnf install gtk4-devel graphene-devel openssl-devel
 
 ### openSUSE RPM
 
+`rpmbuild` expects the source tarball in `~/rpmbuild/SOURCES`, so create it
+first (from the release tag matching `packaging/gitkay.spec`'s `Version:`):
+
 ```sh
+mkdir -p ~/rpmbuild/SOURCES
+git archive --format=tar.gz --prefix=gitkay-1.2.0/ -o ~/rpmbuild/SOURCES/gitkay-1.2.0.tar.gz v1.2.0
 rpmbuild -ba packaging/gitkay.spec
 sudo rpm -i ~/rpmbuild/RPMS/x86_64/gitkay-*.rpm
 ```
 
 ### Ubuntu / Debian .deb
 
+`dpkg-buildpackage` expects `debian/` at the source root; it lives under
+`packaging/`, so link it into place first:
+
 ```sh
+ln -s packaging/debian debian
 dpkg-buildpackage -us -uc -b
 sudo dpkg -i ../gitkay_*.deb
 ```
@@ -127,8 +136,13 @@ sudo dpkg -i ../gitkay_*.deb
 # Inside a git repo
 gitkay
 
-# Or specify a path
-gitkay /path/to/repo
+# Or point it at a repo elsewhere
+gitkay -C /path/to/repo
+
+# Scope the history: all refs, a rev range, or paths
+gitkay --all
+gitkay v1.0..main
+gitkay -- src/
 ```
 
 ### Controls
@@ -147,12 +161,12 @@ gitkay /path/to/repo
 
 ## Architecture
 
-Rust app (~4800 lines in `src/main.rs`, plus `src/config.rs` for fonts + syntax
+Rust app (~7200 lines in `src/main.rs`, plus `src/config.rs` for fonts + syntax
 config, `src/highlight.rs` for syntect highlighting, `src/diff_cache.rs` for the
-line-budget LRU diff cache, and `src/cli.rs` for argument parsing) with 106 unit
-tests:
+line-budget LRU diff cache, `src/cli.rs` for argument parsing, and
+`src/word_diff.rs` for intra-line word diffing) with 157 unit tests:
 
-- **egui** + **eframe** — native Wayland window with wgpu rendering
+- **egui** + **eframe** — native Wayland window with OpenGL (glow) rendering
 - **git2** (libgit2) — repository access, revwalk, diff
 - **syntect** + **two-face** — language-aware diff syntax highlighting (pure-Rust fancy-regex backend, no C deps)
 - **chrono** — date formatting
@@ -191,6 +205,8 @@ commit_summary = { size = 14, font = "proportional" }
 | `file_list` | `"grouped"` | `"grouped"` groups files under directory headers (basenames indented); `"full"` shows each file's full repo-relative path; `"name"` shows just basenames |
 | `syntax` | `true` | `false` restores the original flat per-role coloring (no theme, no highlighter) |
 | `theme` | `"catppuccin-mocha"` | one of 29 bundled themes (e.g. `dracula`, `nord`, `gruvbox-dark`, `github`, `solarized-light`); unknown values warn and fall back |
+| `detect_renames` | `true` | show a renamed file as one `old → new` entry (git `-M`) instead of a delete + add |
+| `detect_copies` | `false` | show a file copied from another *modified* file as `source → copy` (git `-C`); more expensive than renames |
 
 **Diff bands** (`[diff.bands]`) — the add/remove row tints on syntax-on diffs:
 
