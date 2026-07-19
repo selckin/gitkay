@@ -2028,6 +2028,7 @@ fn history_worker(job: HistoryJob) {
             return;
         }
     };
+    let t = std::time::Instant::now();
     let load = match kind {
         HistoryJobKind::Extend {
             skip,
@@ -2046,6 +2047,25 @@ fn history_worker(job: HistoryJob) {
             count,
         },
     };
+    // Completion log with shape + duration, like the diff-load/prefetch/highlight
+    // workers — without it a wasted walk (superseded, duplicated) is invisible in
+    // the debug trace.
+    match &load {
+        HistoryLoad::Extend { new, .. } => {
+            log::debug!(
+                "history-load: extend +{} rows in {:?}",
+                new.len(),
+                t.elapsed()
+            );
+        }
+        HistoryLoad::Rebuild { commits, .. } => {
+            log::debug!(
+                "history-load: rebuild {} rows in {:?}",
+                commits.len(),
+                t.elapsed()
+            );
+        }
+    }
     if tx
         .send(HistoryResult {
             epoch,
@@ -3900,7 +3920,10 @@ impl GitkApp {
     fn drain_history_results(&mut self) {
         while let Ok(result) = self.history_load_rx.try_recv() {
             if !self.history_epoch.is_current(result.epoch) {
-                continue; // superseded; the newer dispatch is still in flight
+                // Superseded; the newer dispatch is still in flight. Logged: the
+                // walk this result came from was wasted work.
+                log::debug!("history-load: drop superseded result");
+                continue;
             }
             self.history_inflight = false;
             let Some(load) = result.load else {
@@ -4824,7 +4847,14 @@ impl GitkApp {
                     // current settings/theme (same rule as the prefetch drain): a
                     // stale-settings key could never be hit again and would only
                     // bloat the LRU. Virtual entries are skipped, their content-
-                    // keyed result may already be stale.
+                    // keyed result may already be stale. Logged: this compute never
+                    // reached the screen — repeats of this line are the duplicate-
+                    // work signal that exposed the pre-dedupe stacking.
+                    log::debug!(
+                        "diff-load: superseded result for {} ({} lines)",
+                        key.oid,
+                        data.lines.len()
+                    );
                     if is_real_commit(key.oid)
                         && self.key_is_current(&key)
                         && !self.diff_cache.contains(&key)
@@ -4849,7 +4879,10 @@ impl GitkApp {
                     // so its failure takes the `None if current` arm above.
                     self.load_selected_diff();
                 }
-                None => {} // a superseded failure: nothing to do
+                // A superseded failure or pre-compute bail: nothing to install,
+                // but log it — during the dedupe diagnosis the open question was
+                // "did that worker ever report?", and this line is the answer.
+                None => log::debug!("diff-load: superseded bail/failure for {}", key.oid),
             }
         }
 
@@ -4886,7 +4919,11 @@ impl GitkApp {
                 self.install_preferring_cache(key, data);
                 continue;
             }
-            if self.key_is_current(&key) && self.current_diff_key.as_ref() != Some(&key) {
+            if !self.key_is_current(&key) {
+                // Settings/theme changed while the worker ran; the key can never be
+                // hit again. Logged: this completed prefetch was wasted work.
+                log::debug!("prefetch: drop stale-keyed result for {}", key.oid);
+            } else if self.current_diff_key.as_ref() != Some(&key) {
                 self.cache_diff(key, data);
             }
         }
