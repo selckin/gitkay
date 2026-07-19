@@ -1458,15 +1458,31 @@ struct FileEntry {
 struct DiffData {
     lines: Vec<DiffLine>,
     files: Vec<FileEntry>,
+    /// Whether `compute_word_emphasis` has run over `lines`. The pass (an LCS per
+    /// changed block) is deferred while the word-diff toggle is off — nothing would
+    /// render it — and run on demand via `ensure_word_emphasis`.
+    word_emphasized: bool,
 }
 
 impl DiffData {
-    /// Finalize a diff builder's output: store the lines + files, computing the
-    /// word-diff emphasis once. The single place every builder produces a `DiffData`,
-    /// so no source can forget the emphasis pass.
-    fn new(mut lines: Vec<DiffLine>, files: Vec<FileEntry>) -> Self {
-        compute_word_emphasis(&mut lines);
-        Self { lines, files }
+    /// Finalize a diff builder's output. The word-diff emphasis pass is NOT run
+    /// here — it's deferred to `ensure_word_emphasis`, which the workers call when
+    /// the toggle is on (keeping the LCS off the UI thread) and `set_diff_content`
+    /// backstops at install, so a displayed diff always matches the toggle.
+    const fn new(lines: Vec<DiffLine>, files: Vec<FileEntry>) -> Self {
+        Self {
+            lines,
+            files,
+            word_emphasized: false,
+        }
+    }
+
+    /// Run the word-diff emphasis pass if it hasn't run yet. Idempotent.
+    fn ensure_word_emphasis(&mut self) {
+        if !self.word_emphasized {
+            compute_word_emphasis(&mut self.lines);
+            self.word_emphasized = true;
+        }
     }
 
     /// An empty diff — returned when a git2 operation fails (the error is logged
@@ -1475,6 +1491,7 @@ impl DiffData {
         Self {
             lines: Vec::new(),
             files: Vec::new(),
+            word_emphasized: true, // vacuously: no lines to emphasize
         }
     }
 }
@@ -2269,6 +2286,8 @@ struct PrefetchJob {
     /// Each neighbour to warm: its cache key plus the pathspec to diff it under.
     targets: Vec<(DiffCacheKey, Vec<String>)>,
     hl: Arc<Highlighter>,
+    /// Run the (deferred) word-diff emphasis pass while still off-thread.
+    word_diff: bool,
     /// This dispatch's epoch; the worker bails once `current_epoch` moves past it.
     epoch: u64,
     current_epoch: Epoch,
@@ -2330,6 +2349,7 @@ fn prefetch_worker(job: PrefetchJob) {
         repo_path,
         targets,
         hl,
+        word_diff,
         epoch,
         current_epoch,
         tx,
@@ -2359,6 +2379,9 @@ fn prefetch_worker(job: PrefetchJob) {
             key.settings,
             &paths,
         );
+        if word_diff {
+            data.ensure_word_emphasis();
+        }
         highlight_diff(&mut data.lines, &data.files, &hl);
         let (oid, lines) = (key.oid, data.lines.len());
         if tx.send((key, data)).is_err() {
@@ -2391,6 +2414,8 @@ struct DiffLoadJob {
     repo_path: String,
     key: DiffCacheKey,
     paths: Vec<String>,
+    /// Run the (deferred) word-diff emphasis pass while still off-thread.
+    word_diff: bool,
     epoch: u64,
     current_epoch: Epoch,
     tx: mpsc::Sender<DiffLoadResult>,
@@ -2408,6 +2433,7 @@ fn diff_load_worker(job: DiffLoadJob) {
         repo_path,
         key,
         paths,
+        word_diff,
         epoch,
         current_epoch,
         tx,
@@ -2438,9 +2464,13 @@ fn diff_load_worker(job: DiffLoadJob) {
     }
     let t = std::time::Instant::now();
     let kind = CommitKind::of(key.oid);
-    let data = get_diff_data(&repo, key.oid, kind, key.settings, &paths);
+    let mut data = get_diff_data(&repo, key.oid, kind, key.settings, &paths);
+    if word_diff {
+        data.ensure_word_emphasis();
+    }
     // Content-key a virtual row off-thread here so an unchanged working tree hits the
-    // cache and reuses its highlighting.
+    // cache and reuses its highlighting. (The hash covers text + kind only, so the
+    // emphasis pass above doesn't affect the key.)
     let key = finalize_diff_key(key, kind, &data);
     log::debug!(
         "diff-load: {} ({} lines) in {:?}",
@@ -3173,6 +3203,10 @@ struct GitkApp {
     /// Deepest file-start line of the current diff (None ⇒ no files) — the render's
     /// `last_top_anchor`. Fixed per diff, so computed at install, not per frame.
     diff_last_top_anchor: Option<usize>,
+    /// Whether the LIVE diff's word-diff emphasis has been computed — mirrors
+    /// `DiffData::word_emphasized` while the lines sit detached in `diff_lines`
+    /// (`stash_current_diff` reassembles a `DiffData` carrying it back).
+    diff_word_emphasized: bool,
     /// Lazily-created arboard connection for the primary selection, kept for the
     /// session instead of reconnecting to the display server on every SHA click.
     clipboard: Option<arboard::Clipboard>,
@@ -3638,6 +3672,7 @@ impl GitkApp {
             config_error_toast: startup_issue.then(std::time::Instant::now),
             diff_max_chars,
             diff_last_top_anchor: None,
+            diff_word_emphasized: true, // empty startup diff — vacuously computed
             clipboard: None,
             highlighter: None,
             syntax_enabled,
@@ -3837,6 +3872,7 @@ impl GitkApp {
             let data = DiffData {
                 lines: std::mem::take(&mut self.diff_lines),
                 files: std::mem::take(&mut self.diff_files),
+                word_emphasized: self.diff_word_emphasized,
             };
             // A virtual entry is content-keyed, so each working-tree edit produces a
             // fresh hash and the previous content would linger under the same sentinel
@@ -3870,7 +3906,15 @@ impl GitkApp {
     /// Swap `key`/`data` in as the displayed diff and run the install tail every
     /// installer needs: reset the scroll top, rebuild the file-list rows, resize the
     /// h-scroll, and (re)arm highlighting.
-    fn set_diff_content(&mut self, key: Option<DiffCacheKey>, data: DiffData) {
+    fn set_diff_content(&mut self, key: Option<DiffCacheKey>, mut data: DiffData) {
+        // Deferred word-diff emphasis: make the displayed diff match the toggle on
+        // the way in. Normally a no-op — the workers already ran the pass when the
+        // toggle was on at dispatch — this backstops entries built while it was off
+        // (e.g. prefetched neighbours revisited after enabling).
+        if self.word_diff {
+            data.ensure_word_emphasis();
+        }
+        self.diff_word_emphasized = data.word_emphasized;
         self.diff_lines = data.lines;
         self.diff_files = data.files;
         self.current_diff_key = key;
@@ -3884,13 +3928,7 @@ impl GitkApp {
     /// Clear the diff pane to empty (no current diff, no file rows). Callers that want
     /// the outgoing diff preserved call `stash_current_diff` first.
     fn clear_diff_pane(&mut self) {
-        self.set_diff_content(
-            None,
-            DiffData {
-                lines: Vec::new(),
-                files: Vec::new(),
-            },
-        );
+        self.set_diff_content(None, DiffData::empty());
     }
 
     /// Install a finished diff (from the cache or a diff-load worker) as the current
@@ -3947,6 +3985,7 @@ impl GitkApp {
         // path the originals would otherwise be dropped unused. The rare spawn-failure
         // fallback re-resolves them instead.
         let repo_path = self.repo_path.clone();
+        let word_diff = self.word_diff;
         // Not spawn_guarded: a panic here must do more than log — it has to report a
         // failed load so the drain's `data: None` arm clears the loading state,
         // otherwise the pane sticks on "Loading diff…" forever (the retained tx clone
@@ -3966,6 +4005,7 @@ impl GitkApp {
                             repo_path,
                             key,
                             paths,
+                            word_diff,
                             epoch,
                             current_epoch,
                             tx,
@@ -4173,6 +4213,7 @@ impl GitkApp {
             repo_path: self.repo_path.clone(),
             targets: jobs,
             hl,
+            word_diff: self.word_diff,
             epoch,
             current_epoch: self.prefetch_epoch.clone(),
             tx: self.prefetch_tx.clone(),
@@ -5482,9 +5523,18 @@ impl eframe::App for GitkApp {
                                             "Detect copies",
                                         )
                                         .changed();
-                                    // Word-diff only changes the render (emphasis is
-                                    // precomputed), so no diff reload — toggling is instant.
-                                    ui.checkbox(&mut self.word_diff, "Word diff");
+                                    // Word-diff only changes the render, so no diff
+                                    // reload. The emphasis pass is deferred while the
+                                    // toggle is off; the first enable runs it once
+                                    // over the live diff (cache entries catch up at
+                                    // install — see set_diff_content).
+                                    if ui.checkbox(&mut self.word_diff, "Word diff").changed()
+                                        && self.word_diff
+                                        && !self.diff_word_emphasized
+                                    {
+                                        compute_word_emphasis(&mut self.diff_lines);
+                                        self.diff_word_emphasized = true;
+                                    }
                                 });
                             });
                         });
@@ -6926,12 +6976,14 @@ mod tests {
 
     #[test]
     fn hash_diff_content_tracks_text_changes() {
-        let mk = |texts: &[&str]| DiffData {
-            lines: texts
-                .iter()
-                .map(|t| DiffLine::new(t, LineKind::Add))
-                .collect(),
-            files: Vec::new(),
+        let mk = |texts: &[&str]| {
+            DiffData::new(
+                texts
+                    .iter()
+                    .map(|t| DiffLine::new(t, LineKind::Add))
+                    .collect(),
+                Vec::new(),
+            )
         };
         let a = mk(&["fn main() {}", "let x = 1;"]);
         assert_eq!(
@@ -6953,10 +7005,7 @@ mod tests {
         // Same text, different kind: body() strips the +/- marker per kind, so these
         // tokenize differently and must hash differently (else a cached virtual diff
         // would be highlighted from the wrong bodies).
-        let one = |text: &str, kind| DiffData {
-            lines: vec![DiffLine::new(text, kind)],
-            files: Vec::new(),
-        };
+        let one = |text: &str, kind| DiffData::new(vec![DiffLine::new(text, kind)], Vec::new());
         assert_ne!(
             hash_diff_content(&one("+foo", LineKind::Add)),
             hash_diff_content(&one("+foo", LineKind::Context)),
@@ -7736,6 +7785,27 @@ mod tests {
         assert_eq!(create.follow_path.as_deref(), Some("old.txt"));
         let edit = rows.iter().find(|c| c.summary == "edit new").unwrap();
         assert_eq!(edit.follow_path.as_deref(), Some("new.txt"));
+    }
+
+    #[test]
+    fn word_emphasis_deferred_until_ensured() {
+        let lines = vec![
+            DiffLine::new("-foo bar", LineKind::Del),
+            DiffLine::new("+foo baz", LineKind::Add),
+        ];
+        let mut data = DiffData::new(lines, Vec::new());
+        // The pass is deferred: nothing computes until a consumer needs it.
+        assert!(!data.word_emphasized);
+        assert!(data.lines.iter().all(|l| l.emphasis.is_empty()));
+        data.ensure_word_emphasis();
+        assert!(data.word_emphasized);
+        assert!(!data.lines[0].emphasis.is_empty());
+        assert!(!data.lines[1].emphasis.is_empty());
+        // Idempotent: a second ensure leaves the computed ranges alone.
+        let snapshot: Vec<_> = data.lines.iter().map(|l| l.emphasis.clone()).collect();
+        data.ensure_word_emphasis();
+        let after: Vec<_> = data.lines.iter().map(|l| l.emphasis.clone()).collect();
+        assert_eq!(after, snapshot);
     }
 
     #[test]

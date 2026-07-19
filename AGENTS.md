@@ -52,7 +52,11 @@ resolution, per-line tokenization), `src/diff_cache.rs` (line-budget LRU cache),
 `src/cli.rs` (pure argv parser, rev-vs-path classification, pathspec
 resolution, window-title suffix, help/version text), and
 `src/word_diff.rs` (pure intra-line word diff: tokenizer + LCS alignment; the
-`DiffLine`-aware driver `compute_word_emphasis` stays in `main.rs`).
+`DiffLine`-aware driver `compute_word_emphasis` stays in `main.rs`, and is
+**deferred**: `DiffData` carries a `word_emphasized` flag, the diff/prefetch
+workers run the pass off-thread only when the word-diff toggle is on, and
+`set_diff_content` backstops at install — so the default toggle-off path never
+pays the LCS, while the first enable computes the live diff once).
 
 The big picture, ahead of the detail sections below:
 
