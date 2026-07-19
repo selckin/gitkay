@@ -85,7 +85,10 @@ pub const DEFAULT_DELETED_BAND_DARK: egui::Color32 = egui::Color32::from_rgb(64,
 /// Test fixtures shared by this module's and main.rs's test suites: the
 /// `[diff.bands]` default value, and a default-theme highlighter over it.
 #[cfg(test)]
-pub const FIXED_DEFAULT_BANDS: DiffBg = DiffBg::Fixed { added: None, deleted: None };
+pub const FIXED_DEFAULT_BANDS: DiffBg = DiffBg::Fixed {
+    added: None,
+    deleted: None,
+};
 #[cfg(test)]
 pub fn test_highlighter() -> Highlighter {
     Highlighter::new(DEFAULT_THEME_SLUG, FIXED_DEFAULT_BANDS).0
@@ -181,7 +184,11 @@ fn scope_attr(
 
 /// First scope the theme actually defines a foreground for (differs from the
 /// default foreground), else None.
-fn scope_color(hl: &SynHighlighter, default_fg: SynColor, scopes: &[&str]) -> Option<egui::Color32> {
+fn scope_color(
+    hl: &SynHighlighter,
+    default_fg: SynColor,
+    scopes: &[&str],
+) -> Option<egui::Color32> {
     scope_attr(hl, default_fg, scopes, |s| s.foreground)
 }
 
@@ -501,7 +508,10 @@ mod tests {
         let code = "let s = \"café→λ 🦀\"; // δ";
         let spans = hl.tokenize_line(&mut state, code);
         let joined: String = spans.iter().map(|(_, r)| &code[r.start..r.end]).collect();
-        assert_eq!(joined, code, "spans must reassemble the multibyte line exactly");
+        assert_eq!(
+            joined, code,
+            "spans must reassemble the multibyte line exactly"
+        );
         // The internally-appended '\n' must never leak into a span range.
         assert!(spans.iter().all(|(_, r)| r.end <= code.len()));
     }
@@ -513,7 +523,10 @@ mod tests {
         // code_len == 0: every span's end clamps to 0, so the `start < end` guard
         // drops them all. Must yield no spans (and not panic), not a span for '\n'.
         let spans = hl.tokenize_line(&mut state, "");
-        assert!(spans.is_empty(), "empty line should yield no spans, got {spans:?}");
+        assert!(
+            spans.is_empty(),
+            "empty line should yield no spans, got {spans:?}"
+        );
     }
 
     #[test]
@@ -616,7 +629,10 @@ mod tests {
         // After warming, tokenizing Rust still works (keywords → multiple spans).
         let mut state = hl.new_file_state("after.rs");
         let spans = hl.tokenize_line(&mut state, "fn main() {}");
-        assert!(spans.len() >= 2, "rust line should tokenize into multiple spans");
+        assert!(
+            spans.len() >= 2,
+            "rust line should tokenize into multiple spans"
+        );
     }
 
     #[test]

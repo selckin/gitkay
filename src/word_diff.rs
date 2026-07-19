@@ -94,7 +94,10 @@ pub fn line_emphasis(del: &str, add: &str) -> (Vec<Range<usize>>, Vec<Range<usiz
     let ds: Vec<&str> = dt.iter().map(|(_, s)| *s).collect();
     let as_: Vec<&str> = at.iter().map(|(_, s)| *s).collect();
     let (d_ch, a_ch) = changed_tokens(&ds, &as_);
-    (merge_token_ranges(&dt, &d_ch), merge_token_ranges(&at, &a_ch))
+    (
+        merge_token_ranges(&dt, &d_ch),
+        merge_token_ranges(&at, &a_ch),
+    )
 }
 
 #[cfg(test)]
@@ -118,8 +121,14 @@ mod tests {
     #[test]
     fn changed_tokens_edge_cases() {
         assert_eq!(changed_tokens(&["a", "b"], &["a", "b"]), (vec![], vec![])); // identical
-        assert_eq!(changed_tokens(&["a", "c"], &["a", "b", "c"]), (vec![], vec![1])); // insert
-        assert_eq!(changed_tokens(&["a", "b", "c"], &["a", "c"]), (vec![1], vec![])); // delete
+        assert_eq!(
+            changed_tokens(&["a", "c"], &["a", "b", "c"]),
+            (vec![], vec![1])
+        ); // insert
+        assert_eq!(
+            changed_tokens(&["a", "b", "c"], &["a", "c"]),
+            (vec![1], vec![])
+        ); // delete
         assert_eq!(changed_tokens(&[], &["a"]), (vec![], vec![0])); // empty → all inserted
         assert_eq!(changed_tokens(&["a"], &[]), (vec![0], vec![])); // all deleted
         assert_eq!(changed_tokens(&[], &[]), (vec![], vec![])); // both empty

@@ -169,7 +169,10 @@ mod tests {
         // contains(&1) must NOT refresh recency: inserting a third entry over budget
         // must still evict key 1 (the LRU). If contains() bumped it, key 2 would go.
         c.insert(3, 3, 15); // total 45 > 30 → evict LRU
-        assert!(!c.contains(&1), "key 1 was LRU; contains() must not have refreshed it");
+        assert!(
+            !c.contains(&1),
+            "key 1 was LRU; contains() must not have refreshed it"
+        );
         assert!(c.contains(&2));
         assert!(c.contains(&3));
     }
