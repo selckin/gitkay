@@ -9,6 +9,8 @@ the same change.
 ## Build / Test / Run
 
 ```sh
+./build.sh                        # pre-push gate: fmt (applied) + clippy --all-targets + debug build
+                                  # (stricter than CI: lints test code, --locked; fails if fmt reformatted anything)
 cargo build                       # debug; release: cargo build --release
 cargo test                        # all tests (main/diff/config/highlight/cli/diff_cache/word_diff modules)
 cargo test test_pr_merge_pattern  # one test by name (substring match)
