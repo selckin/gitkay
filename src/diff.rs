@@ -99,7 +99,10 @@ pub fn pathspec_opts(paths: &[String]) -> DiffOptions {
 
 #[derive(Clone)]
 pub struct DiffLine {
-    pub text: String,
+    /// The line text, shared (`Arc`) so handing the diff to the highlight worker
+    /// clones refcounts, not strings — the text is immutable after the build;
+    /// only the UI-side `spans`/`emphasis` ever change.
+    pub text: std::sync::Arc<String>,
     pub kind: LineKind,
     pub spans: Option<Vec<highlight::Span>>, // None ⇒ not highlighted yet; Some(..) ⇒ highlighted (maybe empty)
     pub emphasis: Option<Vec<std::ops::Range<usize>>>, // word-diff changed byte ranges in body(); None ⇒ not computed yet
@@ -110,7 +113,7 @@ impl DiffLine {
     /// the diff build allocates one of these per patch line.
     pub fn new(text: impl Into<String>, kind: LineKind) -> Self {
         Self {
-            text: text.into(),
+            text: std::sync::Arc::new(text.into()),
             kind,
             spans: None,
             emphasis: None,
@@ -242,6 +245,12 @@ pub struct FileEntry {
 pub struct DiffData {
     pub lines: Vec<DiffLine>,
     pub files: Vec<FileEntry>,
+    /// Widest line in characters — sizes the virtualized diff's horizontal
+    /// scroll content (only visible rows are laid out, so egui can't otherwise
+    /// know an off-screen line is wide; assumes a monospace diff font). Computed
+    /// here at build time — on whatever worker built the diff — so installing a
+    /// diff never rescans every line on the UI thread.
+    pub max_chars: usize,
 }
 
 impl DiffData {
@@ -249,8 +258,28 @@ impl DiffData {
     /// — each line's `emphasis` starts `None` and is filled lazily per visible
     /// window by the UI (`emphasize_rows`), so no builder or worker ever pays the
     /// LCS for lines nobody looks at.
-    pub const fn new(lines: Vec<DiffLine>, files: Vec<FileEntry>) -> Self {
-        Self { lines, files }
+    pub fn new(lines: Vec<DiffLine>, files: Vec<FileEntry>) -> Self {
+        let max_chars = lines
+            .iter()
+            .map(|l| l.text.chars().count())
+            .max()
+            .unwrap_or(0);
+        Self::with_max_chars(lines, files, max_chars)
+    }
+
+    /// Reassemble a diff whose widest line is already known — the stash path
+    /// returns the *displayed* diff to the cache, so rescanning it on the UI
+    /// thread would undo what build-time `max_chars` exists to avoid.
+    pub const fn with_max_chars(
+        lines: Vec<DiffLine>,
+        files: Vec<FileEntry>,
+        max_chars: usize,
+    ) -> Self {
+        Self {
+            lines,
+            files,
+            max_chars,
+        }
     }
 
     /// An empty diff — returned when a git2 operation fails (the error is logged
@@ -259,6 +288,7 @@ impl DiffData {
         Self {
             lines: Vec::new(),
             files: Vec::new(),
+            max_chars: 0,
         }
     }
 }
