@@ -3209,55 +3209,68 @@ impl GitkApp {
         };
         let all_loaded = real_commit_count(&commits) < 200;
 
-        // Watch .git directory for changes (refs, HEAD, index)
+        // Watch .git for changes (refs, HEAD, index). Watch the *directories*,
+        // not the files: git replaces HEAD/index/packed-refs via lock-file +
+        // rename, and an inotify watch on the file itself dies with the old
+        // inode (IN_IGNORED) after the first such update — the second `git add`
+        // or `git checkout` of a session would go unseen. Same technique as the
+        // config watcher; events are filtered to the reload-relevant paths.
         let needs_reload = Arc::new(AtomicBool::new(false));
         let watcher = {
             let git_dir = repo.path().to_path_buf();
-            let mut watcher = make_watcher(&cc.egui_ctx, needs_reload.clone(), |event| {
-                matches!(
-                    event.kind,
-                    notify::EventKind::Create(_)
-                        | notify::EventKind::Modify(_)
-                        | notify::EventKind::Remove(_)
-                )
-            });
-            if let Some(ref mut w) = watcher {
-                // HEAD and refs are the reload-critical watches and always exist
-                // in a git dir, so a failure to watch them is worth surfacing.
-                // index / packed-refs can legitimately be absent (nothing staged,
-                // no packed refs), so those stay best-effort and silent.
-                let mut failed: Vec<String> = Vec::new();
-                if let Err(e) = w.watch(&git_dir.join("HEAD"), RecursiveMode::NonRecursive) {
-                    failed.push(format!("HEAD ({e})"));
-                }
-                let _ = w.watch(&git_dir.join("index"), RecursiveMode::NonRecursive);
-
-                // Watch refs — in a worktree, refs live in the main repo's
-                // .git dir (commondir), not the worktree's .git dir.
-                let common_dir = git_dir.join("commondir");
-                let refs_dir = if common_dir.exists() {
-                    // Worktree: commondir file contains path to the main .git
-                    if let Ok(content) = std::fs::read_to_string(&common_dir) {
-                        let p = content.trim();
-                        if std::path::Path::new(p).is_absolute() {
-                            std::path::PathBuf::from(p)
-                        } else {
-                            git_dir.join(p)
-                        }
+            // In a worktree, refs (and the shared HEAD/packed-refs) live in the
+            // main repo's .git dir (commondir), not the worktree's .git dir.
+            let common_dir = git_dir.join("commondir");
+            let refs_dir = if common_dir.exists() {
+                // Worktree: commondir file contains path to the main .git
+                if let Ok(content) = std::fs::read_to_string(&common_dir) {
+                    let p = content.trim();
+                    if std::path::Path::new(p).is_absolute() {
+                        std::path::PathBuf::from(p)
                     } else {
-                        git_dir.clone()
+                        git_dir.join(p)
                     }
                 } else {
                     git_dir.clone()
-                };
-                if let Err(e) = w.watch(&refs_dir.join("refs"), RecursiveMode::Recursive) {
+                }
+            } else {
+                git_dir.clone()
+            };
+            let refs_root = refs_dir.join("refs");
+            let interesting = [
+                git_dir.join("HEAD"),
+                git_dir.join("index"),
+                refs_dir.join("HEAD"),
+                refs_dir.join("packed-refs"),
+            ];
+            let mut watcher = make_watcher(&cc.egui_ctx, needs_reload.clone(), {
+                let refs_root = refs_root.clone();
+                move |event| {
+                    matches!(
+                        event.kind,
+                        notify::EventKind::Create(_)
+                            | notify::EventKind::Modify(_)
+                            | notify::EventKind::Remove(_)
+                    ) && event
+                        .paths
+                        .iter()
+                        .any(|p| p.starts_with(&refs_root) || interesting.contains(p))
+                }
+            });
+            if let Some(ref mut w) = watcher {
+                let mut failed: Vec<String> = Vec::new();
+                // The non-recursive dir watch covers HEAD + index (+ packed-refs
+                // when this is not a worktree) surviving their atomic renames.
+                if let Err(e) = w.watch(&git_dir, RecursiveMode::NonRecursive) {
+                    failed.push(format!("{git_dir:?} ({e})"));
+                }
+                if let Err(e) = w.watch(&refs_root, RecursiveMode::Recursive) {
                     failed.push(format!("refs ({e})"));
                 }
-                let _ = w.watch(&refs_dir.join("packed-refs"), RecursiveMode::NonRecursive);
                 if refs_dir != git_dir
-                    && let Err(e) = w.watch(&refs_dir.join("HEAD"), RecursiveMode::NonRecursive)
+                    && let Err(e) = w.watch(&refs_dir, RecursiveMode::NonRecursive)
                 {
-                    failed.push(format!("commondir HEAD ({e})"));
+                    failed.push(format!("commondir {refs_dir:?} ({e})"));
                 }
 
                 if !failed.is_empty() {
