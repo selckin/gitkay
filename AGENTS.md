@@ -49,11 +49,15 @@ One egui/eframe immediate-mode app — all app state lives in the `GitkApp`
 struct. `src/main.rs` (commit history/graph layout, the workers, and the UI)
 plus extracted modules: `src/diff.rs` (the diff **data** layer: `DiffLine` /
 `DiffData` / `FileEntry` / `DiffSettings`, `CommitKind` + the sentinel oids,
-`get_diff_data` and the staged/worktree builders, the diff-shaping
-`DiffOptions` helpers, the word-diff emphasis driver, the content hash, and
+`get_diff_data` and the commit/staged/worktree builders (all three run through
+one `build_diff_data` pipeline, and every "commit vs its first parent" diff —
+the pane, the path filter, the `--follow` tracer — goes through
+`commit_parent_diff`), the diff-shaping `DiffOptions` helpers, the word-diff
+emphasis driver, the content hash, and
 the pure line/file lookups — git2-facing and egui-free; cache keying,
 highlight orchestration, and rendering stay in `main.rs`), `src/config.rs`
-(`[fonts]`/`[text]`/`[diff]` config: TOML parsing, fontdb resolution + cache,
+(`[fonts]`/`[text]`/`[diff]` config: TOML parsing, `[diff.bands]` resolution
+(`resolve_diff_bg`), fontdb resolution + cache,
 role→FontId map), `src/highlight.rs` (syntect highlighter, theme/palette
 resolution, per-line tokenization), `src/diff_cache.rs` (line-budget LRU cache),
 `src/cli.rs` (pure argv parser, rev-vs-path classification, pathspec
@@ -109,6 +113,13 @@ parts run off the window-creation critical path:
   re-scans every launch, so `resolve_font_path` warns to make the misconfig visible. A
   live config reload takes the same route (sync role map, off-thread `FontDefinitions`
   rebuild via `pending_fonts`), so a config save never freezes the UI on a scan.
+- **Highlighter prewarm** — `main()` also spawns `gitkay-prewarm` (`spawn_prewarm`): the
+  thread reads config itself, bails if `[diff] syntax` is off, and otherwise builds the
+  `Highlighter` (multi-MB syntect `SyntaxSet` deserialize, ~50–150ms) overlapped with
+  window init — so the deferred first diff usually installs already coloured — then warms
+  the repo's top languages. It has no egui `Context`, so `ensure_diff_highlighted` polls
+  the channel (`request_repaint_after`, like `pending_fonts`) during the brief warm-up;
+  the install re-themes via `with_theme`, so it never races the UI's own config read.
 - **Deferred first diff** (`StartupDiff` state machine) — `GitkApp::new` does *not* compute
   the startup diff (window creation blocks until the creator returns). It auto-selects
   commit 0 with an empty diff pane; `ui()` paints the graph on the first frame, then calls

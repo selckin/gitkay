@@ -1,8 +1,7 @@
 //! Intra-line ("word") diff: given a `-`/`+` line pair, find the changed token runs on
 //! each side so the UI can emphasise just what actually changed. Pure — no egui or git2 —
 //! which is why it lives on its own with its own tests. The `DiffLine`-aware driver that
-//! walks change blocks and calls `line_emphasis` here is `compute_word_emphasis` in
-//! `main.rs`.
+//! walks change blocks and calls `line_emphasis` here is `emphasize_rows` in `diff.rs`.
 
 use std::ops::Range;
 

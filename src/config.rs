@@ -566,9 +566,101 @@ pub fn build_fonts(cfg: &Config) -> (egui::FontDefinitions, Vec<String>) {
     (defs, warnings)
 }
 
+/// Resolve the `[diff.bands]` config into a `DiffBg`, plus any warnings (unparseable
+/// hex falls back to a default). The `source` is a typed enum, so an invalid value is
+/// already a parse error — no mode warning to emit here. The caller surfaces the
+/// warnings (stderr + the in-UI toast). Lives here — not in `main.rs` — for the same
+/// reason `highlight::resolve_theme` lives at its boundary: config values are
+/// interpreted (and validated) once, where they're parsed.
+pub fn resolve_diff_bg(bands: &BandsSection) -> (crate::highlight::DiffBg, Vec<String>) {
+    let mut warnings = Vec::new();
+    // Validate any explicitly-set band hex even in Theme mode (where the parsed
+    // colours are unused), so a malformed value is never silently swallowed.
+    let added = parse_bg_hex("added", bands.added.as_deref(), &mut warnings);
+    let deleted = parse_bg_hex("deleted", bands.deleted.as_deref(), &mut warnings);
+
+    let bg = match bands.source {
+        BandSource::Theme => crate::highlight::DiffBg::Theme,
+        BandSource::Fixed => crate::highlight::DiffBg::Fixed { added, deleted },
+    };
+    (bg, warnings)
+}
+
+/// Parse an optional `"#rrggbb"` background color, pushing a warning if it is
+/// set but invalid.
+fn parse_bg_hex(label: &str, v: Option<&str>, warnings: &mut Vec<String>) -> Option<egui::Color32> {
+    let h = v?;
+    let c = crate::highlight::parse_hex(h);
+    if c.is_none() {
+        warnings.push(format!(
+            "invalid diff.bands.{label} color {h:?}; using default"
+        ));
+    }
+    c
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::highlight::{DiffBg, FIXED_DEFAULT_BANDS};
+
+    #[test]
+    fn resolve_diff_bg_theme_mode_still_validates_band_hex() {
+        // In theme mode the band colours come from the theme and are ignored, but
+        // a malformed value is still a config error and must be surfaced (the
+        // function's doc promises a warning on unparseable hex).
+        let (bg, warns) = resolve_diff_bg(&BandsSection {
+            source: BandSource::Theme,
+            added: Some("nothex".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(bg, DiffBg::Theme);
+        assert_eq!(
+            warns.len(),
+            1,
+            "malformed band hex must warn even in theme mode"
+        );
+    }
+
+    #[test]
+    fn resolve_diff_bg_interprets_config() {
+        // Default → fixed mode, no explicit colors, no warnings.
+        let (bg, warns) = resolve_diff_bg(&BandsSection::default());
+        assert_eq!(bg, FIXED_DEFAULT_BANDS);
+        assert!(warns.is_empty());
+
+        // Theme mode.
+        let (bg, warns) = resolve_diff_bg(&BandsSection {
+            source: BandSource::Theme,
+            ..Default::default()
+        });
+        assert_eq!(bg, DiffBg::Theme);
+        assert!(warns.is_empty());
+
+        // Explicit valid hex in fixed mode.
+        let (bg, warns) = resolve_diff_bg(&BandsSection {
+            source: BandSource::Fixed,
+            added: Some("#0a300a".to_string()),
+            deleted: Some("#400c0e".to_string()),
+        });
+        assert_eq!(
+            bg,
+            DiffBg::Fixed {
+                added: Some(egui::Color32::from_rgb(10, 48, 10)),
+                deleted: Some(egui::Color32::from_rgb(64, 12, 14)),
+            }
+        );
+        assert!(warns.is_empty());
+
+        // Invalid hex → ignored (None) + one warning. (An invalid `source` can't
+        // reach here — it's a parse error; see invalid_band_source_*.)
+        let (bg, warns) = resolve_diff_bg(&BandsSection {
+            added: Some("nothex".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(bg, FIXED_DEFAULT_BANDS);
+        assert_eq!(warns.len(), 1);
+    }
 
     #[test]
     fn role_all_is_in_discriminant_order() {
