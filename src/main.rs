@@ -434,8 +434,9 @@ fn rename_brace(old: &str, new: &str) -> (String, String) {
 /// under the `…/actions/` header) instead of a bare `File.java → File.java`.
 fn build_file_rows(files: &[(&str, Option<&str>)], layout: FileListLayout) -> Vec<FileListRow> {
     let full = layout == FileListLayout::Full;
+    let grouped = layout == FileListLayout::Grouped;
     // (group directory, rendered label) per file. The group directory is read only
-    // by the Grouped arm below; the flat Name/Full layouts ignore it.
+    // by the Grouped arm below, so the flat Name/Full layouts skip its allocation.
     let computed: Vec<(String, String)> = files
         .iter()
         // `old` is already `None` for a non-rename — append_diff_body records it only
@@ -448,7 +449,12 @@ fn build_file_rows(files: &[(&str, Option<&str>)], layout: FileListLayout) -> Ve
                 || {
                     let (dir, base) = split_dir(new);
                     let label = if full { new } else { base };
-                    (dir.to_string(), label.to_string())
+                    let dir = if grouped {
+                        dir.to_string()
+                    } else {
+                        String::new()
+                    };
+                    (dir, label.to_string())
                 },
                 |old| {
                     let (prefix, brace) = rename_brace(old, new);
@@ -1679,6 +1685,14 @@ fn prewarm_highlighter(
 /// idempotent.
 type InflightKeys = Arc<Mutex<HashSet<DiffCacheKey>>>;
 
+/// Lock an `InflightKeys` set, recovering the guard from poisoning. The set is
+/// never poisoned in practice (holders only insert/remove), but a poisoned
+/// dedupe set must degrade to duplicate work, not panic every worker.
+fn lock_inflight(set: &InflightKeys) -> std::sync::MutexGuard<'_, HashSet<DiffCacheKey>> {
+    set.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// RAII claim on one `DiffCacheKey` in an `InflightKeys` set.
 struct InflightClaim {
     set: InflightKeys,
@@ -1686,15 +1700,9 @@ struct InflightClaim {
 }
 
 impl InflightClaim {
-    /// Claim `key`, or `None` when another worker already holds it. The set is
-    /// never poisoned in practice (holders only insert/remove), but recover the
-    /// guard anyway — a poisoned dedupe set must degrade to duplicate work, not
-    /// panic every worker.
+    /// Claim `key`, or `None` when another worker already holds it.
     fn try_claim(set: &InflightKeys, key: DiffCacheKey) -> Option<Self> {
-        let claimed = set
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(key.clone());
+        let claimed = lock_inflight(set).insert(key.clone());
         claimed.then(|| Self {
             set: Arc::clone(set),
             key,
@@ -1704,10 +1712,7 @@ impl InflightClaim {
 
 impl Drop for InflightClaim {
     fn drop(&mut self) {
-        self.set
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.key);
+        lock_inflight(&self.set).remove(&self.key);
     }
 }
 
@@ -1737,11 +1742,26 @@ fn spawn_guarded(
     panic_msg: &'static str,
     f: impl FnOnce() + Send + 'static,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
+    spawn_reporting(name, panic_msg, f, || {})
+}
+
+/// `spawn_guarded` for workers whose every exit must deliver a result: on a panic
+/// in `f`, `on_panic` runs after the warning — sending the failure result that
+/// clears the UI's in-flight tracking (loading state, `inflight_loads`,
+/// `history_inflight`), which would otherwise strand: the dispatchers retain a
+/// sender clone, so the channel never disconnects to signal the death.
+fn spawn_reporting(
+    name: &str,
+    panic_msg: &'static str,
+    f: impl FnOnce() + Send + 'static,
+    on_panic: impl FnOnce() + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name(name.to_string())
         .spawn(move || {
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err() {
                 log::warn!("{panic_msg}");
+                on_panic();
             }
         })
 }
@@ -1863,12 +1883,31 @@ struct DiffLoadJob {
     ctx: egui::Context,
 }
 
+/// Deliver a `data: None` result for a diff-load worker exiting without a diff
+/// (superseded, discover failure, panic) — the single form of the "every worker
+/// exit reports" invariant. The UI tracks the worker in `inflight_loads`, and a
+/// silent exit would strand the key there: a later bounce-back to this commit
+/// would then wait on a worker that no longer exists. The drain clears the
+/// tracking and, if the user is by then waiting on exactly this key,
+/// re-dispatches. A send error just means the UI is gone.
+fn report_failed_diff_load(
+    tx: &mpsc::Sender<DiffLoadResult>,
+    epoch: u64,
+    key: DiffCacheKey,
+    ctx: &egui::Context,
+) {
+    let _ = tx.send(DiffLoadResult {
+        epoch,
+        key,
+        data: None,
+    });
+    ctx.request_repaint();
+}
+
 /// Compute one selected commit's diff off the UI thread — the potentially expensive
 /// `get_diff_data` (a large diff, plus rename/copy detection, can take hundreds of ms)
-/// — and hand the finished `DiffData` back for the UI to display. Bails (without a
-/// result) as soon as a newer selection supersedes it (`epoch`). On a discover failure
-/// it reports an empty result so the UI clears the loading state rather than sticking on
-/// the placeholder forever.
+/// — and hand the finished `DiffData` back for the UI to display. Every early exit
+/// reports through `report_failed_diff_load` (see its doc for why that's load-bearing).
 fn diff_load_worker(job: DiffLoadJob) {
     let DiffLoadJob {
         repo_path,
@@ -1880,45 +1919,25 @@ fn diff_load_worker(job: DiffLoadJob) {
         tx,
         ctx,
     } = job;
-    // Superseded before we even ran — don't open the repo. Still report (data:
-    // None): the UI tracks this worker in `inflight_loads`, and a silent exit
-    // would strand the key there — a later bounce-back to this commit would then
-    // wait on a worker that no longer exists. The drain clears the tracking and,
-    // if the user is by then waiting on exactly this key, re-dispatches.
+    // Superseded before we even ran — don't open the repo.
     if !current_epoch.is_current(epoch) {
-        let _ = tx.send(DiffLoadResult {
-            epoch,
-            key,
-            data: None,
-        });
-        ctx.request_repaint();
+        report_failed_diff_load(&tx, epoch, key, &ctx);
         return;
     }
     let repo = match Repository::discover(&repo_path) {
         Ok(r) => r,
         Err(e) => {
-            // Report the failure so the UI clears the loading state (the epoch check on
-            // the UI side ignores it if the user has since moved on); a send error just
-            // means the UI is gone. Without this the pane sticks on the placeholder.
+            // Report so the UI clears the loading state instead of sticking on
+            // the placeholder (the epoch check on the UI side ignores it if the
+            // user has since moved on).
             log::debug!("diff-load: repo discover failed: {e}");
-            let _ = tx.send(DiffLoadResult {
-                epoch,
-                key,
-                data: None,
-            });
-            ctx.request_repaint();
+            report_failed_diff_load(&tx, epoch, key, &ctx);
             return;
         }
     };
-    // Same as the pre-discover bail: superseded workers must still report, or
-    // their inflight_loads entry leaks.
+    // Superseded while discovering.
     if !current_epoch.is_current(epoch) {
-        let _ = tx.send(DiffLoadResult {
-            epoch,
-            key,
-            data: None,
-        });
-        ctx.request_repaint();
+        report_failed_diff_load(&tx, epoch, key, &ctx);
         return;
     }
     let t = std::time::Instant::now();
@@ -1955,13 +1974,12 @@ fn diff_load_worker(job: DiffLoadJob) {
 enum HistoryJobKind {
     /// Append up to `max_new` commits after the `skip`-long loaded prefix
     /// (anchored at `expect_last`, the last loaded real commit). Falls back to
-    /// a full `requested`-sized rebuild when the incremental resume isn't
+    /// a full `skip + max_new`-sized rebuild when the incremental resume isn't
     /// possible (path filter, reflog, or the walk no longer lines up).
     Extend {
         skip: usize,
         expect_last: git2::Oid,
         max_new: usize,
-        requested: usize,
     },
     /// Rebuild the whole list at `count` commits (the watcher reload).
     Rebuild { count: usize },
@@ -2034,11 +2052,14 @@ fn history_worker(job: HistoryJob) {
             skip,
             expect_last,
             max_new,
-            requested,
         } => load_commits_tail(&repo, &scope, skip, expect_last, max_new).map_or_else(
-            || HistoryLoad::Rebuild {
-                commits: load_history(&repo, requested, &scope),
-                count: requested,
+            || {
+                // Full-rebuild fallback: everything requested so far, in one walk.
+                let requested = skip + max_new;
+                HistoryLoad::Rebuild {
+                    commits: load_history(&repo, requested, &scope),
+                    count: requested,
+                }
             },
             |new| HistoryLoad::Extend { new, max_new },
         ),
@@ -3464,6 +3485,18 @@ impl GitkApp {
         }
     }
 
+    /// Run the deferred word-diff emphasis pass over the live diff if it hasn't had
+    /// it yet. The displayed lines sit detached from their `DiffData` (reassembled in
+    /// `stash_current_diff`), so this is the one place the exploded
+    /// `diff_word_emphasized` mirror and the pass are kept in lockstep —
+    /// `DiffData::ensure_word_emphasis` covers every still-assembled case.
+    fn ensure_live_word_emphasis(&mut self) {
+        if !self.diff_word_emphasized {
+            compute_word_emphasis(&mut self.diff_lines);
+            self.diff_word_emphasized = true;
+        }
+    }
+
     /// Insert a finished diff into the cache under `key` — the single place the
     /// cache's weight unit (line count) is decided.
     fn cache_diff(&mut self, key: DiffCacheKey, data: DiffData) {
@@ -3514,8 +3547,9 @@ impl GitkApp {
         self.diff_top_line.store(0, Ordering::Relaxed);
         self.rebuild_file_rows();
         self.diff_max_chars = max_line_chars(&self.diff_lines);
-        self.diff_last_top_anchor = self.diff_files.iter().filter_map(|f| f.diff_line_idx).max();
         self.file_line_starts = file_line_starts(&self.diff_files);
+        // Sorted by start, so the last entry is the largest file start.
+        self.diff_last_top_anchor = self.file_line_starts.last().map(|&(s, _)| s);
         self.invalidate_diff_highlight();
     }
 
@@ -3600,49 +3634,36 @@ impl GitkApp {
         let claim = InflightClaim::try_claim(&self.inflight_diffs, key.clone());
         // For the inflight_loads tracking below — `key` itself moves into the worker.
         let tracked_key = is_real_commit(oid).then(|| key.clone());
-        // Not spawn_guarded: a panic here must do more than log — it has to report a
-        // failed load so the drain's `data: None` arm clears the loading state,
-        // otherwise the pane sticks on "Loading diff…" forever (the retained tx clone
-        // means the channel never disconnects to signal the death).
-        let spawn = std::thread::Builder::new()
-            .name("gitkay-diff-load".into())
-            .spawn({
-                let (current_epoch, tx, ctx) = (
-                    self.diff_load_epoch.clone(),
-                    self.diff_load_tx.clone(),
-                    self.egui_ctx.clone(),
-                );
-                move || {
-                    // Hold the claim for the worker's lifetime; a panic still
-                    // releases it on unwind. (On spawn failure the unspawned
-                    // closure is dropped, releasing it before the sync fallback.)
-                    let _claim = claim;
-                    let fail = (tx.clone(), key.clone(), ctx.clone());
-                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        diff_load_worker(DiffLoadJob {
-                            repo_path,
-                            key,
-                            paths,
-                            word_diff,
-                            epoch,
-                            current_epoch,
-                            tx,
-                            ctx,
-                        });
-                    }))
-                    .is_err()
-                    {
-                        log::warn!("diff-load worker panicked; reporting the load as failed");
-                        let (tx, key, ctx) = fail;
-                        let _ = tx.send(DiffLoadResult {
-                            epoch,
-                            key,
-                            data: None,
-                        });
-                        ctx.request_repaint();
-                    }
-                }
-            });
+        let fail = (
+            self.diff_load_tx.clone(),
+            key.clone(),
+            self.egui_ctx.clone(),
+        );
+        let job = DiffLoadJob {
+            repo_path,
+            key,
+            paths,
+            word_diff,
+            epoch,
+            current_epoch: self.diff_load_epoch.clone(),
+            tx: self.diff_load_tx.clone(),
+            ctx: self.egui_ctx.clone(),
+        };
+        let spawn = spawn_reporting(
+            "gitkay-diff-load",
+            "diff-load worker panicked; reporting the load as failed",
+            move || {
+                // Hold the claim for the worker's lifetime; a panic still
+                // releases it on unwind. (On spawn failure the unspawned
+                // closure is dropped, releasing it before the sync fallback.)
+                let _claim = claim;
+                diff_load_worker(job);
+            },
+            move || {
+                let (tx, key, ctx) = fail;
+                report_failed_diff_load(&tx, epoch, key, &ctx);
+            },
+        );
         if spawn.is_ok() {
             // Track the worker so a bounce-back to this commit adopts it instead of
             // stacking a duplicate; the drain removes the entry when its (always
@@ -3811,10 +3832,7 @@ impl GitkApp {
             // Also drop targets some worker is already computing — their results
             // arrive regardless, so queueing them would only burn PREFETCH_MAX slots
             // (the worker re-checks at start time; this filter is just the early cut).
-            let inflight = self
-                .inflight_diffs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let inflight = lock_inflight(&self.inflight_diffs);
             prefetch_targets(&self.commits, sel, view, PREFETCH_MAX)
                 .into_iter()
                 .map(|oid| (self.diff_cache_key(oid), self.diff_paths_for_oid(oid)))
@@ -3858,56 +3876,45 @@ impl GitkApp {
     /// the walk costs a `find_commit` per commit (and per-commit tree diffs under a
     /// path filter), far too slow for the frame loop on a long-loaded history. A new
     /// dispatch supersedes any in-flight one via `history_epoch`; the result lands in
-    /// `drain_history_results`. On thread-spawn failure, fall back to the old
-    /// synchronous reload so the feature still works (accepting the UI stall).
+    /// `drain_history_results`. On thread-spawn failure the worker runs inline so the
+    /// feature still works (accepting the UI stall).
     fn dispatch_history_load(&mut self, kind: HistoryJobKind) {
         let epoch = self.history_epoch.bump();
         self.history_inflight = true;
-        // Not spawn_guarded: a panic must still deliver a result (`load: None`),
-        // or `history_inflight` sticks and the extension is dead for the session.
-        let spawn = std::thread::Builder::new()
-            .name("gitkay-history-load".into())
-            .spawn({
-                let job = HistoryJob {
-                    repo_path: self.repo_path.clone(),
-                    scope: self.scope.clone(),
-                    kind,
-                    epoch,
-                    current_epoch: self.history_epoch.clone(),
-                    tx: self.history_load_tx.clone(),
-                    ctx: self.egui_ctx.clone(),
-                };
-                move || {
-                    let fail = (job.tx.clone(), job.ctx.clone());
-                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        history_worker(job);
-                    }))
-                    .is_err()
-                    {
-                        log::warn!("history-load worker panicked; reporting the load as failed");
-                        let (tx, ctx) = fail;
-                        let _ = tx.send(HistoryResult { epoch, load: None });
-                        ctx.request_repaint();
-                    }
-                }
-            });
-        if spawn.is_err() {
-            log::warn!("history-load thread spawn failed; loading synchronously");
-            self.history_inflight = false;
-            let count = match kind {
-                HistoryJobKind::Extend { requested, .. } => requested,
-                HistoryJobKind::Rebuild { count } => count,
-            };
-            if let Ok(repo) = Repository::discover(&self.repo_path) {
-                let previous_oid = self
-                    .selected
-                    .and_then(|sel| self.commits.get(sel))
-                    .map(|commit| commit.oid);
-                let previous_index = self.selected;
-                self.commits = load_history(&repo, count, &self.scope);
-                self.resync_commits(count, None, previous_oid, previous_index);
-                self.load_selected_diff();
+        let make_job = || HistoryJob {
+            repo_path: self.repo_path.clone(),
+            scope: self.scope.clone(),
+            kind,
+            epoch,
+            current_epoch: self.history_epoch.clone(),
+            tx: self.history_load_tx.clone(),
+            ctx: self.egui_ctx.clone(),
+        };
+        // A panic must still deliver a result (`load: None`), or
+        // `history_inflight` sticks and the extension is dead for the session.
+        let on_panic = {
+            let (tx, ctx) = (self.history_load_tx.clone(), self.egui_ctx.clone());
+            move || {
+                let _ = tx.send(HistoryResult { epoch, load: None });
+                ctx.request_repaint();
             }
+        };
+        let spawn = {
+            let job = make_job();
+            spawn_reporting(
+                "gitkay-history-load",
+                "history-load worker panicked; reporting the load as failed",
+                move || history_worker(job),
+                on_panic,
+            )
+        };
+        if spawn.is_err() {
+            // Run the worker inline (accepting the UI stall): its result flows
+            // through the channel into drain_history_results exactly like the
+            // async path's, so the install/re-anchor logic stays in one place
+            // and the incremental Extend resume still applies.
+            log::warn!("history-load thread spawn failed; loading synchronously");
+            history_worker(make_job());
         }
     }
 
@@ -4110,9 +4117,8 @@ impl GitkApp {
         // Stats (+adds / -dels), right-aligned — galleys built once per diff (the
         // colors are fixed, so they're baked in at build time).
         let stat_gap = 3.0;
-        let (add_galley, del_galley) = {
-            let entry = &mut frame.cache.stats[idx];
-            if entry.is_none() {
+        let (add_galley, del_galley) = frame.cache.stats[idx]
+            .get_or_insert_with(|| {
                 let f = &self.diff_files[idx];
                 let stats_font = self.fonts.file_stats_font_id();
                 let add = (f.additions > 0).then(|| {
@@ -4126,10 +4132,9 @@ impl GitkApp {
                     ui.painter()
                         .layout_no_wrap(format!("-{}", f.deletions), stats_font, RED)
                 });
-                *entry = Some((add, del));
-            }
-            entry.clone().unwrap()
-        };
+                (add, del)
+            })
+            .clone();
         let add_w = add_galley.as_ref().map_or(0.0, |g| g.size().x);
         let del_w = del_galley.as_ref().map_or(0.0, |g| g.size().x);
         let inner_gap = if add_galley.is_some() && del_galley.is_some() {
@@ -4147,26 +4152,19 @@ impl GitkApp {
         // Label, elided into the width left of the stats — cached in PLACEHOLDER
         // color so the normal/hover color is applied at paint time (one galley
         // serves both states).
-        let g = {
-            let entry = &mut frame.cache.elided[idx];
-            if entry.is_none() {
-                let name_font = self.fonts.font_id(Role::FileList);
-                let label_max = (right - left - stats_w - pad).max(0.0);
-                let measure = |s: &str| text_width(ui.painter(), s, &name_font);
-                let elide_left = self.file_list == FileListLayout::Full;
-                let elided = if elide_left {
-                    left_elide(label, label_max, measure)
-                } else {
-                    right_elide(label, label_max, measure)
-                };
-                *entry = Some(ui.painter().layout_no_wrap(
-                    elided,
-                    name_font,
-                    egui::Color32::PLACEHOLDER,
-                ));
-            }
-            Arc::clone(entry.as_ref().unwrap())
-        };
+        let g = Arc::clone(frame.cache.elided[idx].get_or_insert_with(|| {
+            let name_font = self.fonts.font_id(Role::FileList);
+            let label_max = (right - left - stats_w - pad).max(0.0);
+            let measure = |s: &str| text_width(ui.painter(), s, &name_font);
+            let elide_left = self.file_list == FileListLayout::Full;
+            let elided = if elide_left {
+                left_elide(label, label_max, measure)
+            } else {
+                right_elide(label, label_max, measure)
+            };
+            ui.painter()
+                .layout_no_wrap(elided, name_font, egui::Color32::PLACEHOLDER)
+        }));
         let gy = cy - g.size().y / 2.0;
         ui.painter().galley(egui::pos2(left, gy), g, name_color);
 
@@ -4604,12 +4602,10 @@ impl GitkApp {
                             && let Some(last_real) =
                                 self.commits.iter().rev().find(|c| is_real_commit(c.oid))
                         {
-                            let real = real_commit_count(&self.commits);
                             self.dispatch_history_load(HistoryJobKind::Extend {
-                                skip: real,
+                                skip: real_commit_count(&self.commits),
                                 expect_last: last_real.oid,
                                 max_new: 500,
-                                requested: real + 500,
                             });
                         }
                     });
@@ -4631,6 +4627,9 @@ impl GitkApp {
             match rx.try_recv() {
                 Ok((font_defs, warnings)) => {
                     ctx.set_fonts(font_defs);
+                    // The sidebar's cached galleys bake the old glyph definitions;
+                    // rebuild them lazily under the new ones.
+                    self.sidebar_cache = SidebarCache::default();
                     if !warnings.is_empty() {
                         self.config_error_toast = Some(std::time::Instant::now());
                     }
@@ -5014,9 +5013,7 @@ impl GitkApp {
             // the top, so `top` always reflects a reachable position (no clamp to work
             // around) and a manual scroll is honoured.
             let top = self.diff_top_line.load(Ordering::Relaxed);
-            if let Some(line) =
-                next_file_line(&self.diff_files, self.diff_lines.len(), top, page_delta > 0)
-            {
+            if let Some(line) = next_file_line(&self.file_line_starts, top, page_delta > 0) {
                 self.diff_scroll_to = Some(line);
             }
         }
@@ -5257,10 +5254,8 @@ impl eframe::App for GitkApp {
                                     // install — see set_diff_content).
                                     if ui.checkbox(&mut self.word_diff, "Word diff").changed()
                                         && self.word_diff
-                                        && !self.diff_word_emphasized
                                     {
-                                        compute_word_emphasis(&mut self.diff_lines);
-                                        self.diff_word_emphasized = true;
+                                        self.ensure_live_word_emphasis();
                                     }
                                 });
                             });
