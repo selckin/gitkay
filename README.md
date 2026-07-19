@@ -12,9 +12,9 @@
 
 <p align="center">
   <a href="#features">Features</a> •
-  <a href="#install">Install</a> •
   <a href="#usage">Usage</a> •
-  <a href="#why">Why</a> •
+  <a href="#configuration">Configuration</a> •
+  <a href="#install">Install</a> •
   <a href="#license">License</a>
 </p>
 
@@ -42,6 +42,7 @@
 - Merge/branch diagonals rendered cleanly — no stubs, no gaps, no false branches
 - Lane-based layout: first parent always continues straight down
 - Convergence detection when multiple branches meet at one commit
+- Selecting a commit highlights its branch — its ancestry (including merged-in history) stays bright while unrelated commits dim
 - Virtual scrolling with lazy loading — handles repos with thousands of commits
 
 ### Diff Viewer
@@ -52,7 +53,7 @@
 - **Word diff** toggle — highlights the exact words that changed within a modified line
 - Hover toolbar on the diff: context-line count, ignore whitespace, rename/copy detection, word diff
 - Highlighting runs in the background, on-screen files first — large diffs never block the UI; diffs are cached and the neighbouring commits prefetched, so stepping through history is instant
-- Click a file to jump to its diff section
+- Click a file to jump to its diff section; the sidebar tracks your position, highlighting the file under the diff view as you scroll
 - Commit header with author, date, full message
 
 ### Search
@@ -70,72 +71,10 @@
 - **Auto-select** first commit on startup with diff shown
 - **Lazy loading** — starts with 200 commits, loads more as you scroll
 - **Unique author colors** — each contributor gets a distinct color
+- **Local commit times** — dates render in each commit's recorded timezone, not UTC
 - **Unique ref colors** — each branch/remote gets its own color with readable contrast
 - **Ref badges** — colored labels for HEAD, branches, remotes, tags
 - **Hover effects** — file list highlights on hover with full path tooltip
-
-## Install
-
-### Gentoo
-
-Packaged in the [GURU](https://wiki.gentoo.org/wiki/Project:GURU) overlay.
-
-```sh
-# Enable the GURU repository (needs app-eselect/eselect-repository)
-sudo eselect repository enable guru
-sudo emaint sync -r guru
-
-sudo emerge --ask dev-vcs/gitkay
-```
-
-### From source (recommended)
-
-```sh
-git clone https://github.com/Marenz/gitkay
-cd gitkay
-cargo build --release
-sudo cp target/release/gitkay /usr/local/bin/
-```
-
-### Build dependencies
-
-**openSUSE Tumbleweed:**
-```sh
-sudo zypper install gtk4-devel libgraphene-devel openssl-devel
-```
-
-**Ubuntu / Debian:**
-```sh
-sudo apt install libgtk-4-dev libgraphene-1.0-dev libssl-dev pkg-config cmake
-```
-
-**Fedora:**
-```sh
-sudo dnf install gtk4-devel graphene-devel openssl-devel
-```
-
-### openSUSE RPM
-
-`rpmbuild` expects the source tarball in `~/rpmbuild/SOURCES`, so create it
-first (from the release tag matching `packaging/gitkay.spec`'s `Version:`):
-
-```sh
-mkdir -p ~/rpmbuild/SOURCES
-git archive --format=tar.gz --prefix=gitkay-1.2.0/ -o ~/rpmbuild/SOURCES/gitkay-1.2.0.tar.gz v1.2.0
-rpmbuild -ba packaging/gitkay.spec
-sudo rpm -i ~/rpmbuild/RPMS/x86_64/gitkay-*.rpm
-```
-
-### Ubuntu / Debian .deb
-
-`dpkg-buildpackage` expects `debian/` at the source root; it lives under
-`packaging/`, so link it into place first:
-
-```sh
-ln -s packaging/debian debian
-dpkg-buildpackage -us -uc -b
-sudo dpkg -i ../gitkay_*.deb
-```
 
 ## Usage
 
@@ -217,9 +156,14 @@ commit_summary = { size = 14, font = "proportional" }
 | `show_stats` | `true` | `false` hides the diffstat block (the file-list sidebar still lists every file) |
 | `file_list` | `"grouped"` | `"grouped"` groups files under directory headers (basenames indented); `"full"` shows each file's full repo-relative path; `"name"` shows just basenames |
 | `syntax` | `true` | `false` restores the original flat per-role coloring (no theme, no highlighter) |
-| `theme` | `"catppuccin-mocha"` | one of 29 bundled themes (e.g. `dracula`, `nord`, `gruvbox-dark`, `github`, `solarized-light`); unknown values warn and fall back |
+| `theme` | `"catppuccin-mocha"` | any of the 29 bundled themes (see below); unknown values warn and fall back |
 | `detect_renames` | `true` | show a renamed file as one `old → new` entry (git `-M`) instead of a delete + add |
 | `detect_copies` | `false` | show a file copied from another *modified* file as `source → copy` (git `-C`); more expensive than renames |
+
+The bundled themes come from [two-face](https://github.com/CosmicHorrorDev/two-face)
+(the [bat](https://github.com/sharkdp/bat) theme collection — Catppuccin, Dracula,
+Gruvbox, Nord, Solarized, …); the commented config template written on first run
+lists every selectable slug.
 
 **Diff bands** (`[diff.bands]`) — the add/remove row tints on syntax-on diffs:
 
@@ -227,6 +171,69 @@ commit_summary = { size = 14, font = "proportional" }
 |-----|---------|---------|
 | `source` | `"fixed"` | `"fixed"` uses the colors below; `"theme"` derives them from the active theme |
 | `added` / `deleted` | built-in dark/light | explicit `"#rrggbb"` band colors for `"fixed"` mode |
+
+## Install
+
+### Gentoo
+
+Packaged in the [GURU](https://wiki.gentoo.org/wiki/Project:GURU) overlay.
+
+```sh
+# Enable the GURU repository (needs app-eselect/eselect-repository)
+sudo eselect repository enable guru
+sudo emaint sync -r guru
+
+sudo emerge --ask dev-vcs/gitkay
+```
+
+### From source (recommended)
+
+```sh
+git clone https://github.com/Marenz/gitkay
+cd gitkay
+cargo build --release
+sudo cp target/release/gitkay /usr/local/bin/
+```
+
+### Build dependencies
+
+**openSUSE Tumbleweed:**
+```sh
+sudo zypper install gtk4-devel libgraphene-devel openssl-devel
+```
+
+**Ubuntu / Debian:**
+```sh
+sudo apt install libgtk-4-dev libgraphene-1.0-dev libssl-dev pkg-config cmake
+```
+
+**Fedora:**
+```sh
+sudo dnf install gtk4-devel graphene-devel openssl-devel
+```
+
+### openSUSE RPM
+
+`rpmbuild` expects the source tarball in `~/rpmbuild/SOURCES`, so create it
+first (from the release tag matching `packaging/gitkay.spec`'s `Version:`):
+
+```sh
+mkdir -p ~/rpmbuild/SOURCES
+git archive --format=tar.gz --prefix=gitkay-1.2.0/ -o ~/rpmbuild/SOURCES/gitkay-1.2.0.tar.gz v1.2.0
+rpmbuild -ba packaging/gitkay.spec
+sudo rpm -i ~/rpmbuild/RPMS/x86_64/gitkay-*.rpm
+```
+
+### Ubuntu / Debian .deb
+
+`dpkg-buildpackage` expects `debian/` at the source root; it lives under
+`packaging/`, so link it into place first:
+
+```sh
+ln -s packaging/debian debian
+dpkg-buildpackage -us -uc -b
+sudo dpkg -i ../gitkay_*.deb
+```
 
 ## License
 
