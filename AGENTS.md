@@ -143,7 +143,7 @@ parts run off the window-creation critical path:
 ### UI (egui immediate mode)
 - **Top panel**: search bar (SHA/author/message/ref), Enter cycles matches, any keypress focuses search, graph auto-scrolls to match
 - **Central panel**: commit graph + list (`show_commit_list`), virtualized with egui `show_rows` (same mechanism as the diff pane). Lazy loading: 200 initial, +500 on scroll-near-bottom — computed on a `gitkay-history-load` worker (never the frame loop), appended incrementally via `load_commits_tail` in the common plain scope, full background rebuild otherwise. The debounced git-watcher reload takes the same worker path. `history_epoch` supersedes stale results; both land in `drain_history_results`, which re-syncs derived state through `resync_commits` (a pure append re-anchors to the same index, so selection and scroll don't move)
-- **Bottom panel**: diff view (left, syntax-highlighted) + file list sidebar (right, dynamic width)
+- **Bottom panel**: diff view (left, syntax-highlighted) + file list sidebar (right, dynamic width). Both remember their scroll position per commit for the session (`scroll_memory`, oid-keyed: saved by `stash_current_diff` when the displayed diff is replaced, restore queued by `load_selected_diff` on a commit switch — an unvisited commit opens at the top, a same-oid re-diff keeps the live position)
 - **Rename/copy detection**: `detect_similar` (`git2::Diff::find_similar`) post-passes
   `get_diff_data`/`get_working_tree_diff`/`get_staged_diff`, coalescing an add+delete pair
   into one `old → new` entry. `[diff].detect_renames` (default on, git `-M`) and
