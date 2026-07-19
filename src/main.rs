@@ -4029,10 +4029,13 @@ impl GitkApp {
             // keeps it from popping up at all mid-wheel (row churn under a still
             // pointer); it reappears ~150ms after the last wheel event.
             let f = &self.diff_files[idx];
+            // Rename/copy: two lines (old on top, new below) — side by side the
+            // combined width gets unwieldy, and stacked paths are easier to diff by
+            // eye. The trailing ⇒ on line one marks the direction.
             let text = f
                 .old_path
                 .as_ref()
-                .map_or_else(|| f.path.clone(), |old| format!("{old} ⇒ {}", f.path));
+                .map_or_else(|| f.path.clone(), |old| format!("{old} ⇒\n{}", f.path));
             // Top-right pivot at the row's bottom-right: the tooltip opens below the
             // row and grows leftward, so it stays inside the window despite the
             // right-edge position (the Area additionally constrains to the screen).
