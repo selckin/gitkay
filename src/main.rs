@@ -124,7 +124,9 @@ enum RefKind {
     Branch,
     Remote,
     Tag,
-    Reflog, // the @{n} selector chip in reflog view
+    Reflog,      // the @{n} selector chip in reflog view
+    WorkingTree, // the virtual "working tree" (uncommitted) row's chip
+    Index,       // the virtual "index" (staged) row's chip
 }
 
 /// Sentinel OID for the "uncommitted changes" virtual entry.
@@ -901,7 +903,7 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
             } else {
                 head_oid.into_iter().collect()
             },
-            vec![("working tree".to_string(), RefKind::Head)],
+            vec![("working tree".to_string(), RefKind::WorkingTree)],
             None,
         ));
     }
@@ -913,7 +915,7 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
             chrono::Utc::now().timestamp(),
             local_tz_offset_min(),
             head_oid.into_iter().collect(),
-            vec![("index".to_string(), RefKind::Tag)],
+            vec![("index".to_string(), RefKind::Index)],
             None,
         ));
     }
@@ -1279,6 +1281,10 @@ enum LineKind {
     FileMeta,
     FileName,
     Stat,
+    /// A structural blank/separator line (header spacing, stat-block trailer) —
+    /// NOT diff content, so `is_code()` is false and the highlighter skips it.
+    /// Patch-context blank lines inside a hunk stay `Context`.
+    Blank,
 }
 
 impl LineKind {
@@ -1306,6 +1312,7 @@ fn kind_color(kind: LineKind, palette: &highlight::DiffPalette) -> egui::Color32
         LineKind::Stat => palette.dim,
         LineKind::Meta => palette.foreground,
         LineKind::Context => palette.foreground,
+        LineKind::Blank => palette.foreground,
     }
 }
 
@@ -1573,7 +1580,7 @@ fn get_diff_data(
     if !date.is_empty() {
         lines.push(DiffLine::new(&format!("Date:   {date}"), LineKind::Meta));
     }
-    lines.push(DiffLine::new("", LineKind::Context));
+    lines.push(DiffLine::new("", LineKind::Blank));
     // Lossy: a legacy-encoded message should render with replacement chars,
     // not vanish (message() errs on non-UTF-8).
     let msg = String::from_utf8_lossy(commit.message_bytes());
@@ -1582,7 +1589,7 @@ fn get_diff_data(
     }
     // The blank above (after the commit message) stays, so the message flows
     // straight into the diffstat/patch produced below.
-    lines.push(DiffLine::new("", LineKind::Context));
+    lines.push(DiffLine::new("", LineKind::Blank));
 
     detect_similar(&mut diff, settings);
     append_diff_body(&mut lines, &mut files, &diff, settings.show_stats);
@@ -1647,7 +1654,7 @@ fn append_diff_body(
                 lines.push(DiffLine::new(l, LineKind::Stat));
             }
         }
-        lines.push(DiffLine::new("", LineKind::Context));
+        lines.push(DiffLine::new("", LineKind::Blank));
     }
 
     // Patch — track which file we're in (by byte path, so non-UTF-8 names don't
@@ -1788,7 +1795,7 @@ fn diff_to_data(diff: &git2::Diff, title: &str, show_stats: bool) -> DiffData {
     let mut files = Vec::new();
 
     lines.push(DiffLine::new(title, LineKind::Meta));
-    lines.push(DiffLine::new("", LineKind::Context));
+    lines.push(DiffLine::new("", LineKind::Blank));
 
     append_diff_body(&mut lines, &mut files, diff, show_stats);
     DiffData::new(lines, files)
@@ -1929,9 +1936,9 @@ fn file_fully_highlighted(lines: &[DiffLine], start: usize, end: usize) -> bool 
 
 /// True when the foreground worker has finished colouring the whole diff: every
 /// code line *inside a file range* is highlighted. Only file ranges are checked —
-/// the diff header has blank `Context` lines (which count as code) that live
-/// outside any file range and are never tokenized, so checking the whole
-/// `[0, len)` range would never be satisfied.
+/// lines outside them (e.g. a no-patch/binary file's placeholder, which is
+/// `Context` but excluded from `file_line_ranges`) are never tokenized, so
+/// checking the whole `[0, len)` range would never be satisfied.
 fn diff_fully_highlighted(lines: &[DiffLine], files: &[FileEntry]) -> bool {
     file_line_ranges(files, lines.len())
         .iter()
@@ -4347,6 +4354,14 @@ impl GitkApp {
                                     RefKind::Head => (egui::Color32::from_rgb(80, 40, 50), RED),
                                     RefKind::Tag => (egui::Color32::from_rgb(60, 55, 30), YELLOW),
                                     RefKind::Reflog => (SURFACE0, SUBTEXT),
+                                    // The virtual rows keep the same styling they had
+                                    // when they borrowed Head/Tag, but as their own
+                                    // kinds — restyling real HEAD/tag chips can no
+                                    // longer silently restyle these.
+                                    RefKind::WorkingTree => {
+                                        (egui::Color32::from_rgb(80, 40, 50), RED)
+                                    }
+                                    RefKind::Index => (egui::Color32::from_rgb(60, 55, 30), YELLOW),
                                     RefKind::Branch | RefKind::Remote => {
                                         // Unique color per branch/remote name
                                         let color = ref_color(ref_name);
@@ -6334,6 +6349,10 @@ mod tests {
         assert_eq!(kind_color(LineKind::Stat, &p), p.dim);
         assert_eq!(kind_color(LineKind::Meta, &p), p.foreground);
         assert_eq!(kind_color(LineKind::Context, &p), p.foreground);
+        assert_eq!(kind_color(LineKind::Blank, &p), p.foreground);
+        // Blank is structural: never handed to the highlighter, unlike Context.
+        assert!(!LineKind::Blank.is_code());
+        assert!(LineKind::Context.is_code());
     }
 
     #[test]
@@ -6371,12 +6390,14 @@ mod tests {
         a1.spans = Some(vec![span()]);
         let lines = vec![
             DiffLine::new("commit abc", LineKind::Meta), // 0 header (structural)
-            DiffLine::new("", LineKind::Context),        // 1 header blank — is_code, never tokenized (None)
-            a0,                                          // 2 file code (Some)
-            a1,                                          // 3 file code (Some)
+            // 1: a `Context` line outside any file range (as a no-patch/binary
+            // file's placeholder would be) — is_code, but never tokenized (None).
+            DiffLine::new("Binary files differ", LineKind::Context),
+            a0, // 2 file code (Some)
+            a1, // 3 file code (Some)
         ];
         let files = vec![fe("x.rs", Some(2))]; // file's range starts at index 2
-        // The blank Context header line (index 1) is None but outside any file
+        // The untokenized Context line (index 1) is None but outside any file
         // range, so the diff still counts as fully highlighted. This is the bug
         // that made the prefetch trigger never fire with file_fully_highlighted(0,len).
         assert!(diff_fully_highlighted(&lines, &files));
@@ -6634,6 +6655,37 @@ mod tests {
             .filter(|c| is_real_commit(c.oid))
             .map(|c| c.summary.clone())
             .collect()
+    }
+
+    #[test]
+    fn default_fonts_fit_the_row_height_floors() {
+        // The commit list floors its row height at 20px and the file list at
+        // FILE_ROW_H (18px), growing only when the configured font outgrows the
+        // floor. Pin that the DEFAULT font sizes (summary/meta 13/12, file list
+        // 12) stay under their floors — i.e. the default look is unchanged by
+        // the font-derived heights — and that a large size actually grows.
+        // Headless egui context; the runtime fonts start from the same
+        // FontDefinitions::default() (build_fonts only adds user fonts on top).
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let h =
+                |size: f32| ui.fonts_mut(|f| f.row_height(&egui::FontId::monospace(size)));
+            assert!(
+                h(13.0).max(h(12.0)) + 4.0 <= 20.0,
+                "default commit-row fonts must fit the 20px floor (got {})",
+                h(13.0).max(h(12.0)) + 4.0
+            );
+            assert!(
+                h(12.0) + 4.0 <= FILE_ROW_H,
+                "default file-list font must fit the {FILE_ROW_H}px floor (got {})",
+                h(12.0) + 4.0
+            );
+            assert!(
+                h(24.0) + 4.0 > 20.0,
+                "a large configured font must grow the row (got {})",
+                h(24.0) + 4.0
+            );
+        });
     }
 
     #[test]
