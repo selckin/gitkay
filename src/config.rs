@@ -258,9 +258,46 @@ fn cache_path() -> Option<PathBuf> {
     dirs::cache_dir().map(|d| d.join("gitkay").join("fonts.toml"))
 }
 
+/// Greedy-wrap `text` into `# `-prefixed comment lines of at most `width` chars.
+fn wrap_comment(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut line = String::from("#");
+    for word in text.split(' ') {
+        if line.len() + 1 + word.len() > width && line.len() > 1 {
+            out.push_str(&line);
+            out.push('\n');
+            line = String::from("#");
+        }
+        line.push(' ');
+        line.push_str(word);
+    }
+    out.push_str(&line);
+    out
+}
+
+/// `#rrggbb` form of a colour, for documenting defaults in the template.
+fn hex(c: egui::Color32) -> String {
+    format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
+}
+
 /// A fully-commented config showing every default. Written on first run.
+/// The theme list, default slug, and band colours are formatted from
+/// `highlight`'s own definitions so the template can't drift from the code.
 fn default_template() -> String {
     let sz = |role: Role| role_default(role).0;
+    let theme_list = wrap_comment(
+        &crate::highlight::theme_slugs()
+            .map(|s| {
+                if s == crate::highlight::DEFAULT_THEME_SLUG {
+                    format!("{s} (default)")
+                } else {
+                    s.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        76,
+    );
     format!(
         "# gitkay configuration — ~/.config/gitkay/config.toml\n\
          # This file is optional. Every line below is commented out and shows its\n\
@@ -306,19 +343,19 @@ fn default_template() -> String {
          # Syntax-highlight diffs. false = the original flat per-role coloring.\n\
          # syntax = true\n\
          # Diff syntax-highlighting theme. Any of:\n\
-         # catppuccin-mocha (default), catppuccin-macchiato, catppuccin-frappe,\n\
-         # catppuccin-latte, dracula, nord, gruvbox-dark, gruvbox-light, github,\n\
-         # solarized-dark, solarized-light, one-half-dark, two-dark, zenburn,\n\
-         # monokai-extended, sublime-snazzy, dark-neon, and more (see docs).\n\
-         # theme = \"catppuccin-mocha\"\n\
+         {theme_list}\n\
+         # theme = \"{default_theme}\"\n\
          \n\
          [diff.bands]\n\
          # Add/remove row band colours (syntax-on diffs). source \"fixed\" (default)\n\
          # uses the colours below (dark, or light pastels on light themes); \"theme\"\n\
          # derives them from the active theme's own diff colours.\n\
          # source = \"fixed\"\n\
-         # added = \"#0a300a\"\n\
-         # deleted = \"#400c0e\"\n",
+         # added = \"{added_band}\"\n\
+         # deleted = \"{deleted_band}\"\n",
+        default_theme = crate::highlight::DEFAULT_THEME_SLUG,
+        added_band = hex(crate::highlight::DEFAULT_ADDED_BAND_DARK),
+        deleted_band = hex(crate::highlight::DEFAULT_DELETED_BAND_DARK),
         diff = sz(Role::Diff),
         commit_summary = sz(Role::CommitSummary),
         commit_meta = sz(Role::CommitMeta),
@@ -705,6 +742,18 @@ mod tests {
         assert!(t.contains("theme ="));
         assert!(t.contains("[diff.bands]"));
         assert!(t.contains("syntax ="));
+    }
+
+    #[test]
+    fn template_documents_every_theme_slug_and_real_band_defaults() {
+        let t = default_template();
+        for slug in crate::highlight::theme_slugs() {
+            assert!(t.contains(slug), "template must document theme {slug}");
+        }
+        assert!(t.contains("catppuccin-mocha (default)"));
+        // Band defaults are formatted from the real colours, not re-typed hex.
+        assert!(t.contains("# added = \"#0a300a\""));
+        assert!(t.contains("# deleted = \"#400c0e\""));
     }
 
     #[test]
