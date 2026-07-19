@@ -76,10 +76,11 @@ struct CommitInfo {
     // Derived once here, immutable per commit, so the hot paths don't recompute them:
     // the row render runs every frame, and search scans every commit each keystroke.
     // `time`/`tz_offset_min` aren't stored — they're only needed to format `date_str`.
-    summary_lc: String, // lowercased summary, for case-insensitive search
-    author_lc: String,  // lowercased author, for case-insensitive search
-    date_str: String,   // commit date formatted with its recorded UTC offset (row display)
-    short_sha: String,  // 7-char abbreviation, empty for the virtual (uncommitted/staged) rows
+    summary_lc: String,   // lowercased summary, for case-insensitive search
+    author_lc: String,    // lowercased author, for case-insensitive search
+    refs_lc: Vec<String>, // lowercased ref names, for case-insensitive search
+    date_str: String,     // commit date formatted with its recorded UTC offset (row display)
+    short_sha: String,    // 7-char abbreviation, empty for the virtual (uncommitted/staged) rows
 }
 
 impl CommitInfo {
@@ -100,6 +101,7 @@ impl CommitInfo {
         CommitInfo {
             summary_lc: summary.to_lowercase(),
             author_lc: author.to_lowercase(),
+            refs_lc: refs.iter().map(|(r, _)| r.to_lowercase()).collect(),
             date_str: format_commit_time(time, tz_offset_min, false),
             short_sha: if is_real_commit(oid) {
                 format!("{oid:.7}")
@@ -283,11 +285,6 @@ fn normalize_rel(path: &str) -> String {
     out.join("/")
 }
 
-/// Fit `path` into `max_width` for left-aligned display. Returns `path` unchanged
-/// when it already fits; otherwise the longest trailing suffix that fits when
-/// prefixed with `…` (so the filename + nearest dirs stay visible), or `…` alone
-/// when even one char won't fit. `measure` returns a string's rendered width and
-/// must be monotonic in suffix length. Pure (no egui), so it is unit-testable.
 /// Width in points of `s` laid out on one line in `font` — the measurement the elide
 /// helpers binary-search against. Color doesn't affect width, so any is fine.
 fn text_width(painter: &egui::Painter, s: &str, font: &egui::FontId) -> f32 {
@@ -326,7 +323,12 @@ fn elide_bsearch(
     }
 }
 
-/// Elide `path` to fit `max_width`, keeping the END and prefixing a "…".
+/// Fit `path` into `max_width` for left-aligned display: elide keeping the END,
+/// prefixing a "…". Returns `path` unchanged when it already fits; otherwise the
+/// longest trailing suffix that fits (so the filename + nearest dirs stay
+/// visible), or `…` alone when even one char won't fit. `measure` returns a
+/// string's rendered width and must be monotonic in suffix length. Pure (no
+/// egui), so it is unit-testable.
 fn left_elide(path: &str, max_width: f32, measure: impl Fn(&str) -> f32) -> String {
     if measure(path) <= max_width {
         return path.to_string();
@@ -856,16 +858,18 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
     // Staged = index vs HEAD tree. Scoped to the active `-- <path>` filter, so a
     // staged change outside the path doesn't add a virtual row on its own lane.
     let t = std::time::Instant::now();
-    let has_staged = show_local
-        && head_oid
+    let has_staged = show_local && {
+        // No HEAD tree (unborn HEAD — fresh `git init` + `git add`) diffs the
+        // index against the EMPTY tree, exactly like `git diff --cached`, so a
+        // staged initial commit still gets its row (mirrors get_staged_diff).
+        let head_tree = head_oid
             .and_then(|head| repo.find_commit(head).ok())
-            .and_then(|head_commit| head_commit.tree().ok())
-            .and_then(|head_tree| {
-                let mut opts = pathspec_opts(&scope.paths);
-                repo.diff_tree_to_index(Some(&head_tree), None, Some(&mut opts))
-                    .ok()
-            })
-            .is_some_and(|diff| diff.deltas().len() > 0);
+            .and_then(|head_commit| head_commit.tree().ok());
+        let mut opts = pathspec_opts(&scope.paths);
+        repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut opts))
+            .ok()
+            .is_some_and(|diff| diff.deltas().len() > 0)
+    };
     log::debug!(
         "perf: load_commits: staged probe (diff_tree_to_index) -> {has_staged} {:?}",
         t.elapsed()
@@ -924,11 +928,16 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
         log::warn!("gitkay: cannot set commit sort order: {e}");
     }
     if scope.all {
-        // Everything: branches, remotes, tags.
+        // Everything: branches, remotes, tags — plus HEAD, like `git rev-list
+        // --all`: a detached HEAD's commits aren't under refs/ and would
+        // otherwise vanish (leaving the virtual rows' parent dangling).
         for glob in ["refs/heads/*", "refs/remotes/*", "refs/tags/*"] {
             if let Err(e) = revwalk.push_glob(glob) {
                 log::warn!("gitkay: cannot walk {glob}: {e}");
             }
+        }
+        if let Err(e) = revwalk.push_head() {
+            log::warn!("gitkay: cannot walk HEAD: {e}");
         }
     } else if scope.revs.is_empty() {
         // default: the current branch only
@@ -941,12 +950,21 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
         }
     }
     let build_info = |oid: git2::Oid, commit: &git2::Commit, parents: Vec<git2::Oid>| {
+        // Lossy conversions: legacy repos carry Latin-1 summaries/names, and a
+        // blank cell (plus an unsearchable commit) is worse than a replacement
+        // char. The AUTHOR date matches `git log`/gitk; `commit.time()` is the
+        // committer timestamp, which shifts on every rebase/cherry-pick/amend.
+        let author = commit.author();
+        let when = author.when();
         CommitInfo::new(
             oid,
-            commit.summary().ok().flatten().unwrap_or("").to_string(),
-            commit.author().name().unwrap_or("").to_string(),
-            commit.time().seconds(),
-            commit.time().offset_minutes(),
+            commit
+                .summary_bytes()
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .unwrap_or_default(),
+            String::from_utf8_lossy(author.name_bytes()).into_owned(),
+            when.seconds(),
+            when.offset_minutes(),
             parents,
             ref_map.get(&oid).cloned().unwrap_or_default(),
             None,
@@ -1128,9 +1146,6 @@ fn build_ref_map(
 
     if let Ok(references) = repo.references() {
         for reference in references.flatten() {
-            let Some(oid) = reference.target() else {
-                continue;
-            };
             let Ok(shorthand) = reference.shorthand() else {
                 continue;
             };
@@ -1144,6 +1159,21 @@ fn build_ref_map(
                 RefKind::Branch
             } else {
                 continue;
+            };
+            // An annotated tag's raw target is the tag OBJECT, not the tagged
+            // commit — peel so the chip lands on a graph row (a lightweight tag
+            // peels to itself). Tags of non-commits (blobs/trees) have no row to
+            // attach to; skip them.
+            let oid = if kind == RefKind::Tag {
+                match reference.peel_to_commit() {
+                    Ok(commit) => commit.id(),
+                    Err(_) => continue,
+                }
+            } else {
+                match reference.target() {
+                    Some(oid) => oid,
+                    None => continue,
+                }
             };
             map.entry(oid)
                 .or_default()
@@ -1191,13 +1221,13 @@ impl DiffLine {
     }
 }
 
-/// Fill in each line's word-diff `emphasis` ranges. A change block (a run of `-`
-/// lines followed by a run of `+` lines) is intra-line diffed only when the two
-/// runs have equal length, pairing them 1:1 — the common "edited in place" case.
 /// Max body length (bytes) for which word-diff is computed; above this the LCS
 /// table grows too large and the highlight isn't readable anyway.
 const MAX_WORD_DIFF_LINE: usize = 2048;
 
+/// Fill in each line's word-diff `emphasis` ranges. A change block (a run of `-`
+/// lines followed by a run of `+` lines) is intra-line diffed only when the two
+/// runs have equal length, pairing them 1:1 — the common "edited in place" case.
 fn compute_word_emphasis(lines: &mut [DiffLine]) {
     let mut i = 0;
     while i < lines.len() {
@@ -1279,15 +1309,6 @@ fn kind_color(kind: LineKind, palette: &highlight::DiffPalette) -> egui::Color32
     }
 }
 
-/// Render `n_lines` rows of the diff with row virtualization — only the visible
-/// rows get a LayoutJob (diffs can be tens of thousands of lines, all uniform
-/// single-line height). `on_visible` receives the visible (real) row range and the
-/// full viewport height in rows — the range tells the highlight worker which files are
-/// on screen (the flat path ignores it), the height drives the Space page-scroll and is
-/// the true screenful even when bottom-padding rows clamp the real range short.
-/// `build_row` produces each row's job, an optional
-/// background tint, and the galley fallback colour. Shared by both render paths
-/// so the scroll/offset/width scaffold lives in one place.
 /// Layout inputs for `show_virtualized_diff`: total rows, the widest line (sizes the
 /// horizontal scroll), an optional forced scroll line, and the deepest file start the
 /// bottom padding must let reach the top (`None` ⇒ no files ⇒ no padding).
@@ -1324,6 +1345,15 @@ fn diff_pad_rows(n_lines: usize, last_top_anchor: Option<usize>, viewport_rows: 
     })
 }
 
+/// Render `n_lines` rows of the diff with row virtualization — only the visible
+/// rows get a LayoutJob (diffs can be tens of thousands of lines, all uniform
+/// single-line height). `on_visible` receives the visible (real) row range and the
+/// full viewport height in rows — the range tells the highlight worker which files are
+/// on screen (the flat path ignores it), the height drives the Space page-scroll and is
+/// the true screenful even when bottom-padding rows clamp the real range short.
+/// `build_row` produces each row's job, an optional background tint, and the galley
+/// fallback colour. Shared by both render paths so the scroll/offset/width scaffold
+/// lives in one place.
 fn show_virtualized_diff(
     ui: &mut egui::Ui,
     font_id: &egui::FontId,
@@ -1536,16 +1566,19 @@ fn get_diff_data(
         &format!("Author: {}", commit.author()),
         LineKind::Meta,
     ));
-    let t = commit.time();
+    // Author date, like `git log`/`git show` — commit.time() is the committer
+    // timestamp, which diverges on rebased/cherry-picked/amended commits.
+    let t = commit.author().when();
     let date = format_commit_time(t.seconds(), t.offset_minutes(), true);
     if !date.is_empty() {
         lines.push(DiffLine::new(&format!("Date:   {date}"), LineKind::Meta));
     }
     lines.push(DiffLine::new("", LineKind::Context));
-    if let Ok(msg) = commit.message() {
-        for l in msg.lines() {
-            lines.push(DiffLine::new(&format!("    {l}"), LineKind::Meta));
-        }
+    // Lossy: a legacy-encoded message should render with replacement chars,
+    // not vanish (message() errs on non-UTF-8).
+    let msg = String::from_utf8_lossy(commit.message_bytes());
+    for l in msg.lines() {
+        lines.push(DiffLine::new(&format!("    {l}"), LineKind::Meta));
     }
     // The blank above (after the commit message) stays, so the message flows
     // straight into the diffstat/patch produced below.
@@ -1646,39 +1679,45 @@ fn append_diff_body(
                 }
                 LineKind::Del
             }
-            'H' | 'F' => LineKind::Hunk,
-            _ => {
-                let content = std::str::from_utf8(line.content()).unwrap_or("");
-                if content.starts_with("diff ") || content.starts_with("index ") {
-                    LineKind::FileMeta
-                } else if content.starts_with("--- ") || content.starts_with("+++ ") {
-                    LineKind::FileName
-                } else if content.starts_with("@@") {
-                    LineKind::Hunk
-                } else {
-                    LineKind::Context
-                }
-            }
+            'H' => LineKind::Hunk,
+            // The file-header block; per-piece FileMeta/FileName refinement below.
+            'F' => LineKind::FileMeta,
+            // Everything else (context ' ', binary/EOF markers) is plain context.
+            // Classify from origin codes only — sniffing the TEXT here would
+            // misclassify code lines that happen to start with "diff "/"@@".
+            _ => LineKind::Context,
         };
         let prefix = match line.origin() {
             '+' => "+",
             '-' => "-",
             _ => "",
         };
-        let content = std::str::from_utf8(line.content()).unwrap_or("");
+        // Lossy: legacy-encoded (e.g. Latin-1) content must render with
+        // replacement chars, not as blank rows (from_utf8().unwrap_or("")
+        // would also make distinct working-tree states hash identically).
+        let content = String::from_utf8_lossy(line.content());
         // git2 delivers a multi-line file header (origin FILE_HDR) as ONE line
         // with embedded newlines; split it so every DiffLine is exactly one
         // visual line — the row-virtualized render allocates a fixed row height
         // per line, so a multi-line entry would draw over the lines below it.
         for piece in content.trim_end_matches('\n').split('\n') {
-            lines.push(DiffLine::new(&format!("{prefix}{piece}"), kind));
+            // Within the header block, the `---`/`+++` file-name lines get their
+            // own (brighter) kind; the rest (diff --git, index, mode, rename
+            // from/to) stay dim FileMeta.
+            let piece_kind = if kind == LineKind::FileMeta
+                && (piece.starts_with("--- ") || piece.starts_with("+++ "))
+            {
+                LineKind::FileName
+            } else {
+                kind
+            };
+            lines.push(DiffLine::new(&format!("{prefix}{piece}"), piece_kind));
         }
         true
     })
     .unwrap_or_else(|e| log::warn!("gitkay: error rendering diff patch: {e}"));
 }
 
-/// Generate diff for uncommitted working tree changes (workdir vs index).
 /// Shared pipeline for the virtual (working-tree / staged) diffs: build the pathspec- and
 /// settings-scoped `DiffOptions`, run `build` to produce the git diff, coalesce
 /// renames/copies, and convert to `DiffData` under `title`. A diff error is logged (with
@@ -1703,6 +1742,7 @@ fn virtual_diff<'r>(
     diff_to_data(&diff, title, settings.show_stats)
 }
 
+/// Generate diff for uncommitted working tree changes (workdir vs index).
 fn get_working_tree_diff(repo: &Repository, settings: DiffSettings, paths: &[String]) -> DiffData {
     virtual_diff(
         repo,
@@ -2174,10 +2214,6 @@ struct PrefetchJob {
     ctx: egui::Context,
 }
 
-/// Background prefetch: for each neighbour `DiffCacheKey`, compute its diff and
-/// fully highlight it, sending the finished `(key, DiffData)` back for the UI to
-/// cache. Bails as soon as a newer dispatch supersedes it (`epoch`). Pure
-/// optimization — any failure just warms fewer neighbours.
 /// Spawn a named detached thread running `f`, catching (and logging, with `panic_msg`) a
 /// panic in `f` so one bad job can't kill the thread and silently break the feature for
 /// the rest of the session. Returns the spawn result so the caller can still handle
@@ -2196,6 +2232,10 @@ fn spawn_guarded(
         })
 }
 
+/// Background prefetch: for each neighbour `DiffCacheKey`, compute its diff and
+/// fully highlight it, sending the finished `(key, DiffData)` back for the UI to
+/// cache. Bails as soon as a newer dispatch supersedes it (`epoch`). Pure
+/// optimization — any failure just warms fewer neighbours.
 fn prefetch_worker(job: PrefetchJob) {
     let PrefetchJob { repo_path, targets, hl, epoch, current_epoch, tx, ctx } = job;
     // Superseded before we even ran — don't open the repo.
@@ -2298,10 +2338,6 @@ fn diff_load_worker(job: DiffLoadJob) {
     ctx.request_repaint();
 }
 
-/// Resolve the `[diff.bands]` config into a `DiffBg`, plus any warnings (unparseable
-/// hex falls back to a default). The `source` is a typed enum, so an invalid value is
-/// already a parse error — no mode warning to emit here. The caller surfaces the
-/// warnings (stderr + the in-UI toast).
 /// The configured diff theme slug, falling back to the built-in default when
 /// `[diff] theme` is unset. Shared by the startup and live-reload config paths.
 fn configured_theme_slug(cfg: &config::Config) -> String {
@@ -2311,6 +2347,10 @@ fn configured_theme_slug(cfg: &config::Config) -> String {
         .unwrap_or_else(|| highlight::DEFAULT_THEME_SLUG.to_string())
 }
 
+/// Resolve the `[diff.bands]` config into a `DiffBg`, plus any warnings (unparseable
+/// hex falls back to a default). The `source` is a typed enum, so an invalid value is
+/// already a parse error — no mode warning to emit here. The caller surfaces the
+/// warnings (stderr + the in-UI toast).
 fn resolve_diff_bg(bands: &config::BandsSection) -> (DiffBg, Vec<String>) {
     let mut warnings = Vec::new();
     // Validate any explicitly-set band hex even in Theme mode (where the parsed
@@ -2972,8 +3012,13 @@ fn show_toast(
     font: egui::FontId,
 ) {
     if let Some(t) = *toast {
-        if t.elapsed().as_secs_f32() < secs {
+        let remaining = secs - t.elapsed().as_secs_f32();
+        if remaining > 0.0 {
             ui.label(egui::RichText::new(text).color(color).font(font));
+            // egui only repaints on input — without a scheduled wake the toast
+            // would stay on screen indefinitely once the app goes idle.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs_f32(remaining));
         } else {
             *toast = None;
         }
@@ -3361,7 +3406,7 @@ impl GitkApp {
                 c.summary_lc.contains(&q)
                     || c.author_lc.contains(&q)
                     || oid_hex_starts_with(c.oid, &q)
-                    || c.refs.iter().any(|(r, _)| r.to_lowercase().contains(&q))
+                    || c.refs_lc.iter().any(|r| r.contains(&q))
             })
             .map(|(i, _)| i)
             .collect();
@@ -3629,13 +3674,6 @@ impl GitkApp {
         self.diff_generation.bump();
     }
 
-    /// Build the highlighter on first use and (re)highlight the current diff if
-    /// it changed. Tokenization always runs on a background thread (the diff
-    /// renders plain until the worker's spans arrive), because the FIRST time
-    /// syntect tokenizes a given language it compiles that language's regexes
-    /// (~0.5s with the fancy-regex backend) — doing that on the UI thread froze
-    /// the window on commit selection. Cheap to call every frame: a no-op once
-    /// `diff_needs_highlight` is cleared.
     /// Install a freshly built highlighter, surfacing any theme-load warning as a log line
     /// plus a config-error toast. Shared by the prewarmed and synchronous build paths.
     fn install_highlighter(&mut self, hl: Highlighter, warning: Option<String>) {
@@ -3646,6 +3684,13 @@ impl GitkApp {
         self.highlighter = Some(Arc::new(hl));
     }
 
+    /// Build the highlighter on first use and (re)highlight the current diff if
+    /// it changed. Tokenization always runs on a background thread (the diff
+    /// renders plain until the worker's spans arrive), because the FIRST time
+    /// syntect tokenizes a given language it compiles that language's regexes
+    /// (~0.5s with the fancy-regex backend) — doing that on the UI thread froze
+    /// the window on commit selection. Cheap to call every frame: a no-op once
+    /// `diff_needs_highlight` is cleared.
     fn ensure_diff_highlighted(&mut self, ctx: &egui::Context) {
         if !self.diff_needs_highlight {
             return;
@@ -4071,17 +4116,22 @@ impl GitkApp {
                             if clicked_idx < num_commits {
                                 let commit = &self.commits[clicked_idx];
                                 let clicked_oid = commit.oid;
-                                // Copy SHA to both clipboards
-                                let sha = clicked_oid.to_string();
-                                ctx.copy_text(sha.clone());
-                                // Also set primary selection (middle-click paste)
-                                if let Ok(mut clip) = arboard::Clipboard::new() {
-                                    let _ = clip
-                                        .set()
-                                        .clipboard(arboard::LinuxClipboardKind::Primary)
-                                        .text(&sha);
+                                // Copy SHA to both clipboards — but only for real
+                                // commits: the virtual Uncommitted/Staged rows carry
+                                // sentinel oids (ffff…/fefe…) that would clobber the
+                                // clipboard with a fake SHA.
+                                if is_real_commit(clicked_oid) {
+                                    let sha = clicked_oid.to_string();
+                                    ctx.copy_text(sha.clone());
+                                    // Also set primary selection (middle-click paste)
+                                    if let Ok(mut clip) = arboard::Clipboard::new() {
+                                        let _ = clip
+                                            .set()
+                                            .clipboard(arboard::LinuxClipboardKind::Primary)
+                                            .text(&sha);
+                                    }
+                                    self.copied_toast = Some(std::time::Instant::now());
                                 }
-                                self.copied_toast = Some(std::time::Instant::now());
                                 // The clicked commit is already loaded at clicked_idx —
                                 // select it and load its diff, exactly like arrow-key nav.
                                 self.select_loaded(clicked_idx);
@@ -5267,18 +5317,17 @@ fn main() -> eframe::Result {
     {
         let repo_path = repo_path.clone();
         let scope = scope.clone();
-        if let Err(e) = std::thread::Builder::new()
-            .name("gitkay-history".to_string())
-            .spawn(move || {
-                if let Ok(repo) = Repository::discover(&repo_path) {
-                    let t = std::time::Instant::now();
-                    let commits = load_history(&repo, 200, &scope);
-                    log::debug!("perf: startup: history prefetch (off-thread) {:?}", t.elapsed());
-                    let _ = history_tx.send(commits);
-                }
-            })
+        if spawn_guarded("gitkay-history", "history prefetch thread panicked", move || {
+            if let Ok(repo) = Repository::discover(&repo_path) {
+                let t = std::time::Instant::now();
+                let commits = load_history(&repo, 200, &scope);
+                log::debug!("perf: startup: history prefetch (off-thread) {:?}", t.elapsed());
+                let _ = history_tx.send(commits);
+            }
+        })
+        .is_err()
         {
-            log::warn!("history prefetch thread spawn failed: {e}; loading synchronously");
+            log::warn!("history prefetch thread spawn failed; loading synchronously");
         }
     }
 
@@ -5289,17 +5338,16 @@ fn main() -> eframe::Result {
     // font, so build_fonts is near-free then — this hoists no wasted work. On spawn
     // failure the sender drops and new() builds fonts inline.
     let (font_tx, font_rx) = mpsc::channel();
-    if let Err(e) = std::thread::Builder::new()
-        .name("gitkay-fonts".to_string())
-        .spawn(move || {
-            let cfg = config::config_path()
-                .as_ref()
-                .and_then(|p| config::read_config(p).ok())
-                .unwrap_or_default();
-            let _ = font_tx.send(config::build_fonts(&cfg));
-        })
+    if spawn_guarded("gitkay-fonts", "font prefetch thread panicked", move || {
+        let cfg = config::config_path()
+            .as_ref()
+            .and_then(|p| config::read_config(p).ok())
+            .unwrap_or_default();
+        let _ = font_tx.send(config::build_fonts(&cfg));
+    })
+    .is_err()
     {
-        log::warn!("font prefetch thread spawn failed: {e}; building fonts inline");
+        log::warn!("font prefetch thread spawn failed; building fonts inline");
     }
 
     // Stable app id "gitkay" (not the per-repo title) so Wayland compositors can
@@ -6482,6 +6530,83 @@ mod tests {
             .filter(|c| is_real_commit(c.oid))
             .map(|c| c.summary.clone())
             .collect()
+    }
+
+    #[test]
+    fn annotated_tag_chip_attaches_to_the_tagged_commit() {
+        let (_d, repo) = temp_repo();
+        let c1 = commit_file(&repo, "a.txt", "1", "base");
+        // `git tag -a v1 -m …`: the ref's raw target is the tag OBJECT, which must
+        // be peeled to the commit or the chip never lands on any graph row.
+        let obj = repo.find_object(c1, None).unwrap();
+        let sig = repo.signature().unwrap();
+        repo.tag("v1", &obj, &sig, "release v1", false).unwrap();
+        let map = build_ref_map(&repo);
+        let refs = map.get(&c1).expect("annotated tag must map to the tagged commit");
+        assert!(refs.iter().any(|(n, k)| n == "v1" && *k == RefKind::Tag));
+    }
+
+    #[test]
+    fn staged_row_appears_with_unborn_head() {
+        let (_d, repo) = temp_repo();
+        // `git init; git add a.txt` — no commit yet, HEAD unborn. The staged
+        // probe must diff the index against the EMPTY tree (like `git diff
+        // --cached`), or the window renders completely blank.
+        std::fs::write(repo.workdir().unwrap().join("a.txt"), "hi").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("a.txt")).unwrap();
+        index.write().unwrap();
+        let commits = load_commits(&repo, 100, &scope(false, &[]));
+        assert!(
+            commits.iter().any(|c| c.oid == oid_staged()),
+            "staged initial commit must get its virtual row"
+        );
+    }
+
+    #[test]
+    fn all_includes_detached_head_commits() {
+        let (_d, repo) = temp_repo();
+        let c1 = commit_file(&repo, "a.txt", "1", "base");
+        commit_file(&repo, "a.txt", "2", "tip");
+        // Detach at c1 and commit: the wip commit is reachable from HEAD only,
+        // not from any ref — `git rev-list --all` still includes it.
+        repo.set_head_detached(c1).unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        let wip = commit_file(&repo, "b.txt", "x", "wip-detached");
+        let commits = load_commits(&repo, 100, &scope(true, &[]));
+        assert!(
+            commits.iter().any(|c| c.oid == wip),
+            "--all must include detached-HEAD commits like git rev-list --all"
+        );
+    }
+
+    #[test]
+    fn commit_dates_use_author_time() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.txt", "1", "base");
+        // Distinct author vs committer times, as a rebase/cherry-pick produces.
+        let author = git2::Signature::new("a", "a@x", &git2::Time::new(1_600_000_000, 0)).unwrap();
+        let committer =
+            git2::Signature::new("c", "c@x", &git2::Time::new(1_700_000_000, 0)).unwrap();
+        std::fs::write(repo.workdir().unwrap().join("a.txt"), "2").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("a.txt")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let oid = repo
+            .commit(Some("HEAD"), &author, &committer, "rebased", &tree, &[&parent])
+            .unwrap();
+        let commits = load_commits(&repo, 10, &scope(false, &[]));
+        let info = commits.iter().find(|c| c.oid == oid).unwrap();
+        // 1_600_000_000 is 2020-09; the 2023 committer time must not leak in
+        // (git log/git show print the author date).
+        assert!(
+            info.date_str.starts_with("2020-"),
+            "date column must show the AUTHOR date, got {}",
+            info.date_str
+        );
     }
 
     #[test]

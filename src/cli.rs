@@ -135,13 +135,26 @@ pub fn validate(reflog: bool, follow: bool, n_revs: usize, n_paths: usize) -> Re
 }
 
 /// Classify a `<rev>` token's shape (`...` is checked before `..`).
+/// Open-ended ranges default the missing endpoint to HEAD, like git
+/// (`main..` ⇒ `main..HEAD`, `..main` ⇒ `HEAD..main`). A fully empty `..` is
+/// left as-is so it can still classify as the parent-directory path.
 pub fn rev_token_kind(tok: &str) -> RevTokenKind {
+    let fill_head = |a: &str, b: &str| -> (String, String) {
+        if a.is_empty() && b.is_empty() {
+            (String::new(), String::new())
+        } else {
+            let fill = |s: &str| if s.is_empty() { "HEAD".to_string() } else { s.to_string() };
+            (fill(a), fill(b))
+        }
+    };
     if let Some(rest) = tok.strip_prefix('^') {
         RevTokenKind::Exclude(rest.to_string())
     } else if let Some((a, b)) = tok.split_once("...") {
-        RevTokenKind::Symmetric(a.to_string(), b.to_string())
+        let (a, b) = fill_head(a, b);
+        RevTokenKind::Symmetric(a, b)
     } else if let Some((a, b)) = tok.split_once("..") {
-        RevTokenKind::Range(a.to_string(), b.to_string())
+        let (a, b) = fill_head(a, b);
+        RevTokenKind::Range(a, b)
     } else {
         RevTokenKind::Single(tok.to_string())
     }
@@ -256,5 +269,19 @@ mod tests {
             rev_token_kind("a...b"),
             RevTokenKind::Symmetric("a".into(), "b".into())
         );
+    }
+
+    #[test]
+    fn rev_token_kind_open_ranges_default_to_head() {
+        // git accepts `main..` / `..main` as `main..HEAD` / `HEAD..main`.
+        assert_eq!(rev_token_kind("main.."), RevTokenKind::Range("main".into(), "HEAD".into()));
+        assert_eq!(rev_token_kind("..main"), RevTokenKind::Range("HEAD".into(), "main".into()));
+        assert_eq!(
+            rev_token_kind("main..."),
+            RevTokenKind::Symmetric("main".into(), "HEAD".into())
+        );
+        // A bare `..` stays empty-endpointed so classify() can still treat the
+        // token as the parent-directory path.
+        assert_eq!(rev_token_kind(".."), RevTokenKind::Range("".into(), "".into()));
     }
 }
