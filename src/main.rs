@@ -1323,8 +1323,8 @@ struct DiffView {
 /// the last line/file never sits flush against the bottom edge.
 const BOTTOM_PAD_ROWS: usize = 2;
 
-/// Height of one file-list row, in points. The file list allocates each entry at this
-/// height and sizes its bottom breathing-room padding from it, so both must agree.
+/// Minimum height of one file-list row, in points — the floor `GitkApp::file_row_h`
+/// grows from when the configured file-list font is larger than the default.
 const FILE_ROW_H: f32 = 18.0;
 /// Indent of a file row under its directory header in the grouped file list.
 const FILE_INDENT: f32 = 12.0;
@@ -3970,9 +3970,17 @@ impl GitkApp {
     /// (`common_dir_prefix_len`); that repeated ancestor is drawn dimmed
     /// (`SUBTEXT_DIM`) and the distinguishing tail in `SUBTEXT`, so a deep tree reads
     /// like an indented breadcrumb instead of a wall of repeated path.
+    /// File-list row height: `FILE_ROW_H` as the floor, growing with the configured
+    /// `file_list` font so larger sizes don't overlap (mirrors the commit list).
+    fn file_row_h(&self, ui: &mut egui::Ui) -> f32 {
+        let font = self.fonts.font_id(Role::FileList);
+        FILE_ROW_H.max(ui.fonts_mut(|f| f.row_height(&font)) + 4.0)
+    }
+
     fn draw_dir_header(&self, ui: &mut egui::Ui, dir: &str, dim_len: usize) {
+        let row_h = self.file_row_h(ui);
         let (rect, _) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), FILE_ROW_H),
+            egui::vec2(ui.available_width(), row_h),
             egui::Sense::hover(),
         );
         let left = rect.min.x + 4.0;
@@ -3990,13 +3998,15 @@ impl GitkApp {
             let st = left_elide(shared, right - left - tail_w, measure);
             let sg = ui.painter().layout_no_wrap(st, font.clone(), SUBTEXT_DIM);
             let sw = sg.size().x;
-            ui.painter().galley(egui::pos2(x, cy - 7.0), sg, SUBTEXT_DIM);
+            let sy = cy - sg.size().y / 2.0;
+            ui.painter().galley(egui::pos2(x, sy), sg, SUBTEXT_DIM);
             x += sw;
         }
         // Distinguishing tail at normal header brightness; left-elide if it overflows.
         let tt = left_elide(tail, (right - x).max(0.0), measure);
         let tg = ui.painter().layout_no_wrap(tt, font.clone(), SUBTEXT);
-        ui.painter().galley(egui::pos2(x, cy - 7.0), tg, SUBTEXT);
+        let ty = cy - tg.size().y / 2.0;
+        ui.painter().galley(egui::pos2(x, ty), tg, SUBTEXT);
     }
 
     /// One file row: `label` at `indent`, with right-aligned `+/-` stats,
@@ -4018,8 +4028,9 @@ impl GitkApp {
         let deletions = self.diff_files[idx].deletions;
         let line_idx = self.diff_files[idx].diff_line_idx;
 
+        let row_h = self.file_row_h(ui);
         let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), FILE_ROW_H),
+            egui::vec2(ui.available_width(), row_h),
             egui::Sense::click(),
         );
 
@@ -4075,16 +4086,19 @@ impl GitkApp {
             right_elide(label, label_max, measure)
         };
         let g = ui.painter().layout_no_wrap(elided, name_font.clone(), name_color);
-        ui.painter().galley(egui::pos2(left, cy - 7.0), g, name_color);
+        let gy = cy - g.size().y / 2.0;
+        ui.painter().galley(egui::pos2(left, gy), g, name_color);
 
         // Stats flush-right.
         let mut sx = right - stats_w;
         if let Some(g) = add_galley {
-            ui.painter().galley(egui::pos2(sx, cy - 6.0), g, GREEN);
+            let sy = cy - g.size().y / 2.0;
+            ui.painter().galley(egui::pos2(sx, sy), g, GREEN);
             sx += add_w + stat_gap;
         }
         if let Some(g) = del_galley {
-            ui.painter().galley(egui::pos2(sx, cy - 6.0), g, RED);
+            let sy = cy - g.size().y / 2.0;
+            ui.painter().galley(egui::pos2(sx, sy), g, RED);
         }
 
         if resp.hovered() {
@@ -4101,7 +4115,14 @@ impl GitkApp {
     }
 
     fn show_commit_list(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let row_height = 20.0;
+        // Row height follows the largest configured row font (summary/meta) so
+        // `[text]` sizes beyond the default don't overlap or clip; today's 20px
+        // stays the floor, so the default look is byte-identical.
+        let text_h = ui.fonts_mut(|f| {
+            f.row_height(&self.fonts.font_id(Role::CommitSummary))
+                .max(f.row_height(&self.fonts.font_id(Role::CommitMeta)))
+        });
+        let row_height = 20.0f32.max(text_h + 4.0);
         let col_width = 12.0;
         let dot_radius = 3.5;
         let max_graph_cols = 20;
@@ -4341,12 +4362,20 @@ impl GitkApp {
                                 let font = self.fonts.font_id(Role::Refs);
                                 let galley = painter.layout_no_wrap(ref_name.clone(), font, fg);
                                 let label_w = galley.size().x + 10.0;
+                                // Chip height/centering follow the galley so a
+                                // configured refs font size still fits its pill.
+                                let label_h = galley.size().y + 3.0;
+                                let galley_h = galley.size().y;
                                 let label_rect = egui::Rect::from_min_size(
-                                    egui::pos2(cursor_x, y_center - 8.0),
-                                    egui::vec2(label_w, 16.0),
+                                    egui::pos2(cursor_x, y_center - label_h / 2.0),
+                                    egui::vec2(label_w, label_h),
                                 );
                                 painter.rect_filled(label_rect, 4.0, bg);
-                                painter.galley(egui::pos2(cursor_x + 5.0, y_center - 7.0), galley, fg);
+                                painter.galley(
+                                    egui::pos2(cursor_x + 5.0, y_center - galley_h / 2.0),
+                                    galley,
+                                    fg,
+                                );
                                 cursor_x += label_w + 4.0;
                             }
 
@@ -4395,21 +4424,25 @@ impl GitkApp {
                                 egui::pos2(cursor_x + 4.0, y_top),
                                 egui::pos2(cursor_x + 4.0 + summary_max_w, y_bottom),
                             );
+                            // Center each galley on the row so configured font
+                            // sizes stay vertically centred instead of clipping.
+                            let summary_y = y_center - summary_galley.size().y / 2.0;
                             painter.with_clip_rect(summary_clip).galley(
-                                egui::pos2(cursor_x + 4.0, y_center - 7.0),
+                                egui::pos2(cursor_x + 4.0, summary_y),
                                 summary_galley,
                                 TEXT,
                             );
 
                             // Draw SHA, author, date (right-aligned)
+                            let meta_y = y_center - date_galley.size().y / 2.0;
                             let mut rx = author_date_x;
                             if sha_w > 0.0 {
-                                painter.galley(egui::pos2(rx, y_center - 7.0), sha_galley, SUBTEXT);
+                                painter.galley(egui::pos2(rx, meta_y), sha_galley, SUBTEXT);
                                 rx += sha_w + 8.0;
                             }
-                            painter.galley(egui::pos2(rx, y_center - 7.0), author_galley, a_color);
+                            painter.galley(egui::pos2(rx, meta_y), author_galley, a_color);
                             painter.galley(
-                                egui::pos2(right_x - date_w - 8.0, y_center - 7.0),
+                                egui::pos2(right_x - date_w - 8.0, meta_y),
                                 date_galley,
                                 SUBTEXT,
                             );
@@ -4442,6 +4475,13 @@ impl GitkApp {
                         {
                             let requested = real_commit_count(&self.commits) + 500;
                             self.reload_to_count(&repo, requested, None);
+                            // Track the (possibly re-anchored) selection, like the
+                            // watcher-reload path: if the selected oid vanished
+                            // (history rewritten) resync falls back to row 0, and
+                            // without this the pane would keep showing the vanished
+                            // commit's diff. A no-op when the selection kept its
+                            // commit (the current-key check returns early).
+                            self.load_selected_diff();
                         }
                     });
             });
@@ -5110,7 +5150,8 @@ impl eframe::App for GitkApp {
                                     }
                                     // Breathing room so the last file isn't flush
                                     // against the bottom edge.
-                                    ui.add_space(BOTTOM_PAD_ROWS as f32 * FILE_ROW_H);
+                                    let pad_h = self.file_row_h(ui);
+                                    ui.add_space(BOTTOM_PAD_ROWS as f32 * pad_h);
                                 });
                         });
                     persist_on_resize_drag(
