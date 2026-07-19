@@ -15,7 +15,7 @@ mod highlight;
 mod word_diff;
 use config::{FileListLayout, Fonts, Role};
 use diff::{
-    CommitKind, DiffData, DiffLine, DiffSettings, FileEntry, LineKind, compute_word_emphasis,
+    CommitKind, DiffData, DiffLine, DiffSettings, FileEntry, LineKind, emphasize_rows,
     file_index_at_line, file_index_at_line_opt, file_line_ranges, file_line_starts,
     format_commit_time, get_diff_data, hash_diff_content, is_real_commit, local_tz_offset_min,
     next_file_line, oid_staged, oid_uncommitted, pathspec_opts, staged_git_diff, worktree_git_diff,
@@ -1722,8 +1722,6 @@ struct PrefetchJob {
     /// Each neighbour to warm: its cache key plus the pathspec to diff it under.
     targets: Vec<(DiffCacheKey, Vec<String>)>,
     hl: Arc<Highlighter>,
-    /// Run the (deferred) word-diff emphasis pass while still off-thread.
-    word_diff: bool,
     /// This dispatch's epoch; the worker bails once `current_epoch` moves past it.
     epoch: u64,
     current_epoch: Epoch,
@@ -1802,7 +1800,6 @@ fn prefetch_worker(job: PrefetchJob) {
         repo_path,
         targets,
         hl,
-        word_diff,
         epoch,
         current_epoch,
         inflight,
@@ -1840,9 +1837,6 @@ fn prefetch_worker(job: PrefetchJob) {
             key.settings,
             &paths,
         );
-        if word_diff {
-            data.ensure_word_emphasis();
-        }
         highlight_diff(&mut data.lines, &data.files, &hl);
         let (oid, lines) = (key.oid, data.lines.len());
         if tx.send((key, data)).is_err() {
@@ -1875,8 +1869,6 @@ struct DiffLoadJob {
     repo_path: String,
     key: DiffCacheKey,
     paths: Vec<String>,
-    /// Run the (deferred) word-diff emphasis pass while still off-thread.
-    word_diff: bool,
     epoch: u64,
     current_epoch: Epoch,
     tx: mpsc::Sender<DiffLoadResult>,
@@ -1913,7 +1905,6 @@ fn diff_load_worker(job: DiffLoadJob) {
         repo_path,
         key,
         paths,
-        word_diff,
         epoch,
         current_epoch,
         tx,
@@ -1942,13 +1933,9 @@ fn diff_load_worker(job: DiffLoadJob) {
     }
     let t = std::time::Instant::now();
     let kind = CommitKind::of(key.oid);
-    let mut data = get_diff_data(&repo, key.oid, kind, key.settings, &paths);
-    if word_diff {
-        data.ensure_word_emphasis();
-    }
+    let data = get_diff_data(&repo, key.oid, kind, key.settings, &paths);
     // Content-key a virtual row off-thread here so an unchanged working tree hits the
-    // cache and reuses its highlighting. (The hash covers text + kind only, so the
-    // emphasis pass above doesn't affect the key.)
+    // cache and reuses its highlighting.
     let key = finalize_diff_key(key, kind, &data);
     log::debug!(
         "diff-load: {} ({} lines) in {:?}",
@@ -2298,15 +2285,21 @@ fn diff_row_job(
     } else {
         (kind_color(line.kind, palette), &[], palette.background)
     };
-    let emph_bg =
-        (word_diff && !line.emphasis.is_empty()).then(|| emphasis_bg(line.kind, palette, backdrop));
+    // With the toggle off — or the lazy pass not yet over this line (None) —
+    // render un-emphasized; the per-frame viewport pass fills visible lines in.
+    let emphasis: &[std::ops::Range<usize>] = if word_diff {
+        line.emphasis.as_deref().unwrap_or(&[])
+    } else {
+        &[]
+    };
+    let emph_bg = (!emphasis.is_empty()).then(|| emphasis_bg(line.kind, palette, backdrop));
     append_body(
         &mut job,
         font_id,
         line.body(),
         spans,
         base_color,
-        &line.emphasis,
+        emphasis,
         emph_bg,
     );
 
@@ -2724,10 +2717,6 @@ struct GitkApp {
     /// Deepest file-start line of the current diff (None ⇒ no files) — the render's
     /// `last_top_anchor`. Fixed per diff, so computed at install, not per frame.
     diff_last_top_anchor: Option<usize>,
-    /// Whether the LIVE diff's word-diff emphasis has been computed — mirrors
-    /// `DiffData::word_emphasized` while the lines sit detached in `diff_lines`
-    /// (`stash_current_diff` reassembles a `DiffData` carrying it back).
-    diff_word_emphasized: bool,
     /// Cached per-row galleys for the (un-virtualized) file-list sidebar.
     sidebar_cache: SidebarCache,
     /// Sorted `(patch start line, file index)` for the current diff — the
@@ -3235,7 +3224,6 @@ impl GitkApp {
             config_error_toast: startup_issue.then(std::time::Instant::now),
             diff_max_chars,
             diff_last_top_anchor: None,
-            diff_word_emphasized: true, // empty startup diff — vacuously computed
             sidebar_cache: SidebarCache::default(),
             file_line_starts: Vec::new(),
             clipboard: None,
@@ -3465,11 +3453,10 @@ impl GitkApp {
                     file_list_y: self.file_list_scroll,
                 },
             );
-            let data = DiffData {
-                lines: std::mem::take(&mut self.diff_lines),
-                files: std::mem::take(&mut self.diff_files),
-                word_emphasized: self.diff_word_emphasized,
-            };
+            let data = DiffData::new(
+                std::mem::take(&mut self.diff_lines),
+                std::mem::take(&mut self.diff_files),
+            );
             // A virtual entry is content-keyed, so each working-tree edit produces a
             // fresh hash and the previous content would linger under the same sentinel
             // oid as unreachable dead weight. Drop superseded same-oid entries before
@@ -3485,15 +3472,29 @@ impl GitkApp {
         }
     }
 
-    /// Run the deferred word-diff emphasis pass over the live diff if it hasn't had
-    /// it yet. The displayed lines sit detached from their `DiffData` (reassembled in
-    /// `stash_current_diff`), so this is the one place the exploded
-    /// `diff_word_emphasized` mirror and the pass are kept in lockstep —
-    /// `DiffData::ensure_word_emphasis` covers every still-assembled case.
-    fn ensure_live_word_emphasis(&mut self) {
-        if !self.diff_word_emphasized {
-            compute_word_emphasis(&mut self.diff_lines);
-            self.diff_word_emphasized = true;
+    /// Lazily fill word-diff emphasis for the rows around the viewport, plus any
+    /// pending jump target so a scroll restore / sidebar click / page-step is
+    /// emphasized the same frame it lands. Called every frame after the drains and
+    /// key handling, before the panels render; the per-line `Option` memo in
+    /// `emphasize_rows` makes a settled viewport cost only kind checks. This is
+    /// the ONLY place the LCS pass runs — bounded by the window, it replaces the
+    /// old whole-diff passes (worker-side and the install backstop, which stalled
+    /// a frame on huge diffs).
+    fn ensure_visible_word_emphasis(&mut self) {
+        if !self.word_diff || self.diff_lines.is_empty() {
+            return;
+        }
+        // One viewport of slack each side tolerates the one-frame lag of the
+        // stored scroll position and gives read-ahead for free. The floor covers
+        // the frames before any diff render has stored a real viewport height.
+        let visible = self.diff_visible_rows.load(Ordering::Relaxed).max(50);
+        let around = |center: usize| center.saturating_sub(visible)..center + 2 * visible;
+        emphasize_rows(
+            &mut self.diff_lines,
+            around(self.diff_top_line.load(Ordering::Relaxed)),
+        );
+        if let Some(target) = self.diff_scroll_to {
+            emphasize_rows(&mut self.diff_lines, around(target));
         }
     }
 
@@ -3532,15 +3533,14 @@ impl GitkApp {
     /// Swap `key`/`data` in as the displayed diff and run the install tail every
     /// installer needs: reset the scroll top, rebuild the file-list rows, resize the
     /// h-scroll, and (re)arm highlighting.
-    fn set_diff_content(&mut self, key: Option<DiffCacheKey>, mut data: DiffData) {
-        // Deferred word-diff emphasis: make the displayed diff match the toggle on
-        // the way in. Normally a no-op — the workers already ran the pass when the
-        // toggle was on at dispatch — this backstops entries built while it was off
-        // (e.g. prefetched neighbours revisited after enabling).
-        if self.word_diff {
-            data.ensure_word_emphasis();
+    fn set_diff_content(&mut self, key: Option<DiffCacheKey>, data: DiffData) {
+        // Word-diff emphasis fills lazily per viewport (ensure_visible_word_emphasis)
+        // at the top of each frame — an install later in a frame (a drain, a
+        // mid-render cache-hit click) renders once before that pass sees the new
+        // lines, so nudge one more frame rather than running any LCS inline here.
+        if self.word_diff && !data.lines.is_empty() {
+            self.egui_ctx.request_repaint();
         }
-        self.diff_word_emphasized = data.word_emphasized;
         self.diff_lines = data.lines;
         self.diff_files = data.files;
         self.current_diff_key = key;
@@ -3625,7 +3625,6 @@ impl GitkApp {
         // path the originals would otherwise be dropped unused. The rare spawn-failure
         // fallback re-resolves them instead.
         let repo_path = self.repo_path.clone();
-        let word_diff = self.word_diff;
         // Claim the key so a prefetch dispatched while this load runs skips it. The
         // reverse — loading a key a prefetch already claimed — still proceeds: the
         // user is waiting on THIS result now, and the prefetch may sit behind other
@@ -3643,7 +3642,6 @@ impl GitkApp {
             repo_path,
             key,
             paths,
-            word_diff,
             epoch,
             current_epoch: self.diff_load_epoch.clone(),
             tx: self.diff_load_tx.clone(),
@@ -3856,7 +3854,6 @@ impl GitkApp {
             repo_path: self.repo_path.clone(),
             targets: jobs,
             hl,
-            word_diff: self.word_diff,
             epoch,
             current_epoch: self.prefetch_epoch.clone(),
             inflight: Arc::clone(&self.inflight_diffs),
@@ -5101,6 +5098,9 @@ impl eframe::App for GitkApp {
 
         let search_id = egui::Id::new("search_field");
         self.handle_keys(&ctx, search_id);
+        // After the drains and key handling: any diff installed or scroll target
+        // queued above gets its visible rows emphasized before this frame renders.
+        self.ensure_visible_word_emphasis();
         let t_keys = std::time::Instant::now();
 
         // ── Top panel: search bar ──
@@ -5248,14 +5248,14 @@ impl eframe::App for GitkApp {
                                         )
                                         .changed();
                                     // Word-diff only changes the render, so no diff
-                                    // reload. The emphasis pass is deferred while the
-                                    // toggle is off; the first enable runs it once
-                                    // over the live diff (cache entries catch up at
-                                    // install — see set_diff_content).
+                                    // reload. Emphasis fills lazily per viewport
+                                    // (ensure_visible_word_emphasis) at the top of
+                                    // the next frame — nudge one so an enable with
+                                    // no further input still emphasizes.
                                     if ui.checkbox(&mut self.word_diff, "Word diff").changed()
                                         && self.word_diff
                                     {
-                                        self.ensure_live_word_emphasis();
+                                        ui.ctx().request_repaint();
                                     }
                                 });
                             });

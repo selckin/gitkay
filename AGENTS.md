@@ -57,11 +57,12 @@ resolution, per-line tokenization), `src/diff_cache.rs` (line-budget LRU cache),
 `src/cli.rs` (pure argv parser, rev-vs-path classification, pathspec
 resolution, window-title suffix, help/version text), and
 `src/word_diff.rs` (pure intra-line word diff: tokenizer + LCS alignment; the
-`DiffLine`-aware driver `compute_word_emphasis` lives in `src/diff.rs`, and is
-**deferred**: `DiffData` carries a `word_emphasized` flag, the diff/prefetch
-workers run the pass off-thread only when the word-diff toggle is on, and
-`set_diff_content` backstops at install — so the default toggle-off path never
-pays the LCS, while the first enable computes the live diff once).
+`DiffLine`-aware driver `emphasize_rows` lives in `src/diff.rs`, and is
+**lazy per viewport**: each line's `emphasis` is an `Option` (`None` = not
+computed, mirroring `spans`), and `ensure_visible_word_emphasis` fills only the
+rows around the visible window — plus any pending scroll target — every frame.
+So the toggle-off path never pays the LCS, and no whole-diff pass ever runs
+anywhere, no matter the diff size; installs and the toggle just nudge a repaint).
 
 The big picture, ahead of the detail sections below:
 
@@ -180,8 +181,8 @@ parts run off the window-creation critical path:
 
 Each module carries its own `#[cfg(test)]` suite: `config` (TOML parsing +
 clamping), `highlight` (theme/palette resolution), `cli` (rev-vs-path
-classification + pathspec/title helpers), `diff` (line/file lookups, word-diff
-deferral, content hashing), `diff_cache` (LRU eviction), `word_diff` (LCS word
+classification + pathspec/title helpers), `diff` (line/file lookups, windowed
+word-diff laziness, content hashing), `diff_cache` (LRU eviction), `word_diff` (LCS word
 alignment), and `main` (graph layout, diff integration over temp repos, and UI
 helpers). The graph-layout suite uses fake
 OIDs via `oid(n)` — no real repo needed — and pins the layout invariants (lane
