@@ -185,7 +185,7 @@ struct DiffCacheKey {
     /// new diff-affecting setting to a single edit site and stops the cache key from
     /// drifting out of sync with the diff it keys.
     settings: DiffSettings,
-    theme: String,
+    theme: highlight::EmbeddedThemeName,
     enabled: bool,
     content: u64,
 }
@@ -2235,20 +2235,13 @@ fn repo_head_extensions(
 /// optimization — any failure simply warms fewer or no languages.
 fn prewarm_highlighter(
     repo_path: &str,
-    theme_slug: &str,
+    theme: highlight::EmbeddedThemeName,
     diff_bg: DiffBg,
     tx: &mpsc::Sender<Arc<Highlighter>>,
     ctx: &egui::Context,
 ) {
     let t = std::time::Instant::now();
-    let (hl, warning) = Highlighter::new(theme_slug, diff_bg);
-    // Surface a bad-theme-slug warning to the log even though the UI re-derives
-    // (and re-warns) via with_theme at install — the install warning is lost if
-    // the config is corrected before the prewarm is installed.
-    if let Some(w) = warning {
-        log::warn!("prewarm: {w}");
-    }
-    let hl = Arc::new(hl);
+    let hl = Arc::new(Highlighter::new(theme, diff_bg));
     log::debug!("prewarm: highlighter built off-thread in {:?}", t.elapsed());
     // Hand the highlighter to the UI immediately so the first diff can install
     // and highlight; warming continues below through the same shared SyntaxSet.
@@ -2598,13 +2591,11 @@ fn history_worker(job: HistoryJob) {
     }
 }
 
-/// The configured diff theme slug, falling back to the built-in default when
-/// `[diff] theme` is unset. Shared by the startup and live-reload config paths.
-fn configured_theme_slug(cfg: &config::Config) -> String {
-    cfg.diff
-        .theme
-        .clone()
-        .unwrap_or_else(|| highlight::DEFAULT_THEME_SLUG.to_string())
+/// The configured diff theme, resolved (and warned about) exactly once at the
+/// config boundary — everything downstream carries the `Copy` enum. Shared by the
+/// startup and live-reload config paths; the caller surfaces the warning.
+fn configured_theme(cfg: &config::Config) -> (highlight::EmbeddedThemeName, Option<String>) {
+    highlight::resolve_theme(cfg.diff.theme.as_deref())
 }
 
 /// Resolve the `[diff.bands]` config into a `DiffBg`, plus any warnings (unparseable
@@ -3191,10 +3182,10 @@ struct GitkApp {
     config_error_toast: Option<std::time::Instant>, // transient parse-error notice
     highlighter: Option<Arc<Highlighter>>,       // built lazily on the first diff (when syntax on)
     syntax_enabled: bool,                        // false ⇒ original flat per-line coloring
-    theme_slug: String,                          // configured syntax theme slug
-    diff_bg: DiffBg,                             // add/del row background mode + colors
-    diff_palette: highlight::DiffPalette,        // theme-derived diff colours (both modes)
-    diff_needs_highlight: bool,                  // diff_lines changed; re-run highlight_diff
+    theme: highlight::EmbeddedThemeName, // configured syntax theme (validated at the config boundary)
+    diff_bg: DiffBg,                     // add/del row background mode + colors
+    diff_palette: highlight::DiffPalette, // theme-derived diff colours (both modes)
+    diff_needs_highlight: bool,          // diff_lines changed; re-run highlight_diff
     diff_generation: Epoch, // bumped each highlight pass; lets stale workers bail + results drop
     highlight_tx: mpsc::Sender<HighlightBatch>, // worker → UI: per-file span updates
     highlight_rx: mpsc::Receiver<HighlightBatch>,
@@ -3361,22 +3352,22 @@ impl GitkApp {
             })
             .unwrap_or_default();
         let syntax_enabled = cfg.diff.syntax;
-        let theme_slug = configured_theme_slug(&cfg);
+        // The one place a configured theme slug is validated: a typo'd theme warns
+        // here, at startup, regardless of syntax mode — everything downstream
+        // (palette, prewarm, cache keys) carries the already-valid enum.
+        let (theme, theme_warn) = configured_theme(&cfg);
+        if let Some(w) = theme_warn {
+            log::warn!("{w}");
+            startup_issue = true;
+        }
         let (diff_bg, diff_bg_warnings) = resolve_diff_bg(&cfg.diff.bands);
         for w in &diff_bg_warnings {
             log::warn!("{w}");
             startup_issue = true;
         }
         // The diff palette is always derived from the configured theme (cheap —
-        // theme blob only, no grammars). Surface a bad-slug warning here, where
-        // the theme is first resolved, regardless of syntax mode (the prewarm /
-        // lazy highlighter build may also report it, but only once a diff is
-        // shown — flagging it here means a typo'd theme is caught at startup).
-        let (diff_palette, dp_warn) = highlight::palette_for(&theme_slug, diff_bg);
-        if let Some(w) = dp_warn {
-            log::warn!("{w}");
-            startup_issue = true;
-        }
+        // theme blob only, no grammars).
+        let diff_palette = highlight::palette_for(theme, diff_bg);
         log::debug!("perf: startup: read + parse config {:?}", t_cfg.elapsed());
 
         // Fonts: never block the window on the font scan. The role map (sizes/families)
@@ -3600,14 +3591,13 @@ impl GitkApp {
             let (tx, rx) = mpsc::channel();
             let ctx = cc.egui_ctx.clone();
             let repo_path_pw = repo_path.clone();
-            let theme_pw = theme_slug.clone();
             // Catch a panic in the (detached) prewarm thread so it's logged rather than a
             // silent stderr message — e.g. if warm_extension panics after the highlighter
             // was already sent and installed.
             match spawn_guarded(
                 "gitkay-prewarm",
                 "prewarm thread panicked; highlighting falls back to the installed or synchronous highlighter",
-                move || prewarm_highlighter(&repo_path_pw, &theme_pw, diff_bg, &tx, &ctx),
+                move || prewarm_highlighter(&repo_path_pw, theme, diff_bg, &tx, &ctx),
             ) {
                 Ok(_) => Some(rx),
                 Err(e) => {
@@ -3676,7 +3666,7 @@ impl GitkApp {
             clipboard: None,
             highlighter: None,
             syntax_enabled,
-            theme_slug,
+            theme,
             diff_bg,
             diff_palette,
             diff_needs_highlight: false, // no diff yet — the deferred startup load arms highlighting
@@ -3778,11 +3768,11 @@ impl GitkApp {
     /// The cache key for a real commit (its immutable oid pins the content). The
     /// virtual entries set `content` to a per-diff hash on top of this (see
     /// `load_selected_diff`).
-    fn diff_cache_key(&self, oid: git2::Oid) -> DiffCacheKey {
+    const fn diff_cache_key(&self, oid: git2::Oid) -> DiffCacheKey {
         DiffCacheKey {
             oid,
             settings: self.diff_settings,
-            theme: self.theme_slug.clone(),
+            theme: self.theme,
             enabled: self.syntax_enabled,
             content: 0,
         }
@@ -4056,16 +4046,6 @@ impl GitkApp {
         self.diff_generation.bump();
     }
 
-    /// Install a freshly built highlighter, surfacing any theme-load warning as a log line
-    /// plus a config-error toast. Shared by the prewarmed and synchronous build paths.
-    fn install_highlighter(&mut self, hl: Highlighter, warning: Option<String>) {
-        if let Some(w) = warning {
-            log::warn!("{w}");
-            self.config_error_toast = Some(std::time::Instant::now());
-        }
-        self.highlighter = Some(Arc::new(hl));
-    }
-
     /// Build the highlighter on first use and (re)highlight the current diff if
     /// it changed. Tokenization always runs on a background thread (the diff
     /// renders plain until the worker's spans arrive), because the FIRST time
@@ -4093,8 +4073,8 @@ impl GitkApp {
                 // for the current theme (it may have changed since startup) — this
                 // reuses the warm SyntaxSet.
                 Some(Ok(prewarmed)) => {
-                    let (hl, warning) = prewarmed.with_theme(&self.theme_slug, self.diff_bg);
-                    self.install_highlighter(hl, warning);
+                    self.highlighter =
+                        Some(Arc::new(prewarmed.with_theme(self.theme, self.diff_bg)));
                     self.prewarm_rx = None;
                 }
                 // Still building off-thread: render plain this frame and retry next
@@ -4106,9 +4086,9 @@ impl GitkApp {
                 Some(Err(mpsc::TryRecvError::Disconnected)) | None => {
                     self.prewarm_rx = None;
                     let t = std::time::Instant::now();
-                    let (hl, warning) = Highlighter::new(&self.theme_slug, self.diff_bg);
+                    let hl = Highlighter::new(self.theme, self.diff_bg);
                     log::debug!("perf: built highlighter (sync fallback) {:?}", t.elapsed());
-                    self.install_highlighter(hl, warning);
+                    self.highlighter = Some(Arc::new(hl));
                 }
             }
         }
@@ -5020,7 +5000,12 @@ impl GitkApp {
                     warned |= !warns.is_empty();
                 }
                 let new_enabled = cfg.diff.syntax;
-                let new_slug = configured_theme_slug(&cfg);
+                // The reload's one theme-validation point (mirrors startup).
+                let (new_theme, theme_warn) = configured_theme(&cfg);
+                if let Some(w) = theme_warn {
+                    log::warn!("{w}");
+                    warned = true;
+                }
                 let (new_diff_bg, diff_bg_warnings) = resolve_diff_bg(&cfg.diff.bands);
                 // Surface diff-background warnings (stderr now, toast below)
                 // so config typos aren't silent on a headless desktop.
@@ -5029,11 +5014,11 @@ impl GitkApp {
                     warned = true;
                 }
                 if new_enabled != self.syntax_enabled
-                    || new_slug != self.theme_slug
+                    || new_theme != self.theme
                     || new_diff_bg != self.diff_bg
                 {
                     self.syntax_enabled = new_enabled;
-                    self.theme_slug = new_slug;
+                    self.theme = new_theme;
                     self.diff_bg = new_diff_bg;
                     // If syntax was just turned off, drop any in-flight prewarm
                     // receiver: it would otherwise linger as a dead channel, and
@@ -5049,21 +5034,13 @@ impl GitkApp {
                     // the highlighter for the new theme. When a highlighter
                     // exists, take the palette from its rebuild so the theme
                     // blob is loaded once, not twice; a new Arc leaves any
-                    // in-flight worker holding the old one valid. Either way
-                    // surface a bad-slug warning, regardless of syntax mode.
-                    let dp_warn = if let Some(old_hl) = self.highlighter.take() {
-                        let (new_hl, w) = old_hl.with_theme(&self.theme_slug, self.diff_bg);
+                    // in-flight worker holding the old one valid.
+                    if let Some(old_hl) = self.highlighter.take() {
+                        let new_hl = old_hl.with_theme(self.theme, self.diff_bg);
                         self.diff_palette = new_hl.palette().clone();
                         self.highlighter = Some(Arc::new(new_hl));
-                        w
                     } else {
-                        let (palette, w) = highlight::palette_for(&self.theme_slug, self.diff_bg);
-                        self.diff_palette = palette;
-                        w
-                    };
-                    if let Some(w) = dp_warn {
-                        log::warn!("{w}");
-                        warned = true;
+                        self.diff_palette = highlight::palette_for(self.theme, self.diff_bg);
                     }
                     // Re-highlight the visible diff under the new settings.
                     // Reset live spans to None so the worker re-colours every
@@ -5075,11 +5052,9 @@ impl GitkApp {
                     }
                     // Re-key the live diff so its eventual stash lands under
                     // the new theme/enabled, not the old key.
-                    let (rekey_theme, rekey_enabled) =
-                        (self.theme_slug.clone(), self.syntax_enabled);
                     if let Some(key) = &mut self.current_diff_key {
-                        key.theme = rekey_theme;
-                        key.enabled = rekey_enabled;
+                        key.theme = new_theme;
+                        key.enabled = new_enabled;
                     }
                     // Bumps the generation so an in-flight old-theme worker's
                     // queued spans are dropped, not applied for a frame.
@@ -6908,38 +6883,40 @@ mod tests {
 
     #[test]
     fn diff_cache_key_includes_theme_enabled_show_stats_and_content() {
-        let key = |theme: &str, enabled: bool, show_stats: bool, content: u64| DiffCacheKey {
+        use highlight::EmbeddedThemeName as T;
+        let key = |theme: T, enabled: bool, show_stats: bool, content: u64| DiffCacheKey {
             oid: git2::Oid::ZERO_SHA1,
             settings: DiffSettings { show_stats, ..ds() },
-            theme: theme.to_string(),
+            theme,
             enabled,
             content,
         };
+        let dark = T::CatppuccinMocha;
         let mut c: DiffCache<DiffCacheKey, u32> = DiffCache::new(100);
-        c.insert(key("dark", true, true, 0), 1, 1);
+        c.insert(key(dark, true, true, 0), 1, 1);
         assert_eq!(
-            c.remove(&key("light", true, true, 0)),
+            c.remove(&key(T::CatppuccinLatte, true, true, 0)),
             None,
             "different theme ⇒ miss"
         );
         assert_eq!(
-            c.remove(&key("dark", false, true, 0)),
+            c.remove(&key(dark, false, true, 0)),
             None,
             "different enabled ⇒ miss"
         );
         assert_eq!(
-            c.remove(&key("dark", true, false, 0)),
+            c.remove(&key(dark, true, false, 0)),
             None,
             "different show_stats ⇒ miss"
         );
         // content distinguishes virtual diffs whose working-tree content changed.
         assert_eq!(
-            c.remove(&key("dark", true, true, 7)),
+            c.remove(&key(dark, true, true, 7)),
             None,
             "different content ⇒ miss"
         );
         assert_eq!(
-            c.remove(&key("dark", true, true, 0)),
+            c.remove(&key(dark, true, true, 0)),
             Some(1),
             "same key ⇒ hit"
         );
@@ -6955,7 +6932,7 @@ mod tests {
                 detect_copies,
                 ..ds()
             },
-            theme: "dark".to_string(),
+            theme: highlight::DEFAULT_THEME,
             enabled: true,
             content: 0,
         };
