@@ -4833,6 +4833,10 @@ impl eframe::App for GitkApp {
         // (Arc) clone of the Context so the existing ctx-based logic is unchanged,
         // while the top-level panels attach to `ui` via show_inside.
         let ctx = ui.ctx().clone();
+        // Frame-time attribution for the slow-frame log at the end of this fn: any
+        // UI stutter (scroll hitches, input lag) shows up here as which section ate
+        // the frame. Debug-level like the other `perf:` logs.
+        let frame_t0 = std::time::Instant::now();
 
         // Deferred startup diff: paint the graph on the first frame, then compute the
         // initial diff on the next one (load_selected_diff runs get_diff_data + arms
@@ -4859,9 +4863,11 @@ impl eframe::App for GitkApp {
         self.handle_config_reload(&ctx);
         self.drain_history_results();
         self.drain_worker_results(&ctx);
+        let t_drains = std::time::Instant::now();
 
         let search_id = egui::Id::new("search_field");
         self.handle_keys(&ctx, search_id);
+        let t_keys = std::time::Instant::now();
 
         // ── Top panel: search bar ──
         egui::Panel::top("search_panel")
@@ -4926,6 +4932,7 @@ impl eframe::App for GitkApp {
             });
 
         self.show_commit_list(ui, &ctx);
+        let t_commits = std::time::Instant::now();
 
         // ── Diff view: the central panel, so it fills the height left below
         // the commit list and absorbs window resizes. ──
@@ -5271,6 +5278,19 @@ impl eframe::App for GitkApp {
                     ui.painter().vline(r.left() - 5.0, r.y_range(), stroke);
                 }
             });
+
+        // Slow-frame log: anything over a vsync-ish budget, attributed by section,
+        // so scroll hitches can be blamed on render cost vs background drains.
+        let total = frame_t0.elapsed();
+        if total > std::time::Duration::from_millis(20) {
+            log::debug!(
+                "perf: slow frame {total:?} (drains {:?}, keys {:?}, commits {:?}, diff+files {:?})",
+                t_drains - frame_t0,
+                t_keys - t_drains,
+                t_commits - t_keys,
+                t_commits.elapsed(),
+            );
+        }
     }
 }
 
