@@ -1880,8 +1880,18 @@ fn diff_load_worker(job: DiffLoadJob) {
         tx,
         ctx,
     } = job;
-    // Superseded before we even ran — don't open the repo.
+    // Superseded before we even ran — don't open the repo. Still report (data:
+    // None): the UI tracks this worker in `inflight_loads`, and a silent exit
+    // would strand the key there — a later bounce-back to this commit would then
+    // wait on a worker that no longer exists. The drain clears the tracking and,
+    // if the user is by then waiting on exactly this key, re-dispatches.
     if !current_epoch.is_current(epoch) {
+        let _ = tx.send(DiffLoadResult {
+            epoch,
+            key,
+            data: None,
+        });
+        ctx.request_repaint();
         return;
     }
     let repo = match Repository::discover(&repo_path) {
@@ -1900,7 +1910,15 @@ fn diff_load_worker(job: DiffLoadJob) {
             return;
         }
     };
+    // Same as the pre-discover bail: superseded workers must still report, or
+    // their inflight_loads entry leaks.
     if !current_epoch.is_current(epoch) {
+        let _ = tx.send(DiffLoadResult {
+            epoch,
+            key,
+            data: None,
+        });
+        ctx.request_repaint();
         return;
     }
     let t = std::time::Instant::now();
@@ -2696,6 +2714,13 @@ struct GitkApp {
     diff_load_tx: mpsc::Sender<DiffLoadResult>, // worker → UI: the selected commit's finished diff
     diff_load_rx: mpsc::Receiver<DiffLoadResult>,
     diff_load_epoch: Epoch, // bumped per selection; supersedes older diff-load workers + results
+    /// Keys with a diff-load worker in flight (real commits only). A re-dispatch
+    /// for a tracked key — bouncing back to a commit whose load never finished —
+    /// skips spawning a duplicate and adopts the in-flight result instead (see
+    /// `dispatch_diff_load` / the drain's `awaiting` rule). Sound because every
+    /// diff-load worker exit path reports a `DiffLoadResult` (normal, failed,
+    /// superseded bail, panic), so the drain always clears the entry.
+    inflight_loads: HashSet<DiffCacheKey>,
     /// Background history loads (lazy-load extension + watcher rebuild). Results
     /// return over this channel; `history_epoch` supersedes stale ones; the
     /// in-flight flag stops the scroll trigger from re-dispatching every frame.
@@ -3191,6 +3216,7 @@ impl GitkApp {
             prefetch_epoch: Epoch::default(),
             prefetched_gen: 0,
             inflight_diffs: Arc::default(),
+            inflight_loads: HashSet::new(),
             last_highlight_check_gen: 0,
             // A generous first-frame estimate so a diff that settles before the
             // commit panel has rendered once still warms the top commits; the panel
@@ -3432,6 +3458,24 @@ impl GitkApp {
         *key == self.diff_cache_key(key.oid)
     }
 
+    /// True when the UI is sitting in the loading state waiting for exactly this
+    /// diff: a load is armed, the selected commit is the key's oid, and the key
+    /// matches the current settings/theme. The drains install an arriving result
+    /// that passes this — current epoch or not — which is what lets a re-selection
+    /// adopt an in-flight worker instead of stacking a duplicate. Real commits
+    /// only: a virtual key is content-keyed, so two computes of it aren't "the
+    /// same diff" and those always take a fresh worker.
+    fn awaiting(&self, key: &DiffCacheKey) -> bool {
+        self.diff_load_started_at.is_some()
+            && is_real_commit(key.oid)
+            && self
+                .selected
+                .and_then(|s| self.commits.get(s))
+                .map(|c| c.oid)
+                == Some(key.oid)
+            && self.key_is_current(key)
+    }
+
     /// Swap `key`/`data` in as the displayed diff and run the install tail every
     /// installer needs: reset the scroll top, rebuild the file-list rows, resize the
     /// h-scroll, and (re)arm highlighting.
@@ -3509,6 +3553,18 @@ impl GitkApp {
         self.diff_load_started_at
             .get_or_insert_with(std::time::Instant::now);
 
+        // A worker for this exact key is already in flight — the user bounced back
+        // to a commit whose load never finished. Don't stack an identical worker:
+        // stay in the loading state and adopt the in-flight result when it lands
+        // (the drain installs any arriving result the UI is `awaiting`, current
+        // epoch or not; a worker that bailed pre-compute reports `data: None` and
+        // the drain re-dispatches). The epoch bump above still supersedes workers
+        // for OTHER keys.
+        if is_real_commit(key.oid) && self.inflight_loads.contains(&key) {
+            log::debug!("diff-load: adopt in-flight worker for {}", key.oid);
+            return;
+        }
+
         let oid = key.oid;
         // The worker thread must own its inputs. repo_path is borrowed from self so it's
         // cloned; paths and key are moved in (not cloned) — on the common spawn-succeeds
@@ -3522,6 +3578,8 @@ impl GitkApp {
         // queue targets, so blocking on it would trade bounded duplicate work for
         // unbounded latency.
         let claim = InflightClaim::try_claim(&self.inflight_diffs, key.clone());
+        // For the inflight_loads tracking below — `key` itself moves into the worker.
+        let tracked_key = is_real_commit(oid).then(|| key.clone());
         // Not spawn_guarded: a panic here must do more than log — it has to report a
         // failed load so the drain's `data: None` arm clears the loading state,
         // otherwise the pane sticks on "Loading diff…" forever (the retained tx clone
@@ -3565,7 +3623,14 @@ impl GitkApp {
                     }
                 }
             });
-        if spawn.is_err() {
+        if spawn.is_ok() {
+            // Track the worker so a bounce-back to this commit adopts it instead of
+            // stacking a duplicate; the drain removes the entry when its (always
+            // delivered) result arrives.
+            if let Some(k) = tracked_key {
+                self.inflight_loads.insert(k);
+            }
+        } else {
             log::warn!("diff-load thread spawn failed; loading synchronously");
             // paths/key were moved into the (dropped) closure; re-resolve them for the
             // synchronous fallback. Only this rare path needs a repo handle, so discover
@@ -4726,9 +4791,17 @@ impl GitkApp {
         // still cache it, so returning to that commit is instant instead of recomputing.
         while let Ok(result) = self.diff_load_rx.try_recv() {
             let DiffLoadResult { epoch, key, data } = result;
+            // This worker has delivered — clear its tracking BEFORE anything below
+            // can re-dispatch, or the new dispatch would "adopt" the dead worker.
+            // (A virtual result's content-keyed `key` was never tracked; no-op.)
+            self.inflight_loads.remove(&key);
             let current = self.diff_load_epoch.is_current(epoch);
+            // A stale-epoch result the UI is nonetheless waiting on: the user
+            // bounced back to this commit while its (superseded, but tracked and
+            // adopted) load was still running. Install it like a current one.
+            let awaited = !current && self.awaiting(&key);
             match data {
-                Some(data) if current => {
+                Some(data) if current || awaited => {
                     // Re-key from CURRENT state before installing: the diff data
                     // itself is theme-independent, but the dispatch-time key pins
                     // theme/enabled — a config theme change while the load ran
@@ -4768,6 +4841,14 @@ impl GitkApp {
                     self.stash_current_diff();
                     self.clear_diff_pane();
                 }
+                None if awaited => {
+                    // The adopted worker turned out to have bailed pre-compute (it
+                    // was superseded before it started, then the user bounced back).
+                    // Nothing else will deliver this diff — dispatch a fresh load.
+                    // No retry loop: that fresh load runs under the current epoch,
+                    // so its failure takes the `None if current` arm above.
+                    self.load_selected_diff();
+                }
                 None => {} // a superseded failure: nothing to do
             }
         }
@@ -4795,6 +4876,16 @@ impl GitkApp {
         // it could never be hit again and would only bloat the LRU. (Settings unchanged
         // but selection moved still matches — those neighbour diffs stay useful.)
         while let Ok((key, data)) = self.prefetch_rx.try_recv() {
+            // The user is sitting on "Loading diff…" for exactly this key and the
+            // prefetch got there first (its head start beat the diff-load worker
+            // that was spawned alongside it) — install it now instead of waiting
+            // out the duplicate, and supersede that worker so its later result is
+            // cached rather than installed over this one.
+            if self.awaiting(&key) {
+                self.diff_load_epoch.bump();
+                self.install_preferring_cache(key, data);
+                continue;
+            }
             if self.key_is_current(&key) && self.current_diff_key.as_ref() != Some(&key) {
                 self.cache_diff(key, data);
             }

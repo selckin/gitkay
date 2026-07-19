@@ -120,14 +120,21 @@ parts run off the window-creation critical path:
   preserved across rapid re-dispatch (`get_or_insert`), cleared on apply/fail/cancel. A
   monotonic `diff_load_epoch` (bumped per selection and by every synchronous install)
   supersedes stale workers; a superseded result is still **cached** (real commits only —
-  immutable). A worker whose `Repository::discover` fails reports `data: None` so the
-  loading state clears. Diff workers (prefetch and diff-load) dedupe through a shared
-  in-flight claim set (`InflightKeys` / RAII `InflightClaim`): a prefetch skips any key
-  another worker already claimed, and the diff-load claims its key so later prefetch
-  dispatches skip it — without this, overlapping prefetch batches recompute the same
-  large diff concurrently. (A diff-load does NOT wait on a prefetch that beat it to the
-  claim: that prefetch may sit behind other queue targets, so the load always computes —
-  bounded duplicate work instead of unbounded latency.) Highlighting stays a separate
+  immutable). **Every diff-load worker exit reports a `DiffLoadResult`** — success,
+  discover-failure, superseded pre-compute bail, even a panic — this invariant is
+  load-bearing for the loading state AND for `inflight_loads` (below). Diff workers
+  dedupe at two levels: (1) a shared claim set (`InflightKeys` / RAII `InflightClaim`) —
+  a prefetch skips any key another worker already claimed, and the diff-load claims its
+  key so later prefetch dispatches skip it (a diff-load does NOT wait on a prefetch that
+  beat it to the claim: that prefetch may sit behind other queue targets, so the load
+  still computes — bounded duplicate work instead of unbounded latency); (2)
+  `inflight_loads` (UI-side, real commits only) tracks keys with a load worker running —
+  bouncing back to a commit whose superseded load is still computing re-arms the loading
+  state and **adopts** the in-flight worker instead of stacking a duplicate. Adoption
+  works through the drains' `awaiting` rule: a result for the exact key the UI is
+  waiting on installs even with a stale epoch (an awaited `data: None` — the adopted
+  worker had bailed pre-compute — re-dispatches), and a prefetch result for the awaited
+  key installs directly, superseding the parallel load. Highlighting stays a separate
   downstream step
   (`ensure_diff_highlighted`); an arriving result prefers an existing cache entry (a
   prefetch may have highlighted the same commit meanwhile). Selecting the already-shown
