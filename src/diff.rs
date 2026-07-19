@@ -67,7 +67,7 @@ pub fn is_real_commit(oid: git2::Oid) -> bool {
 ///
 /// A 64-bit collision (two different diffs, one hash) would serve the wrong cached diff,
 /// but at ~1/2^64 per edit — self-healing on the next edit, and capped at one entry per
-/// sentinel oid (see `load_selected_diff`'s `retain_keys`) so collisions can't pile up —
+/// sentinel oid (see `stash_current_diff`'s `retain_keys`) so collisions can't pile up —
 /// it's an accepted risk, not worth a wider hash or a full content compare on every hit.
 pub fn hash_diff_content(data: &DiffData) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -624,31 +624,29 @@ pub fn diff_to_data(diff: &git2::Diff, title: &str, show_stats: bool) -> DiffDat
 /// `--- /+++` display lines. Files with no patch body (`diff_line_idx` is `None`)
 /// are skipped; `end` is clamped to `total_lines`.
 pub fn file_line_ranges(files: &[FileEntry], total_lines: usize) -> Vec<(usize, usize, usize)> {
-    // (file index, patch start line) for every file that has a patch body.
-    let mut sorted: Vec<(usize, usize)> = (0..files.len())
-        .filter_map(|i| files[i].diff_line_idx.map(|start| (i, start)))
-        .collect();
-    sorted.sort_by_key(|&(_, start)| start);
-    sorted
+    let starts = file_line_starts(files);
+    starts
         .iter()
         .enumerate()
-        .map(|(k, &(i, start))| {
-            let end = sorted.get(k + 1).map_or(total_lines, |&(_, s)| s);
+        .map(|(k, &(start, i))| {
+            let end = starts.get(k + 1).map_or(total_lines, |&(s, _)| s);
             (i, start.min(total_lines), end.min(total_lines))
         })
         .collect()
 }
 
 /// Sorted `(patch start line, file index)` pairs for every file with a patch body —
-/// the binary-search structure behind `file_index_at_line*`. Derived once per diff
-/// at install; the lookups run several times per frame.
+/// the single sorted file-boundary structure: `file_index_at_line*` binary-search
+/// it, `next_file_line` steps over it, and `file_line_ranges` derives from it.
+/// Derived once per diff at install; the lookups run several times per frame.
 pub fn file_line_starts(files: &[FileEntry]) -> Vec<(usize, usize)> {
     let mut starts: Vec<(usize, usize)> = files
         .iter()
         .enumerate()
         .filter_map(|(i, f)| f.diff_line_idx.map(|s| (s, i)))
         .collect();
-    starts.sort_unstable_by_key(|&(s, _)| s);
+    // Full-tuple sort so equal starts tie-break on file index deterministically.
+    starts.sort_unstable();
     starts
 }
 
@@ -670,16 +668,9 @@ pub fn file_index_at_line(starts: &[(usize, usize)], line: usize) -> usize {
 /// line): when `down`, the next file's start strictly below `top`; otherwise the
 /// nearest file start strictly above `top` (so paging up from inside a file lands on
 /// its own header first, then the previous file's). None when there's no file in that
-/// direction. File starts come from `file_line_ranges` (sorted, body-bearing files).
-pub fn next_file_line(
-    files: &[FileEntry],
-    total_lines: usize,
-    top: usize,
-    down: bool,
-) -> Option<usize> {
-    let starts = file_line_ranges(files, total_lines)
-        .into_iter()
-        .map(|(_, s, _)| s);
+/// direction. `starts` is the per-diff `file_line_starts` (sorted, body-bearing files).
+pub fn next_file_line(starts: &[(usize, usize)], top: usize, down: bool) -> Option<usize> {
+    let starts = starts.iter().map(|&(s, _)| s);
     if down {
         starts.filter(|&s| s > top).min()
     } else {
@@ -735,9 +726,9 @@ mod tests {
     #[test]
     fn next_file_line_steps_between_files() {
         // File starts at lines 2 and 5 (a no-patch file in between is skipped).
-        let files = vec![fe("x", Some(2)), fe("x", None), fe("x", Some(5))];
-        let down = |top| next_file_line(&files, 9, top, true);
-        let up = |top| next_file_line(&files, 9, top, false);
+        let starts = file_line_starts(&[fe("x", Some(2)), fe("x", None), fe("x", Some(5))]);
+        let down = |top| next_file_line(&starts, top, true);
+        let up = |top| next_file_line(&starts, top, false);
 
         // Down → the next file start strictly below `top`.
         assert_eq!(down(0), Some(2)); // header → first file

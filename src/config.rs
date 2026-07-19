@@ -571,6 +571,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn role_all_is_in_discriminant_order() {
+        // `Fonts::style` indexes the `styles` array (filled in `ALL` order) by
+        // `role as usize`, so `ALL` must list every variant in declaration order —
+        // a reorder would silently swap roles' fonts.
+        for (i, role) in Role::ALL.iter().enumerate() {
+            assert_eq!(*role as usize, i);
+        }
+    }
+
+    #[test]
     fn empty_config_is_all_defaults() {
         // Parsed text styles are unset (None) — per-role defaults live in
         // `role_default`, applied at resolution (see default_font_ids_match_*).
