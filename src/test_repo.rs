@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! Temp-repository helpers shared by the `main` and `apply` test suites.
 //! Test-only: the module is declared `#[cfg(test)]`, so none of this is built
 //! into the binary.

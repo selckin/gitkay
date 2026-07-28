@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
+mod apply;
 mod cli;
 mod config;
 mod diff;
@@ -1920,6 +1921,13 @@ fn prefetch_worker(job: PrefetchJob) {
     }
 }
 
+/// One finished apply. Every worker exit reports one of these — success, failure,
+/// or panic — so the in-flight flag can never stick and wedge the menus off.
+struct ApplyResult {
+    req: apply::ApplyRequest,
+    outcome: Result<(), apply::ApplyError>,
+}
+
 /// A finished async diff load handed back to the UI: the computed data plus the cache
 /// key to store it under (its `content` hash filled in here for a virtual entry) and
 /// the epoch it was dispatched under, so a stale result — the user has since selected
@@ -2939,6 +2947,14 @@ struct GitkApp {
     // threshold; cleared to None when a load applies, fails, or is cancelled.
     diff_load_started_at: Option<std::time::Instant>,
     egui_ctx: egui::Context, // stored Context handle so workers can request a repaint
+    /// Applies run off the frame loop (a large file's diff regeneration is not
+    /// frame-budget work) and one at a time — the menus disable while in flight.
+    apply_tx: mpsc::Sender<ApplyResult>,
+    apply_rx: mpsc::Receiver<ApplyResult>,
+    apply_in_flight: bool,
+    /// The transient status message: text, whether it is an error, and when it
+    /// was posted (successes fade, errors persist).
+    apply_status: Option<(String, bool, std::time::Instant)>,
 }
 
 /// The file paths a config-file event must match, and the directories to watch for
@@ -3320,6 +3336,7 @@ impl GitkApp {
         let (prefetch_tx, prefetch_rx) = mpsc::channel();
         let (diff_load_tx, diff_load_rx) = mpsc::channel();
         let (history_load_tx, history_load_rx) = mpsc::channel();
+        let (apply_tx, apply_rx) = mpsc::channel();
         let egui_ctx = cc.egui_ctx.clone();
         let diff_max_chars = 0; // no diff yet — set_diff_content installs the real width
 
@@ -3415,6 +3432,10 @@ impl GitkApp {
             history_epoch: Epoch::default(),
             history_inflight: false,
             egui_ctx,
+            apply_tx,
+            apply_rx,
+            apply_in_flight: false,
+            apply_status: None,
         })
     }
 
@@ -3872,6 +3893,133 @@ impl GitkApp {
                 }
             }
         }
+    }
+
+    /// Is a write in flight? Menus disable while one is, so two actions can never
+    /// race each other over the same index.
+    #[allow(dead_code)] // Task 8 (context menus) reads this to disable menu items
+    const fn apply_in_flight(&self) -> bool {
+        self.apply_in_flight
+    }
+
+    /// Run one write on a worker. The repo handle is not `Send`, so the worker
+    /// re-discovers from the path, exactly like the diff-load worker.
+    #[allow(dead_code)] // Task 8 (context menus) calls this; no caller yet
+    fn request_apply(&mut self, req: apply::ApplyRequest) {
+        if self.apply_in_flight {
+            return;
+        }
+        self.apply_in_flight = true;
+        let repo_path = self.repo_path.clone();
+        let settings = self.diff_settings;
+        let tx = self.apply_tx.clone();
+        let ctx = self.egui_ctx.clone();
+        let panic_req = req.clone();
+        let panic_tx = self.apply_tx.clone();
+        let panic_ctx = self.egui_ctx.clone();
+        let spawn = spawn_reporting(
+            "gitkay-apply",
+            "apply worker panicked; reporting the write as failed",
+            move || {
+                let outcome = match Repository::discover(&repo_path) {
+                    Ok(repo) => apply::apply_request(&repo, &req, settings),
+                    Err(e) => Err(apply::ApplyError::Git(e)),
+                };
+                let _ = tx.send(ApplyResult { req, outcome });
+                ctx.request_repaint();
+            },
+            move || {
+                let _ = panic_tx.send(ApplyResult {
+                    req: panic_req,
+                    outcome: Err(apply::ApplyError::Git(git2::Error::from_str(
+                        "the write worker crashed",
+                    ))),
+                });
+                panic_ctx.request_repaint();
+            },
+        );
+        if spawn.is_err() {
+            log::warn!("apply thread spawn failed");
+            self.apply_in_flight = false;
+            self.apply_status = Some((
+                "Could not start the write".to_string(),
+                true,
+                std::time::Instant::now(),
+            ));
+        }
+    }
+
+    /// Install finished writes: post the status message and, on success, refresh
+    /// through the same debounced reload the git watcher arms. Staging writes
+    /// `.git/index` so the watcher fires too and the two coalesce; a worktree
+    /// revert touches nothing under `.git`, so this is its only trigger.
+    fn drain_apply_results(&mut self) {
+        while let Ok(ApplyResult { req, outcome }) = self.apply_rx.try_recv() {
+            self.apply_in_flight = false;
+            let action = apply::ApplyAction::of(req.oid);
+            let scope = if req.hunk.is_some() { "hunk" } else { "file" };
+            match outcome {
+                Ok(()) => {
+                    self.apply_status = Some((
+                        format!("{} {scope}: {}", action.verb(), req.path),
+                        false,
+                        std::time::Instant::now(),
+                    ));
+                    self.reload_armed_at = Some(std::time::Instant::now());
+                    self.load_selected_diff();
+                }
+                Err(e) => {
+                    if let Some(raw) = e.detail() {
+                        log::warn!("gitkay: {} {scope} failed: {raw}", action.verb());
+                    }
+                    self.apply_status = Some((
+                        e.user_message(action, &req.path),
+                        true,
+                        std::time::Instant::now(),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// The write status message: a small overlay at the bottom-left of the diff
+    /// panel. NOT in the diff toolbar — that is revealed only while the pointer is
+    /// in the panel's top strip, so a message parked there would go unseen.
+    /// Successes fade; errors stay until the next action.
+    ///
+    /// Non-interactable, matching the file-list path tooltip's `Area` (see its
+    /// comment above): an interactable overlay wins the hit-test over the
+    /// diff's `ScrollArea` beneath it, so the panel would silently stop
+    /// scrolling with the pointer parked here — errors persist indefinitely,
+    /// so that dead zone could last as long as the message is showing.
+    fn show_apply_status(&mut self, panel_rect: egui::Rect, ctx: &egui::Context) {
+        const FADE: std::time::Duration = std::time::Duration::from_secs(3);
+        let Some((text, is_error, posted)) = self.apply_status.clone() else {
+            return;
+        };
+        if !is_error {
+            let elapsed = posted.elapsed();
+            if elapsed >= FADE {
+                self.apply_status = None;
+                return;
+            }
+            ctx.request_repaint_after(FADE.saturating_sub(elapsed));
+        }
+        let pos = egui::pos2(panel_rect.min.x + 8.0, panel_rect.max.y - 30.0);
+        egui::Area::new(egui::Id::new("apply_status"))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    let color = if is_error { RED } else { TEXT };
+                    ui.label(
+                        egui::RichText::new(&text)
+                            .font(self.fonts.font_id(Role::Ui))
+                            .color(color),
+                    );
+                });
+            });
     }
 
     /// Mark the current diff as needing (re)highlighting and bump the generation
@@ -5583,6 +5731,7 @@ impl eframe::App for GitkApp {
         self.handle_config_reload(&ctx);
         self.drain_history_results();
         self.drain_worker_results(&ctx);
+        self.drain_apply_results();
         let t_drains = std::time::Instant::now();
 
         let search_id = egui::Id::new("search_field");
@@ -5675,6 +5824,7 @@ impl eframe::App for GitkApp {
                 // Diff options toolbar — a floating hover overlay (see
                 // show_diff_toolbar).
                 self.show_diff_toolbar(ui.max_rect(), &ctx);
+                self.show_apply_status(ui.max_rect(), &ctx);
 
                 // A diff-load worker is computing the selected commit's diff. Until it
                 // lands we keep the previous diff (and its sidebar) on screen so fast
@@ -7367,6 +7517,43 @@ mod tests {
         assert!(
             commits.iter().any(|c| c.oid == oid_staged()),
             "staged initial commit must get its virtual row"
+        );
+    }
+
+    #[test]
+    fn load_commits_puts_the_staged_row_first_when_uncommitted_disappears() {
+        // load_commits pushes uncommitted first, then staged, then history — so a
+        // rebuild that no longer has the uncommitted row must land on staged, not
+        // somewhere arbitrary in history. This test covers only that row-ordering
+        // half. The other half of the claimed selection behaviour — that
+        // finish_resync falls back to row 0 when the previously selected oid is
+        // gone, which is what actually makes the *selection* land on staged — is
+        // NOT covered by any test: GitkApp cannot be constructed in this test
+        // module, so finish_resync itself is untested here.
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", "base\n", "base");
+
+        // Staged change AND a further unstaged change: both virtual rows exist.
+        std::fs::write(repo.workdir().unwrap().join("f.txt"), "staged\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("f.txt")).unwrap();
+        index.write().unwrap();
+        std::fs::write(repo.workdir().unwrap().join("f.txt"), "unstaged\n").unwrap();
+
+        let both = load_commits(&repo, 10, &scope(false, &[]));
+        assert_eq!(both[0].oid, oid_uncommitted());
+        assert_eq!(both[1].oid, oid_staged());
+
+        // Stage everything: the uncommitted row's reason to exist is gone.
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("f.txt")).unwrap();
+        index.write().unwrap();
+
+        let after = load_commits(&repo, 10, &scope(false, &[]));
+        assert_eq!(
+            after[0].oid,
+            oid_staged(),
+            "row 0 — where finish_resync falls back — must be the staged row"
         );
     }
 
