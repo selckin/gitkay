@@ -720,6 +720,68 @@ pub fn file_index_at_line(starts: &[(usize, usize)], line: usize) -> usize {
     file_index_at_line_opt(starts, line).unwrap_or(0)
 }
 
+/// One hunk's two line ranges, as spelled in its `@@ -old_start,old_lines
+/// +new_start,new_lines @@` header. Copied out of the display's `DiffLine`s so an
+/// action can be matched against a freshly generated diff's hunks later, when the
+/// original `git2::DiffHunk` is long gone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)] // until apply.rs consumes it; expect() would be unfulfilled (the tests below use it)
+pub struct HunkRange {
+    pub old_start: u32,
+    pub old_lines: u32,
+    pub new_start: u32,
+    pub new_lines: u32,
+}
+
+/// Parse a unified-diff hunk header. git omits a range's count when it is 1
+/// (`@@ -1 +1 @@`), so an absent count reads as 1. Returns `None` for anything that
+/// isn't a well-formed header — the caller then treats the row as hunkless rather
+/// than guessing.
+#[must_use]
+#[allow(dead_code)] // until apply.rs consumes it; expect() would be unfulfilled (the tests below use it)
+pub fn parse_hunk_header(text: &str) -> Option<HunkRange> {
+    let inner = text.strip_prefix("@@ ")?;
+    let inner = &inner[..inner.find(" @@")?];
+    let mut sides = inner.split_whitespace();
+    let old = sides.next()?.strip_prefix('-')?;
+    let new = sides.next()?.strip_prefix('+')?;
+    let range = |s: &str| -> Option<(u32, u32)> {
+        let mut parts = s.split(',');
+        let start = parts.next()?.parse().ok()?;
+        let lines = parts.next().map_or(Some(1), |c| c.parse().ok())?;
+        Some((start, lines))
+    };
+    let (old_start, old_lines) = range(old)?;
+    let (new_start, new_lines) = range(new)?;
+    Some(HunkRange {
+        old_start,
+        old_lines,
+        new_start,
+        new_lines,
+    })
+}
+
+/// The hunk that `line` belongs to: scan back to the nearest `LineKind::Hunk`,
+/// stopping at the file boundary so a row in a hunkless file (binary, mode-only) or
+/// in a file's header block never inherits the previous file's hunk. `None` ⇒ the
+/// row has no hunk to act on.
+#[must_use]
+#[allow(dead_code)] // until apply.rs consumes it; expect() would be unfulfilled (the tests below use it)
+pub fn hunk_at_line(lines: &[DiffLine], line: usize) -> Option<HunkRange> {
+    let mut i = line.min(lines.len().checked_sub(1)?);
+    loop {
+        match lines[i].kind {
+            LineKind::Hunk => return parse_hunk_header(&lines[i].text),
+            // File header / commit header: we've left the hunk body.
+            LineKind::FileMeta | LineKind::FileName | LineKind::Meta | LineKind::Stat => {
+                return None;
+            }
+            _ => {}
+        }
+        i = i.checked_sub(1)?;
+    }
+}
+
 /// The diff line to scroll to for a page-by-file step, given `top` (the first visible
 /// line): when `down`, the next file's start strictly below `top`; otherwise the
 /// nearest file start strictly above `top` (so paging up from inside a file lands on
@@ -921,5 +983,100 @@ mod tests {
         emphasize_rows(&mut lines, 0..2);
         assert_eq!(lines[0].emphasis, Some(Vec::new()));
         assert_eq!(lines[1].emphasis, Some(Vec::new()));
+    }
+
+    #[test]
+    fn parse_hunk_header_reads_both_ranges() {
+        assert_eq!(
+            parse_hunk_header("@@ -8,6 +12,9 @@ fn context()"),
+            Some(HunkRange {
+                old_start: 8,
+                old_lines: 6,
+                new_start: 12,
+                new_lines: 9
+            })
+        );
+    }
+
+    #[test]
+    fn parse_hunk_header_defaults_omitted_counts_to_one() {
+        // git omits the count when it is 1: "@@ -1 +1 @@"
+        assert_eq!(
+            parse_hunk_header("@@ -1 +1 @@"),
+            Some(HunkRange {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1
+            })
+        );
+        // A pure insertion has a zero-length old side, which IS spelled out.
+        assert_eq!(
+            parse_hunk_header("@@ -0,0 +1,3 @@"),
+            Some(HunkRange {
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 3
+            })
+        );
+    }
+
+    #[test]
+    fn parse_hunk_header_rejects_non_headers() {
+        assert_eq!(parse_hunk_header("+ not a header"), None);
+        assert_eq!(parse_hunk_header("@@ garbage @@"), None);
+        assert_eq!(parse_hunk_header(""), None);
+    }
+
+    #[test]
+    fn hunk_at_line_finds_the_enclosing_hunk() {
+        let lines = vec![
+            DiffLine::new("commit abc", LineKind::Meta),
+            DiffLine::new("diff --git a/f b/f", LineKind::FileMeta),
+            DiffLine::new("--- a/f", LineKind::FileName),
+            DiffLine::new("@@ -1,3 +1,3 @@", LineKind::Hunk),
+            DiffLine::new(" ctx", LineKind::Context),
+            DiffLine::new("+add", LineKind::Add),
+            DiffLine::new("@@ -20,3 +20,4 @@", LineKind::Hunk),
+            DiffLine::new("+second", LineKind::Add),
+        ];
+        // A body row resolves to the hunk above it.
+        assert_eq!(hunk_at_line(&lines, 5).unwrap().old_start, 1);
+        assert_eq!(hunk_at_line(&lines, 7).unwrap().old_start, 20);
+        // The hunk header row itself resolves to its own hunk.
+        assert_eq!(hunk_at_line(&lines, 6).unwrap().old_start, 20);
+    }
+
+    #[test]
+    fn hunk_at_line_stops_at_the_file_boundary() {
+        let lines = vec![
+            DiffLine::new("@@ -1,3 +1,3 @@", LineKind::Hunk),
+            DiffLine::new(" ctx", LineKind::Context),
+            DiffLine::new("diff --git a/g b/g", LineKind::FileMeta),
+            DiffLine::new("--- a/g", LineKind::FileName),
+            // Binary bodies print as Context ("Binary files ... differ") with no hunk.
+            DiffLine::new("Binary files a/g and b/g differ", LineKind::Context),
+        ];
+        // Must NOT walk back past the file header into the previous file's hunk.
+        assert_eq!(hunk_at_line(&lines, 4), None);
+        assert_eq!(hunk_at_line(&lines, 2), None);
+        // Header rows above any file have no hunk either.
+        assert_eq!(hunk_at_line(&[], 0), None);
+    }
+
+    #[test]
+    fn parse_hunk_header_is_multibyte_safe() {
+        // The trailing context text is never sliced, but it is attacker-adjacent
+        // input — pin that a multibyte tail cannot panic the parser.
+        assert_eq!(
+            parse_hunk_header("@@ -1,2 +1,2 @@ fn 日本語() {"),
+            Some(HunkRange {
+                old_start: 1,
+                old_lines: 2,
+                new_start: 1,
+                new_lines: 2,
+            })
+        );
     }
 }
