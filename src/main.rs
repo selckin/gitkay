@@ -12,6 +12,8 @@ mod config;
 mod diff;
 mod diff_cache;
 mod highlight;
+#[cfg(test)]
+mod test_repo;
 mod word_diff;
 use config::{FileListLayout, Fonts, Role};
 use diff::{
@@ -6026,6 +6028,7 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_repo::{commit_file, commit_index, commit_rename, temp_repo};
 
     /// Make a fake OID from an integer for testing.
     fn oid(n: u32) -> git2::Oid {
@@ -7176,47 +7179,6 @@ mod tests {
         // selected = 2 (first real), whole list visible. Virtual rows 0,1 excluded;
         // candidates 3,4,5,6 by distance; capped at 2.
         assert_eq!(prefetch_targets(&commits, 2, 0..7, 2), vec![oid(3), oid(4)]);
-    }
-
-    fn temp_repo() -> (tempfile::TempDir, git2::Repository) {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = git2::Repository::init(dir.path()).unwrap();
-        let mut cfg = repo.config().unwrap();
-        cfg.set_str("user.name", "t").unwrap();
-        cfg.set_str("user.email", "t@example.com").unwrap();
-        (dir, repo)
-    }
-
-    /// Write the (already-staged) `index`, commit its tree onto HEAD, and return
-    /// the new commit's oid — the shared tail of every staging helper below.
-    fn commit_index(repo: &git2::Repository, index: &mut git2::Index, msg: &str) -> git2::Oid {
-        index.write().unwrap();
-        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
-        let sig = repo.signature().unwrap();
-        let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
-        let parents: Vec<&git2::Commit> = parent.iter().collect();
-        repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents)
-            .unwrap()
-    }
-
-    fn commit_file(repo: &git2::Repository, path: &str, content: &str, msg: &str) -> git2::Oid {
-        let root = repo.workdir().unwrap();
-        let full = root.join(path);
-        if let Some(p) = full.parent() {
-            std::fs::create_dir_all(p).unwrap();
-        }
-        std::fs::write(&full, content).unwrap();
-        let mut index = repo.index().unwrap();
-        index.add_path(std::path::Path::new(path)).unwrap();
-        commit_index(repo, &mut index, msg)
-    }
-
-    /// Stage a rename `old` -> `new` (the file is already moved on disk) and commit.
-    fn commit_rename(repo: &git2::Repository, old: &str, new: &str, msg: &str) -> git2::Oid {
-        let mut index = repo.index().unwrap();
-        index.remove_path(std::path::Path::new(old)).unwrap();
-        index.add_path(std::path::Path::new(new)).unwrap();
-        commit_index(repo, &mut index, msg)
     }
 
     fn scope(all: bool, revs: &[&str]) -> cli::Scope {
