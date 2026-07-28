@@ -737,7 +737,6 @@ pub struct HunkRange {
 /// isn't a well-formed header — the caller then treats the row as hunkless rather
 /// than guessing.
 #[must_use]
-#[allow(dead_code)] // used by hunk_at_line and Task 4+ (internal helper)
 pub fn parse_hunk_header(text: &str) -> Option<HunkRange> {
     let inner = text.strip_prefix("@@ ")?;
     let inner = &inner[..inner.find(" @@")?];
@@ -765,7 +764,6 @@ pub fn parse_hunk_header(text: &str) -> Option<HunkRange> {
 /// in a file's header block never inherits the previous file's hunk. `None` ⇒ the
 /// row has no hunk to act on.
 #[must_use]
-#[allow(dead_code)] // Task 4+ (click handler) uses this to find which hunk was clicked
 pub fn hunk_at_line(lines: &[DiffLine], line: usize) -> Option<HunkRange> {
     let mut i = line.min(lines.len().checked_sub(1)?);
     loop {
