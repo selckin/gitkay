@@ -55,7 +55,10 @@ the pane, the path filter, the `--follow` tracer — goes through
 `commit_parent_diff`), the diff-shaping `DiffOptions` helpers, the word-diff
 emphasis driver, the content hash, and
 the pure line/file lookups — git2-facing and egui-free; cache keying,
-highlight orchestration, and rendering stay in `main.rs`), `src/config.rs`
+highlight orchestration, and rendering stay in `main.rs`), `src/apply.rs` (the
+write layer: `ApplyAction`/`ApplyRequest`/`ApplyError`, the
+`CommitKind`-driven verb mapping, and the three write mechanisms — see below),
+`src/config.rs`
 (`[fonts]`/`[text]`/`[diff]` config: TOML parsing, `[diff.bands]` resolution
 (`resolve_diff_bg`), fontdb resolution + cache,
 role→FontId map), `src/highlight.rs` (syntect highlighter, theme/palette
@@ -190,18 +193,84 @@ parts run off the window-creation critical path:
 - **Text**: summary clipped via `with_clip_rect`. Authors colored by hash. Refs colored by name hash (12-color extended palette)
 - **Clipboard**: SHA copied to both clipboard + primary selection on click
 
+### Write actions (`src/apply.rs`)
+Right-click in the diff pane or the file sidebar to act on a hunk or a file. The verb
+comes from the row kind via `ApplyAction::of` → `CommitKind::of` (uncommitted ⇒ Stage,
+staged ⇒ Unstage, real commit ⇒ Revert). Every action is reversible, so none prompts.
+
+Patch application is the mechanism for **hunks**, not for everything:
+- **whole-file stage/unstage** are direct index operations (`index.add_path` / restore the
+  HEAD entry) — exact for binary, mode changes, CRLF and missing trailing newlines, all of
+  which the patch path handles badly or refuses. These need an explicit `index.write()`.
+  A HEAD entry that is not a blob (gitlink/tree) is `Unsupported`, not "HEAD has no such
+  file" — dropping it would silently stage a submodule deletion.
+- **whole-file revert of a binary** restores the parent blob, guarded on the worktree still
+  matching the commit's blob (libgit2 refuses to apply binary deltas from a diff object).
+  A delta set mixing binary and text is `Unsupported` — neither route can carry both, and
+  doing half of it silently is worse than refusing.
+- **everything else** regenerates the diff through the *same* `diff.rs` builder the pane
+  displayed — with `ignore_whitespace` forced off, the display's `context`, and BOTH sides
+  of a rename in the pathspec — then lets libgit2 reverse it (`DiffOptions::reverse`) and
+  select hunks (`ApplyOptions::hunk_callback`). No patch text is ever built or parsed.
+  `repo.apply` commits its own index writer, so this path must NOT call `index.write()`.
+
+Because nothing prompts, **every decision is taken before anything is written**, and
+libgit2 will not take them for us:
+
+- **The hunk callback is not a gate.** libgit2 skips `git_apply__patch` — and with it the
+  callback — for a `GIT_DELTA_DELETED` delta, and `git_apply__to_index` removes
+  `DELETED`/`RENAMED` old paths before it ever looks at the postimage. So an acceptance
+  count of zero does *not* mean nothing happened: unguarded, a stale click could delete a
+  file / stage a deletion / unstage an added entry and still report failure. The hunk path
+  therefore **pre-matches** with `git2::Patch::from_diff` + `hunk_matches` and returns
+  `Stale` without calling `repo.apply` at all when nothing matches. The acceptance counter
+  stays as a second line of defence, skipped when the diff holds a delta that bypasses the
+  callback (`bypasses_hunk_callback`), where zero is the expected count of a *success*.
+- **A worktree deletion has no context to refuse on.** `apply_one` reads the preimage from
+  the worktree and never compares it to `delta->old_file.id`; `git_apply__to_workdir` then
+  checks out with `baseline_index = preimage`, so the baseline matches the worktree by
+  construction and `GIT_CHECKOUT_SAFE` never conflicts. Reverting a commit that *added* a
+  file would delete the worktree copy whatever it now holds. `guard_workdir_deletions`
+  (shared by the whole-file and hunk routes) requires every reversed-`Deleted` delta's
+  worktree content to still equal the commit's blob, or returns `ChangedSinceCommit` — the
+  same guard, and the same `read_if_present`/`content_matches` helpers, as the binary route.
+- A **one-path pathspec** drops a rename's delete side, because `apply_pathspec` filters
+  before `detect_similar` runs — so both sides are always passed.
+
+The context menu takes its oid from `current_diff_key` (the diff **on screen**), never from
+`selected_oid()`: during a diff load the sidebar and pane still render the outgoing diff, so
+the selection and the displayed paths belong to two different diffs.
+
+Applies run on a `gitkay-apply` worker, one at a time; on success they arm the same
+debounced reload the git watcher arms (every action rewrites `.git/index` — `git_apply`
+commits an index writer for `WorkDir` too — so both triggers fire and coalesce).
+
 ## Tests
 
 Each module carries its own `#[cfg(test)]` suite: `config` (TOML parsing +
 clamping), `highlight` (theme/palette resolution), `cli` (rev-vs-path
 classification + pathspec/title helpers), `diff` (line/file lookups, windowed
 word-diff laziness, content hashing), `diff_cache` (LRU eviction), `word_diff` (LCS word
-alignment), and `main` (graph layout, diff integration over temp repos, and UI
-helpers). The graph-layout suite uses fake
+alignment), `apply` (the largest suite — hunk matching and error phrasing as pure
+units, then stage/unstage/revert end-to-end over real temp repos: renames, binaries,
+symlinks, modes, and every refusal the write layer owes the user), and `main` (graph
+layout, diff integration over temp repos, and UI helpers). The graph-layout suite uses fake
 OIDs via `oid(n)` — no real repo needed — and pins the layout invariants (lane
 stability, merge diagonals, convergence, out-of-scope-parent continuation
 lines; `grep 'fn test_' src/main.rs` for the list). Change `layout_graph` only
 with that suite green.
+
+`src/test_repo.rs` (`#[cfg(test)]`, so nothing lands in the binary) holds the temp-repo
+helpers the `apply` and `main` suites share — `temp_repo`, `write_file`/`stage`/
+`commit_index`/`commit_file`/`commit_rename` to build history, and `read_file`/`index_blob`
+to assert on the worktree vs. the index separately. Add fixtures there rather than
+re-rolling them per module.
+
+The write layer's tests are the safety net for code that can destroy uncommitted work, so
+each destructive guard is pinned by a test that was **demonstrated to fail without it**
+(revert refusing a file changed since the commit, a stale hunk click on a deletion staging
+nothing, a whole-file revert keeping a later change to the same file). Keep that standard:
+a new guard without a test proven to catch its removal is not covered.
 
 ## Common Pitfalls
 

@@ -56,27 +56,39 @@ pub enum ApplyError {
     /// The file moved on since the diff was displayed: no hunk matched, or the
     /// patch context no longer lines up.
     Stale,
-    /// A binary revert whose worktree file no longer matches the commit's blob;
-    /// restoring the parent blob would silently discard the later changes.
-    BinaryChanged,
-    /// A target the write layer does not handle (submodule / gitlink).
+    /// A revert whose worktree file no longer matches the commit's own content,
+    /// on a route that cannot detect that for itself and would therefore discard
+    /// the later changes without a trace: the binary blob restore (no context to
+    /// check) and any delete-the-file revert (libgit2 applies a deletion straight
+    /// from the worktree preimage, never comparing it to the commit's blob).
+    ChangedSinceCommit,
+    /// A target the write layer does not handle (submodule / gitlink, or a mixed
+    /// binary+text delta set that neither route can carry on its own).
     Unsupported,
     Git(git2::Error),
 }
 
 impl ApplyError {
     /// One line for the status bar: what was attempted, on what, and why it did
-    /// not happen. Recognised causes (`Stale`, `BinaryChanged`, `Unsupported`) are
-    /// phrased in the user's terms; the catch-all keeps libgit2's message for
-    /// unexpected failures (see `detail` for that).
+    /// not happen. Recognised causes (`Stale`, `ChangedSinceCommit`,
+    /// `Unsupported`) are phrased in the user's terms; the catch-all keeps
+    /// libgit2's message for unexpected failures (see `detail` for that).
     pub fn user_message(&self, action: ApplyAction, path: &str) -> String {
         let verb = action.verb();
         match self {
             Self::Stale => {
                 format!("{verb} failed — {path} has changed since this diff was shown")
             }
-            Self::BinaryChanged => {
-                format!("{verb} failed — {path} has changed since that commit")
+            // No confirmation prompt guards these actions, so the refusal has to
+            // say why: the worktree no longer matches what the commit recorded.
+            // Phrased as a precaution, not a claim of certain loss — the
+            // comparison is raw bytes (see `read_if_present`), which follows
+            // symlinks, so a reverted commit that added a symlink is refused
+            // here too even though nothing has actually changed and nothing is
+            // at risk. "Those changes would be lost" would be false in that
+            // case; this wording is accurate either way.
+            Self::ChangedSinceCommit => {
+                format!("{verb} failed — {path} no longer matches that commit; nothing changed")
             }
             Self::Unsupported => format!("{verb} failed — {path} is not a supported target"),
             Self::Git(e) => format!("{verb} failed — {path}: {}", e.message()),
@@ -230,17 +242,21 @@ fn stage_file(repo: &Repository, index: &mut git2::Index, path: &str) -> Result<
 /// Unstage a whole file: put HEAD's version of it back in the index, or drop the
 /// entry when HEAD has no such file (a newly added one). The worktree is untouched.
 ///
+/// A HEAD entry that is not a blob (a gitlink — i.e. a submodule — or a tree) is
+/// refused rather than restored: it cannot be expressed as the single blob entry
+/// built below, and folding it into the "HEAD has no such file" case would drop
+/// the entry, silently staging a submodule DELETION. `stage_file` needs no such
+/// arm — `index.add_path` records a gitlink correctly on its own.
+///
 /// Takes the caller's `Index` rather than opening its own — same reason as
 /// `stage_file`: a rename touches two paths and the caller writes both mutations
 /// once, atomically.
 fn unstage_file(repo: &Repository, index: &mut git2::Index, path: &str) -> Result<(), ApplyError> {
     let p = std::path::Path::new(path);
-    let head_entry = crate::diff::head_tree(repo)
-        .and_then(|tree| tree.get_path(p).ok())
-        .filter(|entry| entry.kind() == Some(git2::ObjectType::Blob));
+    let head_entry = crate::diff::head_tree(repo).and_then(|tree| tree.get_path(p).ok());
 
     match head_entry {
-        Some(entry) => {
+        Some(entry) if entry.kind() == Some(git2::ObjectType::Blob) => {
             // Zeroed stat fields: git re-checks the worktree on the next status,
             // which is exactly right — the file may or may not still match HEAD.
             index.add(&git2::IndexEntry {
@@ -258,6 +274,7 @@ fn unstage_file(repo: &Repository, index: &mut git2::Index, path: &str) -> Resul
                 path: path.as_bytes().to_vec(),
             })?;
         }
+        Some(_) => return Err(ApplyError::Unsupported),
         None => index.remove_path(p)?,
     }
     Ok(())
@@ -330,7 +347,7 @@ fn restore_binary(repo: &Repository, delta: &git2::DiffDelta<'_>) -> Result<(), 
         .flatten();
     let commit_blob = repo.find_blob(commit_side.id()).ok();
     if !content_matches(current.as_deref(), commit_blob.as_ref()) {
-        return Err(ApplyError::BinaryChanged);
+        return Err(ApplyError::ChangedSinceCommit);
     }
 
     let Some(parent_rel) = parent_side.path() else {
@@ -355,7 +372,7 @@ fn restore_binary(repo: &Repository, delta: &git2::DiffDelta<'_>) -> Result<(), 
         // silently clobber whatever unrelated content is already there.
         let existing_at_target = read_if_present(&parent_path)?;
         if !safe_to_overwrite(existing_at_target.as_deref(), parent_blob.as_ref()) {
-            return Err(ApplyError::BinaryChanged);
+            return Err(ApplyError::ChangedSinceCommit);
         }
     }
 
@@ -442,23 +459,95 @@ fn delta_is_binary(repo: &Repository, delta: &git2::DiffDelta<'_>) -> bool {
         .any(|blob| blob.content().iter().take(SNIFF_LEN).any(|b| *b == 0))
 }
 
+/// Refuse a worktree apply that would DELETE a file whose content no longer
+/// matches the commit's own.
+///
+/// libgit2 does not check this for us, and cannot be made to: `apply_one` reads
+/// the preimage from the WORKTREE and never compares it against
+/// `delta->old_file.id`, then `git_apply__to_workdir` checks out with
+/// `baseline_index = preimage` — so the baseline matches the worktree by
+/// construction and even `GIT_CHECKOUT_SAFE` never reports a conflict. A
+/// deletion also carries no context lines, so the patch machinery has nothing to
+/// refuse on either. Reverting a commit that ADDED a file therefore deletes the
+/// worktree copy no matter what has happened to it since — including unstaged
+/// edits, content that exists in no commit, no index and nowhere in the odb.
+/// Real git refuses this ("does not match"); we have to do it ourselves.
+///
+/// The diff is reversed (see `action_diff`), so a `Deleted` delta is exactly
+/// "the commit added this file, reverting removes it", and the delta's OLD side
+/// is the commit's content. Same rule, same helpers, as the binary route's guard
+/// in `restore_binary`.
+///
+/// Fails closed: content is compared as raw bytes, so anything that makes the
+/// worktree copy differ from the blob (a checkout filter, a symlink read through)
+/// refuses the revert rather than silently deleting.
+fn guard_workdir_deletions(repo: &Repository, diff: &git2::Diff<'_>) -> Result<(), ApplyError> {
+    let workdir = repo.workdir().ok_or(ApplyError::Unsupported)?;
+    for delta in diff.deltas() {
+        if delta.status() != git2::Delta::Deleted {
+            continue;
+        }
+        let commit_side = delta.old_file();
+        let Some(rel) = commit_side.path() else {
+            return Err(ApplyError::Unsupported);
+        };
+        let current = read_if_present(&workdir.join(rel))?;
+        let commit_blob = repo.find_blob(commit_side.id()).ok();
+        if !content_matches(current.as_deref(), commit_blob.as_ref()) {
+            return Err(ApplyError::ChangedSinceCommit);
+        }
+    }
+    Ok(())
+}
+
+/// Apply `diff` to the worktree as a revert, guarding the deletions libgit2 would
+/// otherwise perform unconditionally. Shared by the whole-file and hunk routes —
+/// a hunk click on an added file reaches the very same deletion. The location is
+/// fixed rather than passed: `action_diff` maps Revert (and only Revert) to
+/// `ApplyLocation::WorkDir`, and only a revert may write the worktree.
+fn apply_revert_to_workdir(
+    repo: &Repository,
+    diff: &git2::Diff<'_>,
+    opts: Option<&mut ApplyOptions<'_>>,
+) -> Result<(), ApplyError> {
+    guard_workdir_deletions(repo, diff)?;
+    match repo.apply(diff, ApplyLocation::WorkDir, opts) {
+        // Exact-context matching, no fuzz: the surrounding lines have moved on.
+        Err(e) if e.code() == git2::ErrorCode::ApplyFail => Err(ApplyError::Stale),
+        Err(e) => Err(ApplyError::Git(e)),
+        Ok(()) => Ok(()),
+    }
+}
+
 /// Revert a whole file into the worktree. Text goes through the patch pipeline so
 /// later changes elsewhere in the file survive; binary content cannot (libgit2
 /// refuses to apply binary deltas from a diff object), so it takes the guarded blob
 /// restore instead.
+///
+/// The two routes are mutually exclusive, so a delta set carrying both is refused
+/// rather than half-done: the patch path applies the diff whole (it cannot skip
+/// the binary deltas), and the blob path only knows how to restore binaries.
+/// Reaching this needs the pathspec to match more than the clicked file, which
+/// `disable_pathspec_match` already rules out for literal paths.
 fn revert_file(
     repo: &Repository,
     req: &ApplyRequest,
     settings: DiffSettings,
 ) -> Result<(), ApplyError> {
-    let (diff, location, _) = action_diff(repo, req, settings)?;
+    let (diff, _, _) = action_diff(repo, req, settings)?;
+    if diff.deltas().len() == 0 {
+        // The regenerated, pathspec-filtered action diff has nothing for this
+        // request at all. Mirrors the hunk path's `any_hunk_matches` pre-check:
+        // an empty diff applies as a trivial no-op and would otherwise report
+        // `Ok(())` for a write that touched nothing.
+        return Err(ApplyError::Stale);
+    }
     let binary: Vec<_> = diff.deltas().filter(|d| delta_is_binary(repo, d)).collect();
     if binary.is_empty() {
-        return match repo.apply(&diff, location, None) {
-            Err(e) if e.code() == git2::ErrorCode::ApplyFail => Err(ApplyError::Stale),
-            Err(e) => Err(ApplyError::Git(e)),
-            Ok(()) => Ok(()),
-        };
+        return apply_revert_to_workdir(repo, &diff, None);
+    }
+    if binary.len() != diff.deltas().len() {
+        return Err(ApplyError::Unsupported);
     }
     for delta in &binary {
         restore_binary(repo, delta)?;
@@ -466,11 +555,55 @@ fn revert_file(
     Ok(())
 }
 
+/// Does any hunk of the freshly generated `diff` correspond to the clicked one?
+///
+/// Answered from `git2::Patch`, i.e. from the same generated hunks the apply
+/// callback would see, but *before* anything is written — because for some delta
+/// statuses libgit2 mutates without ever asking the callback (see
+/// `bypasses_hunk_callback`), so a decision taken from the callback's answers
+/// comes too late.
+fn any_hunk_matches(
+    diff: &git2::Diff<'_>,
+    clicked: &HunkRange,
+    reversed: bool,
+) -> Result<bool, ApplyError> {
+    for idx in 0..diff.deltas().len() {
+        // `None` = nothing to patch (a binary delta, or one with no content
+        // change): no hunks, so nothing here can match.
+        let Some(patch) = git2::Patch::from_diff(diff, idx)? else {
+            continue;
+        };
+        for h in 0..patch.num_hunks() {
+            let (hunk, _) = patch.hunk(h)?;
+            let generated = HunkRange {
+                old_start: hunk.old_start(),
+                old_lines: hunk.old_lines(),
+                new_start: hunk.new_start(),
+                new_lines: hunk.new_lines(),
+            };
+            if hunk_matches(clicked, &generated, reversed) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Does this diff contain a delta libgit2 applies without consulting the hunk
+/// callback? It skips `git_apply__patch` entirely for a `Deleted` delta, and
+/// `git_apply__to_index` removes a `Renamed` delta's old path outside the patch
+/// machinery too. For those, an acceptance count of zero is the expected outcome
+/// of a *successful* apply, so it must not be read as "nothing happened".
+fn bypasses_hunk_callback(diff: &git2::Diff<'_>) -> bool {
+    diff.deltas()
+        .any(|d| matches!(d.status(), git2::Delta::Deleted | git2::Delta::Renamed))
+}
+
 /// Perform one requested write.
 ///
 /// Whole-file requests take their own routes (Tasks 5 and 6); this is the hunk
-/// path: regenerate the diff, let libgit2 select the matching hunks through the
-/// apply callback, and apply.
+/// path: regenerate the diff, check the click still matches a real hunk, then let
+/// libgit2 apply through the callback that selects it.
 pub fn apply_request(
     repo: &Repository,
     req: &ApplyRequest,
@@ -511,13 +644,31 @@ pub fn apply_request(
     };
     let (diff, location, reversed) = action_diff(repo, req, settings)?;
 
-    // libgit2 returns Ok when the callback accepts nothing, so count acceptances:
-    // zero means the file moved on and the click is stale, not that it worked.
+    // Decide BEFORE mutating. The hunk callback cannot be the gate: libgit2 skips
+    // `git_apply__patch` — and with it the callback — whenever
+    // `delta->status == GIT_DELTA_DELETED`, and `git_apply__to_index` removes a
+    // DELETED/RENAMED old path before it ever consults the postimage. So a click
+    // that matches nothing can still delete a file, stage a deletion, or unstage
+    // an added entry, all while the acceptance count below reads zero and we
+    // report failure — a mutation the user was told did not happen.
+    //
+    // This works uniformly: for an Added/Deleted delta git still emits a hunk
+    // header (`@@ -0,0 +1,N @@`), so a genuine match proceeds and applies the whole
+    // delta — which for an add/delete IS the whole file, and is the right outcome.
+    if !any_hunk_matches(&diff, &clicked, reversed)? {
+        return Err(ApplyError::Stale);
+    }
+
+    // Second line of defence: libgit2 returns Ok when the callback accepts nothing,
+    // so count acceptances — zero means the click is stale, not that it worked.
     let accepted = Cell::new(0usize);
     let mut opts = ApplyOptions::new();
     opts.hunk_callback(|hunk| {
-        // A None hunk is the file-level callback; let it through.
-        let Some(hunk) = hunk else { return true };
+        // libgit2 calls this once per generated hunk and always with a real one
+        // (apply.c passes `&patch->hunks[i].hunk`), so `None` would mean that
+        // contract changed underneath us — decline rather than wave through a hunk
+        // we cannot identify.
+        let Some(hunk) = hunk else { return false };
         let generated = HunkRange {
             old_start: hunk.old_start(),
             old_lines: hunk.old_lines(),
@@ -531,12 +682,24 @@ pub fn apply_request(
         take
     });
 
-    match repo.apply(&diff, location, Some(&mut opts)) {
-        // Exact-context matching, no fuzz: the surrounding lines have moved on.
-        Err(e) if e.code() == git2::ErrorCode::ApplyFail => Err(ApplyError::Stale),
-        Err(e) => Err(ApplyError::Git(e)),
-        Ok(()) if accepted.get() == 0 => Err(ApplyError::Stale),
-        Ok(()) => Ok(()),
+    // A revert lands in the worktree, where a `Deleted` delta destroys whatever is
+    // on disk without checking it — the same guard the whole-file route needs.
+    let outcome = if matches!(location, ApplyLocation::WorkDir) {
+        apply_revert_to_workdir(repo, &diff, Some(&mut opts))
+    } else {
+        match repo.apply(&diff, location, Some(&mut opts)) {
+            // Exact-context matching, no fuzz: the surrounding lines have moved on.
+            Err(e) if e.code() == git2::ErrorCode::ApplyFail => Err(ApplyError::Stale),
+            Err(e) => Err(ApplyError::Git(e)),
+            Ok(()) => Ok(()),
+        }
+    };
+    match outcome {
+        // The pre-match said a hunk matched, so the callback must have accepted one
+        // — unless this delta never reaches the callback at all, in which case zero
+        // is the expected count and says nothing about whether the apply worked.
+        Ok(()) if accepted.get() == 0 && !bypasses_hunk_callback(&diff) => Err(ApplyError::Stale),
+        other => other,
     }
 }
 
@@ -599,7 +762,7 @@ mod tests {
     fn user_message_phrases_recognised_causes_in_plain_language() {
         for e in [
             ApplyError::Stale,
-            ApplyError::BinaryChanged,
+            ApplyError::ChangedSinceCommit,
             ApplyError::Unsupported,
         ] {
             let msg = e.user_message(ApplyAction::Revert, "src/main.rs");
@@ -1125,7 +1288,7 @@ mod tests {
         std::fs::write(&bin, [7u8, 7, 7, 7]).unwrap();
 
         let err = apply_request(&repo, &req(target, "b.bin", None), settings()).unwrap_err();
-        assert!(matches!(err, ApplyError::BinaryChanged), "{err:?}");
+        assert!(matches!(err, ApplyError::ChangedSinceCommit), "{err:?}");
         assert_eq!(std::fs::read(&bin).unwrap(), [7u8, 7, 7, 7], "left alone");
     }
 
@@ -1234,7 +1397,7 @@ mod tests {
             hunk: None,
         };
         let err = apply_request(&repo, &request, settings()).unwrap_err();
-        assert!(matches!(err, ApplyError::BinaryChanged), "{err:?}");
+        assert!(matches!(err, ApplyError::ChangedSinceCommit), "{err:?}");
 
         assert_eq!(
             std::fs::read(repo.workdir().unwrap().join("a.bin")).unwrap(),
@@ -1310,5 +1473,337 @@ mod tests {
             bin.symlink_metadata().is_err(),
             "reverting an added binary must delete it"
         );
+    }
+
+    #[test]
+    fn revert_file_keeps_a_later_change_elsewhere_in_the_same_file() {
+        // THE property the whole no-confirmation design rests on: a whole-file
+        // text revert is a reversed PATCH, not a checkout of the parent blob, so
+        // work done after the target commit — in the very same file — survives.
+        // Every other revert test asserts on a different file, which a
+        // blob-restore implementation would also pass.
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", &body(&[]), "base");
+        let target = commit_file(&repo, "f.txt", &body(&[5]), "edit line 5");
+        commit_file(&repo, "f.txt", &body(&[5, 17]), "later edit, same file");
+
+        apply_request(&repo, &req(target, "f.txt", None), settings()).unwrap();
+
+        let wd = read_file(&repo, "f.txt");
+        assert!(
+            !wd.contains("EDITED 5"),
+            "the target commit's change is undone"
+        );
+        assert!(
+            wd.contains("EDITED 17"),
+            "a LATER change to the same file must survive the revert"
+        );
+    }
+
+    #[test]
+    fn revert_file_returns_stale_rather_than_a_false_success_when_nothing_matches() {
+        // The hunk path already refuses (`any_hunk_matches`) when the regenerated
+        // diff has no matching hunk. The whole-file path used to have no
+        // equivalent check: a pathspec that matches nothing in this commit's own
+        // diff produces an empty `git2::Diff`, which both the deletion guard and
+        // `repo.apply` accept as a trivial no-op, so `revert_file` reported
+        // `Ok(())` for a write that touched nothing at all.
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "unrelated.txt", "x\n", "base");
+        let target = commit_file(&repo, "changed.txt", &body(&[]), "add changed.txt");
+
+        let outcome = apply_request(&repo, &req(target, "unrelated.txt", None), settings());
+
+        assert!(matches!(outcome, Err(ApplyError::Stale)), "{outcome:?}");
+        assert_eq!(
+            read_file(&repo, "unrelated.txt"),
+            "x\n",
+            "a file this commit never touched must be left alone"
+        );
+    }
+
+    /// The worktree content of `path`, or `None` when the file is gone — unlike
+    /// `read_file`, which panics on a deletion and so cannot tell a guard failure
+    /// from the destruction it was meant to prevent.
+    fn still_on_disk(repo: &git2::Repository, path: &str) -> Option<String> {
+        std::fs::read_to_string(repo.workdir().unwrap().join(path)).ok()
+    }
+
+    /// A commit that adds a 20-line text file, with the worktree copy then edited
+    /// but not staged: the shape where reverting means deleting a file whose
+    /// content exists in no commit, no index, and nowhere in the odb.
+    fn added_file_with_local_edits(repo: &git2::Repository) -> git2::Oid {
+        commit_file(repo, "unrelated.txt", "x\n", "base");
+        let target = commit_file(repo, "new.txt", &body(&[]), "add new.txt");
+        write_file(repo, "new.txt", &body(&[9]));
+        target
+    }
+
+    #[test]
+    fn revert_file_refuses_to_delete_a_file_changed_since_the_commit() {
+        // libgit2's apply reads the preimage from the WORKTREE and never compares
+        // it to delta->old_file.id, so an unguarded reversed apply deletes this
+        // file — unsaved work included — and reports success. Real git refuses.
+        let (_d, repo) = temp_repo();
+        let target = added_file_with_local_edits(&repo);
+
+        let outcome = apply_request(&repo, &req(target, "new.txt", None), settings());
+
+        // State first: the whole point is that nothing was destroyed. `read_to_string`
+        // is fallible on purpose — a deleted file must read as `None`, not a panic.
+        assert_eq!(
+            still_on_disk(&repo, "new.txt").as_deref(),
+            Some(body(&[9]).as_str()),
+            "the refusal must leave the worktree file untouched — it holds work that \
+             exists in no commit, no index, and nowhere in the odb"
+        );
+        assert!(
+            matches!(outcome, Err(ApplyError::ChangedSinceCommit)),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn revert_hunk_refuses_to_delete_a_file_changed_since_the_commit() {
+        // Same hazard through the hunk menu item: for an added file git still
+        // emits a hunk header (`@@ -0,0 +1,20 @@`), so the click matches and the
+        // apply deletes the whole file. The clicked range comes from the real
+        // displayed diff, exactly as the context menu builds it.
+        let (_d, repo) = temp_repo();
+        let target = added_file_with_local_edits(&repo);
+
+        let data = crate::diff::get_diff_data(
+            &repo,
+            target,
+            crate::diff::CommitKind::Real,
+            settings(),
+            &[],
+        );
+        let row = data
+            .lines
+            .iter()
+            .position(|l| l.kind == crate::diff::LineKind::Add)
+            .expect("the added file's body is in the diff");
+        let hunk = hunk_at_line(&data.lines, row).expect("that row is inside a hunk");
+
+        let outcome = apply_request(&repo, &req(target, "new.txt", Some(hunk)), settings());
+
+        assert_eq!(
+            still_on_disk(&repo, "new.txt").as_deref(),
+            Some(body(&[9]).as_str()),
+            "the refusal must leave the worktree file untouched — it holds work that \
+             exists in no commit, no index, and nowhere in the odb"
+        );
+        assert!(
+            matches!(outcome, Err(ApplyError::ChangedSinceCommit)),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_stale_hunk_click_on_a_deletion_stages_nothing() {
+        // libgit2 never runs the hunk callback for a DELETED delta, and
+        // git_apply__to_index drops the old path before it consults the
+        // postimage — so counting acceptances after the fact cannot prevent the
+        // mutation. Without the pre-match this stages the deletion and THEN
+        // reports failure: the worst possible pair.
+        let (dir, repo) = temp_repo();
+        commit_file(&repo, "f.txt", &body(&[]), "base");
+        std::fs::remove_file(repo.workdir().unwrap().join("f.txt")).unwrap();
+
+        let stale = hr(500, 5, 500, 5);
+        let err = apply_request(
+            &repo,
+            &req(oid_uncommitted(), "f.txt", Some(stale)),
+            settings(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ApplyError::Stale), "{err:?}");
+        // Reopened, because git_apply commits its own index writer: an in-memory
+        // handle could still show the pre-apply state.
+        let reopened = git2::Repository::open(dir.path()).unwrap();
+        assert_eq!(
+            index_blob(&reopened, "f.txt"),
+            body(&[]),
+            "a rejected click must not stage the deletion"
+        );
+    }
+
+    #[test]
+    fn a_stale_hunk_click_reverting_a_deletion_does_not_create_the_file() {
+        // Mirror of `a_stale_hunk_click_on_a_deletion_stages_nothing` for the
+        // OTHER shape any_hunk_matches was added to close: reverting a commit
+        // that DELETED a file produces an `Added` delta on the action diff —
+        // NOT in `bypasses_hunk_callback`'s set, so the hunk callback IS
+        // consulted. But an `Added` delta has no old-side content to
+        // preimage-match against, so libgit2 creates the (empty) file on disk
+        // before ever asking the callback whether to accept its one hunk —
+        // declining that hunk still leaves the empty file behind and returns
+        // Ok(()). Without the pre-match, the acceptance-count check only
+        // catches this AFTER that file already landed; any_hunk_matches must
+        // reject the click before `repo.apply` runs at all.
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", &body(&[]), "add f");
+        std::fs::remove_file(repo.workdir().unwrap().join("f.txt")).unwrap();
+        let target = {
+            let mut index = repo.index().unwrap();
+            index.remove_path(std::path::Path::new("f.txt")).unwrap();
+            crate::test_repo::commit_index(&repo, &mut index, "delete f")
+        };
+
+        // Nowhere near the real hunk, which restores lines 1..=20.
+        let stale = hr(500, 5, 500, 5);
+        let outcome = apply_request(&repo, &req(target, "f.txt", Some(stale)), settings());
+
+        assert!(matches!(outcome, Err(ApplyError::Stale)), "{outcome:?}");
+        assert!(
+            std::fs::read(repo.workdir().unwrap().join("f.txt")).is_err(),
+            "a rejected click must not create the empty file libgit2 would otherwise leave behind"
+        );
+    }
+
+    #[test]
+    fn stage_hunk_of_a_worktree_deletion_stages_the_deletion() {
+        // Pins the `bypasses_hunk_callback` carve-out: a worktree deletion is a
+        // `Deleted` delta on the STAGE route's own (non-reversed) diff.
+        // `git_apply__to_index` removes the old path outside the patch
+        // machinery, so a genuine match still ends with `accepted == 0` — the
+        // carve-out is what keeps that from being misread as "nothing
+        // happened". Deleting `&& !bypasses_hunk_callback(&diff)` turns this
+        // real success into a reported (but already-applied) failure.
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", &body(&[]), "base");
+        std::fs::remove_file(repo.workdir().unwrap().join("f.txt")).unwrap();
+
+        let data = crate::diff::get_working_tree_diff(&repo, settings(), &[]);
+        let row = data
+            .lines
+            .iter()
+            .position(|l| l.kind == crate::diff::LineKind::Del)
+            .expect("the deletion shows as removed lines");
+        let hunk = hunk_at_line(&data.lines, row).expect("that row is inside a hunk");
+
+        apply_request(
+            &repo,
+            &req(oid_uncommitted(), "f.txt", Some(hunk)),
+            settings(),
+        )
+        .unwrap();
+
+        let index = repo.index().unwrap();
+        assert!(
+            index.get_path(std::path::Path::new("f.txt"), 0).is_none(),
+            "the deletion must be staged"
+        );
+    }
+
+    #[test]
+    fn unstage_hunk_of_a_newly_added_staged_file_unstages_it() {
+        // Pins the `bypasses_hunk_callback` carve-out via the Index location
+        // instead of WorkDir: a newly staged file is `Added` on the display
+        // diff (HEAD -> index), so the UNSTAGE route's reversed action diff
+        // carries a `Deleted` delta — again a callback-bypassing status.
+        let (_d, repo) = temp_repo();
+        write_file(&repo, "new.txt", &body(&[]));
+        stage(&repo, "new.txt");
+
+        let data = crate::diff::get_staged_diff(&repo, settings(), &[]);
+        let row = data
+            .lines
+            .iter()
+            .position(|l| l.kind == crate::diff::LineKind::Add)
+            .expect("the whole new file shows as added lines");
+        let hunk = hunk_at_line(&data.lines, row).expect("that row is inside a hunk");
+
+        apply_request(&repo, &req(oid_staged(), "new.txt", Some(hunk)), settings()).unwrap();
+
+        let index = repo.index().unwrap();
+        assert!(
+            index.get_path(std::path::Path::new("new.txt"), 0).is_none(),
+            "the entry must be unstaged"
+        );
+        assert_eq!(
+            read_file(&repo, "new.txt"),
+            body(&[]),
+            "the worktree copy must survive untouched"
+        );
+    }
+
+    #[test]
+    fn revert_hunk_of_an_added_file_deletes_it() {
+        // Pins the `bypasses_hunk_callback` carve-out for the REVERT route: a
+        // commit that ADDS a file produces a `Deleted` delta on the reversed
+        // action diff — the same bypass case `guard_workdir_deletions`
+        // documents, exercised here through a click that genuinely matches
+        // (unlike `revert_hunk_refuses_to_delete_a_file_changed_since_the_commit`,
+        // the worktree here still matches the commit exactly, so the guard
+        // passes and the apply proceeds to a real, correct deletion).
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "unrelated.txt", "x\n", "base");
+        let target = commit_file(&repo, "new.txt", &body(&[]), "add new.txt");
+
+        let data = crate::diff::get_diff_data(
+            &repo,
+            target,
+            crate::diff::CommitKind::Real,
+            settings(),
+            &[],
+        );
+        let row = data
+            .lines
+            .iter()
+            .position(|l| l.kind == crate::diff::LineKind::Add)
+            .expect("the added file's body is in the diff");
+        let hunk = hunk_at_line(&data.lines, row).expect("that row is inside a hunk");
+
+        apply_request(&repo, &req(target, "new.txt", Some(hunk)), settings()).unwrap();
+
+        assert!(
+            still_on_disk(&repo, "new.txt").is_none(),
+            "reverting an added file's hunk must delete it"
+        );
+    }
+
+    #[test]
+    fn unstage_file_refuses_a_submodule_instead_of_staging_its_removal() {
+        // HEAD's entry for a gitlink is a Commit, not a Blob. Filtering it out
+        // and falling through to remove_path silently stages a submodule
+        // DELETION — a write nobody asked for.
+        let (_d, repo) = temp_repo();
+        let first = commit_file(&repo, "unrelated.txt", "x\n", "base");
+        let second = commit_file(&repo, "unrelated.txt", "y\n", "second");
+        let gitlink = |id: git2::Oid| git2::IndexEntry {
+            ctime: git2::IndexTime::new(0, 0),
+            mtime: git2::IndexTime::new(0, 0),
+            dev: 0,
+            ino: 0,
+            mode: 0o160_000,
+            uid: 0,
+            gid: 0,
+            file_size: 0,
+            id,
+            flags: 0,
+            flags_extended: 0,
+            path: b"sub".to_vec(),
+        };
+        // HEAD records the submodule at `first`; the index has it moved to
+        // `second` — a staged submodule bump, the thing being unstaged.
+        {
+            let mut index = repo.index().unwrap();
+            index.add(&gitlink(first)).unwrap();
+            crate::test_repo::commit_index(&repo, &mut index, "add submodule");
+            index.add(&gitlink(second)).unwrap();
+            index.write().unwrap();
+        }
+
+        let err = apply_request(&repo, &req(oid_staged(), "sub", None), settings()).unwrap_err();
+
+        assert!(matches!(err, ApplyError::Unsupported), "{err:?}");
+        let index = repo.index().unwrap();
+        let entry = index
+            .get_path(std::path::Path::new("sub"), 0)
+            .expect("the submodule entry must still be in the index");
+        assert_eq!(entry.id, second, "and must be left exactly as it was");
     }
 }
