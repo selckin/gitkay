@@ -39,13 +39,92 @@ impl ApplyAction {
 pub struct ApplyRequest {
     /// The row the diff belongs to — classified by `ApplyAction::of`.
     pub oid: git2::Oid,
-    /// Target file, new-side path (the identity key `FileEntry::path` uses).
-    pub path: String,
-    /// Rename/copy source, when the entry has one. Both sides must reach the
-    /// pathspec or the rename cannot be detected and the apply would add the new
-    /// file without removing the old.
-    pub old_path: Option<String>,
+    /// Target file, new-side path, as RAW BYTES — the identity key
+    /// `FileEntry::path_bytes` uses. Not the `String`: `FileEntry::path` is built
+    /// with `from_utf8_lossy` for display, so a non-UTF-8 name arrives with
+    /// U+FFFD where its bytes were. Used as a path it resolves to nothing, and
+    /// `index.remove_path` tolerates a miss — so the write reported success while
+    /// doing nothing at all. `display_path` derives the message string from these
+    /// bytes, rather than the two being stored separately and drifting.
+    pub path: Vec<u8>,
+    /// The rename/copy source the pane displayed, raw, exactly as it came from
+    /// the delta — NOT pre-filtered. `status` is what says whether acting on it
+    /// is right, and only `rename_source` below may answer that.
+    pub old_path: Option<Vec<u8>>,
+    /// The delta's status as the pane displayed it.
+    ///
+    /// Carried whole rather than pre-digested into flags, because more than one
+    /// decision needs it and they need different parts: whether `old_path` is a
+    /// rename's other half or a copy's bystander source, and whether a deletion
+    /// the worktree shows now is one the user actually saw. Reducing it to
+    /// booleans at the call site would mean a new flag — and a sweep of every
+    /// construction site — for the next status this layer has to tell apart.
+    pub status: git2::Delta,
     pub hunk: Option<HunkRange>,
+}
+
+impl ApplyRequest {
+    /// Build the request for a file the pane is displaying. The single place the
+    /// menu's rows become a write, so the tests exercise the same mapping the
+    /// context menu does instead of a parallel copy that can drift.
+    pub fn for_entry(
+        oid: git2::Oid,
+        file: &crate::diff::FileEntry,
+        hunk: Option<HunkRange>,
+    ) -> Self {
+        Self {
+            oid,
+            path: file.path_bytes.clone(),
+            old_path: file.old_path_bytes.clone(),
+            status: file.status,
+            hunk,
+        }
+    }
+
+    /// The old path of a genuine RENAME — never a copy's source.
+    ///
+    /// Both sides of a rename must reach the pathspec or the rename cannot be
+    /// detected and the apply would add the new file without removing the old. A
+    /// copy's source is the opposite case: a bystander that predates the change,
+    /// which must not be touched at all. `old_path` alone cannot tell them apart,
+    /// which is why the status travels with it.
+    pub fn rename_source(&self) -> Option<&[u8]> {
+        match self.status {
+            git2::Delta::Renamed => self.old_path.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Did the diff the user right-clicked show this file as deleted from the
+    /// worktree? Whole-file Stage records whatever the worktree holds when the
+    /// worker runs, so without this a file removed in the gap between the display
+    /// and the click — by a build script, a `git clean`, an editor — would be
+    /// staged as a DELETION that the pane never showed and the next commit would
+    /// carry out. Comparing against what was displayed is the only way to tell
+    /// that apart from a deletion the user is deliberately staging.
+    pub fn shown_deleted(&self) -> bool {
+        self.status == git2::Delta::Deleted
+    }
+
+    /// The target path for messages — the same lossy rendering the pane showed.
+    /// Derived, never stored: one source of truth (`path`) means the message can
+    /// never name a different file than the one that was written.
+    pub fn display_path(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.path)
+    }
+}
+
+/// A raw git path as a `Path`, without laundering it through a lossy `String`.
+///
+/// git stores paths as bytes and unix filesystems accept any byte but NUL and
+/// `/`, so a name need not be valid UTF-8; this is the free reinterpret that
+/// makes the whole write layer byte-exact. There is no portable equivalent, and
+/// no portable fallback is offered: a lossy one would silently reintroduce the
+/// "matches nothing, reports success" bug this exists to prevent. gitkay is
+/// unix-only anyway (see the `compile_error!` in main.rs).
+fn path_from_bytes(bytes: &[u8]) -> &std::path::Path {
+    use std::os::unix::ffi::OsStrExt;
+    std::path::Path::new(std::ffi::OsStr::from_bytes(bytes))
 }
 
 /// Why a write did not happen. Distinguished from a bare `git2::Error` so the
@@ -65,6 +144,17 @@ pub enum ApplyError {
     /// A target the write layer does not handle (submodule / gitlink, or a mixed
     /// binary+text delta set that neither route can carry on its own).
     Unsupported,
+    /// A hunk was clicked on a file the commit also renamed. libgit2 performs the
+    /// move outside the patch machinery, so applying any hunk of that delta
+    /// relocates the whole file — a whole-file mutation from a sub-file request.
+    /// Actionable rather than fatal: the whole-file action does exactly this, on
+    /// purpose.
+    RenameNeedsWholeFile,
+    /// The clicked hunk cannot be written on its own: with whitespace ignored the
+    /// pane split it out of a wider real hunk, and a hunk is indivisible, so
+    /// applying it would carry along edits the display never showed as changes.
+    /// Actionable rather than fatal — the same click works with the toggle off.
+    HiddenByWhitespace,
     Git(git2::Error),
 }
 
@@ -91,6 +181,17 @@ impl ApplyError {
                 format!("{verb} failed — {path} no longer matches that commit; nothing changed")
             }
             Self::Unsupported => format!("{verb} failed — {path} is not a supported target"),
+            // Names the action that DOES work, since the file itself is fine.
+            Self::RenameNeedsWholeFile => format!(
+                "{verb} failed — {path} was renamed, which moves the whole file; {} the file instead of a hunk",
+                verb.to_lowercase()
+            ),
+            // Says what to do about it: the click is fine, the whitespace toggle
+            // is what makes this hunk unwritable on its own.
+            Self::HiddenByWhitespace => format!(
+                "{verb} failed — {path}: this hunk also holds changes that \"ignore whitespace\" is hiding; turn it off to {} it",
+                verb.to_lowercase()
+            ),
             Self::Git(e) => format!("{verb} failed — {path}: {}", e.message()),
         }
     }
@@ -110,40 +211,66 @@ impl From<git2::Error> for ApplyError {
     }
 }
 
-/// Do two line ranges touch? A zero-length side (a pure insertion or deletion)
+/// A range's exclusive end. A zero-length side (a pure insertion or deletion)
 /// still occupies a position, so it counts as one line wide — otherwise a clicked
 /// insertion hunk could never match anything.
-const fn ranges_overlap(a_start: u32, a_lines: u32, b_start: u32, b_lines: u32) -> bool {
-    let a_end = a_start + if a_lines == 0 { 1 } else { a_lines };
-    let b_end = b_start + if b_lines == 0 { 1 } else { b_lines };
-    a_start < b_end && b_start < a_end
+const fn range_end(start: u32, lines: u32) -> u32 {
+    start + if lines == 0 { 1 } else { lines }
 }
 
-/// Does a freshly generated hunk correspond to the one the user clicked?
+/// The clicked range in the coordinates the generated diff uses.
 ///
 /// The clicked range comes from the *displayed* (forward) diff. When the action's
 /// diff is generated with `DiffOptions::reverse(true)`, libgit2 swaps the two sides
 /// of every header — verified: forward `@@ -8,6 +8,9 @@` becomes `@@ -8,9 +8,6 @@`
 /// — so the display's old side is the generated diff's NEW side.
-///
-/// Overlap rather than equality, because the display may have been built with
-/// ignore-whitespace on, which merges what git considers several hunks; every
-/// overlapping hunk is then part of what the user pointed at.
-pub const fn hunk_matches(clicked: &HunkRange, generated: &HunkRange, reversed: bool) -> bool {
+const fn generated_side(generated: &HunkRange, reversed: bool) -> (u32, u32) {
     if reversed {
-        ranges_overlap(
-            clicked.old_start,
-            clicked.old_lines,
-            generated.new_start,
-            generated.new_lines,
-        )
+        (generated.new_start, generated.new_lines)
     } else {
-        ranges_overlap(
-            clicked.old_start,
-            clicked.old_lines,
-            generated.old_start,
-            generated.old_lines,
-        )
+        (generated.old_start, generated.old_lines)
+    }
+}
+
+/// How a freshly generated hunk relates to the one the user clicked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HunkFit {
+    /// Nothing to do with the click.
+    Disjoint,
+    /// Exactly what was clicked, or less — safe to apply.
+    Within,
+    /// Overlaps the click but reaches beyond it. Applying it would write changes
+    /// the user did not point at, and a hunk is indivisible, so it cannot be
+    /// trimmed to fit.
+    Exceeds,
+}
+
+/// Classify a generated hunk against the clicked one.
+///
+/// Containment, not overlap. The clicked range is always a whole displayed hunk
+/// header (`hunk_at_line` parses the `@@` line), and the action diff is built
+/// with the display's own `context`, so in the ordinary case the two ranges are
+/// identical. Exactly one option diverges — `ignore_whitespace`, forced off for
+/// the action (a whitespace-ignored diff does not describe the real content and
+/// is unsafe to apply) — and it only ever makes the generated hunk WIDER:
+/// ignoring whitespace turns changed lines into context, which splits the
+/// display into narrower hunks and can never merge it. Verified: a file edited at
+/// lines 10 and 22 with a whitespace-only change at 16 displays as
+/// `@@ -7,7 @@` + `@@ -19,7 @@` but generates one `@@ -7,19 @@`.
+///
+/// So an overlapping-but-wider hunk is never "more of what the user pointed at";
+/// it is a different hunk's changes fused onto the clicked one by the whitespace
+/// the display was hiding. Taking it would stage an edit the user never clicked.
+pub const fn hunk_fit(clicked: &HunkRange, generated: &HunkRange, reversed: bool) -> HunkFit {
+    let (gen_start, gen_lines) = generated_side(generated, reversed);
+    let gen_end = range_end(gen_start, gen_lines);
+    let click_end = range_end(clicked.old_start, clicked.old_lines);
+    if gen_end <= clicked.old_start || click_end <= gen_start {
+        HunkFit::Disjoint
+    } else if clicked.old_start <= gen_start && gen_end <= click_end {
+        HunkFit::Within
+    } else {
+        HunkFit::Exceeds
     }
 }
 
@@ -161,18 +288,32 @@ use std::cell::Cell;
 /// sides of a rename — `apply_pathspec` filters deltas before `detect_similar`
 /// runs, so a one-path pathspec would drop the delete side, leave the rename
 /// undetected, and add the new file without removing the old.
-fn action_diff_opts(req: &ApplyRequest, settings: DiffSettings, reversed: bool) -> DiffOptions {
+///
+/// A rename, and only a rename: `req.rename_source()` is `None` for a copy (see
+/// `ApplyRequest::rename_source`). Widening the pathspec to a copy's source would
+/// pull that bystander file's OWN delta into the diff, and every route here
+/// applies the diff whole — so a revert would undo an unrelated file's changes
+/// and a hunk click would have two files' hunks to choose between.
+fn action_diff_opts(
+    req: &ApplyRequest,
+    settings: DiffSettings,
+    reversed: bool,
+    ignore_ws: bool,
+) -> DiffOptions {
     let mut opts = DiffOptions::new();
     opts.context_lines(settings.context)
-        .ignore_whitespace(false)
+        .ignore_whitespace(ignore_ws)
         .reverse(reversed);
-    // req.path/old_path are literal paths lifted straight from the diff's own
+    // req.path/rename_source are literal paths lifted straight from the diff's own
     // file list (FileEntry::path), never a user-typed glob — disable fnmatch so
     // a filename containing `[`, `*` or `?` cannot also match an unrelated
     // sibling (e.g. pathspec "a[1].bin" would otherwise match "a1.bin" too).
     opts.disable_pathspec_match(true);
-    opts.pathspec(&req.path);
-    if let Some(old) = &req.old_path {
+    // Byte pathspecs: git2 takes `&[u8]` directly, so a non-UTF-8 name reaches
+    // libgit2 exactly as git stored it rather than as U+FFFD placeholders that
+    // would match no delta at all.
+    opts.pathspec(req.path.as_slice());
+    if let Some(old) = req.rename_source() {
         opts.pathspec(old);
     }
     opts
@@ -192,10 +333,11 @@ fn action_diff<'r>(
     repo: &'r Repository,
     req: &ApplyRequest,
     settings: DiffSettings,
+    ignore_ws: bool,
 ) -> Result<(git2::Diff<'r>, ApplyLocation, bool), ApplyError> {
     let action = ApplyAction::of(req.oid);
     let reversed = !matches!(action, ApplyAction::Stage);
-    let mut opts = action_diff_opts(req, settings, reversed);
+    let mut opts = action_diff_opts(req, settings, reversed, ignore_ws);
     let (mut diff, location) = match action {
         ApplyAction::Stage => (worktree_git_diff(repo, &mut opts)?, ApplyLocation::Index),
         ApplyAction::Unstage => (staged_git_diff(repo, &mut opts)?, ApplyLocation::Index),
@@ -221,22 +363,65 @@ fn action_diff<'r>(
 /// Takes the caller's `Index` rather than opening its own: a rename routes through
 /// two calls (old path removed, new path added) that must land on one handle so the
 /// caller can write it once, atomically — see `apply_request`'s routing.
-fn stage_file(repo: &Repository, index: &mut git2::Index, path: &str) -> Result<(), ApplyError> {
-    let p = std::path::Path::new(path);
+fn stage_file(
+    repo: &Repository,
+    index: &mut git2::Index,
+    path: &[u8],
+    shown_deleted: bool,
+) -> Result<(), ApplyError> {
+    let p = path_from_bytes(path);
+    let workdir = repo.workdir().ok_or(ApplyError::Unsupported)?;
     // `Path::exists()` follows symlinks, so a symlink whose target is currently
     // missing reads as "gone" even though the symlink itself is present and
     // tracked — that would silently take the remove branch below instead of
     // staging the symlink. `symlink_metadata` is lstat-based and does not follow
     // the link, so a dangling symlink still reports present.
-    if repo
-        .workdir()
-        .is_some_and(|w| w.join(path).symlink_metadata().is_ok())
-    {
+    //
+    // Only NotFound means "gone", for the same reason `read_if_present` splits
+    // the buckets: lstat also fails with EACCES (an unsearchable parent
+    // directory), ELOOP (a symlink cycle in a parent component) and ESTALE, none
+    // of which say the file was deleted. Folding those in would record a staged
+    // DELETION of a file that is still there and report it as a success — and
+    // the next commit would carry it out.
+    // The check runs in BOTH directions: what the worktree holds now has to
+    // agree with what the pane displayed, or the write is not the one the user
+    // asked for. Gone-but-shown-present would stage a DELETION they never saw;
+    // present-but-shown-deleted would stage CONTENT they never saw (a build
+    // script regenerating the file in the gap is the ordinary way that happens).
+    // Either way the diff has moved on, so refuse — the same "decide before
+    // mutating" rule the other routes keep.
+    let present = match workdir.join(p).symlink_metadata() {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(io_error(&e)),
+    };
+    if present == shown_deleted {
+        return Err(ApplyError::Stale);
+    }
+    if present {
         index.add_path(p)?;
     } else {
         index.remove_path(p)?;
     }
     Ok(())
+}
+
+/// HEAD's tree for a write: `Ok(None)` ONLY for a genuinely unborn HEAD.
+///
+/// `diff::head_tree` returns `Option` and folds every failure into `None`, which
+/// is right for a display (show nothing) and wrong for a write: `unstage_file`
+/// reads `None` as "HEAD has no such file" and drops the index entry, so a HEAD
+/// that merely could not be read would stage the DELETION of a tracked file and
+/// report success. Only `UnbornBranch` means "there is no HEAD commit yet"; a
+/// corrupt ref file reports `GenericError` and a HEAD pointing at a missing
+/// object fails when peeling — both are real failures and must surface.
+fn head_tree_for_write(repo: &Repository) -> Result<Option<git2::Tree<'_>>, ApplyError> {
+    let head = match repo.head() {
+        Ok(head) => head,
+        Err(e) if e.code() == git2::ErrorCode::UnbornBranch => return Ok(None),
+        Err(e) => return Err(ApplyError::Git(e)),
+    };
+    Ok(Some(head.peel_to_commit()?.tree()?))
 }
 
 /// Unstage a whole file: put HEAD's version of it back in the index, or drop the
@@ -251,12 +436,25 @@ fn stage_file(repo: &Repository, index: &mut git2::Index, path: &str) -> Result<
 /// Takes the caller's `Index` rather than opening its own — same reason as
 /// `stage_file`: a rename touches two paths and the caller writes both mutations
 /// once, atomically.
-fn unstage_file(repo: &Repository, index: &mut git2::Index, path: &str) -> Result<(), ApplyError> {
-    let p = std::path::Path::new(path);
-    let head_entry = crate::diff::head_tree(repo).and_then(|tree| tree.get_path(p).ok());
+fn unstage_file(repo: &Repository, index: &mut git2::Index, path: &[u8]) -> Result<(), ApplyError> {
+    let p = path_from_bytes(path);
+    let head_entry = head_tree_for_write(repo)?.and_then(|tree| tree.get_path(p).ok());
 
     match head_entry {
         Some(entry) if entry.kind() == Some(git2::ObjectType::Blob) => {
+            // Drop any conflict stages first. `index.add` below replaces an entry
+            // with the same path AND stage, so on a path left unmerged by a merge
+            // it would insert a stage-0 entry alongside the surviving stages 1/2/3
+            // — an index that reads as both resolved and conflicted, which `git
+            // status` still calls unmerged and `git commit` still refuses, while
+            // we reported the unstage as done. Removing all stages first makes the
+            // restore below the file's only entry. (`stage_file` needs no
+            // equivalent: `index.add_path` moves conflict entries to the REUC
+            // itself. The `None` arm below is safe too — `git_index_remove_bypath`
+            // already drops every stage.)
+            if index.has_conflicts() && index.conflict_get(p).is_ok() {
+                index.conflict_remove(p)?;
+            }
             // Zeroed stat fields: git re-checks the worktree on the next status,
             // which is exactly right — the file may or may not still match HEAD.
             index.add(&git2::IndexEntry {
@@ -264,14 +462,21 @@ fn unstage_file(repo: &Repository, index: &mut git2::Index, path: &str) -> Resul
                 mtime: git2::IndexTime::new(0, 0),
                 dev: 0,
                 ino: 0,
-                mode: entry.filemode_raw().try_into().unwrap_or(0o100_644),
+                // `filemode()`, not `filemode_raw()`: the raw value is whatever
+                // the tree literally recorded, and trees in the wild carry modes
+                // outside git's canonical five (a `100664` from an older
+                // importer, say). `git_index_add` rejects those outright, so the
+                // raw mode turned a routine unstage into "invalid entry mode".
+                // `filemode()` normalizes exactly as git does when it reads a
+                // tree, which is also what preserves the executable bit.
+                mode: entry.filemode().try_into().unwrap_or(0o100_644),
                 uid: 0,
                 gid: 0,
                 file_size: 0,
                 id: entry.id(),
                 flags: 0,
                 flags_extended: 0,
-                path: path.as_bytes().to_vec(),
+                path: path.to_vec(),
             })?;
         }
         Some(_) => return Err(ApplyError::Unsupported),
@@ -280,25 +485,64 @@ fn unstage_file(repo: &Repository, index: &mut git2::Index, path: &str) -> Resul
     Ok(())
 }
 
-/// Read a file for the binary-restore guard. A genuinely absent file
-/// (`NotFound`) reads as `Ok(None)`; any other IO error (permissions, ...) is a
-/// real failure and must be reported, not folded into the same "absent" bucket
-/// the guard treats as safe — an unreadable-but-present file must not read as
-/// "the commit deleted it".
-fn read_if_present(path: &std::path::Path) -> Result<Option<Vec<u8>>, ApplyError> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(io_error(&e)),
+/// What a worktree path holds, as far as the destructive-path guards care.
+///
+/// The third case is the point: a path can be occupied by something that is not
+/// a regular file, and folding that into either of the other two is unsafe in
+/// opposite directions.
+enum WorktreeContent {
+    /// Nothing is there.
+    Absent,
+    /// A regular file, identified by the blob oid its bytes would hash to —
+    /// never the bytes themselves. The guards only ever ask "is this the
+    /// commit's blob?", and hashing answers that by streaming the file in
+    /// constant memory. Holding the content instead meant every revert of a
+    /// large asset allocated it whole (twice, with `blob.content()`) just to
+    /// decide whether to proceed.
+    Blob(git2::Oid),
+    /// A symlink, directory, socket, … — present, but not the blob and not
+    /// something this layer may write through.
+    Other,
+}
+
+/// Read a worktree path for a guard, WITHOUT following a symlink.
+///
+/// `std::fs::read` follows links, and so do `std::fs::write` and
+/// `set_permissions` — so a guard that reads through a link validates one file
+/// while the write lands on another. With a link into a shared store whose
+/// target happens to hold the committed bytes, the guard passes and the restore
+/// then overwrites and chmods a file OUTSIDE the working tree, while the repo
+/// path is untouched and still reported as reverted. lstat first, and treat
+/// anything that is not a regular file as `Other`, which no comparison accepts.
+///
+/// A genuinely absent path (`NotFound`) is `Absent`; any other IO error
+/// (permissions, ELOOP, ...) is a real failure and must be reported, not folded
+/// into the "absent" bucket the guards treat as safe — an unreadable-but-present
+/// file must not read as "the commit deleted it". Same split `stage_file` makes.
+fn worktree_content(path: &std::path::Path) -> Result<WorktreeContent, ApplyError> {
+    match path.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(WorktreeContent::Absent),
+        Err(e) => return Err(io_error(&e)),
+        Ok(md) if !md.is_file() => return Ok(WorktreeContent::Other),
+        Ok(_) => {}
+    }
+    // Streams the file; no filters are applied, so this is the hash of the raw
+    // bytes on disk — the same comparison a byte-for-byte read would make.
+    match git2::Oid::hash_file(git2::ObjectType::Blob, path) {
+        Ok(oid) => Ok(WorktreeContent::Blob(oid)),
+        // Raced away between the lstat and the hash.
+        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(WorktreeContent::Absent),
+        Err(e) => Err(ApplyError::Git(e)),
     }
 }
 
 /// Does on-disk content match a blob, treating "neither exists" as a match too
-/// (the commit-deleted-it / parent-never-had-it case)?
-fn content_matches(on_disk: Option<&[u8]>, blob: Option<&git2::Blob<'_>>) -> bool {
+/// (the commit-deleted-it / parent-never-had-it case)? `Other` never matches:
+/// whatever is there, it is not the blob.
+fn content_matches(on_disk: &WorktreeContent, blob: Option<&git2::Blob<'_>>) -> bool {
     match (on_disk, blob) {
-        (Some(bytes), Some(blob)) => bytes == blob.content(),
-        (None, None) => true,
+        (WorktreeContent::Blob(oid), Some(blob)) => *oid == blob.id(),
+        (WorktreeContent::Absent, None) => true,
         _ => false,
     }
 }
@@ -306,11 +550,17 @@ fn content_matches(on_disk: Option<&[u8]>, blob: Option<&git2::Blob<'_>>) -> boo
 /// Is it safe to write `blob` over whatever is currently at a path? Yes if
 /// nothing is there yet (the common rename-revert case — the pre-rename path
 /// is expected to be empty), or if what's there already matches `blob` byte
-/// for byte (writing it again is a no-op). Refused only when something
-/// *different* already occupies the path — an untracked file the write would
-/// otherwise clobber unseen.
-fn safe_to_overwrite(existing: Option<&[u8]>, blob: Option<&git2::Blob<'_>>) -> bool {
-    existing.is_none_or(|bytes| blob.is_some_and(|blob| bytes == blob.content()))
+/// for byte (writing it again is a no-op). Refused when something *different*
+/// already occupies the path — an untracked file the write would otherwise
+/// clobber unseen — and refused for `Other`, where the write would not even land
+/// on this path (a dangling symlink here would otherwise read as "nothing is
+/// there" and the write would create the link's target instead).
+fn safe_to_overwrite(existing: &WorktreeContent, blob: Option<&git2::Blob<'_>>) -> bool {
+    match existing {
+        WorktreeContent::Absent => true,
+        WorktreeContent::Blob(oid) => blob.is_some_and(|blob| *oid == blob.id()),
+        WorktreeContent::Other => false,
+    }
 }
 
 /// Write a binary delta's parent-side blob back into the worktree, or delete the
@@ -342,11 +592,11 @@ fn restore_binary(repo: &Repository, delta: &git2::DiffDelta<'_>) -> Result<(), 
     // What the commit left behind must still be what is on disk.
     let current = commit_path
         .as_deref()
-        .map(read_if_present)
+        .map(worktree_content)
         .transpose()?
-        .flatten();
+        .unwrap_or(WorktreeContent::Absent);
     let commit_blob = repo.find_blob(commit_side.id()).ok();
-    if !content_matches(current.as_deref(), commit_blob.as_ref()) {
+    if !content_matches(&current, commit_blob.as_ref()) {
         return Err(ApplyError::ChangedSinceCommit);
     }
 
@@ -370,8 +620,8 @@ fn restore_binary(repo: &Repository, delta: &git2::DiffDelta<'_>) -> Result<(), 
         // The guard above only ever validated the commit-side path. The write
         // below lands on this second, different path — refuse rather than
         // silently clobber whatever unrelated content is already there.
-        let existing_at_target = read_if_present(&parent_path)?;
-        if !safe_to_overwrite(existing_at_target.as_deref(), parent_blob.as_ref()) {
+        let existing_at_target = worktree_content(&parent_path)?;
+        if !safe_to_overwrite(&existing_at_target, parent_blob.as_ref()) {
             return Err(ApplyError::ChangedSinceCommit);
         }
     }
@@ -383,7 +633,6 @@ fn restore_binary(repo: &Repository, delta: &git2::DiffDelta<'_>) -> Result<(), 
                 std::fs::create_dir_all(parent).map_err(|e| io_error(&e))?;
             }
             std::fs::write(&parent_path, blob.content()).map_err(|e| io_error(&e))?;
-            #[cfg(unix)]
             {
                 // `std::fs::write` preserves an existing file's mode, but creates a
                 // new one at `0o666 & ~umask` — flip only the execute bits on
@@ -481,6 +730,19 @@ fn delta_is_binary(repo: &Repository, delta: &git2::DiffDelta<'_>) -> bool {
 /// Fails closed: content is compared as raw bytes, so anything that makes the
 /// worktree copy differ from the blob (a checkout filter, a symlink read through)
 /// refuses the revert rather than silently deleting.
+///
+/// Unscoped on purpose — unlike `best_hunk_fit` / `delta_callback` /
+/// `bypasses_hunk_callback`, this does NOT filter to the clicked path, because
+/// "target" is a property of the route and not of the diff: the whole-file route
+/// applies the diff whole, so every delta in it is the target. The hunk route
+/// shares it, and there the guard leans on a property `action_diff_opts` owns:
+/// the pathspec holds at most `{path, rename_source}`, so the only possible
+/// non-target delta is a rename SOURCE — and in the reversed diff a rename
+/// source can only appear as `Added` (it was `Deleted` forward), never as the
+/// `Deleted` this scans for. A reversed-`Deleted` on it would mean the commit
+/// created that path, contradicting the `Renamed` status that admitted it to the
+/// pathspec. So the unfilterable case cannot arise; add a third pathspec entry
+/// and that stops being true.
 fn guard_workdir_deletions(repo: &Repository, diff: &git2::Diff<'_>) -> Result<(), ApplyError> {
     let workdir = repo.workdir().ok_or(ApplyError::Unsupported)?;
     for delta in diff.deltas() {
@@ -491,11 +753,41 @@ fn guard_workdir_deletions(repo: &Repository, diff: &git2::Diff<'_>) -> Result<(
         let Some(rel) = commit_side.path() else {
             return Err(ApplyError::Unsupported);
         };
-        let current = read_if_present(&workdir.join(rel))?;
+        let current = worktree_content(&workdir.join(rel))?;
         let commit_blob = repo.find_blob(commit_side.id()).ok();
-        if !content_matches(current.as_deref(), commit_blob.as_ref()) {
+        if !content_matches(&current, commit_blob.as_ref()) {
             return Err(ApplyError::ChangedSinceCommit);
         }
+    }
+    Ok(())
+}
+
+/// Refuse a worktree apply carrying an entry the patch pipeline cannot express,
+/// BEFORE it fails in a way that misdescribes itself.
+///
+/// - A **symlink**: libgit2's workdir reader resolves the path, so it reads the
+///   *target file's* bytes where the patch expects the link text. The context
+///   can never line up, and the apply comes back `GIT_EAPPLYFAIL` — which
+///   `apply_diff` maps to `Stale`, telling the user the file "has changed since
+///   this diff was shown" about a link that is byte-identical to the commit's.
+///   Every symlink change would be permanently un-revertable, with a false
+///   reason each time.
+/// - A **gitlink** (submodule): there is no blob to patch at all, and the path
+///   is a directory when checked out, so the deletion guard's read fails with a
+///   raw `Is a directory (os error 21)` — or, when the submodule is not checked
+///   out, passes and lets the apply report a success that changed nothing.
+///
+/// Both are honestly `Unsupported`: the write layer does not do them, and saying
+/// so is the one answer that neither lies nor destroys anything. Only the
+/// worktree routes need this — `index.add_path` records a symlink or a gitlink
+/// correctly, so Stage/Unstage are unaffected.
+fn refuse_unwritable_modes(diff: &git2::Diff<'_>) -> Result<(), ApplyError> {
+    let unwritable = |m: git2::FileMode| matches!(m, git2::FileMode::Link | git2::FileMode::Commit);
+    if diff
+        .deltas()
+        .any(|d| unwritable(d.old_file().mode()) || unwritable(d.new_file().mode()))
+    {
+        return Err(ApplyError::Unsupported);
     }
     Ok(())
 }
@@ -510,8 +802,20 @@ fn apply_revert_to_workdir(
     diff: &git2::Diff<'_>,
     opts: Option<&mut ApplyOptions<'_>>,
 ) -> Result<(), ApplyError> {
+    refuse_unwritable_modes(diff)?;
     guard_workdir_deletions(repo, diff)?;
-    match repo.apply(diff, ApplyLocation::WorkDir, opts) {
+    apply_diff(repo, diff, ApplyLocation::WorkDir, opts)
+}
+
+/// `repo.apply`, with libgit2's "the patch did not fit" mapped to `Stale`.
+/// Shared so the two apply sites cannot classify the same failure differently.
+fn apply_diff(
+    repo: &Repository,
+    diff: &git2::Diff<'_>,
+    location: ApplyLocation,
+    opts: Option<&mut ApplyOptions<'_>>,
+) -> Result<(), ApplyError> {
+    match repo.apply(diff, location, opts) {
         // Exact-context matching, no fuzz: the surrounding lines have moved on.
         Err(e) if e.code() == git2::ErrorCode::ApplyFail => Err(ApplyError::Stale),
         Err(e) => Err(ApplyError::Git(e)),
@@ -534,10 +838,10 @@ fn revert_file(
     req: &ApplyRequest,
     settings: DiffSettings,
 ) -> Result<(), ApplyError> {
-    let (diff, _, _) = action_diff(repo, req, settings)?;
+    let (diff, _, _) = action_diff(repo, req, settings, false)?;
     if diff.deltas().len() == 0 {
         // The regenerated, pathspec-filtered action diff has nothing for this
-        // request at all. Mirrors the hunk path's `any_hunk_matches` pre-check:
+        // request at all. Mirrors the hunk path's `best_hunk_fit` pre-check:
         // an empty diff applies as a trivial no-op and would otherwise report
         // `Ok(())` for a write that touched nothing.
         return Err(ApplyError::Stale);
@@ -555,19 +859,53 @@ fn revert_file(
     Ok(())
 }
 
-/// Does any hunk of the freshly generated `diff` correspond to the clicked one?
+/// Is this delta the file whose hunk was clicked?
+///
+/// A hunk click identifies a position in ONE file, but `hunk_fit` compares
+/// line numbers only — it has no path — so without this the clicked range can be
+/// satisfied by an equally-numbered hunk in a different delta. The action
+/// pathspec holds two paths whenever the pane showed a rename, and those two
+/// paths do not always come back as one coalesced `Renamed` delta: if the old
+/// path exists again by the time the worker runs, `find_similar` has no deletion
+/// to pair up and the diff arrives as two independent deltas sitting at the same
+/// line numbers.
+///
+/// Either side is accepted because a reversed diff (Unstage, Revert) swaps them:
+/// a rename's delta carries the clicked file on its old side there, not its new.
+fn delta_is_target(delta: &git2::DiffDelta<'_>, path: &[u8]) -> bool {
+    // Compared as bytes, like every other identity check here.
+    [delta.new_file().path_bytes(), delta.old_file().path_bytes()]
+        .into_iter()
+        .flatten()
+        .any(|p| p == path)
+}
+
+/// How the freshly generated `diff`'s best-fitting hunk relates to the clicked one.
 ///
 /// Answered from `git2::Patch`, i.e. from the same generated hunks the apply
 /// callback would see, but *before* anything is written — because for some delta
 /// statuses libgit2 mutates without ever asking the callback (see
 /// `bypasses_hunk_callback`), so a decision taken from the callback's answers
 /// comes too late.
-fn any_hunk_matches(
+///
+/// `Exceeds` beats `Disjoint`: if nothing fits but something overlapped, the
+/// click was not stale — it landed on a hunk the whitespace setting made
+/// unwritable, which is a different thing to tell the user.
+fn best_hunk_fit(
     diff: &git2::Diff<'_>,
     clicked: &HunkRange,
     reversed: bool,
-) -> Result<bool, ApplyError> {
-    for idx in 0..diff.deltas().len() {
+    path: &[u8],
+) -> Result<HunkFit, ApplyError> {
+    let mut best = HunkFit::Disjoint;
+    for (idx, delta) in diff.deltas().enumerate() {
+        // Same file-identity gate the apply's `delta_callback` enforces — the
+        // pre-check must agree with it, or it would green-light a write that the
+        // callback then declines (reported as a spurious `Stale`), or worse pass
+        // on a match found in a file the click never pointed at.
+        if !delta_is_target(&delta, path) {
+            continue;
+        }
         // `None` = nothing to patch (a binary delta, or one with no content
         // change): no hunks, so nothing here can match.
         let Some(patch) = git2::Patch::from_diff(diff, idx)? else {
@@ -575,18 +913,14 @@ fn any_hunk_matches(
         };
         for h in 0..patch.num_hunks() {
             let (hunk, _) = patch.hunk(h)?;
-            let generated = HunkRange {
-                old_start: hunk.old_start(),
-                old_lines: hunk.old_lines(),
-                new_start: hunk.new_start(),
-                new_lines: hunk.new_lines(),
-            };
-            if hunk_matches(clicked, &generated, reversed) {
-                return Ok(true);
+            match hunk_fit(clicked, &(&hunk).into(), reversed) {
+                HunkFit::Within => return Ok(HunkFit::Within),
+                HunkFit::Exceeds => best = HunkFit::Exceeds,
+                HunkFit::Disjoint => {}
             }
         }
     }
-    Ok(false)
+    Ok(best)
 }
 
 /// Does this diff contain a delta libgit2 applies without consulting the hunk
@@ -594,8 +928,14 @@ fn any_hunk_matches(
 /// `git_apply__to_index` removes a `Renamed` delta's old path outside the patch
 /// machinery too. For those, an acceptance count of zero is the expected outcome
 /// of a *successful* apply, so it must not be read as "nothing happened".
-fn bypasses_hunk_callback(diff: &git2::Diff<'_>) -> bool {
+/// Restricted to the clicked file, like the two gates it backs up. A delta that
+/// is not the target never reaches the callback anyway — `delta_callback`
+/// declines it first — so letting an unrelated `Deleted` delta answer this would
+/// waive the acceptance-count check for a target that does consult the callback,
+/// which is precisely the split-rename diff this gating exists to handle.
+fn bypasses_hunk_callback(diff: &git2::Diff<'_>, path: &[u8]) -> bool {
     diff.deltas()
+        .filter(|d| delta_is_target(d, path))
         .any(|d| matches!(d.status(), git2::Delta::Deleted | git2::Delta::Renamed))
 }
 
@@ -617,23 +957,28 @@ pub fn apply_request(
         // rename that touches two paths must not leave the index half-migrated on
         // disk if the second mutation fails.
         return match action {
-            ApplyAction::Stage => {
+            // One shell for both index routes. They differ only in which helper
+            // runs; the shape around it — open the index, act on the rename's old
+            // path and then the new one, write ONCE — is the atomicity guarantee,
+            // and it has to stay identical for the two. Written twice it drifted
+            // (the staleness check landed on Stage alone), so it is written once.
+            ApplyAction::Stage | ApplyAction::Unstage => {
+                let staging = matches!(action, ApplyAction::Stage);
+                let act = |index: &mut git2::Index, path: &[u8], shown_deleted: bool| {
+                    if staging {
+                        stage_file(repo, index, path, shown_deleted)
+                    } else {
+                        unstage_file(repo, index, path)
+                    }
+                };
                 let mut index = repo.index()?;
-                if let Some(old) = &req.old_path {
-                    stage_file(repo, &mut index, old)?;
+                if let Some(old) = req.rename_source() {
+                    // A rename's old path is gone from the worktree BY
+                    // DEFINITION — that absence is the rename's delete half, not
+                    // a stale diff — so it is always "shown deleted".
+                    act(&mut index, old, true)?;
                 }
-                stage_file(repo, &mut index, &req.path)?;
-                // Our own index mutation, so unlike repo.apply this needs an
-                // explicit write.
-                index.write()?;
-                Ok(())
-            }
-            ApplyAction::Unstage => {
-                let mut index = repo.index()?;
-                if let Some(old) = &req.old_path {
-                    unstage_file(repo, &mut index, old)?;
-                }
-                unstage_file(repo, &mut index, &req.path)?;
+                act(&mut index, &req.path, req.shown_deleted())?;
                 // Our own index mutation, so unlike repo.apply this needs an
                 // explicit write.
                 index.write()?;
@@ -642,7 +987,7 @@ pub fn apply_request(
             ApplyAction::Revert => revert_file(repo, req, settings),
         };
     };
-    let (diff, location, reversed) = action_diff(repo, req, settings)?;
+    let (diff, location, reversed) = action_diff(repo, req, settings, false)?;
 
     // Decide BEFORE mutating. The hunk callback cannot be the gate: libgit2 skips
     // `git_apply__patch` — and with it the callback — whenever
@@ -655,27 +1000,68 @@ pub fn apply_request(
     // This works uniformly: for an Added/Deleted delta git still emits a hunk
     // header (`@@ -0,0 +1,N @@`), so a genuine match proceeds and applies the whole
     // delta — which for an add/delete IS the whole file, and is the right outcome.
-    if !any_hunk_matches(&diff, &clicked, reversed)? {
-        return Err(ApplyError::Stale);
+    //
+    // A RENAME is not that case. libgit2 performs the move outside the patch
+    // machinery — `git_apply__to_index` removes the old path itself, and the
+    // workdir route checks out both sides — so however few hunks the callback
+    // accepts, applying a `Renamed` delta relocates the whole file. That is a
+    // whole-file mutation from a sub-file request: "Revert hunk" on one hunk of
+    // a renamed file would move the file back, and "Unstage hunk" would unstage
+    // the rename. Neither is what was clicked, and neither is reversible by
+    // clicking again, so refuse and let the user act on the file instead.
+    if diff
+        .deltas()
+        .filter(|d| delta_is_target(d, &req.path))
+        .any(|d| d.status() == git2::Delta::Renamed)
+    {
+        return Err(ApplyError::RenameNeedsWholeFile);
+    }
+
+    match best_hunk_fit(&diff, &clicked, reversed, &req.path)? {
+        HunkFit::Within => {}
+        // Overlapped, but every candidate reaches past the click — see `hunk_fit`.
+        // Two different causes produce that, and they need opposite advice: the
+        // display split the hunk (whitespace), or the file moved on (stale).
+        // `Exceeds` alone cannot tell them apart, so ASK: regenerate the diff the
+        // way the pane built it — whitespace included — and see whether the
+        // clicked hunk still fits there. If it does, the display is current and
+        // whitespace is the only thing that widened the action diff. If it does
+        // not, the diff has moved on and whitespace is irrelevant; blaming it
+        // would send the user to flip a toggle, retry, and fail again for the
+        // real reason. Only on the refusal path, so the extra diff costs nothing
+        // in the common case.
+        HunkFit::Exceeds if settings.ignore_ws => {
+            let (as_shown, _, rev) = action_diff(repo, req, settings, true)?;
+            return Err(
+                if best_hunk_fit(&as_shown, &clicked, rev, &req.path)? == HunkFit::Within {
+                    ApplyError::HiddenByWhitespace
+                } else {
+                    ApplyError::Stale
+                },
+            );
+        }
+        HunkFit::Exceeds | HunkFit::Disjoint => return Err(ApplyError::Stale),
     }
 
     // Second line of defence: libgit2 returns Ok when the callback accepts nothing,
     // so count acceptances — zero means the click is stale, not that it worked.
     let accepted = Cell::new(0usize);
     let mut opts = ApplyOptions::new();
+    // The hunk callback is handed a bare `DiffHunk` with no delta, so file
+    // identity has to be enforced one level up. Declining here makes libgit2 skip
+    // the delta whole — `apply_one` returns before it touches the preimage — so a
+    // delta that is not the clicked file is never consulted, never mutated, and
+    // never reaches the deletion/rename shortcuts that bypass the hunk callback.
+    opts.delta_callback(|delta| delta.is_some_and(|d| delta_is_target(&d, &req.path)));
     opts.hunk_callback(|hunk| {
         // libgit2 calls this once per generated hunk and always with a real one
         // (apply.c passes `&patch->hunks[i].hunk`), so `None` would mean that
         // contract changed underneath us — decline rather than wave through a hunk
         // we cannot identify.
         let Some(hunk) = hunk else { return false };
-        let generated = HunkRange {
-            old_start: hunk.old_start(),
-            old_lines: hunk.old_lines(),
-            new_start: hunk.new_start(),
-            new_lines: hunk.new_lines(),
-        };
-        let take = hunk_matches(&clicked, &generated, reversed);
+        // Same containment rule AND the same copy-out (`HunkRange::from`) the
+        // pre-check used, so the two cannot disagree.
+        let take = hunk_fit(&clicked, &(&hunk).into(), reversed) == HunkFit::Within;
         if take {
             accepted.set(accepted.get() + 1);
         }
@@ -687,18 +1073,15 @@ pub fn apply_request(
     let outcome = if matches!(location, ApplyLocation::WorkDir) {
         apply_revert_to_workdir(repo, &diff, Some(&mut opts))
     } else {
-        match repo.apply(&diff, location, Some(&mut opts)) {
-            // Exact-context matching, no fuzz: the surrounding lines have moved on.
-            Err(e) if e.code() == git2::ErrorCode::ApplyFail => Err(ApplyError::Stale),
-            Err(e) => Err(ApplyError::Git(e)),
-            Ok(()) => Ok(()),
-        }
+        apply_diff(repo, &diff, location, Some(&mut opts))
     };
     match outcome {
         // The pre-match said a hunk matched, so the callback must have accepted one
         // — unless this delta never reaches the callback at all, in which case zero
         // is the expected count and says nothing about whether the apply worked.
-        Ok(()) if accepted.get() == 0 && !bypasses_hunk_callback(&diff) => Err(ApplyError::Stale),
+        Ok(()) if accepted.get() == 0 && !bypasses_hunk_callback(&diff, &req.path) => {
+            Err(ApplyError::Stale)
+        }
         other => other,
     }
 }
@@ -708,7 +1091,8 @@ mod tests {
     use super::*;
     use crate::diff::{DiffSettings, hunk_at_line, oid_staged, oid_uncommitted};
     use crate::test_repo::{
-        commit_file, commit_rename, index_blob, read_file, stage, temp_repo, write_file,
+        commit_bytes, commit_file, commit_index, commit_rename, index_blob, read_file, stage,
+        temp_repo, write_file,
     };
 
     fn hr(old_start: u32, old_lines: u32, new_start: u32, new_lines: u32) -> HunkRange {
@@ -734,10 +1118,18 @@ mod tests {
         // that consulted the wrong one would answer the opposite of every
         // assertion here.
         let generated = hr(8, 6, 100, 9);
-        assert!(hunk_matches(&hr(8, 6, 8, 7), &generated, false));
-        assert!(hunk_matches(&hr(10, 2, 10, 2), &generated, false));
-        assert!(!hunk_matches(&hr(100, 5, 100, 5), &generated, false));
-        assert!(!hunk_matches(&hr(40, 5, 40, 5), &generated, false));
+        assert_eq!(
+            hunk_fit(&hr(8, 6, 8, 7), &generated, false),
+            HunkFit::Within
+        );
+        assert_eq!(
+            hunk_fit(&hr(100, 5, 100, 5), &generated, false),
+            HunkFit::Disjoint
+        );
+        assert_eq!(
+            hunk_fit(&hr(40, 5, 40, 5), &generated, false),
+            HunkFit::Disjoint
+        );
     }
 
     #[test]
@@ -746,16 +1138,49 @@ mod tests {
         // back as `@@ -8,9 +8,6 @@`, so the display's OLD side is the generated
         // diff's NEW side. Disjoint sides again, so reading the wrong one is
         // detectable rather than coincidentally right.
-        let generated = hr(100, 5, 8, 9);
-        assert!(hunk_matches(&hr(8, 6, 200, 6), &generated, true));
-        assert!(!hunk_matches(&hr(100, 5, 300, 5), &generated, true));
+        let generated = hr(100, 5, 8, 6);
+        assert_eq!(
+            hunk_fit(&hr(8, 6, 200, 6), &generated, true),
+            HunkFit::Within
+        );
+        assert_eq!(
+            hunk_fit(&hr(100, 5, 300, 5), &generated, true),
+            HunkFit::Disjoint
+        );
     }
 
     #[test]
     fn zero_length_sides_still_match_their_position() {
-        // A pure insertion has old_lines == 0; it must still match the hunk it
-        // sits in. Sides disjoint for the same reason as above.
-        assert!(hunk_matches(&hr(12, 0, 12, 3), &hr(10, 6, 500, 9), false));
+        // A pure insertion has old_lines == 0 on both sides of the comparison; it
+        // must still match the hunk it sits in rather than reading as empty.
+        assert_eq!(
+            hunk_fit(&hr(12, 0, 12, 3), &hr(12, 0, 500, 9), false),
+            HunkFit::Within
+        );
+    }
+
+    /// The whole point of containment: a generated hunk that starts where the
+    /// click did but runs past it carries changes the display never showed (see
+    /// `hunk_fit`), and a hunk cannot be trimmed, so it must be refused — with a
+    /// verdict distinct from "nothing matched at all".
+    #[test]
+    fn a_generated_hunk_wider_than_the_click_is_refused_not_applied() {
+        // Displayed `@@ -7,7 @@`, generated `@@ -7,19 @@` — the real shapes from
+        // the ignore-whitespace fixture below.
+        assert_eq!(
+            hunk_fit(&hr(7, 7, 7, 7), &hr(7, 19, 7, 19), false),
+            HunkFit::Exceeds
+        );
+        // Reaching past only on the far end still counts.
+        assert_eq!(
+            hunk_fit(&hr(10, 5, 10, 5), &hr(10, 6, 10, 6), false),
+            HunkFit::Exceeds
+        );
+        // Equal ranges are the ordinary (whitespace off) case.
+        assert_eq!(
+            hunk_fit(&hr(10, 5, 10, 5), &hr(10, 5, 10, 5), false),
+            HunkFit::Within
+        );
     }
 
     #[test]
@@ -764,6 +1189,8 @@ mod tests {
             ApplyError::Stale,
             ApplyError::ChangedSinceCommit,
             ApplyError::Unsupported,
+            ApplyError::HiddenByWhitespace,
+            ApplyError::RenameNeedsWholeFile,
         ] {
             let msg = e.user_message(ApplyAction::Revert, "src/main.rs");
             assert!(msg.starts_with("Revert failed"), "{msg}");
@@ -774,6 +1201,11 @@ mod tests {
                 .user_message(ApplyAction::Revert, "src/main.rs")
                 .contains("changed")
         );
+        // This one has to be actionable, not just descriptive: it names the
+        // setting to change and the verb to retry.
+        let ws = ApplyError::HiddenByWhitespace.user_message(ApplyAction::Stage, "f.rs");
+        assert!(ws.contains("ignore whitespace"), "{ws}");
+        assert!(ws.contains("turn it off to stage it"), "{ws}");
     }
 
     #[test]
@@ -797,26 +1229,53 @@ mod tests {
         }
     }
 
-    /// 20 numbered lines, with the given 1-based line numbers rewritten.
-    fn body(edits: &[usize]) -> String {
-        (1..=20)
+    /// `n` numbered lines ("line 1\n", …), with the given 1-based lines rewritten
+    /// as "<marker> <i>\n". One generator so a fixture's shape is described in one
+    /// place rather than re-derived per test.
+    fn numbered(n: usize, edits: &[(usize, &str)]) -> String {
+        (1..=n)
             .map(|i| {
-                if edits.contains(&i) {
-                    format!("EDITED {i}\n")
-                } else {
-                    format!("line {i}\n")
-                }
+                edits
+                    .iter()
+                    .find(|(line, _)| *line == i)
+                    .map_or_else(|| format!("line {i}\n"), |(_, m)| format!("{m} {i}\n"))
             })
             .collect()
     }
 
-    fn req(oid: git2::Oid, path: &str, hunk: Option<HunkRange>) -> ApplyRequest {
-        ApplyRequest {
-            oid,
-            path: path.to_string(),
-            old_path: None,
-            hunk,
+    /// 20 numbered lines, with the given 1-based line numbers rewritten.
+    fn body(edits: &[usize]) -> String {
+        let edits: Vec<_> = edits.iter().map(|&l| (l, "EDITED")).collect();
+        numbered(20, &edits)
+    }
+
+    /// A request for a file the pane displayed as RENAMED from `old`.
+    /// A `FileEntry` as the pane would have built it for this delta.
+    fn entry(path: &str, old: Option<&str>, status: git2::Delta) -> crate::diff::FileEntry {
+        crate::diff::FileEntry {
+            old_path: old.map(str::to_string),
+            old_path_bytes: old.map(|o| o.as_bytes().to_vec()),
+            status,
+            ..crate::test_repo::file_entry(path, None)
         }
+    }
+
+    fn renamed_req(oid: git2::Oid, old: &str, path: &str) -> ApplyRequest {
+        ApplyRequest::for_entry(oid, &entry(path, Some(old), git2::Delta::Renamed), None)
+    }
+
+    /// A request for a file the pane displayed as DELETED from the worktree.
+    fn deleted_req(oid: git2::Oid, path: &str) -> ApplyRequest {
+        ApplyRequest::for_entry(oid, &entry(path, None, git2::Delta::Deleted), None)
+    }
+
+    /// Every request in this suite is built the way the context menu builds one —
+    /// through `ApplyRequest::for_entry`, from a `FileEntry` — rather than as a
+    /// struct literal. That is what makes the suite actually exercise the
+    /// mapping: a change to `for_entry` that the menu would suffer shows up here
+    /// instead of compiling quietly past ~60 hand-written literals.
+    fn req(oid: git2::Oid, path: &str, hunk: Option<HunkRange>) -> ApplyRequest {
+        ApplyRequest::for_entry(oid, &entry(path, None, git2::Delta::Modified), hunk)
     }
 
     #[test]
@@ -827,12 +1286,7 @@ mod tests {
 
         // The second hunk, as the pane would show it: two edits 14 lines apart
         // with 3 context lines cannot merge, so this is "@@ -14,7 +14,7 @@".
-        let hunk = HunkRange {
-            old_start: 14,
-            old_lines: 7,
-            new_start: 14,
-            new_lines: 7,
-        };
+        let hunk = hr(14, 7, 14, 7);
         apply_request(
             &repo,
             &req(oid_uncommitted(), "f.txt", Some(hunk)),
@@ -858,12 +1312,7 @@ mod tests {
         write_file(&repo, "f.txt", &body(&[3, 17]));
         stage(&repo, "f.txt");
 
-        let hunk = HunkRange {
-            old_start: 14,
-            old_lines: 7,
-            new_start: 14,
-            new_lines: 7,
-        };
+        let hunk = hr(14, 7, 14, 7);
         apply_request(&repo, &req(oid_staged(), "f.txt", Some(hunk)), settings()).unwrap();
 
         let staged = index_blob(&repo, "f.txt");
@@ -882,12 +1331,7 @@ mod tests {
         write_file(&repo, "f.txt", &body(&[17]));
         stage(&repo, "f.txt");
 
-        let hunk = HunkRange {
-            old_start: 14,
-            old_lines: 7,
-            new_start: 14,
-            new_lines: 7,
-        };
+        let hunk = hr(14, 7, 14, 7);
         apply_request(&repo, &req(oid_staged(), "f.txt", Some(hunk)), settings()).unwrap();
 
         let reopened = git2::Repository::open(dir.path()).unwrap();
@@ -900,12 +1344,7 @@ mod tests {
         commit_file(&repo, "f.txt", &body(&[]), "base");
         let oid = commit_file(&repo, "f.txt", &body(&[5, 17]), "two edits");
 
-        let hunk = HunkRange {
-            old_start: 2,
-            old_lines: 7,
-            new_start: 2,
-            new_lines: 7,
-        };
+        let hunk = hr(2, 7, 2, 7);
         apply_request(&repo, &req(oid, "f.txt", Some(hunk)), settings()).unwrap();
 
         let wd = read_file(&repo, "f.txt");
@@ -930,12 +1369,7 @@ mod tests {
         write_file(&repo, "f.txt", &body(&[3]));
 
         // A range far from the only real hunk: nothing overlaps.
-        let stale = HunkRange {
-            old_start: 500,
-            old_lines: 5,
-            new_start: 500,
-            new_lines: 5,
-        };
+        let stale = hr(500, 5, 500, 5);
         let err = apply_request(
             &repo,
             &req(oid_uncommitted(), "f.txt", Some(stale)),
@@ -958,12 +1392,7 @@ mod tests {
         let oid = commit_file(&repo, "f.txt", &body(&[5]), "edit line 5");
         write_file(&repo, "f.txt", &body(&[5, 6]));
 
-        let hunk = HunkRange {
-            old_start: 2,
-            old_lines: 7,
-            new_start: 2,
-            new_lines: 7,
-        };
+        let hunk = hr(2, 7, 2, 7);
         let err = apply_request(&repo, &req(oid, "f.txt", Some(hunk)), settings()).unwrap_err();
         assert!(matches!(err, ApplyError::Stale), "{err:?}");
         assert!(
@@ -990,7 +1419,11 @@ mod tests {
         commit_file(&repo, "f.txt", &body(&[]), "base");
         std::fs::remove_file(repo.workdir().unwrap().join("f.txt")).unwrap();
 
-        apply_request(&repo, &req(oid_uncommitted(), "f.txt", None), settings()).unwrap();
+        // `shown_deleted` because the pane showed the deletion — the menu derives
+        // it from the delta status, and staging is refused without it (see
+        // `stage_file_refuses_a_deletion_the_displayed_diff_did_not_show`).
+        let request = deleted_req(oid_uncommitted(), "f.txt");
+        apply_request(&repo, &request, settings()).unwrap();
 
         let index = repo.index().unwrap();
         assert!(index.get_path(std::path::Path::new("f.txt"), 0).is_none());
@@ -1027,8 +1460,8 @@ mod tests {
 
     #[test]
     fn stage_file_migrates_a_worktree_only_rename_to_the_new_path() {
-        // Whole-file Stage acts on BOTH req.old_path and req.path through one
-        // Index handle. A change that drops the old_path side, swaps the call
+        // Whole-file Stage acts on BOTH req.rename_source and req.path through one
+        // Index handle. A change that drops the rename_source side, swaps the call
         // order, or reuses req.path twice must fail the "no OLD entry" assertion
         // below.
         let (_d, repo) = temp_repo();
@@ -1038,12 +1471,7 @@ mod tests {
 
         apply_request(
             &repo,
-            &ApplyRequest {
-                oid: oid_uncommitted(),
-                path: "new.txt".to_string(),
-                old_path: Some("old.txt".to_string()),
-                hunk: None,
-            },
+            &renamed_req(oid_uncommitted(), "old.txt", "new.txt"),
             settings(),
         )
         .unwrap();
@@ -1055,7 +1483,7 @@ mod tests {
         );
         assert!(
             index.get_path(std::path::Path::new("old.txt"), 0).is_none(),
-            "old path dropped from the index — a dropped old_path side would leave this present"
+            "old path dropped from the index — a dropped rename_source side would leave this present"
         );
     }
 
@@ -1078,12 +1506,7 @@ mod tests {
 
         apply_request(
             &repo,
-            &ApplyRequest {
-                oid: oid_staged(),
-                path: "new.txt".to_string(),
-                old_path: Some("old.txt".to_string()),
-                hunk: None,
-            },
+            &renamed_req(oid_staged(), "old.txt", "new.txt"),
             settings(),
         )
         .unwrap();
@@ -1095,7 +1518,7 @@ mod tests {
         );
         assert!(
             index.get_path(std::path::Path::new("new.txt"), 0).is_none(),
-            "new path removed — a dropped old_path side would leave this staged instead"
+            "new path removed — a dropped rename_source side would leave this staged instead"
         );
     }
 
@@ -1132,12 +1555,7 @@ mod tests {
     fn file_operations_handle_binaries_the_patch_path_refuses() {
         let (_d, repo) = temp_repo();
         let bin = repo.workdir().unwrap().join("b.bin");
-        std::fs::write(&bin, [0u8, 1, 2, 3, 0, 5]).unwrap();
-        stage(&repo, "b.bin");
-        {
-            let mut index = repo.index().unwrap();
-            crate::test_repo::commit_index(&repo, &mut index, "base");
-        }
+        commit_bytes(&repo, "b.bin", &[0u8, 1, 2, 3, 0, 5], "base");
         std::fs::write(&bin, [0u8, 9, 9, 9, 0, 5]).unwrap();
 
         apply_request(&repo, &req(oid_uncommitted(), "b.bin", None), settings()).unwrap();
@@ -1181,7 +1599,7 @@ mod tests {
         {
             let mut index = repo.index().unwrap();
             index.add_path(std::path::Path::new("s.sh")).unwrap();
-            crate::test_repo::commit_index(&repo, &mut index, "base executable");
+            commit_index(&repo, &mut index, "base executable");
         }
         write_file(&repo, "s.sh", "#!/bin/sh\necho changed\n");
         stage(&repo, "s.sh");
@@ -1248,22 +1666,49 @@ mod tests {
     fn revert_file_restores_a_binary_from_the_parent_blob() {
         let (_d, repo) = temp_repo();
         let bin = repo.workdir().unwrap().join("b.bin");
-        std::fs::write(&bin, [0u8, 1, 2, 3]).unwrap();
-        stage(&repo, "b.bin");
-        {
-            let mut index = repo.index().unwrap();
-            crate::test_repo::commit_index(&repo, &mut index, "base");
-        }
-        std::fs::write(&bin, [0u8, 9, 9, 9]).unwrap();
-        stage(&repo, "b.bin");
-        let target = {
-            let mut index = repo.index().unwrap();
-            crate::test_repo::commit_index(&repo, &mut index, "change binary")
-        };
+        commit_bytes(&repo, "b.bin", &[0u8, 1, 2, 3], "base");
+        let target = commit_bytes(&repo, "b.bin", &[0u8, 9, 9, 9], "change binary");
 
         apply_request(&repo, &req(target, "b.bin", None), settings()).unwrap();
 
         assert_eq!(std::fs::read(&bin).unwrap(), [0u8, 1, 2, 3]);
+    }
+
+    /// A binary revert must never write THROUGH a symlink sitting at the target
+    /// path. Every IO on that path — the guard's read and the restore's write —
+    /// follows links by default, so a link into a shared store makes the revert
+    /// clobber and chmod a file outside the working tree while the repo path
+    /// itself is left untouched and still reported as reverted.
+    #[cfg(unix)]
+    #[test]
+    fn revert_file_refuses_a_binary_behind_a_symlink() {
+        let (_d, repo) = temp_repo();
+        commit_bytes(&repo, "b.bin", &[0u8, 1, 2, 3], "base");
+        let target = commit_bytes(&repo, "b.bin", &[0u8, 9, 9, 9], "change binary");
+
+        // The worktree copy is replaced by a link to a file OUTSIDE the repo,
+        // whose contents currently equal what the commit recorded — so a
+        // read-through guard sees exactly what it expects.
+        let outside = tempfile::tempdir().unwrap();
+        let store = outside.path().join("cache.bin");
+        std::fs::write(&store, [0u8, 9, 9, 9]).unwrap();
+        let bin = repo.workdir().unwrap().join("b.bin");
+        std::fs::remove_file(&bin).unwrap();
+        std::os::unix::fs::symlink(&store, &bin).unwrap();
+
+        let err = apply_request(&repo, &req(target, "b.bin", None), settings())
+            .expect_err("a symlink at the target path must not be written through");
+
+        assert!(matches!(err, ApplyError::ChangedSinceCommit), "{err:?}");
+        assert_eq!(
+            std::fs::read(&store).unwrap(),
+            [0u8, 9, 9, 9],
+            "the file outside the working tree must not be touched"
+        );
+        assert!(
+            bin.symlink_metadata().unwrap().file_type().is_symlink(),
+            "and the repo path must still be the symlink it was"
+        );
     }
 
     #[test]
@@ -1272,24 +1717,58 @@ mod tests {
         // the guard this would silently discard the later change.
         let (_d, repo) = temp_repo();
         let bin = repo.workdir().unwrap().join("b.bin");
-        std::fs::write(&bin, [0u8, 1, 2, 3]).unwrap();
-        stage(&repo, "b.bin");
-        {
-            let mut index = repo.index().unwrap();
-            crate::test_repo::commit_index(&repo, &mut index, "base");
-        }
-        std::fs::write(&bin, [0u8, 9, 9, 9]).unwrap();
-        stage(&repo, "b.bin");
-        let target = {
-            let mut index = repo.index().unwrap();
-            crate::test_repo::commit_index(&repo, &mut index, "change binary")
-        };
+        commit_bytes(&repo, "b.bin", &[0u8, 1, 2, 3], "base");
+        let target = commit_bytes(&repo, "b.bin", &[0u8, 9, 9, 9], "change binary");
         // Someone changed it again since.
         std::fs::write(&bin, [7u8, 7, 7, 7]).unwrap();
 
         let err = apply_request(&repo, &req(target, "b.bin", None), settings()).unwrap_err();
         assert!(matches!(err, ApplyError::ChangedSinceCommit), "{err:?}");
         assert_eq!(std::fs::read(&bin).unwrap(), [7u8, 7, 7, 7], "left alone");
+    }
+
+    /// A hunk click is scoped to one hunk; libgit2 carries out a `Renamed`
+    /// delta's move OUTSIDE the patch machinery, so without a guard the click
+    /// silently performs the whole rename — a whole-file mutation from a
+    /// sub-file request. AGENTS.md justifies the acceptance-count carve-out only
+    /// for Added/Deleted deltas ("which for an add/delete IS the whole file, and
+    /// is the right outcome"); a rename is not that case.
+    #[test]
+    fn a_hunk_click_refuses_a_rename_instead_of_moving_the_whole_file() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.txt", &body(&[]), "base");
+        std::fs::rename(
+            repo.workdir().unwrap().join("a.txt"),
+            repo.workdir().unwrap().join("b.txt"),
+        )
+        .unwrap();
+        write_file(&repo, "b.txt", &body(&[3]));
+        let target = commit_rename(&repo, "a.txt", "b.txt", "rename a->b and edit");
+
+        let data = crate::diff::get_diff_data(&repo, target, CommitKind::Real, settings(), &[]);
+        let row = data
+            .lines
+            .iter()
+            .position(|l| l.text.contains("EDITED 3") && l.kind == crate::diff::LineKind::Add)
+            .expect("the edit is in the commit diff");
+        let hunk = hunk_at_line(&data.lines, row).expect("that row is inside a hunk");
+
+        let request = ApplyRequest {
+            hunk: Some(hunk),
+            ..renamed_req(target, "a.txt", "b.txt")
+        };
+        let err = apply_request(&repo, &request, settings())
+            .expect_err("a hunk click must not carry out the rename");
+
+        assert!(matches!(err, ApplyError::RenameNeedsWholeFile), "{err:?}");
+        assert!(
+            repo.workdir().unwrap().join("b.txt").exists(),
+            "the file must not have been moved back by a hunk-scoped click"
+        );
+        assert!(
+            !repo.workdir().unwrap().join("a.txt").exists(),
+            "and the pre-rename path must not have been recreated"
+        );
     }
 
     #[test]
@@ -1303,12 +1782,7 @@ mod tests {
         .unwrap();
         let target = commit_rename(&repo, "a.txt", "b.txt", "rename a->b");
 
-        let request = ApplyRequest {
-            oid: target,
-            path: "b.txt".to_string(),
-            old_path: Some("a.txt".to_string()),
-            hunk: None,
-        };
+        let request = renamed_req(target, "a.txt", "b.txt");
         apply_request(&repo, &request, settings()).unwrap();
 
         assert!(
@@ -1333,7 +1807,7 @@ mod tests {
         stage(&repo, "a.bin");
         {
             let mut index = repo.index().unwrap();
-            crate::test_repo::commit_index(&repo, &mut index, "add binary");
+            commit_index(&repo, &mut index, "add binary");
         }
         std::fs::rename(
             repo.workdir().unwrap().join("a.bin"),
@@ -1342,12 +1816,7 @@ mod tests {
         .unwrap();
         let target = commit_rename(&repo, "a.bin", "b.bin", "rename binary a->b");
 
-        let request = ApplyRequest {
-            oid: target,
-            path: "b.bin".to_string(),
-            old_path: Some("a.bin".to_string()),
-            hunk: None,
-        };
+        let request = renamed_req(target, "a.bin", "b.bin");
         apply_request(&repo, &request, settings()).unwrap();
 
         assert_eq!(
@@ -1378,7 +1847,7 @@ mod tests {
         stage(&repo, "a.bin");
         {
             let mut index = repo.index().unwrap();
-            crate::test_repo::commit_index(&repo, &mut index, "add binary");
+            commit_index(&repo, &mut index, "add binary");
         }
         std::fs::rename(
             repo.workdir().unwrap().join("a.bin"),
@@ -1390,12 +1859,7 @@ mod tests {
         // Someone/something put different content at the pre-rename path since.
         std::fs::write(repo.workdir().unwrap().join("a.bin"), [9u8, 9, 9, 9]).unwrap();
 
-        let request = ApplyRequest {
-            oid: target,
-            path: "b.bin".to_string(),
-            old_path: Some("a.bin".to_string()),
-            hunk: None,
-        };
+        let request = renamed_req(target, "a.bin", "b.bin");
         let err = apply_request(&repo, &request, settings()).unwrap_err();
         assert!(matches!(err, ApplyError::ChangedSinceCommit), "{err:?}");
 
@@ -1428,7 +1892,7 @@ mod tests {
             let mut index = repo.index().unwrap();
             index.add_path(std::path::Path::new("a[1].bin")).unwrap();
             index.add_path(std::path::Path::new("a1.bin")).unwrap();
-            crate::test_repo::commit_index(&repo, &mut index, "base");
+            commit_index(&repo, &mut index, "base");
         }
         write_file(&repo, "a[1].bin", "changed one\n");
         std::fs::write(repo.workdir().unwrap().join("a1.bin"), [0u8, 9, 9, 9]).unwrap();
@@ -1436,7 +1900,7 @@ mod tests {
             let mut index = repo.index().unwrap();
             index.add_path(std::path::Path::new("a[1].bin")).unwrap();
             index.add_path(std::path::Path::new("a1.bin")).unwrap();
-            crate::test_repo::commit_index(&repo, &mut index, "edit both files")
+            commit_index(&repo, &mut index, "edit both files")
         };
 
         apply_request(&repo, &req(target, "a[1].bin", None), settings()).unwrap();
@@ -1460,12 +1924,7 @@ mod tests {
         let (_d, repo) = temp_repo();
         commit_file(&repo, "unrelated.txt", "x\n", "base");
         let bin = repo.workdir().unwrap().join("b.bin");
-        std::fs::write(&bin, [0u8, 1, 2, 3]).unwrap();
-        stage(&repo, "b.bin");
-        let target = {
-            let mut index = repo.index().unwrap();
-            crate::test_repo::commit_index(&repo, &mut index, "add binary")
-        };
+        let target = commit_bytes(&repo, "b.bin", &[0u8, 1, 2, 3], "add binary");
 
         apply_request(&repo, &req(target, "b.bin", None), settings()).unwrap();
 
@@ -1502,7 +1961,7 @@ mod tests {
 
     #[test]
     fn revert_file_returns_stale_rather_than_a_false_success_when_nothing_matches() {
-        // The hunk path already refuses (`any_hunk_matches`) when the regenerated
+        // The hunk path already refuses (`best_hunk_fit`) when the regenerated
         // diff has no matching hunk. The whole-file path used to have no
         // equivalent check: a pathspec that matches nothing in this commit's own
         // diff produces an empty `git2::Diff`, which both the deletion guard and
@@ -1633,7 +2092,7 @@ mod tests {
     #[test]
     fn a_stale_hunk_click_reverting_a_deletion_does_not_create_the_file() {
         // Mirror of `a_stale_hunk_click_on_a_deletion_stages_nothing` for the
-        // OTHER shape any_hunk_matches was added to close: reverting a commit
+        // OTHER shape best_hunk_fit was added to close: reverting a commit
         // that DELETED a file produces an `Added` delta on the action diff —
         // NOT in `bypasses_hunk_callback`'s set, so the hunk callback IS
         // consulted. But an `Added` delta has no old-side content to
@@ -1641,7 +2100,7 @@ mod tests {
         // before ever asking the callback whether to accept its one hunk —
         // declining that hunk still leaves the empty file behind and returns
         // Ok(()). Without the pre-match, the acceptance-count check only
-        // catches this AFTER that file already landed; any_hunk_matches must
+        // catches this AFTER that file already landed; best_hunk_fit must
         // reject the click before `repo.apply` runs at all.
         let (_d, repo) = temp_repo();
         commit_file(&repo, "f.txt", &body(&[]), "add f");
@@ -1649,7 +2108,7 @@ mod tests {
         let target = {
             let mut index = repo.index().unwrap();
             index.remove_path(std::path::Path::new("f.txt")).unwrap();
-            crate::test_repo::commit_index(&repo, &mut index, "delete f")
+            commit_index(&repo, &mut index, "delete f")
         };
 
         // Nowhere near the real hunk, which restores lines 1..=20.
@@ -1670,7 +2129,7 @@ mod tests {
         // `git_apply__to_index` removes the old path outside the patch
         // machinery, so a genuine match still ends with `accepted == 0` — the
         // carve-out is what keeps that from being misread as "nothing
-        // happened". Deleting `&& !bypasses_hunk_callback(&diff)` turns this
+        // happened". Deleting `&& !bypasses_hunk_callback(&diff, &req.path)` turns this
         // real success into a reported (but already-applied) failure.
         let (_d, repo) = temp_repo();
         commit_file(&repo, "f.txt", &body(&[]), "base");
@@ -1792,7 +2251,7 @@ mod tests {
         {
             let mut index = repo.index().unwrap();
             index.add(&gitlink(first)).unwrap();
-            crate::test_repo::commit_index(&repo, &mut index, "add submodule");
+            commit_index(&repo, &mut index, "add submodule");
             index.add(&gitlink(second)).unwrap();
             index.write().unwrap();
         }
@@ -1805,5 +2264,681 @@ mod tests {
             .get_path(std::path::Path::new("sub"), 0)
             .expect("the submodule entry must still be in the index");
         assert_eq!(entry.id, second, "and must be left exactly as it was");
+    }
+
+    /// A near-copy of `a`, differing only at line `edit` — similar enough for
+    /// `find_similar` to record a `Copied` delta.
+    fn copy_body(edit: usize, marker: &str) -> String {
+        numbered(40, &[(edit, marker)])
+    }
+
+    fn copy_settings() -> DiffSettings {
+        DiffSettings {
+            detect_copies: true,
+            ..settings()
+        }
+    }
+
+    /// Stage a modification to `a.rs` plus `b.rs` as a near-copy of it, and
+    /// return the staged diff's entry for `b.rs` — copy detection needs the
+    /// source to be modified in the same diff, so both are staged.
+    fn staged_copy_repo() -> (tempfile::TempDir, Repository) {
+        let (d, repo) = temp_repo();
+        commit_file(&repo, "a.rs", &copy_body(0, ""), "base");
+        write_file(&repo, "a.rs", &copy_body(10, "SOURCE-EDIT"));
+        write_file(&repo, "b.rs", &copy_body(10, "COPY-EDIT"));
+        stage(&repo, "a.rs");
+        stage(&repo, "b.rs");
+        (d, repo)
+    }
+
+    /// A non-UTF-8 filename is legal in git and on Linux, and `FileEntry::path`
+    /// is built with `from_utf8_lossy` — diff.rs flags it as display-only and
+    /// keeps raw bytes for identity. The write layer used that display string as
+    /// a real filesystem path and pathspec, so every lookup missed: `remove_path`
+    /// tolerates `GIT_ENOTFOUND`, `index.write()` wrote an unchanged index, and the
+    /// status line reported a successful stage that never happened.
+    #[cfg(unix)]
+    #[test]
+    fn stage_file_handles_a_non_utf8_filename() {
+        use std::os::unix::ffi::OsStrExt;
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "anchor.txt", "x\n", "base");
+        // "caf\xe9.txt" — valid Latin-1, invalid UTF-8.
+        let raw = b"caf\xe9.txt";
+        let name = std::ffi::OsStr::from_bytes(raw);
+        let full = repo.workdir().unwrap().join(name);
+        std::fs::write(&full, "before\n").unwrap();
+        {
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new(name)).unwrap();
+            commit_index(&repo, &mut index, "add it");
+        }
+        // Now a tracked, modified file — what the uncommitted row would list.
+        std::fs::write(&full, "after\n").unwrap();
+
+        let data = crate::diff::get_working_tree_diff(&repo, settings(), &[]);
+        let f = data
+            .files
+            .iter()
+            .find(|f| f.path.contains("caf"))
+            .expect("the file must show up in the diff");
+        assert!(
+            f.path.as_bytes() != raw,
+            "fixture must actually be lossy, or this proves nothing"
+        );
+
+        apply_request(
+            &repo,
+            &ApplyRequest::for_entry(oid_uncommitted(), f, None),
+            settings(),
+        )
+        .unwrap();
+
+        let index = repo.index().unwrap();
+        let entry = index
+            .get_path(std::path::Path::new(name), 0)
+            .expect("the real file must still have an index entry");
+        assert_eq!(
+            repo.find_blob(entry.id).unwrap().content(),
+            b"after\n",
+            "the edit must actually be staged — reporting success while staging \
+             nothing is worse than failing"
+        );
+    }
+
+    /// The whole-file routes mutate an `Index` handle we opened ourselves, so
+    /// unlike `repo.apply` they only reach `.git/index` via an explicit
+    /// `index.write()`. Every other whole-file test asserts through
+    /// `repo.index()` on the SAME `Repository` — which hands back the repo's
+    /// cached in-memory index, the very object just mutated — so they pass with
+    /// or without the write. Reopening from disk is what actually pins it: drop
+    /// `index.write()` from the Stage arm and only this test fails.
+    #[test]
+    fn stage_file_persists_to_the_index_file_on_disk() {
+        let (dir, repo) = temp_repo();
+        commit_file(&repo, "f.txt", &body(&[]), "base");
+        write_file(&repo, "f.txt", &body(&[3]));
+
+        apply_request(&repo, &req(oid_uncommitted(), "f.txt", None), settings()).unwrap();
+
+        let reopened = git2::Repository::open(dir.path()).unwrap();
+        assert!(
+            index_blob(&reopened, "f.txt").contains("EDITED 3"),
+            "the staged content must survive reopening the repository"
+        );
+    }
+
+    /// The Unstage arm's half of the same guarantee.
+    #[test]
+    fn unstage_file_persists_to_the_index_file_on_disk() {
+        let (dir, repo) = temp_repo();
+        commit_file(&repo, "f.txt", &body(&[]), "base");
+        write_file(&repo, "f.txt", &body(&[3]));
+        stage(&repo, "f.txt");
+
+        apply_request(&repo, &req(oid_staged(), "f.txt", None), settings()).unwrap();
+
+        let reopened = git2::Repository::open(dir.path()).unwrap();
+        assert!(
+            !index_blob(&reopened, "f.txt").contains("EDITED 3"),
+            "the unstage must survive reopening the repository"
+        );
+    }
+
+    /// Whole-file Stage reads the worktree as it is NOW, so a deletion that
+    /// happened after the diff was shown would be staged as a deletion — a write
+    /// the displayed diff never described and the user never asked for.
+    ///
+    /// Every other route already decides before it writes (the hunk route
+    /// pre-matches, `revert_file` refuses an empty diff, the revert routes guard
+    /// worktree deletions); this one had no equivalent.
+    #[test]
+    fn stage_file_refuses_a_deletion_the_displayed_diff_did_not_show() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", &body(&[]), "base");
+        write_file(&repo, "f.txt", &body(&[3]));
+
+        // The request as the menu built it, from a diff showing a MODIFIED file.
+        let data = crate::diff::get_working_tree_diff(&repo, settings(), &[]);
+        let f = &data.files[0];
+        assert_eq!(f.status, git2::Delta::Modified);
+        let request = ApplyRequest::for_entry(oid_uncommitted(), f, None);
+
+        // The race: the file goes away before the worker runs.
+        std::fs::remove_file(repo.workdir().unwrap().join("f.txt")).unwrap();
+
+        let err = apply_request(&repo, &request, settings())
+            .expect_err("staging must refuse a deletion the diff never showed");
+
+        assert!(matches!(err, ApplyError::Stale), "{err:?}");
+        assert!(
+            repo.index()
+                .unwrap()
+                .get_path(std::path::Path::new("f.txt"), 0)
+                .is_some(),
+            "and must leave the index entry alone"
+        );
+    }
+
+    /// The same route must still stage a deletion the user actually saw.
+    #[test]
+    fn stage_file_stages_a_deletion_the_displayed_diff_did_show() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", &body(&[]), "base");
+        std::fs::remove_file(repo.workdir().unwrap().join("f.txt")).unwrap();
+
+        let data = crate::diff::get_working_tree_diff(&repo, settings(), &[]);
+        let f = &data.files[0];
+        assert_eq!(f.status, git2::Delta::Deleted);
+
+        apply_request(
+            &repo,
+            &ApplyRequest::for_entry(oid_uncommitted(), f, None),
+            settings(),
+        )
+        .unwrap();
+
+        assert!(
+            repo.index()
+                .unwrap()
+                .get_path(std::path::Path::new("f.txt"), 0)
+                .is_none(),
+            "a deletion the pane showed must still stage"
+        );
+    }
+
+    /// An lstat that fails for a reason OTHER than "the file is not there" must
+    /// not read as a deletion.
+    ///
+    /// `read_if_present` already draws this line (and says why); `stage_file`
+    /// branched on `is_ok()`, folding every errno into the absent bucket. A
+    /// symlink cycle in a parent component gives a deterministic ELOOP with no
+    /// permission games — so it works the same whether or not the suite runs as
+    /// root, unlike a `chmod 000` directory.
+    #[cfg(unix)]
+    #[test]
+    fn stage_file_refuses_when_the_path_cannot_be_read_at_all() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "d/f.txt", "content\n", "base");
+        let workdir = repo.workdir().unwrap().to_path_buf();
+        // The content survives under a different name; only the tracked path
+        // becomes unresolvable, so this is emphatically not a deletion.
+        std::fs::rename(workdir.join("d"), workdir.join("real")).unwrap();
+        std::os::unix::fs::symlink("d", workdir.join("d")).unwrap();
+        let kind = workdir
+            .join("d/f.txt")
+            .symlink_metadata()
+            .unwrap_err()
+            .kind();
+        assert_ne!(
+            kind,
+            std::io::ErrorKind::NotFound,
+            "fixture must fail for a reason OTHER than absence (got {kind:?})"
+        );
+
+        let err = apply_request(&repo, &req(oid_uncommitted(), "d/f.txt", None), settings())
+            .expect_err("an unreadable path must not be staged as a deletion");
+
+        assert!(matches!(err, ApplyError::Git(_)), "{err:?}");
+        let index = repo.index().unwrap();
+        assert!(
+            index.get_path(std::path::Path::new("d/f.txt"), 0).is_some(),
+            "the entry must still be in the index — a staged deletion would drop it"
+        );
+    }
+
+    /// "Ignore whitespace is hiding changes" must not be said when whitespace is
+    /// not the reason. `Exceeds` alone cannot tell the two apart: an oversized
+    /// generated hunk means either the display split it (whitespace) or the file
+    /// moved on (stale). Blaming the toggle in the second case sends the user to
+    /// turn off a setting, retry, and fail again for the real reason.
+    #[test]
+    fn an_oversize_hunk_is_only_blamed_on_whitespace_when_whitespace_is_the_cause() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", &numbered(40, &[]), "base");
+        write_file(&repo, "f.txt", &numbered(40, &[(10, "EDITED")]));
+
+        let ws = DiffSettings {
+            ignore_ws: true,
+            ..settings()
+        };
+        let data = crate::diff::get_working_tree_diff(&repo, ws, &[]);
+        let row = data
+            .lines
+            .iter()
+            .position(|l| l.text.contains("EDITED 10") && l.kind == crate::diff::LineKind::Add)
+            .expect("the edit is in the displayed diff");
+        let clicked = hunk_at_line(&data.lines, row).expect("that row is inside a hunk");
+
+        // The file moves on: a second REAL edit lands beside the clicked hunk, so
+        // the regenerated hunk is wider with or without whitespace ignored.
+        write_file(
+            &repo,
+            "f.txt",
+            &numbered(40, &[(10, "EDITED"), (12, "EDITED")]),
+        );
+
+        let err = apply_request(&repo, &req(oid_uncommitted(), "f.txt", Some(clicked)), ws)
+            .expect_err("an oversized hunk must be refused");
+
+        assert!(
+            matches!(err, ApplyError::Stale),
+            "whitespace is not the cause here, so it must not be blamed: {err:?}"
+        );
+    }
+
+    /// A symlink revert is refused, and says so.
+    ///
+    /// libgit2's workdir apply reads the preimage THROUGH the link, so it sees
+    /// the target file's bytes where the patch expects the link text and the
+    /// context can never match. That surfaced as `Stale` — "has changed since
+    /// this diff was shown" — for a symlink byte-identical to what the commit
+    /// recorded, i.e. a permanent failure with a false reason.
+    #[cfg(unix)]
+    #[test]
+    fn revert_refuses_a_symlink_rather_than_blaming_the_diff() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "aaa", "A\n", "base");
+        commit_file(&repo, "bbb", "B\n", "second");
+        let wd = repo.workdir().unwrap().to_path_buf();
+
+        std::os::unix::fs::symlink("aaa", wd.join("l")).unwrap();
+        stage(&repo, "l");
+        let mut index = repo.index().unwrap();
+        commit_index(&repo, &mut index, "add link -> aaa");
+        drop(index);
+
+        std::fs::remove_file(wd.join("l")).unwrap();
+        std::os::unix::fs::symlink("bbb", wd.join("l")).unwrap();
+        stage(&repo, "l");
+        let mut index = repo.index().unwrap();
+        let target = commit_index(&repo, &mut index, "retarget link -> bbb");
+        drop(index);
+
+        let err = apply_request(&repo, &req(target, "l", None), settings())
+            .expect_err("a symlink revert must be refused, not reported as stale");
+
+        assert!(matches!(err, ApplyError::Unsupported), "{err:?}");
+        assert_eq!(
+            std::fs::read_link(wd.join("l")).unwrap(),
+            std::path::Path::new("bbb"),
+            "and must leave the link alone"
+        );
+    }
+
+    /// A submodule revert is refused with the documented message, not a raw OS
+    /// error leaked from a regular-file read of a directory.
+    #[test]
+    fn revert_refuses_a_submodule_instead_of_leaking_an_os_error() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "unrelated.txt", "x\n", "base");
+        let sub = git2::Oid::from_bytes(&[3u8; 20]).unwrap();
+
+        // A gitlink entry, committed: what adding a submodule records.
+        {
+            let mut index = repo.index().unwrap();
+            index
+                .add(&git2::IndexEntry {
+                    ctime: git2::IndexTime::new(0, 0),
+                    mtime: git2::IndexTime::new(0, 0),
+                    dev: 0,
+                    ino: 0,
+                    mode: 0o160_000,
+                    uid: 0,
+                    gid: 0,
+                    file_size: 0,
+                    id: sub,
+                    flags: 0,
+                    flags_extended: 0,
+                    path: b"vendor/lib".to_vec(),
+                })
+                .unwrap();
+            commit_index(&repo, &mut index, "add submodule");
+        }
+        let target = repo.head().unwrap().peel_to_commit().unwrap().id();
+        // Checked out, as a real submodule would be.
+        std::fs::create_dir_all(repo.workdir().unwrap().join("vendor/lib")).unwrap();
+
+        let err = apply_request(&repo, &req(target, "vendor/lib", None), settings())
+            .expect_err("a submodule revert must be refused");
+
+        assert!(matches!(err, ApplyError::Unsupported), "{err:?}");
+    }
+
+    /// The staleness guard has to work in BOTH directions. The reverse of
+    /// `stage_file_refuses_a_deletion_the_displayed_diff_did_not_show`: the pane
+    /// showed the file deleted, it is back by the time the worker runs, and
+    /// staging it records content the user was never shown.
+    #[test]
+    fn stage_file_refuses_content_the_displayed_deletion_did_not_show() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "generated.rs", &body(&[]), "base");
+        std::fs::remove_file(repo.workdir().unwrap().join("generated.rs")).unwrap();
+
+        // The request as the menu built it, from a diff showing a DELETED file.
+        let data = crate::diff::get_working_tree_diff(&repo, settings(), &[]);
+        let f = &data.files[0];
+        assert_eq!(f.status, git2::Delta::Deleted);
+        let request = ApplyRequest::for_entry(oid_uncommitted(), f, None);
+
+        // The race: a build script puts the file back before the worker runs.
+        write_file(&repo, "generated.rs", "REGENERATED\n");
+
+        let err = apply_request(&repo, &request, settings())
+            .expect_err("staging must refuse content the diff never showed");
+
+        assert!(matches!(err, ApplyError::Stale), "{err:?}");
+        assert_eq!(
+            index_blob(&repo, "generated.rs"),
+            body(&[]),
+            "and must leave the index entry as HEAD had it"
+        );
+    }
+
+    /// An unreadable HEAD is not an unborn one.
+    ///
+    /// Both used to arrive as `head_tree() == None`, and the `None` arm means
+    /// "HEAD has no such file, so drop the index entry" — which on a repo whose
+    /// HEAD merely could not be READ stages the deletion of a tracked file and
+    /// reports success. Same NotFound-vs-could-not-read split `stage_file` and
+    /// `worktree_content` already make.
+    #[test]
+    fn unstage_file_refuses_when_head_cannot_be_read() {
+        let (dir, repo) = temp_repo();
+        commit_file(&repo, "f.txt", "base\n", "base");
+        write_file(&repo, "f.txt", "edited\n");
+        stage(&repo, "f.txt");
+        drop(repo);
+
+        // A corrupt HEAD — distinct from unborn, which reports `UnbornBranch`.
+        std::fs::write(dir.path().join(".git/HEAD"), "this is not a ref\n").unwrap();
+        let repo = git2::Repository::open(dir.path()).unwrap();
+
+        let err = apply_request(&repo, &req(oid_staged(), "f.txt", None), settings())
+            .expect_err("an unreadable HEAD must not read as 'HEAD has no such file'");
+
+        assert!(matches!(err, ApplyError::Git(_)), "{err:?}");
+        assert_eq!(
+            index_blob(&repo, "f.txt"),
+            "edited\n",
+            "the staged entry must be left alone, not dropped"
+        );
+    }
+
+    /// HEAD trees in the wild carry modes libgit2 will not accept back.
+    ///
+    /// `filemode_raw` hands back the tree's verbatim mode; `git_index_add`
+    /// accepts only its five canonical ones, so a `100664` blob — written by
+    /// older importers, and normalized on read by git itself — made whole-file
+    /// Unstage fail with "invalid entry mode" instead of restoring HEAD.
+    #[test]
+    fn unstage_file_normalizes_a_non_canonical_head_filemode() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", "base\n", "base");
+        let blob = repo.blob(b"base\n").unwrap();
+
+        // A tree recording the blob with a real-world but non-canonical mode.
+        // Written straight to the odb: libgit2's own treebuilder refuses the
+        // mode, which is precisely why such trees only ever arrive from
+        // elsewhere — and why reading one back has to cope.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"100664 f.txt\0");
+        raw.extend_from_slice(blob.as_bytes());
+        let tree_oid = repo
+            .odb()
+            .unwrap()
+            .write(git2::ObjectType::Tree, &raw)
+            .unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let sig = repo.signature().unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "odd mode", &tree, &[&parent])
+            .unwrap();
+        assert_eq!(
+            repo.head()
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .tree()
+                .unwrap()
+                .get_path(std::path::Path::new("f.txt"))
+                .unwrap()
+                .filemode_raw(),
+            0o100_664,
+            "fixture must actually record the non-canonical mode"
+        );
+        write_file(&repo, "f.txt", "edited\n");
+        stage(&repo, "f.txt");
+
+        apply_request(&repo, &req(oid_staged(), "f.txt", None), settings())
+            .expect("unstaging must restore HEAD's entry, not reject its mode");
+
+        assert_eq!(index_blob(&repo, "f.txt"), "base\n");
+    }
+
+    /// Unstaging a path left conflicted by a merge must resolve it, not add a
+    /// fourth entry beside the three conflict stages.
+    ///
+    /// `index.add` replaces an entry with the same path AND stage, so writing a
+    /// stage-0 entry leaves stages 1/2/3 in place. `git status` then still calls
+    /// the file unmerged and `git commit` still refuses, while the write layer
+    /// reported success.
+    #[test]
+    fn unstage_file_resolves_a_conflicted_path() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", "base\n", "base");
+        let head_blob = repo
+            .index()
+            .unwrap()
+            .get_path(std::path::Path::new("f.txt"), 0)
+            .unwrap()
+            .id;
+
+        // The three stages a merge conflict leaves behind: base, ours, theirs.
+        let conflicted = |stage: u16, content: &str| git2::IndexEntry {
+            ctime: git2::IndexTime::new(0, 0),
+            mtime: git2::IndexTime::new(0, 0),
+            dev: 0,
+            ino: 0,
+            mode: 0o100_644,
+            uid: 0,
+            gid: 0,
+            file_size: 0,
+            id: repo.blob(content.as_bytes()).unwrap(),
+            flags: stage << 12, // GIT_INDEX_ENTRY_STAGESHIFT
+            flags_extended: 0,
+            path: b"f.txt".to_vec(),
+        };
+        {
+            let mut index = repo.index().unwrap();
+            index.remove_path(std::path::Path::new("f.txt")).unwrap();
+            index.add(&conflicted(1, "base\n")).unwrap();
+            index.add(&conflicted(2, "ours\n")).unwrap();
+            index.add(&conflicted(3, "theirs\n")).unwrap();
+            index.write().unwrap();
+            assert!(index.has_conflicts(), "fixture must actually be conflicted");
+        }
+
+        apply_request(&repo, &req(oid_staged(), "f.txt", None), settings()).unwrap();
+
+        let index = repo.index().unwrap();
+        assert!(
+            !index.has_conflicts(),
+            "unstaging must clear the conflict stages, not leave a half-resolved index"
+        );
+        let entry = index
+            .get_path(std::path::Path::new("f.txt"), 0)
+            .expect("HEAD's version must be back in the index at stage 0");
+        assert_eq!(entry.id, head_blob);
+    }
+
+    /// Ignoring whitespace SPLITS the displayed diff relative to the action
+    /// diff, it never merges it: a whitespace-only line reads as context, so two
+    /// real edits that ignore-ws shows as separate hunks are one wide hunk once
+    /// whitespace counts again. Verified for this fixture — displayed
+    /// `@@ -7,7 @@` + `@@ -19,7 @@`, generated `@@ -7,19 @@`. Clicking the first
+    /// must never drag in the second's edit.
+    #[test]
+    fn a_hunk_click_cannot_apply_changes_ignore_whitespace_hid() {
+        let (_d, repo) = temp_repo();
+        let base = copy_body(0, "");
+        commit_file(&repo, "f.txt", &base, "base");
+        // Line 16 keeps its text and gains an indent, so it is a whitespace-only
+        // change — invisible under ignore-whitespace.
+        let edited = numbered(40, &[(10, "EDITED"), (16, "    line"), (22, "EDITED")]);
+        write_file(&repo, "f.txt", &edited);
+
+        let ws = DiffSettings {
+            ignore_ws: true,
+            ..settings()
+        };
+        let data = crate::diff::get_working_tree_diff(&repo, ws, &[]);
+        // The row the user right-clicks: the "+EDITED 10" line itself.
+        let row = data
+            .lines
+            .iter()
+            .position(|l| l.text.contains("EDITED 10") && l.kind == crate::diff::LineKind::Add)
+            .expect("the first edit is in the displayed diff");
+        let first = hunk_at_line(&data.lines, row).expect("that row is inside a hunk");
+        assert_eq!(
+            (first.old_start, first.old_lines),
+            (7, 7),
+            "fixture must produce the split display this test is about"
+        );
+
+        let req = req(oid_uncommitted(), "f.txt", Some(first));
+        let err = apply_request(&repo, &req, ws)
+            .expect_err("an indivisible hunk that exceeds the click must be refused");
+
+        assert!(
+            matches!(err, ApplyError::HiddenByWhitespace),
+            "and must say why, since the same click works with the toggle off: {err:?}"
+        );
+        assert!(
+            !index_blob(&repo, "f.txt").contains("EDITED 22"),
+            "clicking the first hunk must not stage the second hunk's edit"
+        );
+    }
+
+    /// A rename click whose two pathspec paths no longer resolve to ONE delta.
+    ///
+    /// The pane showed `old.txt ⇒ new.txt`, so the request carries both paths.
+    /// By the time the worker runs, `old.txt` is back — recreated with unrelated
+    /// content — so `find_similar` has no deletion to pair with `new.txt` and the
+    /// action diff comes back as TWO deltas whose hunks sit at the same lines.
+    /// Clicking `new.txt`'s hunk must not also take `old.txt`'s.
+    #[test]
+    fn a_hunk_click_never_reaches_into_another_files_delta() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "old.txt", &copy_body(0, ""), "base");
+        // The rename the pane displayed, then old.txt reappearing underneath it.
+        write_file(&repo, "new.txt", &copy_body(10, "RENAMED-EDIT"));
+        write_file(&repo, "old.txt", &copy_body(10, "UNRELATED-EDIT"));
+
+        let hunk = hr(7, 7, 7, 7);
+        let req = ApplyRequest {
+            hunk: Some(hunk),
+            ..renamed_req(oid_uncommitted(), "old.txt", "new.txt")
+        };
+        let _ = apply_request(&repo, &req, settings());
+
+        assert!(
+            !index_blob(&repo, "old.txt").contains("UNRELATED-EDIT"),
+            "a hunk click on new.txt must not stage an overlapping hunk from old.txt"
+        );
+    }
+
+    #[test]
+    fn unstaging_a_copy_leaves_the_copy_source_staged() {
+        let (_d, repo) = staged_copy_repo();
+        let data = crate::diff::get_staged_diff(&repo, copy_settings(), &[]);
+        let b = data
+            .files
+            .iter()
+            .find(|f| f.path == "b.rs")
+            .expect("b.rs must be in the staged diff");
+        assert_eq!(
+            b.old_path.as_deref(),
+            Some("a.rs"),
+            "the fixture must actually produce a Copied delta, or this proves nothing"
+        );
+
+        apply_request(
+            &repo,
+            &ApplyRequest::for_entry(oid_staged(), b, None),
+            copy_settings(),
+        )
+        .unwrap();
+
+        assert!(
+            index_blob(&repo, "a.rs").contains("SOURCE-EDIT"),
+            "unstaging the copy destination must not discard the copy SOURCE's staged work"
+        );
+    }
+
+    #[test]
+    fn staging_a_copy_leaves_the_copy_source_alone() {
+        let (_d, repo) = staged_copy_repo();
+        // Same shape, but now the copy is only in the worktree: unstage a.rs's
+        // edit so staging b.rs would visibly drag it back in.
+        let data = crate::diff::get_staged_diff(&repo, copy_settings(), &[]);
+        let b = data
+            .files
+            .iter()
+            .find(|f| f.path == "b.rs")
+            .unwrap()
+            .clone();
+        {
+            let mut index = repo.index().unwrap();
+            unstage_file(&repo, &mut index, b"a.rs").unwrap();
+            index.write().unwrap();
+        }
+        assert!(!index_blob(&repo, "a.rs").contains("SOURCE-EDIT"));
+
+        apply_request(
+            &repo,
+            &ApplyRequest::for_entry(oid_uncommitted(), &b, None),
+            copy_settings(),
+        )
+        .unwrap();
+
+        assert!(
+            !index_blob(&repo, "a.rs").contains("SOURCE-EDIT"),
+            "staging the copy destination must not also stage the copy SOURCE"
+        );
+    }
+
+    #[test]
+    fn reverting_a_copy_leaves_the_copy_source_alone() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.rs", &copy_body(0, ""), "base");
+        write_file(&repo, "a.rs", &copy_body(10, "SOURCE-EDIT"));
+        write_file(&repo, "b.rs", &copy_body(10, "COPY-EDIT"));
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("a.rs")).unwrap();
+        index.add_path(std::path::Path::new("b.rs")).unwrap();
+        let oid = commit_index(&repo, &mut index, "copy a to b, edit a");
+        drop(index);
+
+        let data = crate::diff::get_diff_data(&repo, oid, CommitKind::Real, copy_settings(), &[]);
+        let b = data
+            .files
+            .iter()
+            .find(|f| f.path == "b.rs")
+            .expect("b.rs must be in the commit diff");
+        assert_eq!(b.old_path.as_deref(), Some("a.rs"));
+
+        apply_request(
+            &repo,
+            &ApplyRequest::for_entry(oid, b, None),
+            copy_settings(),
+        )
+        .unwrap();
+
+        assert!(
+            read_file(&repo, "a.rs").contains("SOURCE-EDIT"),
+            "reverting the copy destination must not revert the copy SOURCE in the worktree"
+        );
     }
 }

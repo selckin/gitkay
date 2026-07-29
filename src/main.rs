@@ -1,3 +1,12 @@
+// gitkay is a native Wayland application and was already unix-only in practice
+// (`arboard::SetExtLinux` below, the mode handling in `apply::restore_binary`, the
+// symlink tests). Stating it once, here, is what lets the write layer treat git
+// paths as the raw bytes they are: the alternative is a lossy per-platform
+// fallback that silently matches nothing and reports success — see
+// `apply::path_from_bytes`.
+#[cfg(not(unix))]
+compile_error!("gitkay is unix-only: git paths are raw bytes, with no portable equivalent");
+
 use arboard::SetExtLinux;
 use eframe::egui;
 use git2::{Repository, Sort};
@@ -374,6 +383,14 @@ struct SidebarFrame<'c> {
     /// `draw_file_row` (an `&self` method) and drained by the caller once the
     /// row loop's borrows have ended.
     pending_apply: Option<apply::ApplyRequest>,
+    /// Which diff these rows belong to — mixed into each row's widget id so an
+    /// open context menu cannot outlive the diff it was opened over. See
+    /// `diff_menu_salt`.
+    menu_salt: u64,
+    /// Is any popup open this frame? Probed once here rather than per row, so a
+    /// non-hovered row can skip attaching its context menu entirely — see
+    /// `draw_file_row`.
+    any_menu_open: bool,
 }
 
 /// Split a path into (directory-with-trailing-slash, basename). The directory is
@@ -1247,6 +1264,9 @@ struct DiffView {
     content_chars: usize,
     scroll_target: Option<usize>,
     last_top_anchor: Option<usize>,
+    /// Which diff these rows belong to, mixed into each row's widget id so an
+    /// open context menu cannot outlive it. See `diff_menu_salt`.
+    menu_salt: u64,
 }
 
 /// Empty rows kept below the content (diff view and file list) for breathing room, so
@@ -1280,6 +1300,29 @@ fn diff_pad_rows(n_lines: usize, last_top_anchor: Option<usize>, viewport_rows: 
     })
 }
 
+/// The identity an open context menu is pinned to: which diff it was opened over.
+///
+/// egui keys a popup on its widget's id and keeps it open across frames, so an id
+/// built from the row index alone survives the diff being replaced underneath it
+/// — the debounced watcher reload, the post-apply refresh, an arrow key moving
+/// the selection. The popup stays up, but its closure now re-resolves the row
+/// against the NEW content, so the next click writes a file the user never
+/// right-clicked. Mixing this into the id makes the widget a *different* widget
+/// once the diff changes, which orphans the popup and closes it.
+///
+/// Hashes the whole `DiffCacheKey`, not just its oid: the uncommitted and staged
+/// rows keep one sentinel oid for the life of the process and are distinguished
+/// only by `content`, so an oid-only salt would let every working-tree reload
+/// share a single id — exactly the rows where the file list churns most.
+fn diff_menu_salt(key: Option<&DiffCacheKey>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    // `Option`'s own Hash writes a discriminant, so "no diff on screen" is
+    // already distinct from every real key without a hand-rolled sentinel.
+    key.hash(&mut h);
+    h.finish()
+}
+
 /// Render `n_lines` rows of the diff with row virtualization — only the visible
 /// rows get a `LayoutJob` (diffs can be tens of thousands of lines, all uniform
 /// single-line height). `on_visible` receives the visible (real) row range and the
@@ -1287,24 +1330,28 @@ fn diff_pad_rows(n_lines: usize, last_top_anchor: Option<usize>, viewport_rows: 
 /// on screen (the flat path ignores it), the height drives the Space page-scroll and is
 /// the true screenful even when bottom-padding rows clamp the real range short.
 /// `build_row` produces each row's job, an optional background tint, and the galley
-/// fallback colour. The callbacks keep the scroll/offset/width scaffold here separate
-/// from the row-building policy in the (single) caller.
+/// fallback colour. `row_menu_target` answers "which file does this row act on, if
+/// any" — ONE lookup, so whether a menu is attached and what it acts on cannot
+/// disagree — and `row_menu` draws it. The callbacks keep the scroll/offset/width
+/// scaffold here separate from the row-building policy in the (single) caller.
 fn show_virtualized_diff(
     ui: &mut egui::Ui,
     font_id: &egui::FontId,
     view: DiffView,
     mut on_visible: impl FnMut(std::ops::Range<usize>, usize),
     mut build_row: impl FnMut(usize) -> (egui::text::LayoutJob, Option<egui::Color32>, egui::Color32),
-    row_has_menu: impl Fn(usize) -> bool,
-    mut row_menu: impl FnMut(&mut egui::Ui, usize),
+    row_menu_target: impl Fn(usize) -> Option<usize>,
+    mut row_menu: impl FnMut(&mut egui::Ui, usize, usize),
 ) {
     let DiffView {
         n_lines,
         content_chars,
         scroll_target,
         last_top_anchor,
+        menu_salt,
     } = view;
     let row_h = ui.fonts_mut(|f| f.row_height(font_id));
+    let any_menu_open = egui::Popup::is_any_open(ui.ctx());
     ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
     // Bottom padding: empty rows below the diff so the deepest file's start can scroll
     // to the top of the viewport — without it the scroll clamps a near-end line partway
@@ -1337,26 +1384,53 @@ fn show_virtualized_diff(
         on_visible(real, viewport_rows);
         for i in rows {
             if i >= n_lines {
-                // Padding row: reserve the height, draw nothing.
-                ui.allocate_exact_size(egui::vec2(content_w, row_h), egui::Sense::hover());
+                // Padding row: reserve the height, draw nothing. `allocate_space`,
+                // not `allocate_exact_size` — the latter also registers a widget
+                // and builds a `Response` that nothing here reads, and `pad` can
+                // reach a full screenful at the end of a diff.
+                ui.allocate_space(egui::vec2(content_w, row_h));
                 continue;
             }
             let (job, row_bg, fallback) = build_row(i);
             let galley = ui.fonts_mut(|f| f.layout_job(job));
             let width = ui.available_width().max(galley.size().x);
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, row_h), egui::Sense::hover());
+            let (_, rect) = ui.allocate_space(egui::vec2(width, row_h));
             // A STABLE id per line: inside show_rows the auto-generated ids are
             // positional, so an open menu would migrate to a different row as soon
-            // as the view scrolled.
-            let resp = ui.interact(rect, ui.id().with(("diff_row", i)), egui::Sense::click());
+            // as the view scrolled. `menu_salt` additionally pins it to the diff
+            // this row belongs to, so an open menu cannot survive the diff being
+            // replaced underneath it — see `diff_menu_salt`.
             // Decide *whether to attach* the menu, not just what it draws: egui commits
             // to opening a popup on secondary-click regardless of whether the context_menu
             // closure draws anything, so an attached-but-empty closure still paints a
             // popup frame (fill/stroke/shadow) with nothing in it. Rows with no menu (the
             // commit-message header, the diffstat block) must never get `context_menu`
             // called at all.
-            if row_has_menu(i) {
-                resp.context_menu(|ui| row_menu(ui, i));
+            //
+            // Hover is the second gate, for cost: `context_menu` is not a cheap no-op
+            // when closed — it allocates and takes several `Context` locks before it
+            // even checks — and this runs for every visible row every frame. A menu can
+            // only *open* on a hovered row, and while one IS open every row must keep
+            // attaching, because egui closes a popup whose owner stops calling in.
+            //
+            // The whole interaction is inside the gate, so a row nobody is pointing at
+            // registers no widget at all. `rect_contains_pointer` answers the hover
+            // question without one; going through `ui.interact` first would register
+            // every visible row every frame just to ask.
+            if let Some(file_idx) = row_menu_target(i)
+                && (ui.rect_contains_pointer(rect) || any_menu_open)
+            {
+                // `Sense::CLICK`, not `Sense::click()` — the latter is
+                // `CLICK | FOCUSABLE`, which enters every diff row into the tab
+                // order, so Tab would walk ~50 invisible per-row widgets instead
+                // of reaching the search field. Nothing here reads `clicked()`;
+                // the sense exists only so `context_menu` can see a right-click.
+                let resp = ui.interact(
+                    rect,
+                    ui.id().with(("diff_row", menu_salt, i)),
+                    egui::Sense::CLICK,
+                );
+                resp.context_menu(|ui| row_menu(ui, i, file_idx));
             }
             if let Some(bg) = row_bg {
                 ui.painter().rect_filled(rect, 0.0, bg);
@@ -3507,6 +3581,12 @@ impl GitkApp {
     }
 
     fn set_selected(&mut self, idx: usize) {
+        // A write error describes the diff it was raised on, so moving to another
+        // row retires it — the second dismissal path besides Escape, and the one
+        // that happens by itself in normal use.
+        if self.selected != Some(idx) {
+            self.apply_status.take_if(|&mut (_, is_error, _)| is_error);
+        }
         self.selected = Some(idx);
         // Reflog entries are parentless, so branch-ancestry highlighting would dim
         // every other row whenever one is selected — skip it in reflog mode.
@@ -3913,12 +3993,6 @@ impl GitkApp {
         }
     }
 
-    /// Is a write in flight? Menus disable while one is, so two actions can never
-    /// race each other over the same index.
-    const fn apply_in_flight(&self) -> bool {
-        self.apply_in_flight
-    }
-
     /// Run one write on a worker. The repo handle is not `Send`, so the worker
     /// re-discovers from the path, exactly like the diff-load worker.
     fn request_apply(&mut self, req: apply::ApplyRequest) {
@@ -3964,11 +4038,7 @@ impl GitkApp {
         if spawn.is_err() {
             log::warn!("apply thread spawn failed");
             self.apply_in_flight = false;
-            self.apply_status = Some((
-                "Could not start the write".to_string(),
-                true,
-                std::time::Instant::now(),
-            ));
+            self.set_apply_status("Could not start the write".to_string(), true);
         }
     }
 
@@ -3986,26 +4056,42 @@ impl GitkApp {
             let scope = if req.hunk.is_some() { "hunk" } else { "file" };
             match outcome {
                 Ok(()) => {
-                    self.apply_status = Some((
-                        format!("{} {scope}: {}", action.verb(), req.path),
+                    self.set_apply_status(
+                        format!("{} {scope}: {}", action.verb(), req.display_path()),
                         false,
-                        std::time::Instant::now(),
-                    ));
+                    );
                     self.reload_armed_at = Some(std::time::Instant::now());
-                    self.load_selected_diff();
+                    // `handle_git_reload` — which schedules the wake-up that runs
+                    // an armed reload — already ran earlier this frame, so arming
+                    // it here would otherwise wait for some other repaint to come
+                    // along. Usually one does (the `.git` watcher fires, because
+                    // every action rewrites `.git/index`), but not for the binary
+                    // blob restore: `restore_binary` only touches the worktree, so
+                    // nothing under `.git` changes and the watcher stays silent.
+                    // Without this the pane would sit on pre-revert content until
+                    // the status message's own fade timer happened to repaint.
+                    self.egui_ctx.request_repaint_after(RELOAD_DEBOUNCE);
+                    // No `load_selected_diff()` here: the armed reload dispatches
+                    // a Rebuild, and `drain_history_results` already ends with one
+                    // — so calling it now would compute the same diff twice, and
+                    // for a virtual row (content-keyed, so the immediate call
+                    // always misses the cache) that means two full `get_diff_data`
+                    // runs plus a visible re-flash of the pane per click.
                 }
                 Err(e) => {
                     if let Some(raw) = e.detail() {
                         log::warn!("gitkay: {} {scope} failed: {raw}", action.verb());
                     }
-                    self.apply_status = Some((
-                        e.user_message(action, &req.path),
-                        true,
-                        std::time::Instant::now(),
-                    ));
+                    self.set_apply_status(e.user_message(action, &req.display_path()), true);
                 }
             }
         }
+    }
+
+    /// Post a line to the write status overlay, stamped now. One place so the
+    /// "posted at" instant the fade reads cannot drift between call sites.
+    fn set_apply_status(&mut self, text: String, is_error: bool) {
+        self.apply_status = Some((text, is_error, std::time::Instant::now()));
     }
 
     /// The write status message: a small overlay at the bottom-left of the diff
@@ -4486,10 +4572,10 @@ impl GitkApp {
     /// (`SUBTEXT_DIM`) and the distinguishing tail in `SUBTEXT`, so a deep tree reads
     /// like an indented breadcrumb instead of a wall of repeated path.
     fn draw_dir_header(&self, ui: &mut egui::Ui, dir: &str, dim_len: usize, row_h: f32) {
-        let (rect, _) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), row_h),
-            egui::Sense::hover(),
-        );
+        // `allocate_space`: a header is inert, so registering a widget and
+        // building a `Response` for it is pure waste — and in `Grouped` layout
+        // there is one per directory, every frame, unvirtualized.
+        let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), row_h));
         let left = rect.min.x + 4.0;
         let right = rect.max.x - 4.0;
         let cy = rect.center().y;
@@ -4530,44 +4616,44 @@ impl GitkApp {
     /// (The sidebar's click handler guards the same hazard by ignoring clicks
     /// mid-load; here the displayed key is the more precise answer, since it also
     /// keeps the menu working while a load is in flight.)
+    ///
+    /// `offer_hunk` is whether a hunk item belongs in this menu at all, which is
+    /// a property of the CALLER, not of `hunk`. In the diff pane a row may or may
+    /// not sit inside a hunk, so a disabled item explaining that is useful. A
+    /// sidebar row is a whole file by definition and can never be inside one, so
+    /// there the item could never become enabled — it would just be a permanently
+    /// dead entry whose tooltip describes a concept that pane does not have.
     fn apply_menu_items(
         &self,
         ui: &mut egui::Ui,
         file_idx: usize,
         hunk: Option<diff::HunkRange>,
+        offer_hunk: bool,
     ) -> Option<apply::ApplyRequest> {
         let oid = self.current_diff_key.as_ref().map(|k| k.oid)?;
         let file = self.diff_files.get(file_idx)?;
         let verb = apply::ApplyAction::of(oid).verb();
-        let busy = self.apply_in_flight();
+        let busy = self.apply_in_flight;
         let mut chosen = None;
 
-        let hunk_item = ui.add_enabled(
-            !busy && hunk.is_some(),
-            egui::Button::new(format!("{verb} hunk")),
-        );
-        if hunk.is_none() {
-            let _ = hunk_item.on_disabled_hover_text("this row is not inside a hunk");
-        } else if hunk_item.clicked() {
-            chosen = Some(apply::ApplyRequest {
-                oid,
-                path: file.path.clone(),
-                old_path: file.old_path.clone(),
-                hunk,
-            });
-            ui.close();
+        if offer_hunk {
+            let hunk_item = ui.add_enabled(
+                !busy && hunk.is_some(),
+                egui::Button::new(format!("{verb} hunk")),
+            );
+            if hunk.is_none() {
+                let _ = hunk_item.on_disabled_hover_text("this row is not inside a hunk");
+            } else if hunk_item.clicked() {
+                chosen = Some(apply::ApplyRequest::for_entry(oid, file, hunk));
+                ui.close();
+            }
         }
 
         if ui
             .add_enabled(!busy, egui::Button::new(format!("{verb} file")))
             .clicked()
         {
-            chosen = Some(apply::ApplyRequest {
-                oid,
-                path: file.path.clone(),
-                old_path: file.old_path.clone(),
-                hunk: None,
-            });
+            chosen = Some(apply::ApplyRequest::for_entry(oid, file, None));
             ui.close();
         }
         chosen
@@ -4592,9 +4678,20 @@ impl GitkApp {
     ) -> Option<usize> {
         let line_idx = self.diff_files[idx].diff_line_idx;
 
-        let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), frame.row_h),
-            egui::Sense::click(),
+        let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), frame.row_h));
+        // A STABLE id, not the positional auto-id `allocate_space` would
+        // hand back: the sidebar rebuilds its row list on every reload, so an
+        // open context menu keyed on position migrates to whatever file now
+        // occupies that slot — and reverts a file the user never right-clicked.
+        // `frame.menu_salt` pins the row to the diff it belongs to, `idx` to the
+        // file within it. Same reasoning as the diff pane's `("diff_row", ..)`.
+        // `Sense::CLICK`, not `Sense::click()`: the latter is `CLICK | FOCUSABLE`,
+        // which would enter every file row into the tab order. The row is a click
+        // target, not a keyboard one.
+        let resp = ui.interact(
+            rect,
+            ui.id().with(("file_row", frame.menu_salt, idx)),
+            egui::Sense::CLICK,
         );
 
         if frame.current_file == Some(idx) {
@@ -4704,7 +4801,14 @@ impl GitkApp {
             // Top-right pivot at the row's bottom-right: the tooltip opens below the
             // row and grows leftward, so it stays inside the window despite the
             // right-edge position (the Area additionally constrains to the screen).
-            egui::Area::new(resp.id.with("path_tip"))
+            // Deliberately NOT `resp.id`: that carries `menu_salt`, a fresh value
+            // per commit selected and per working-tree edit, and egui never prunes
+            // `Areas` — it keeps every LayerId it has ever seen, linear-scans on
+            // insert and re-sorts the whole order every frame. Inheriting the salt
+            // would mint a new layer on every hover while browsing and grow both
+            // without bound. The row index alone is all the tooltip needs: only one
+            // is ever shown, and it belongs to whatever row is hovered now.
+            egui::Area::new(ui.id().with(("path_tip", idx)))
                 .order(egui::Order::Tooltip)
                 .interactable(false)
                 .pivot(egui::Align2::RIGHT_TOP)
@@ -4718,12 +4822,21 @@ impl GitkApp {
                     });
                 });
         }
-        resp.context_menu(|ui| {
-            // Sidebar rows are whole files: no hunk to point at.
-            if let Some(req) = self.apply_menu_items(ui, idx, None) {
-                frame.pending_apply = Some(req);
-            }
-        });
+        // Attaching is not free — `Response::context_menu` allocates a style
+        // modifier and takes several `Context` locks before it even checks
+        // whether a popup is open — and the file list is NOT row-virtualized, so
+        // this runs for every file every frame. A menu can only *open* on a
+        // hovered row (`secondary_clicked` implies hover), so non-hovered rows
+        // need it only while some popup is already up and must keep being drawn.
+        if resp.hovered() || frame.any_menu_open {
+            resp.context_menu(|ui| {
+                // Sidebar rows are whole files: no hunk to point at, and no hunk
+                // item either — see `apply_menu_items`' `offer_hunk`.
+                if let Some(req) = self.apply_menu_items(ui, idx, None, false) {
+                    frame.pending_apply = Some(req);
+                }
+            });
+        }
 
         if resp.clicked() { line_idx } else { None }
     }
@@ -5288,6 +5401,8 @@ impl GitkApp {
                         current_file,
                         cache: &mut cache,
                         pending_apply: None,
+                        menu_salt: diff_menu_salt(self.current_diff_key.as_ref()),
+                        any_menu_open: egui::Popup::is_any_open(ui.ctx()),
                     };
                     let mut scroll_to: Option<usize> = None;
                     for row in &self.file_rows {
@@ -5688,6 +5803,21 @@ impl GitkApp {
     /// (match cycling or selection), PageUp/Down (file jumps), and Space /
     /// Shift+Space (half-page diff scroll).
     fn handle_keys(&mut self, ctx: &egui::Context, search_id: egui::Id) {
+        // Escape dismisses a write error. The overlay itself cannot do it: it is
+        // `interactable(false)` on purpose (an interactable layer over the diff
+        // steals the hit-test and silently eats wheel input — see AGENTS.md), so
+        // clicking it does nothing. Only the success branch of `show_apply_status`
+        // expires on its own, so without this an error box sits over the bottom
+        // of every diff for the rest of the session.
+        if self
+            .apply_status
+            .as_ref()
+            .is_some_and(|&(_, is_error, _)| is_error)
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.apply_status = None;
+        }
+
         // Any printable keypress when search bar is not focused → focus it. The literal
         // Space is the one exception: it's the diff page-scroll key, so it must not open
         // search (you'd never start a search with a leading space anyway). Only ' ' is
@@ -6000,6 +6130,7 @@ impl eframe::App for GitkApp {
                                 self.diff_scroll_to.take()
                             },
                             last_top_anchor: self.diff_last_top_anchor,
+                            menu_salt: diff_menu_salt(self.current_diff_key.as_ref()),
                         };
                         // One render path for both modes. Syntax-on takes row colours from
                         // the theme's token spans plus an add/del tint; syntax-off uses one
@@ -6061,19 +6192,15 @@ impl eframe::App for GitkApp {
                                 (job, row_bg, render_palette.foreground)
                             },
                             // A row above the first file (commit meta, diffstat) belongs to
-                            // no file — no menu is attached for it at all, so egui never
-                            // opens a (necessarily empty) popup on right-click there.
-                            |i| file_index_at_line_opt(starts, i).is_some(),
-                            |ui, i| {
-                                // A row above the first file (commit meta, diffstat)
-                                // belongs to no file — open no menu at all.
-                                let Some(file_idx) = file_index_at_line_opt(starts, i) else {
-                                    return;
-                                };
+                            // no file — `None` means no menu is attached for it at all, so
+                            // egui never opens a (necessarily empty) popup there.
+                            |i| file_index_at_line_opt(starts, i),
+                            |ui, i, file_idx| {
                                 if let Some(req) = self.apply_menu_items(
                                     ui,
                                     file_idx,
                                     diff::hunk_at_line(lines, i),
+                                    true,
                                 ) {
                                     pending_apply = Some(req);
                                 }
@@ -6309,7 +6436,9 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_repo::{commit_file, commit_index, commit_rename, temp_repo};
+    use crate::test_repo::{
+        commit_file, commit_index, commit_rename, stage, temp_repo, write_file,
+    };
 
     /// Make a fake OID from an integer for testing.
     fn oid(n: u32) -> git2::Oid {
@@ -7049,16 +7178,52 @@ mod tests {
         assert_eq!(format_commit_time(secs, 100_000, false), "");
     }
 
-    /// A `FileEntry` fixture: no rename, zero counts (nothing below asserts them).
-    fn fe(path: &str, diff_line_idx: Option<usize>) -> FileEntry {
-        FileEntry {
-            path: path.to_string(),
-            old_path: None,
-            additions: 0,
-            deletions: 0,
-            diff_line_idx,
-        }
+    /// A context menu is keyed on its widget's id, and egui keeps a popup open
+    /// across frames. So the id has to carry the identity of the diff the menu
+    /// was opened over: if it does not, a diff that swaps underneath an open menu
+    /// leaves the popup attached, and the closure re-resolves its file against
+    /// the NEW content — reverting a file the user never right-clicked.
+    ///
+    /// The whole key, not just the oid: the uncommitted/staged rows keep one
+    /// sentinel oid forever and are told apart only by `content`, so an oid-only
+    /// salt would leave every working-tree reload sharing one id.
+    #[test]
+    fn the_menu_salt_changes_whenever_the_displayed_diff_does() {
+        let key = |oid: git2::Oid, content: u64| DiffCacheKey {
+            oid,
+            settings: ds(),
+            theme: highlight::EmbeddedThemeName::CatppuccinMocha,
+            enabled: true,
+            content,
+        };
+        let a = key(diff::oid_uncommitted(), 1);
+        let same = key(diff::oid_uncommitted(), 1);
+        let edited = key(diff::oid_uncommitted(), 2);
+        let other_commit = key(git2::Oid::from_bytes(&[7u8; 20]).unwrap(), 1);
+
+        assert_eq!(
+            diff_menu_salt(Some(&a)),
+            diff_menu_salt(Some(&same)),
+            "the same diff must keep one id, or menus would close every frame"
+        );
+        assert_ne!(
+            diff_menu_salt(Some(&a)),
+            diff_menu_salt(Some(&edited)),
+            "a working-tree edit re-keys the diff and must orphan an open menu"
+        );
+        assert_ne!(
+            diff_menu_salt(Some(&a)),
+            diff_menu_salt(Some(&other_commit)),
+            "selecting another commit must orphan an open menu"
+        );
+        assert_ne!(
+            diff_menu_salt(None),
+            diff_menu_salt(Some(&a)),
+            "no diff on screen is its own identity"
+        );
     }
+
+    use crate::test_repo::file_entry as fe;
 
     /// Baseline `DiffSettings` (default context, every toggle off); tests flip the
     /// flag under test via struct-update syntax: `DiffSettings { show_stats: true, ..ds() }`.
@@ -7640,10 +7805,8 @@ mod tests {
         // `git init; git add a.txt` — no commit yet, HEAD unborn. The staged
         // probe must diff the index against the EMPTY tree (like `git diff
         // --cached`), or the window renders completely blank.
-        std::fs::write(repo.workdir().unwrap().join("a.txt"), "hi").unwrap();
-        let mut index = repo.index().unwrap();
-        index.add_path(std::path::Path::new("a.txt")).unwrap();
-        index.write().unwrap();
+        write_file(&repo, "a.txt", "hi");
+        stage(&repo, "a.txt");
         let commits = load_commits(&repo, 100, &scope(false, &[]));
         assert!(
             commits.iter().any(|c| c.oid == oid_staged()),
@@ -7665,20 +7828,16 @@ mod tests {
         commit_file(&repo, "f.txt", "base\n", "base");
 
         // Staged change AND a further unstaged change: both virtual rows exist.
-        std::fs::write(repo.workdir().unwrap().join("f.txt"), "staged\n").unwrap();
-        let mut index = repo.index().unwrap();
-        index.add_path(std::path::Path::new("f.txt")).unwrap();
-        index.write().unwrap();
-        std::fs::write(repo.workdir().unwrap().join("f.txt"), "unstaged\n").unwrap();
+        write_file(&repo, "f.txt", "staged\n");
+        stage(&repo, "f.txt");
+        write_file(&repo, "f.txt", "unstaged\n");
 
         let both = load_commits(&repo, 10, &scope(false, &[]));
         assert_eq!(both[0].oid, oid_uncommitted());
         assert_eq!(both[1].oid, oid_staged());
 
         // Stage everything: the uncommitted row's reason to exist is gone.
-        let mut index = repo.index().unwrap();
-        index.add_path(std::path::Path::new("f.txt")).unwrap();
-        index.write().unwrap();
+        stage(&repo, "f.txt");
 
         let after = load_commits(&repo, 10, &scope(false, &[]));
         assert_eq!(
@@ -7714,7 +7873,7 @@ mod tests {
         let author = git2::Signature::new("a", "a@x", &git2::Time::new(1_600_000_000, 0)).unwrap();
         let committer =
             git2::Signature::new("c", "c@x", &git2::Time::new(1_700_000_000, 0)).unwrap();
-        std::fs::write(repo.workdir().unwrap().join("a.txt"), "2").unwrap();
+        write_file(&repo, "a.txt", "2");
         let mut index = repo.index().unwrap();
         index.add_path(std::path::Path::new("a.txt")).unwrap();
         index.write().unwrap();
@@ -7997,7 +8156,7 @@ mod tests {
         commit_file(&repo, "a.txt", "1", "a-1");
         commit_file(&repo, "b.txt", "1", "b-1");
         // Uncommitted modification to a tracked file, b.txt only.
-        std::fs::write(repo.workdir().unwrap().join("b.txt"), "dirty").unwrap();
+        write_file(&repo, "b.txt", "dirty");
 
         let has_uncommitted_row = |paths: Vec<String>| -> bool {
             let s = cli::Scope {
@@ -8032,7 +8191,7 @@ mod tests {
         // A second branch to view explicitly, plus an uncommitted change on disk.
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         repo.branch("foobar", &head, false).unwrap();
-        std::fs::write(repo.workdir().unwrap().join("a.txt"), "dirty").unwrap();
+        write_file(&repo, "a.txt", "dirty");
 
         let has_worktree_row = |scope: cli::Scope| {
             load_commits(&repo, 100, &scope)

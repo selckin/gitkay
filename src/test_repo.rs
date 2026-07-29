@@ -48,6 +48,32 @@ pub fn commit_file(repo: &git2::Repository, path: &str, content: &str, msg: &str
     commit_index(repo, &mut index, msg)
 }
 
+/// `commit_file`'s binary twin: raw bytes, staged and committed. Separate because
+/// the write layer's binary routes need content `&str` cannot express (a NUL byte
+/// is what makes git call a blob binary in the first place).
+pub fn commit_bytes(repo: &git2::Repository, path: &str, content: &[u8], msg: &str) -> git2::Oid {
+    std::fs::write(repo.workdir().unwrap().join(path), content).unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(Path::new(path)).unwrap();
+    commit_index(repo, &mut index, msg)
+}
+
+/// A `FileEntry` fixture: given path + patch start, no rename, zero counts.
+/// Shared because the `diff` and `main` suites both need one and both had to be
+/// edited identically every time `FileEntry` gained a field.
+pub fn file_entry(path: &str, diff_line_idx: Option<usize>) -> crate::diff::FileEntry {
+    crate::diff::FileEntry {
+        path: path.to_string(),
+        old_path: None,
+        path_bytes: path.as_bytes().to_vec(),
+        old_path_bytes: None,
+        status: git2::Delta::Modified,
+        additions: 0,
+        deletions: 0,
+        diff_line_idx,
+    }
+}
+
 /// Stage a rename `old` -> `new` (the file is already moved on disk) and commit.
 pub fn commit_rename(repo: &git2::Repository, old: &str, new: &str, msg: &str) -> git2::Oid {
     let mut index = repo.index().unwrap();
