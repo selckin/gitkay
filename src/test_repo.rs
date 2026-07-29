@@ -10,6 +10,15 @@ pub fn temp_repo() -> (tempfile::TempDir, git2::Repository) {
     let mut cfg = repo.config().unwrap();
     cfg.set_str("user.name", "t").unwrap();
     cfg.set_str("user.email", "t@example.com").unwrap();
+    // Pin every core setting the write-layer suite asserts on, so the developer's
+    // own ~/.gitconfig cannot decide whether the tests pass. These are not
+    // hypothetical: with `core.autocrlf = true` set globally, the reverted
+    // patches land through the CRLF filter and the on-disk assertions compare
+    // "x\r\n" against "x\n". `fileMode`/`symlinks` are the same story for the
+    // mode and symlink tests. Repo-local, so it wins over global and system.
+    cfg.set_bool("core.autocrlf", false).unwrap();
+    cfg.set_bool("core.fileMode", true).unwrap();
+    cfg.set_bool("core.symlinks", true).unwrap();
     (dir, repo)
 }
 
