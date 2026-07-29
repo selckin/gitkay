@@ -1310,16 +1310,33 @@ fn diff_pad_rows(n_lines: usize, last_top_anchor: Option<usize>, viewport_rows: 
 /// right-clicked. Mixing this into the id makes the widget a *different* widget
 /// once the diff changes, which orphans the popup and closes it.
 ///
-/// Hashes the whole `DiffCacheKey`, not just its oid: the uncommitted and staged
-/// rows keep one sentinel oid for the life of the process and are distinguished
-/// only by `content`, so an oid-only salt would let every working-tree reload
-/// share a single id — exactly the rows where the file list churns most.
+/// Hashes the key fields that decide the ROWS — more than the oid, less than the
+/// whole key. The uncommitted and staged rows keep one sentinel oid for the life
+/// of the process and are distinguished only by `content`, so an oid-only salt
+/// would let every working-tree reload share a single id — exactly the rows where
+/// the file list churns most. But `theme` and `enabled` only recolour the same
+/// lines (they change spans, never the line or file list), so hashing them would
+/// dismiss an open menu on a live config reload that merely re-themed the diff.
 fn diff_menu_salt(key: Option<&DiffCacheKey>) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    // `Option`'s own Hash writes a discriminant, so "no diff on screen" is
-    // already distinct from every real key without a hand-rolled sentinel.
-    key.hash(&mut h);
+    // A discriminant first, so "no diff on screen" is its own identity rather
+    // than colliding with some real key's hash.
+    match key {
+        None => h.write_u8(0),
+        // Destructured, so a new key field has to be classified here — row
+        // identity or not — instead of silently staying out of the salt.
+        Some(DiffCacheKey {
+            oid,
+            settings,
+            content,
+            theme: _,
+            enabled: _,
+        }) => {
+            h.write_u8(1);
+            (oid, settings, content).hash(&mut h);
+        }
+    }
     h.finish()
 }
 
@@ -4083,6 +4100,18 @@ impl GitkApp {
                         log::warn!("gitkay: {} {scope} failed: {raw}", action.verb());
                     }
                     self.set_apply_status(e.user_message(action, &req.display_path()), true);
+                    // Refresh on this branch too. Most failures are refusals
+                    // decided before anything was written, where the reload is a
+                    // cheap no-op — but not all of them are: `restore_binary`
+                    // writes the parent-side file before it removes the
+                    // commit-side one, so an IO error in between fails with the
+                    // worktree already changed. Left unarmed, the pane would keep
+                    // rendering pre-write content until something else happened
+                    // to reload — and for the blob restore nothing does, since it
+                    // never touches `.git` and the watcher stays silent (same
+                    // reason the success branch needs the explicit repaint).
+                    self.reload_armed_at = Some(std::time::Instant::now());
+                    self.egui_ctx.request_repaint_after(RELOAD_DEBOUNCE);
                 }
             }
         }
@@ -4383,19 +4412,25 @@ impl GitkApp {
                 continue;
             }
             self.history_inflight = false;
-            let Some(load) = result.load else {
-                continue; // worker failed (logged there); a scroll re-triggers
-            };
-            match load {
-                HistoryLoad::Extend { new, max_new } => {
+            // A failed worker (logged there) leaves the commit list alone — a
+            // scroll re-triggers the extension — but the diff refresh below still
+            // has to run. The reload `drain_apply_results` armed is the ONLY
+            // post-write refresh, and it is spent by the time we get here, so
+            // returning early would strand the pane on pre-write content with
+            // nothing left to re-arm it: the reverted file would keep reading as
+            // changed, and clicking Revert again would then fail with "no longer
+            // matches that commit".
+            match result.load {
+                None => {}
+                Some(HistoryLoad::Extend { new, max_new }) => {
                     let requested = real_commit_count(&self.commits) + max_new;
                     self.append_commits(new, requested);
                 }
-                HistoryLoad::Rebuild {
+                Some(HistoryLoad::Rebuild {
                     commits,
                     count,
                     derived,
-                } => {
+                }) => {
                     let previous_oid = self.selected_oid();
                     let previous_index = self.selected;
                     self.commits = commits;
@@ -5809,10 +5844,18 @@ impl GitkApp {
         // clicking it does nothing. Only the success branch of `show_apply_status`
         // expires on its own, so without this an error box sits over the bottom
         // of every diff for the rest of the session.
-        if self
-            .apply_status
-            .as_ref()
-            .is_some_and(|&(_, is_error, _)| is_error)
+        //
+        // Not while a context menu is open, though. egui's `Popup` decides to
+        // close on Escape by READING the key (`key_pressed`) when it draws, which
+        // happens later in the frame — so consuming it here deletes the event
+        // first and leaves the menu stuck open, having silently dismissed the
+        // error instead. The menu is what the user is looking at; let it have the
+        // key, and the error goes on the next press.
+        if !egui::Popup::is_any_open(ctx)
+            && self
+                .apply_status
+                .as_ref()
+                .is_some_and(|&(_, is_error, _)| is_error)
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
             self.apply_status = None;
@@ -7220,6 +7263,20 @@ mod tests {
             diff_menu_salt(None),
             diff_menu_salt(Some(&a)),
             "no diff on screen is its own identity"
+        );
+        // …but only the fields that decide the ROWS. A live config reload that
+        // re-themes the diff re-keys it with byte-identical lines and files, and
+        // dismissing a menu the user has open mid-interaction for that is a
+        // change that moved nothing.
+        let retimed = DiffCacheKey {
+            theme: highlight::EmbeddedThemeName::CatppuccinLatte,
+            enabled: false,
+            ..a
+        };
+        assert_eq!(
+            diff_menu_salt(Some(&a)),
+            diff_menu_salt(Some(&retimed)),
+            "a re-theme changes only colours, so it must not orphan an open menu"
         );
     }
 

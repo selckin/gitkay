@@ -637,7 +637,24 @@ pub fn staged_git_diff<'r>(
     repo: &'r Repository,
     opts: &mut DiffOptions,
 ) -> Result<git2::Diff<'r>, git2::Error> {
-    repo.diff_tree_to_index(head_tree(repo).as_ref(), None, Some(opts))
+    staged_diff_against(repo, head_tree(repo).as_ref(), opts)
+}
+
+/// The same "staged changes" diff, against a HEAD tree the caller resolved.
+///
+/// Split out for the write layer: `head_tree`'s `None` means two different things
+/// — a genuinely unborn HEAD, or a HEAD that could not be read — and folding them
+/// is only safe for a display. A write that diffs against the EMPTY tree by
+/// mistake sees every staged path as a whole-file add/delete, which libgit2
+/// applies outside the hunk callback. So `apply::head_tree_for_write` resolves
+/// HEAD there and hands the answer in here, and the *definition* of the diff
+/// still lives in one place.
+pub fn staged_diff_against<'r>(
+    repo: &'r Repository,
+    head: Option<&git2::Tree<'_>>,
+    opts: &mut DiffOptions,
+) -> Result<git2::Diff<'r>, git2::Error> {
+    repo.diff_tree_to_index(head, None, Some(opts))
 }
 
 /// The git diff that defines "uncommitted changes" (workdir vs index — tracked files
@@ -689,9 +706,26 @@ pub fn commit_parent_diff<'r>(
     commit: &git2::Commit<'_>,
     opts: Option<&mut DiffOptions>,
 ) -> Result<git2::Diff<'r>, git2::Error> {
-    let tree = commit.tree()?;
     let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
-    repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), opts)
+    commit_diff_against(repo, commit, parent_tree.as_ref(), opts)
+}
+
+/// The same commit diff, against a parent tree the caller resolved.
+///
+/// Split out for the write layer, for the same reason as `staged_diff_against`:
+/// the `None` above folds "root commit" together with "the first parent could not
+/// be read", which for a *revert* turns the reversed diff into "delete every file
+/// this commit has" — it would delete the worktree copy instead of restoring the
+/// parent's version. `apply::parent_tree_for_write` tells the two apart and hands
+/// the answer in here.
+pub fn commit_diff_against<'r>(
+    repo: &'r Repository,
+    commit: &git2::Commit<'_>,
+    parent_tree: Option<&git2::Tree<'_>>,
+    opts: Option<&mut DiffOptions>,
+) -> Result<git2::Diff<'r>, git2::Error> {
+    let tree = commit.tree()?;
+    repo.diff_tree_to_tree(parent_tree, Some(&tree), opts)
 }
 
 /// Each file's `(file index, start, end)` line range, ordered by start. File

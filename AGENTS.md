@@ -288,13 +288,22 @@ libgit2 will not take them for us:
   before any of it: returning false makes `apply_one` skip that delta whole, before it
   touches the preimage, so it never reaches the deletion/rename shortcuts either. The
   pre-check applies the same gate, or the two would disagree.
-- **Whole-file Stage compares against what was displayed.** It records whatever the
+- **Both routes compare against what was displayed.** A write records whatever the
   worktree holds when the worker runs, so a file removed in the gap between the display and
   the click would be staged as a DELETION the pane never showed. `ApplyRequest::shown_deleted()`
   (from the delta status) is what tells that apart from a deletion the user is deliberately
-  staging; without a match it is `Stale`. Relatedly, only `NotFound` counts as "gone" —
-  lstat also fails with EACCES/ELOOP/ESTALE on a file that is still there, and folding
-  those in would stage its deletion (same split `read_if_present` already makes).
+  staging; without a match it is `Stale`. The **hunk** route needs it just as much as
+  whole-file Stage, and for a sharper reason: a deletion is precisely the delta libgit2
+  applies outside the patch machinery, so a click whose range contains the deletion's own
+  `@@ -1,N +0,0 @@` header (a whole-file hunk always does) drops the path while
+  `bypasses_hunk_callback` waives the acceptance-count check — a whole-file deletion from a
+  sub-file click, reported as a success. It compares through `generated_shows_deleted`,
+  because a reversed action diff swaps every delta's sides: what the pane showed as a
+  deletion arrives as `Added` on the Unstage and Revert routes.
+  Relatedly, only `NotFound` counts as "gone" — lstat also fails with EACCES/ELOOP/ESTALE
+  on a file that is still there, and folding those in would stage its deletion, or skip the
+  removal half of a rename revert and call it done. `path_present` is that split, shared by
+  every presence check here (same one `worktree_content` makes).
 - **The worktree is touched only through lstat-first helpers.** `std::fs::read`,
   `write` and `set_permissions` all follow symlinks, so a guard that reads through a
   link validates one file while the write lands on another — with a link into a shared
@@ -302,17 +311,50 @@ libgit2 will not take them for us:
   the repo path is reported as reverted. `worktree_content` lstats first and answers
   `Absent` / `Blob(oid)` / `Other`; `Other` matches nothing, so a symlink can never be
   written through. It identifies a file by hashing it (`Oid::hash_file`) rather than
-  reading it, so guarding a multi-GB asset costs constant memory.
+  reading it, so guarding a multi-GB asset costs constant memory. **Known limitation:**
+  that hash is of the RAW bytes, while the blob it is compared against is the *filtered*
+  content — so on a repo using `core.autocrlf`, a `text`/`ident` attribute or Git LFS the
+  guards refuse an untouched file (`ChangedSinceCommit`, permanently). git2 0.21 exposes no
+  filter-aware hash (`git_repository_hashfile` is unwrapped; `blob_path` is
+  `create_fromdisk`, unfiltered), so fixing it means either writing a blob to the odb from a
+  guard or rebuilding the guards on a libgit2 tree-to-workdir diff — a design call, not a
+  patch.
+- **A binary rename revert undoes its own write when the removal fails.** `restore_binary`
+  writes the parent-side file first and only then removes the commit-side one, so an IO
+  error in between used to be reported as "Revert failed" with the worktree holding BOTH
+  copies — the duplicate the removal exists to prevent, under a message saying nothing
+  happened. The guard admits that path only when nothing was there, so removing what was
+  just written restores the pre-call state exactly, and the reported failure is true again.
 - **A hunk click never performs a whole-file mutation.** libgit2 carries out a
   `Renamed` delta's move outside the patch machinery, so applying it relocates the file
   however few hunks the callback accepts — "Revert hunk" would move the file back.
   Refused as `RenameNeedsWholeFile`, which names the whole-file action that does work.
   The Added/Deleted carve-out stays: there the delta IS the whole file.
+
+  A **copy** is refused for a different reason and with its own verdict
+  (`CopyNeedsWholeFile`, decided from the *displayed* status before any diff is generated).
+  Its source is deliberately outside the action pathspec, so nothing pairs with the file
+  and it regenerates as a plain add whose one `@@ -0,0 +1,N @@` header can never contain
+  the copy patch's coordinates — the click could only ever come back `Stale`, blaming a
+  change that never happened, with no retry that could work. Same permanently-false-reason
+  defect as the symlink case below.
 - **Symlinks and gitlinks are refused on the worktree routes** (`refuse_unwritable_modes`).
   libgit2's workdir reader resolves a link, so it reads the target's bytes where the
   patch expects the link text and the apply fails as `Stale` — a false reason, forever.
   A gitlink has no blob at all. Index routes are unaffected: `index.add_path` records
-  both correctly.
+  both correctly. Modes are read from the **trees** the diff was generated from
+  (`RevertTrees` + `TreeEntry::filemode`), never from the diff: `git2::DiffFile::mode()`
+  `panic!`s on anything outside git2's canonical seven, and a tree-to-tree diff carries the
+  tree's mode **verbatim** (`iterator.c`: `iter->entry.mode = tree_entry->attr`), so an old
+  importer's `100775` crashed the write worker instead of reverting. `TreeEntry::filemode`
+  is libgit2's own normalization of that same value and returns a plain `i32` — git's rule
+  rather than a reimplementation of it, and no `unsafe` to reach the raw field. The diff is
+  reversed, so a delta's old side is an entry of the commit's tree and its new side an entry
+  of the parent's; `RevertTrees::of` resolves both from the request's oid through the same
+  `parent_tree_for_write` that built the diff, so the modes cannot come off a different pair
+  of trees than the deltas did. (The binary route then reverts such a file correctly; on the
+  patch route libgit2 itself declines the non-canonical mode when it builds the preimage
+  index — its call, and an honest error instead of a crashed worker.)
 
   Reverting either is **deliberately out of scope**, not a gap waiting to be filled.
   Both are implementable — recreate the link at the parent's target, run a submodule
@@ -331,9 +373,28 @@ libgit2 will not take them for us:
   beside the surviving stages 1/2/3 — an index that reads as both resolved and conflicted,
   which `git status` still calls unmerged, while the write reported success. `stage_file`
   needs no equivalent (`index.add_path` moves conflict entries to the REUC itself).
-- **`head_tree_for_write`, not `diff::head_tree`.** The latter folds every failure into
-  `None`, which for a write means "HEAD has no such file" — so an unreadable HEAD would
-  stage the deletion of a tracked file. Only `UnbornBranch` is a legitimate `None`.
+- **A failure to READ is never a benign default on a write path.** The display builders all
+  fold "could not read" into "there is nothing there", which is right for a pane and a
+  silent whole-file deletion for a write. So every tree the write layer needs, it resolves
+  itself:
+  - `head_tree_for_write`, not `diff::head_tree` — an unreadable HEAD would otherwise mean
+    "HEAD has no such file" and stage the deletion of a tracked file. Only `UnbornBranch` is
+    a legitimate `None`. The hunk route needs it too, via `diff::staged_diff_against`:
+    diffing the index against the EMPTY tree turns every staged path into a reversed
+    `Deleted` delta libgit2 removes wholesale, outside the hunk callback.
+  - The **entry** lookup inside that tree, not `tree.get_path(p).ok()` —
+    `git_tree_entry_bypath` also fails when an intermediate sub-tree object cannot be loaded
+    (a treeless partial clone, a pruned or corrupt odb), which the `None` arm reads as "HEAD
+    has no such file". Only `NotFound` is an answer.
+  - `parent_tree_for_write`, not `commit_parent_diff`'s own `.ok()`, via
+    `diff::commit_diff_against` — a revert diff is the commit's diff REVERSED, so an empty
+    parent tree makes it "delete every file this commit has". `parent_count` is what tells a
+    root commit apart from an unreadable parent.
+  - `commit_side_blob`, not `find_blob(..).ok()` — `content_matches` counts
+    `(Absent, None)` as a MATCH, so a folded load failure makes the guards answer "the
+    worktree still holds the commit's content" for an object they never read. Only the zero
+    oid means "this side has no file".
+
   Relatedly, restore HEAD's entry with `filemode()`, not `filemode_raw()`: trees in the
   wild carry modes outside git's canonical five and `git_index_add` rejects them.
 - **A worktree deletion has no context to refuse on.** `apply_one` reads the preimage from
@@ -343,7 +404,7 @@ libgit2 will not take them for us:
   file would delete the worktree copy whatever it now holds. `guard_workdir_deletions`
   (shared by the whole-file and hunk routes) requires every reversed-`Deleted` delta's
   worktree content to still equal the commit's blob, or returns `ChangedSinceCommit` — the
-  same guard, and the same `read_if_present`/`content_matches` helpers, as the binary route.
+  same guard, and the same `worktree_content`/`content_matches` helpers, as the binary route.
 - A **one-path pathspec** drops a rename's delete side, because `apply_pathspec` filters
   before `detect_similar` runs — so both sides are always passed.
 
@@ -352,13 +413,21 @@ The context menu takes its oid from `current_diff_key` (the diff **on screen**),
 the selection and the displayed paths belong to two different diffs.
 
 Both menus are **pinned to the diff they were opened over** by mixing `diff_menu_salt`
-(a hash of the whole `DiffCacheKey`) into the row's widget id. egui keeps a popup open
+(a hash of the `DiffCacheKey`'s row-deciding fields) into the row's widget id. egui keeps a popup open
 across frames and keys it on that id, so without the salt an open menu survives the diff
 being replaced underneath it — by the debounced reload, the post-apply refresh, an arrow
 key — and its closure then re-resolves the row against the NEW content, writing a file the
 user never right-clicked. A changed salt makes the row a different widget, which orphans
-the popup. The whole key, not the oid: the virtual rows keep one sentinel oid forever and
-are told apart only by `content`.
+the popup. More than the oid: the virtual rows keep one sentinel oid forever and
+are told apart only by `content`. Less than the whole key: `theme`/`enabled` only recolour
+the same lines, so hashing them would dismiss a menu the user has open mid-interaction for
+a live config reload that moved nothing. The salt is destructured, so a new key field has
+to be classified rather than silently join in.
+
+Escape dismisses a write error, but **only when no popup is open** (`Popup::is_any_open`).
+`consume_key` deletes the event, and egui's `Popup` decides to close by *reading* the key
+later in the frame — so consuming it in `handle_keys` leaves an open context menu stuck and
+silently dismisses the error instead.
 
 Applies run on a `gitkay-apply` worker, one at a time; on success they arm the same
 debounced reload the git watcher arms (every action rewrites `.git/index` — `git_apply`
@@ -370,6 +439,14 @@ content-keyed virtual row the extra call always misses the cache and pays a seco
 *after* `handle_git_reload` in the frame, so nothing else schedules the wake-up that runs
 what it just armed. Usually the watcher covers it, but not for the binary blob restore:
 `restore_binary` only touches the worktree, so nothing under `.git` changes.
+
+The **failure** branch arms it too. Most failures are refusals decided before anything was
+written, where the reload is a cheap no-op — but not all are (`restore_binary` can fail
+with the parent-side write already landed), and for those the pane would otherwise sit on
+pre-write content indefinitely. For the same reason `drain_history_results` runs its
+closing `load_selected_diff()` even when the worker reports a failed load: that armed
+reload is the only post-write refresh, and returning early would strand the pane with
+nothing left to re-arm it.
 
 ## Tests
 
@@ -385,6 +462,11 @@ OIDs via `oid(n)` — no real repo needed — and pins the layout invariants (la
 stability, merge diagonals, convergence, out-of-scope-parent continuation
 lines; `grep 'fn test_' src/main.rs` for the list). Change `layout_graph` only
 with that suite green.
+
+`temp_repo` pins `core.autocrlf=false`, `core.fileMode=true` and `core.symlinks=true` on the
+repo-local config, not just user.name/email. The write-layer suite asserts on on-disk bytes,
+file modes and symlinks, so without that the developer's own `~/.gitconfig` decides whether
+`cargo test` passes — a global `autocrlf = true` alone turns the suite red.
 
 `src/test_repo.rs` (`#[cfg(test)]`, so nothing lands in the binary) holds the temp-repo
 helpers the `apply` and `main` suites share — `temp_repo`, `write_file`/`stage`/
