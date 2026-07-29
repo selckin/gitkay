@@ -117,15 +117,7 @@ pub struct DiffLine {
     /// Structural rows carry `None` on both — and so do git's EOF/binary marker
     /// rows, which are `LineKind::Context` but are filtered out by origin in
     /// `append_diff_body`.
-    ///
-    /// Not yet read by any production code — only this module's own tests —
-    /// until the scroll-anchor resolver (a later task) becomes their consumer.
-    /// `#[allow(dead_code)]`, not `#[expect]`: the latter is unfulfilled under
-    /// `./build.sh`'s `--all-targets`, which sees the test-only usage and
-    /// disagrees with CI's bin-only gate about whether the item is dead.
-    #[allow(dead_code)]
     pub old_lineno: Option<NonZeroU32>,
-    #[allow(dead_code)]
     pub new_lineno: Option<NonZeroU32>,
 }
 
@@ -173,11 +165,6 @@ impl DiffLine {
     }
 
     /// This row's number on `side`, or `None` when it has none there.
-    ///
-    /// Removed in Task 4, when `load_selected_diff` becomes the first
-    /// production caller. Read only from `#[cfg(test)]` code until then, which
-    /// is dead in the bin build, so `#[expect]` would fail `--all-targets`.
-    #[allow(dead_code)]
     pub const fn lineno_on(&self, side: AnchorSide) -> Option<NonZeroU32> {
         match side {
             AnchorSide::Old => self.old_lineno,
@@ -191,11 +178,6 @@ impl DiffLine {
     /// EOF/binary markers — which is exactly the set anchoring must skip, stated
     /// once as a property of the data rather than as a second classification
     /// that could drift from it.
-    ///
-    /// Removed in Task 4, when `load_selected_diff` becomes the first
-    /// production caller. Read only from `#[cfg(test)]` code until then, which
-    /// is dead in the bin build, so `#[expect]` would fail `--all-targets`.
-    #[allow(dead_code)]
     pub const fn anchor_point(&self) -> Option<(AnchorSide, NonZeroU32)> {
         match (self.new_lineno, self.old_lineno) {
             (Some(n), _) => Some((AnchorSide::New, n)),
@@ -218,11 +200,6 @@ pub enum AnchorSide {
 /// line of it, and how far below the viewport's top row that line sat. Captured
 /// before a same-oid re-diff and resolved back to a row after it, so a toolbar
 /// toggle keeps the line under the reader's eye instead of the raw row offset.
-///
-/// Removed in Task 4, when `load_selected_diff` becomes the first production
-/// caller. Read only from `#[cfg(test)]` code until then, which is dead in the
-/// bin build, so `#[expect]` would fail `--all-targets`.
-#[allow(dead_code)]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DiffAnchor {
     /// The file's byte path — never the lossy display `String`, which can
@@ -1003,11 +980,6 @@ pub fn file_index_at_line(starts: &[(usize, usize)], line: usize) -> usize {
 ///
 /// `None` when the diff holds no numbered row at all — an empty pane, or a
 /// binary-only diff — because there is then nothing to re-find.
-///
-/// Removed in Task 4, when `load_selected_diff` becomes the first production
-/// caller. Read only from `#[cfg(test)]` code until then, which is dead in the
-/// bin build, so `#[expect]` would fail `--all-targets`.
-#[allow(dead_code)]
 pub fn capture_anchor(
     lines: &[DiffLine],
     files: &[FileEntry],
@@ -1050,11 +1022,6 @@ pub fn capture_anchor(
 /// next surviving line rather than the nearest in either direction, which is
 /// marginally further in line-number terms but does not read as the view jumping
 /// the wrong way.
-///
-/// Removed in Task 4, when `load_selected_diff` becomes the first production
-/// caller. Read only from `#[cfg(test)]` code until then, which is dead in the
-/// bin build, so `#[expect]` would fail `--all-targets`.
-#[allow(dead_code)]
 pub fn resolve_anchor(anchor: &DiffAnchor, lines: &[DiffLine], files: &[FileEntry]) -> usize {
     // The exact path match must run FIRST and win outright: a file's own entry
     // is always the correct identity when one exists, and checking it first is
