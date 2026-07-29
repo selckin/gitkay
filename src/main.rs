@@ -655,6 +655,45 @@ fn invalidate_stats_state(
     epoch.bump();
 }
 
+/// Record the key a virtual row's freshly computed diff came back under, and drop
+/// that row's cached stats when its CONTENT changed.
+///
+/// The stats map is keyed by oid alone, which is right for a real commit (its
+/// diff is immutable) and wrong for the two virtual rows: they keep one sentinel
+/// oid forever. `handle_git_reload` evicts them, but a worktree-only edit never
+/// touches `.git`, so that reload never fires and the column would keep pre-edit
+/// numbers while the pane — content-keyed via `finalize_diff_key`, so it
+/// recomputes every time — shows the edit. A changed content hash under an
+/// otherwise identical key is the one signal the app gets that the working tree
+/// moved; act on it and the ordinary dispatch path recomputes exactly that row.
+///
+/// Only under identical `DiffSettings`, though. The same working tree laid out
+/// with more context lines hashes differently (`hash_diff_content` covers every
+/// line), and evicting on that would blank and recompute the virtual rows every
+/// time the toolbar's `+`/`-` is clicked — the flicker `stats_relevant` exists
+/// to avoid. The rest of the key is deliberately not compared: `theme`/`enabled`
+/// only recolour, and the hash is over line text and kind, so two keys differing
+/// in those describe the same content and a change between them is a real one.
+///
+/// Free rather than a method, and taking the two maps rather than `&mut self`,
+/// so the regression is pinned against the real function instead of a model of
+/// it — no repo, no worker, no `egui::Context`.
+fn sync_virtual_stats(
+    seen: &mut HashMap<git2::Oid, DiffCacheKey>,
+    known: &mut HashMap<git2::Oid, Option<CommitStats>>,
+    key: &DiffCacheKey,
+) {
+    if !CommitKind::of(key.oid).is_virtual() {
+        return;
+    }
+    if let Some(prev) = seen.insert(key.oid, key.clone())
+        && prev.settings == key.settings
+        && prev.content != key.content
+    {
+        known.remove(&key.oid);
+    }
+}
+
 /// Apply one `<rev>` token to the revwalk: `^X` hides, `A..B` hides A + pushes B,
 /// `A...B` pushes both + hides their merge-base, else pushes the single rev. Each
 /// endpoint is resolved with `revparse_single` (so `HEAD~3`, `@{u}`, tags, etc.
@@ -3236,6 +3275,12 @@ struct GitkApp {
     /// every `CommitInfo`, and these survive it, correctly — a real commit's
     /// diff cannot change.
     commit_stats: HashMap<git2::Oid, Option<CommitStats>>,
+    /// The key each virtual row's diff was last computed under — two entries at
+    /// most. Its content hash is the only signal a worktree-only edit gives the
+    /// app (nothing under `.git` changes, so the watcher stays quiet), and
+    /// `sync_virtual_stats` turns a change in it into an eviction from
+    /// `commit_stats`.
+    virtual_diff_keys: HashMap<git2::Oid, DiffCacheKey>,
     /// Oids the stats worker is computing right now. Doubles as the "a batch is
     /// running" flag, so the two can never disagree — which makes emptying it
     /// load-bearing: see `invalidate_commit_stats`.
@@ -3757,6 +3802,7 @@ impl GitkApp {
             // overwrites this with the exact visible range every frame.
             commit_view_range: 0..64,
             commit_stats: HashMap::new(),
+            virtual_diff_keys: HashMap::new(),
             stats_inflight: HashSet::new(),
             stats_epoch: Epoch::default(),
             stats_tx,
@@ -4127,6 +4173,13 @@ impl GitkApp {
     /// prefetch warmed the same commit while the worker ran) — so its highlighting
     /// is reused instead of re-tokenized.
     fn install_preferring_cache(&mut self, key: DiffCacheKey, data: DiffData) {
+        // The single point where a freshly computed diff becomes the displayed
+        // one (a virtual row never installs from the cache — load_selected_diff
+        // gates that on is_real_commit), so it is also where a working-tree edit
+        // becomes visible to the stats column. Before the early return: an
+        // unchanged key is exactly the "content did not move" case, and it must
+        // still be recorded as seen.
+        sync_virtual_stats(&mut self.virtual_diff_keys, &mut self.commit_stats, &key);
         // Same key ⇒ same content (real commits are oid+settings-keyed; virtual
         // entries carry a content hash), so keep the on-screen copy — spans and
         // scroll position included — and just clear the loading state.
@@ -8279,6 +8332,99 @@ mod tests {
             "a stale batch must not leave claims behind — dispatch is gated on this"
         );
         assert!(known.is_empty(), "and no stale numbers may be installed");
+    }
+
+    /// A worktree-only edit never touches `.git`, so the watcher's debounced
+    /// reload — the only other thing that evicts the virtual rows' stats — never
+    /// fires. The diff PANE stays correct regardless (a virtual key carries a
+    /// content hash, so it re-keys and recomputes), and without this the column
+    /// would sit beside it showing the pre-edit numbers: exactly the
+    /// column-vs-pane disagreement the feature exists to make impossible.
+    #[test]
+    fn a_worktree_edit_drops_the_edited_virtual_rows_stats() {
+        let k = |o: git2::Oid, content: u64| DiffCacheKey {
+            oid: o,
+            settings: ds(),
+            theme: highlight::EmbeddedThemeName::CatppuccinMocha,
+            enabled: true,
+            content,
+        };
+        let st = |files| {
+            Some(CommitStats {
+                files,
+                lines: Some((1, 0)),
+            })
+        };
+        let mut seen: HashMap<git2::Oid, DiffCacheKey> = HashMap::new();
+        let mut known: HashMap<git2::Oid, Option<CommitStats>> = HashMap::new();
+        known.insert(oid_uncommitted(), st(1));
+        known.insert(oid_staged(), st(2));
+        known.insert(oid(9), st(3));
+
+        // First sighting of each virtual diff: recorded, nothing evicted.
+        sync_virtual_stats(&mut seen, &mut known, &k(oid_uncommitted(), 10));
+        sync_virtual_stats(&mut seen, &mut known, &k(oid_staged(), 20));
+        assert_eq!(known.len(), 3, "a first sighting is not a change");
+
+        // The same content again — re-selecting the row, a debounced refresh,
+        // an apply that changed nothing. Must not evict, or the column would
+        // blank and recompute on every visit to a virtual row.
+        sync_virtual_stats(&mut seen, &mut known, &k(oid_uncommitted(), 10));
+        assert_eq!(
+            known.len(),
+            3,
+            "recomputing identical content is not a change"
+        );
+
+        // A real commit's diff is immutable; it can never invalidate anything.
+        sync_virtual_stats(&mut seen, &mut known, &k(oid(9), 99));
+        assert!(
+            known.contains_key(&oid(9)),
+            "a real commit is never evicted"
+        );
+
+        // The edit: same diff, new content hash.
+        sync_virtual_stats(&mut seen, &mut known, &k(oid_uncommitted(), 11));
+        assert!(
+            !known.contains_key(&oid_uncommitted()),
+            "the edited row must be recomputed, not left showing pre-edit numbers"
+        );
+        assert!(
+            known.contains_key(&oid_staged()),
+            "the other virtual row did not change"
+        );
+        assert!(
+            known.contains_key(&oid(9)),
+            "and neither did any real commit"
+        );
+
+        // Widening the toolbar's context re-hashes the SAME working tree (more
+        // context lines in the diff text). That is not a content change, and
+        // evicting on it would blank the virtual rows every time `+`/`-` is
+        // clicked — the flicker `stats_relevant` exists to avoid.
+        let wider = DiffCacheKey {
+            settings: DiffSettings { context: 9, ..ds() },
+            ..k(oid_staged(), 21)
+        };
+        sync_virtual_stats(&mut seen, &mut known, &wider);
+        assert!(
+            known.contains_key(&oid_staged()),
+            "a settings change is not a working-tree change"
+        );
+
+        // A re-theme is not a settings change: it only recolours, and the hash
+        // is over line text and kind. An edit landing across one is still an
+        // edit, and must not be masked by the theme having moved with it.
+        let retimed = DiffCacheKey {
+            theme: highlight::EmbeddedThemeName::CatppuccinLatte,
+            settings: DiffSettings { context: 9, ..ds() },
+            ..k(oid_staged(), 22)
+        };
+        sync_virtual_stats(&mut seen, &mut known, &retimed);
+        assert!(
+            !known.contains_key(&oid_staged()),
+            "a re-theme must not mask a working-tree change"
+        );
     }
 
     /// The worker end-to-end over a real repo: every dispatched target reports
