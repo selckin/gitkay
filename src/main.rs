@@ -3346,9 +3346,12 @@ struct GitkApp {
     /// can move without going through `load_selected_diff` at all
     /// (`jump_to_current_match_deferred` selects on a search keystroke and defers
     /// the diff load), and the `awaiting` install routes deliberately let a
-    /// result for `selected_oid()` install even under a stale epoch, so a load
-    /// dispatched — and anchored — for one commit can end up installing under a
-    /// different one that was selected in the meantime.
+    /// result for `selected_oid()` install even under a stale epoch, so a
+    /// different commit's install — landing while this one's anchored load is
+    /// still in flight — can consume (via `take()`) the anchor measured for
+    /// this commit before it ever resolves. A load always installs under its
+    /// own oid (the drain re-keys from `key.oid`); it is the *consumption*,
+    /// not the installation, that crosses commits.
     pending_anchor: Option<(git2::Oid, DiffAnchor)>,
     /// The sidebar's live scroll offset, recorded each frame it renders — what
     /// `stash_current_diff` saves into `scroll_memory` for the outgoing commit.

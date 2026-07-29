@@ -421,9 +421,18 @@ pub fn scoped_diff_opts(settings: DiffSettings, paths: &[String]) -> DiffOptions
 
 /// Coalesce renamed/copied files in a freshly built diff, per the diff settings.
 /// No-op when both toggles are off. Renames are cheap; copies use plain `-C`
-/// (`DiffFindOptions::copies`), which only considers files modified in the same
-/// diff as copy sources. A detection error is logged and left non-fatal — the
-/// diff simply stays in its raw add/delete form (mirrors `rename_source`).
+/// (`DiffFindOptions::copies`, no `copies_from_unmodified`): libgit2 accepts
+/// any delta already present in the diff as a copy source EXCEPT one that is
+/// itself unmodified (that needs `--find-copies-harder`, not requested here)
+/// or newly added (`diff_tform.c`'s `is_rename_source`) — a deleted file is an
+/// ordinary, unconditionally eligible source, not a special case requiring
+/// modification. The same deleted entry can be claimed as an exact rename's
+/// source AND, separately, as a copy source for a second, less-similar
+/// addition (`tgt2src_copy` is filled from every eligible source regardless of
+/// what else claims it), so a copy's `old_path_bytes` can name a source that
+/// has no entry of its own left in the diff — the case `resolve_anchor`'s
+/// `Renamed` gate exists for. A detection error is logged and left non-fatal —
+/// the diff simply stays in its raw add/delete form (mirrors `rename_source`).
 pub fn detect_similar(diff: &mut git2::Diff, settings: DiffSettings) {
     if !settings.detect_renames && !settings.detect_copies {
         return;
@@ -1036,17 +1045,21 @@ pub fn resolve_anchor(anchor: &DiffAnchor, lines: &[DiffLine], files: &[FileEntr
     // `old_path_bytes` is a fallback, and gated on `Renamed` specifically — it
     // is set for `Copied` too, but there it names the copy's SOURCE, a
     // bystander file that predates the change (AGENTS.md: "A rename's old
-    // path, and only a rename's"). This gate is defence-in-depth rather than
-    // load-bearing: a copy source must itself be modified in the same diff for
-    // `-C` to pair it at all (`detect_similar`'s own contract), so it always
-    // has its own entry, so the exact-path match above always wins first for
-    // it — the fallback is never reached with a `Copied` delta's old path in
-    // practice, gate or no gate (deleting the `Renamed` check leaves every test
-    // green). A rename's surviving entry carries both paths, so this still
-    // lets the anchor survive a detection toggle in both directions: ON -> OFF
-    // finds the exact path directly (the coalesced entry split back into its
-    // own two), OFF -> ON has no exact entry for the old name anymore and
-    // falls through to the rename match.
+    // path, and only a rename's"). The gate IS load-bearing: a copy source can
+    // be fully consumed by an unrelated exact rename in the same diff, leaving
+    // it with NO entry of its own for the exact-path match above to find
+    // first. libgit2 fills its copy-candidate table from every rename-source-
+    // eligible deletion, including one an exact rename already claimed
+    // (`detect_similar`'s doc comment), so an ungated old-path match can find
+    // the copy's entry instead and steal the anchor from the file the rename
+    // actually produced —
+    // `a_deleted_copy_source_consumed_by_a_rename_keeps_its_anchor_out_of_the_copy`
+    // pins exactly this, and was demonstrated to fail with the gate removed. A
+    // rename's surviving entry carries both paths, so this still lets the
+    // anchor survive a detection toggle in both directions: ON -> OFF finds
+    // the exact path directly (the coalesced entry split back into its own
+    // two), OFF -> ON has no exact entry for the old name anymore and falls
+    // through to the rename match.
     let matched = files
         .iter()
         .position(|f| f.path_bytes == anchor.path)
@@ -2051,15 +2064,18 @@ mod tests {
     }
 
     /// Rung 1, under `detect_copies` rather than `detect_renames`. A `Copied`
-    /// delta's `old_path_bytes` names its SOURCE, not a vacated name — the
+    /// delta's `old_path_bytes` names its SOURCE, not a vacated name — here the
     /// source is a bystander file that predates the change and keeps its OWN
-    /// entry in the same diff (a copy source must itself be modified for `-C`
-    /// to consider it one at all, per `detect_similar`'s doc comment). Here
-    /// `z.txt` is copied to `a.txt` in the same commit that edits `z.txt`
-    /// itself, so `files` (path order) is `[a.txt (Copied, old=z.txt), z.txt
-    /// (Modified)]` — the copy's target sorts before its source. An anchor
-    /// captured in `z.txt`'s own patch must resolve back into `z.txt`, not
-    /// into `a.txt` just because `a.txt.old_path_bytes == b"z.txt"`.
+    /// entry in the same diff because `z.txt` is itself edited (a `Modified`
+    /// delta) rather than deleted or consumed as some other delta's rename
+    /// source (a copy source is NOT required to be modified for `-C` to
+    /// consider it one — see `detect_similar`'s doc comment for the case where
+    /// the source vanishes instead). Here `z.txt` is copied to `a.txt` in the
+    /// same commit that edits `z.txt` itself, so `files` (path order) is
+    /// `[a.txt (Copied, old=z.txt), z.txt (Modified)]` — the copy's target
+    /// sorts before its source. An anchor captured in `z.txt`'s own patch must
+    /// resolve back into `z.txt`, not into `a.txt` just because
+    /// `a.txt.old_path_bytes == b"z.txt"`.
     #[test]
     fn a_copy_source_does_not_steal_an_anchor_meant_for_itself() {
         use crate::test_repo::{commit_file, commit_index, stage, temp_repo, write_file};
@@ -2160,6 +2176,131 @@ mod tests {
         assert!(
             (start..end).contains(&got),
             "resolved into the anchored file, not its lossy twin"
+        );
+    }
+
+    /// The gate on `resolve_anchor`'s `old_path_bytes` fallback (`f.status ==
+    /// git2::Delta::Renamed`) is reachable, and this pins it: a `Copied`
+    /// delta's `old_path_bytes` can name a source that has been fully consumed
+    /// by an unrelated `Renamed` delta, leaving that source with NO entry of
+    /// its own in the diff. libgit2's copy-candidate table (`diff_tform.c`'s
+    /// `tgt2src_copy`) is filled from every rename-source-eligible deletion,
+    /// including one an exact rename already claimed, and the `-C` pass can
+    /// still pick that same deletion as a copy source for a second, less
+    /// similar destination — so a deleted file can end up named only as a
+    /// bystander `old_path_bytes` on a `Copied` delta, never as its own entry.
+    ///
+    /// Fixture: `sss.txt` (`c1`..`c100`) is deleted; `zz.txt` is added with
+    /// `sss.txt`'s content verbatim (an exact rename); `aa.txt` is added with
+    /// `sss.txt`'s content but lines 1-15 replaced by `mmm.txt`'s first 15
+    /// lines (similar enough to pair as a copy, from the same deleted
+    /// source). `mmm.txt` also gets an unrelated one-line edit, purely so the
+    /// diff has an ordinary `Modified` entry alongside the other two. An
+    /// anchor captured in `sss.txt`'s own (pre-detection) entry must resolve
+    /// into `zz.txt` (the rename) and never into `aa.txt` (the copy), even
+    /// though both share `old_path_bytes == b"sss.txt"`.
+    #[test]
+    fn a_deleted_copy_source_consumed_by_a_rename_keeps_its_anchor_out_of_the_copy() {
+        use crate::test_repo::{commit_index, stage, temp_repo, write_file};
+        let (_d, repo) = temp_repo();
+        let numbered_lines = |prefix: &str, n: u32| -> String {
+            use std::fmt::Write;
+            (1..=n).fold(String::new(), |mut acc, i| {
+                let _ = writeln!(acc, "{prefix}{i}");
+                acc
+            })
+        };
+        let mmm_base = numbered_lines("m", 100);
+        let sss_base = numbered_lines("c", 100);
+        write_file(&repo, "mmm.txt", &mmm_base);
+        write_file(&repo, "sss.txt", &sss_base);
+        stage(&repo, "mmm.txt");
+        stage(&repo, "sss.txt");
+        {
+            let mut index = repo.index().unwrap();
+            commit_index(&repo, &mut index, "base");
+        }
+
+        let mut m_next: Vec<String> = (1..=100).map(|i| format!("m{i}")).collect();
+        m_next[49] = "m50-edited".to_string();
+        let mmm_next = m_next.join("\n") + "\n";
+        write_file(&repo, "mmm.txt", &mmm_next);
+        std::fs::remove_file(repo.workdir().unwrap().join("sss.txt")).unwrap();
+        write_file(&repo, "zz.txt", &sss_base);
+        let mut aa_lines: Vec<String> = (1..=15).map(|i| format!("m{i}")).collect();
+        aa_lines.extend((16..=100).map(|i| format!("c{i}")));
+        let aa_content = aa_lines.join("\n") + "\n";
+        write_file(&repo, "aa.txt", &aa_content);
+        let oid = {
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("mmm.txt")).unwrap();
+            index.remove_path(std::path::Path::new("sss.txt")).unwrap();
+            index.add_path(std::path::Path::new("zz.txt")).unwrap();
+            index.add_path(std::path::Path::new("aa.txt")).unwrap();
+            commit_index(
+                &repo,
+                &mut index,
+                "edit mmm.txt, delete sss.txt, add zz.txt + aa.txt",
+            )
+        };
+
+        // Detection OFF: sss.txt is its own Deleted entry, so capturing an
+        // anchor on one of its rows exercises the real capture path instead
+        // of hand-building a DiffAnchor.
+        let off = diff_at(&repo, oid, base_settings());
+        let off_row = row_of(&off, "sss.txt", AnchorSide::Old, 50);
+        let anchor = capture_anchor(&off.lines, &off.files, off_row).expect("an anchor");
+        assert_eq!(anchor.path, b"sss.txt".to_vec());
+        assert_eq!(anchor.side, AnchorSide::Old);
+
+        let on = diff_at(
+            &repo,
+            oid,
+            DiffSettings {
+                detect_renames: true,
+                detect_copies: true,
+                ..base_settings()
+            },
+        );
+
+        // Fixture preconditions, asserted before trusting anything
+        // resolve_anchor does with them: without these, a future libgit2
+        // change could silently turn this into a test that proves nothing.
+        assert!(
+            !on.files.iter().any(|f| f.path == "sss.txt"),
+            "sss.txt must have no entry of its own — the rename consumed it"
+        );
+        let copy = on
+            .files
+            .iter()
+            .find(|f| f.status == git2::Delta::Copied)
+            .expect("a Copied entry");
+        assert_eq!(copy.path, "aa.txt");
+        assert_eq!(copy.old_path_bytes.as_deref(), Some(&b"sss.txt"[..]));
+        let rename = on
+            .files
+            .iter()
+            .find(|f| f.status == git2::Delta::Renamed)
+            .expect("a Renamed entry");
+        assert_eq!(rename.path, "zz.txt");
+        assert_eq!(rename.old_path_bytes.as_deref(), Some(&b"sss.txt"[..]));
+
+        let got = resolve_anchor(&anchor, &on.lines, &on.files);
+        let (_, zz_start, zz_end) = file_line_ranges(&on.files, on.lines.len())
+            .into_iter()
+            .find(|&(i, _, _)| on.files[i].path == "zz.txt")
+            .expect("zz.txt has an entry");
+        let (_, aa_start, aa_end) = file_line_ranges(&on.files, on.lines.len())
+            .into_iter()
+            .find(|&(i, _, _)| on.files[i].path == "aa.txt")
+            .expect("aa.txt has a patch body");
+        assert!(
+            (zz_start..zz_end).contains(&got),
+            "must resolve into zz.txt's row range (the rename), got row {got}"
+        );
+        assert!(
+            !(aa_start..aa_end).contains(&got),
+            "must never resolve into aa.txt's row range (the copy), got row {got}"
         );
     }
 
