@@ -735,7 +735,6 @@ pub fn commit_diff_against<'r>(
 /// changed blob. (`detect_similar` reads content too when rename detection is
 /// on, so `FilesOnly` is cheaper, not free.)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)] // consumed by the stats worker in the next task
 pub enum StatsWant {
     FilesOnly,
     FilesAndLines,
@@ -743,7 +742,6 @@ pub enum StatsWant {
 
 /// One commit-list row's change counts.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[allow(dead_code)] // consumed by the stats worker in the next task
 pub struct CommitStats {
     pub files: usize,
     /// `(additions, deletions)`, or `None` when only `StatsWant::FilesOnly` was
@@ -759,7 +757,6 @@ pub struct CommitStats {
 /// file-list sidebar — it is the same diff with the patch text thrown away.
 /// Dispatches on `CommitKind` exhaustively, like `get_diff_data`, so a new row
 /// kind can't silently fall through to the commit path.
-#[allow(dead_code)] // consumed by the stats worker in the next task
 pub fn commit_stats(
     repo: &Repository,
     oid: git2::Oid,
