@@ -332,9 +332,12 @@ pub struct FileEntry {
     pub additions: usize,
     pub deletions: usize,
     /// `Some(n)`: this file's patch starts at `diff_lines[n]`. `None`: the file
-    /// has no patch body. Defensive — in practice git2 emits at least a header
-    /// line for every delta (binary and mode-only changes included), so a listed
-    /// file always gets a start; nothing relies on `None` actually occurring.
+    /// has no patch body — a real, occurring case: under `ignore_ws` a file
+    /// whose every change is whitespace-only stays listed but loses its whole
+    /// patch body (see `a_file_without_a_patch_body_falls_to_the_previous_header`
+    /// / `a_leading_file_without_a_patch_body_falls_to_the_next_header`).
+    /// `resolve_anchor`'s rungs 3 and 4 are the consumer: a bodyless file is why
+    /// a scroll anchor falls back to a header instead of a line.
     pub diff_line_idx: Option<usize>,
 }
 
@@ -1024,20 +1027,26 @@ pub fn capture_anchor(
 /// the wrong way.
 pub fn resolve_anchor(anchor: &DiffAnchor, lines: &[DiffLine], files: &[FileEntry]) -> usize {
     // The exact path match must run FIRST and win outright: a file's own entry
-    // is always the correct identity when one exists, and checking it first is
-    // what keeps a `Copied` delta's `old_path_bytes` from ever being consulted
-    // for a path that has its own entry. `old_path_bytes` is a fallback, and
-    // gated on `Renamed` specifically — it is set for `Copied` too, but there it
-    // names the copy's SOURCE, a bystander file that predates the change and
-    // has its own entry in the same diff (AGENTS.md: "A rename's old path, and
-    // only a rename's"). Without the status gate, an anchor in a copy's source
-    // file would match the copy's entry before its own — whichever sorts first
-    // in path order — and resolve into the copy instead. A rename's surviving
-    // entry carries both paths, so this still lets the anchor survive a
-    // detection toggle in both directions: ON -> OFF finds the exact path
-    // directly (the coalesced entry split back into its own two), OFF -> ON has
-    // no exact entry for the old name anymore and falls through to the rename
-    // match.
+    // is always the correct identity when one exists. That ordering is load-
+    // bearing and is what `a_copy_source_does_not_steal_an_anchor_meant_for_itself`
+    // pins: an anchor in a copy's source file must resolve into that file's own
+    // entry, not the copy's, when both name it (the copy's `old_path_bytes` and
+    // the source's own `path_bytes`).
+    //
+    // `old_path_bytes` is a fallback, and gated on `Renamed` specifically — it
+    // is set for `Copied` too, but there it names the copy's SOURCE, a
+    // bystander file that predates the change (AGENTS.md: "A rename's old
+    // path, and only a rename's"). This gate is defence-in-depth rather than
+    // load-bearing: a copy source must itself be modified in the same diff for
+    // `-C` to pair it at all (`detect_similar`'s own contract), so it always
+    // has its own entry, so the exact-path match above always wins first for
+    // it — the fallback is never reached with a `Copied` delta's old path in
+    // practice, gate or no gate (deleting the `Renamed` check leaves every test
+    // green). A rename's surviving entry carries both paths, so this still
+    // lets the anchor survive a detection toggle in both directions: ON -> OFF
+    // finds the exact path directly (the coalesced entry split back into its
+    // own two), OFF -> ON has no exact entry for the old name anymore and
+    // falls through to the rename match.
     let matched = files
         .iter()
         .position(|f| f.path_bytes == anchor.path)
@@ -1657,6 +1666,11 @@ mod tests {
     fn two_hunk_repo() -> (tempfile::TempDir, Repository, git2::Oid) {
         use crate::test_repo::{commit_file, temp_repo};
         let (d, repo) = temp_repo();
+        // fold + writeln!, not map + format! + collect: every line here is the
+        // same shape, so a bare `.map(|i| format!(...)).collect()` would be
+        // exactly what `clippy::format_collect` flags. `edited` below can use
+        // the map/format!/collect idiom because its closure body is a `match`
+        // (per-line content varies), which the lint's pattern doesn't cover.
         let base: String = (1..=80).fold(String::new(), |mut acc, i| {
             use std::fmt::Write as _;
             let _ = writeln!(acc, "line {i}");

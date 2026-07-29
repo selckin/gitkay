@@ -240,35 +240,43 @@ parts run off the window-creation critical path:
   instead of blanking the map — the file counts stay on screen while the line
   counts fill in. Switching the whole column OFF still clears the map, since
   nothing will read it again.
-- **Bottom panel**: diff view (left, syntax-highlighted) + file list sidebar (right, dynamic width). Both remember their scroll position per commit for the session (`scroll_memory`,
-oid-keyed: saved by `stash_current_diff` when the displayed diff is replaced,
-restore queued by `load_selected_diff` on a commit switch — an unvisited commit
-opens at the top). A **same-oid rebuild anchors instead of restoring**: every
-toolbar setting reshapes the content under a fixed row offset (context width
-inserts lines above every hunk, `ignore_ws` merges hunks and can leave a file
-with no patch body at all, rename detection collapses two entries into one), so
-`load_selected_diff` captures a `DiffAnchor` — byte path, side, git line number,
-and rows below the viewport's top — from the content still on screen, and
-`apply_loaded_diff` resolves it back to a row through a five-rung ladder (the
-line, the next surviving line at or after it, its file's header, the nearest
-surviving file's header, the top) into the existing `diff_scroll_to`. Capture
-lives in `load_selected_diff` because that is the one choke point every rebuild
-passes through, so the toolbar toggles, the config reload and the virtual-row
-refresh all get it without per-trigger wiring — and it must stay ABOVE the
-synchronous cache-hit install, which resolves the anchor in the same call.
-`ScrollPlan::of` is the single place the switch-vs-rebuild distinction is made;
-both bail-out paths clear the pending anchor, and the resolve writes
-`diff_scroll_to` only when one was pending (a commit switch sets that field
-before the content arrives, and the render preserves it across the in-flight
-load). The resolve also rewrites `scroll_memory` for that oid, whose row
-`stash_current_diff` had just saved in the pre-rebuild coordinate system. The
-**sidebar keeps its pixel offset** (`file_list_y`) and can still drift under
-`ignore_ws` — a second mechanism for a much smaller annoyance, deliberately not
-built. What makes the anchor possible is `DiffLine::old_lineno`/`new_lineno`,
-recorded in `append_diff_body` from git2's **origin char** and not from
-`LineKind`: git2 reports a line number on its EOF markers too, and those origins
-have already been folded into `LineKind::Context` by the time only the kind is
-left)
+- **Bottom panel**: diff view (left, syntax-highlighted) + file list sidebar
+  (right, dynamic width). Both remember their scroll position per commit for
+  the session (`scroll_memory`, oid-keyed: saved by `stash_current_diff` when
+  the displayed diff is replaced, restore queued by `load_selected_diff` on a
+  commit switch — an unvisited commit opens at the top). A **same-oid rebuild
+  anchors instead of restoring**: every toolbar setting reshapes the content
+  under a fixed row offset (context width inserts lines above every hunk,
+  `ignore_ws` merges hunks and can leave a file with no patch body at all,
+  rename detection collapses two entries into one), so `load_selected_diff`
+  captures a `DiffAnchor` — byte path, side, git line number, and rows below
+  the viewport's top — from the content still on screen, and
+  `apply_loaded_diff` resolves it back to a row through a five-rung ladder
+  (the line, the next surviving line at or after it, its file's header, the
+  nearest surviving file's header, the top) into the existing
+  `diff_scroll_to`. Capture lives in `load_selected_diff` because that is the
+  one choke point every rebuild passes through, so the toolbar toggles, the
+  config reload and the virtual-row refresh all get it without per-trigger
+  wiring — and it must stay ABOVE the synchronous cache-hit install, which
+  resolves the anchor in the same call. `ScrollPlan::of` is the single place
+  the switch-vs-rebuild distinction is made. A pending anchor is cleared at
+  three sites — `load_selected_diff`'s identical-key early return, its
+  unconditional clear ahead of the match (which also covers the no-selection
+  bail-out), and `install_preferring_cache`'s identical-content early return
+  — but what actually keeps a stale one from firing against the wrong diff is
+  the oid it is tagged with: `apply_loaded_diff` drops any anchor whose tag
+  doesn't match the oid it is installing. The resolve writes `diff_scroll_to`
+  only when one was pending (a commit switch sets that field before the
+  content arrives, and the render preserves it across the in-flight load).
+  The resolve also rewrites `scroll_memory` for that oid, whose row
+  `stash_current_diff` had just saved in the pre-rebuild coordinate system.
+  The **sidebar keeps its pixel offset** (`file_list_y`) and can still drift
+  under `ignore_ws` — a second mechanism for a much smaller annoyance,
+  deliberately not built. What makes the anchor possible is
+  `DiffLine::old_lineno`/`new_lineno`, recorded in `append_diff_body` from
+  git2's **origin char** and not from `LineKind`: git2 reports a line number
+  on its EOF markers too, and those origins have already been folded into
+  `LineKind::Context` by the time only the kind is left.
 - **Rename/copy detection**: `detect_similar` (`git2::Diff::find_similar`) post-passes
   `get_diff_data`/`get_working_tree_diff`/`get_staged_diff`, coalescing an add+delete pair
   into one `old → new` entry. `[diff].detect_renames` (default on, git `-M`) and

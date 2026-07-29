@@ -3289,9 +3289,10 @@ enum ScrollPlan {
     /// different line — so capture an anchor and put the reader back on THEIR
     /// line once the rebuild lands.
     Anchor,
-    /// A different commit: queue its remembered position from `scroll_memory`,
-    /// and drop any pending anchor, which belongs to a diff being navigated away
-    /// from.
+    /// A different commit: queue its remembered position from `scroll_memory`.
+    /// Any pending anchor belongs to a diff being navigated away from — it is
+    /// cleared unconditionally above, in `load_selected_diff`, before this is
+    /// even matched on; this arm only queues the restore.
     Restore,
 }
 
@@ -3339,11 +3340,16 @@ struct GitkApp {
     /// Where the diff pane was reading when a same-oid rebuild was dispatched:
     /// captured by `load_selected_diff` from the content still on screen, and
     /// consumed by `apply_loaded_diff` once the rebuilt content is installed.
-    /// Mutually exclusive with a `scroll_memory` restore by construction — only
-    /// the `ScrollPlan::Anchor` branch ever sets it — and cleared by both of
-    /// `load_selected_diff`'s bail-out paths, so it can never fire against a
-    /// diff it was not measured against.
-    pending_anchor: Option<DiffAnchor>,
+    /// Tagged with the oid it was measured against — `apply_loaded_diff` checks
+    /// the tag and drops a mismatched anchor instead of resolving it against the
+    /// wrong diff's lines. The tag is load-bearing, not belt-and-braces: `selected`
+    /// can move without going through `load_selected_diff` at all
+    /// (`jump_to_current_match_deferred` selects on a search keystroke and defers
+    /// the diff load), and the `awaiting` install routes deliberately let a
+    /// result for `selected_oid()` install even under a stale epoch, so a load
+    /// dispatched — and anchored — for one commit can end up installing under a
+    /// different one that was selected in the meantime.
+    pending_anchor: Option<(git2::Oid, DiffAnchor)>,
     /// The sidebar's live scroll offset, recorded each frame it renders — what
     /// `stash_current_diff` saves into `scroll_memory` for the outgoing commit.
     file_list_scroll: f32,
@@ -4184,7 +4190,8 @@ impl GitkApp {
                     &self.diff_lines,
                     &self.diff_files,
                     self.diff_top_line.load(Ordering::Relaxed),
-                );
+                )
+                .map(|a| (oid, a));
             }
         }
         // Identical for the synchronous hit-install and the async miss-dispatch below, so
@@ -4355,8 +4362,14 @@ impl GitkApp {
         // rebuild. Only when an anchor is actually pending: on a commit switch
         // the caller set diff_scroll_to before the content arrived and the render
         // preserves it across the in-flight load, so an unconditional write here
-        // would destroy the very restore it exists to perform.
-        if let Some(anchor) = self.pending_anchor.take() {
+        // would destroy the very restore it exists to perform. take() runs either
+        // way, so an anchor measured against a DIFFERENT oid than the one
+        // installing here (selection can move without a load — see
+        // `pending_anchor`'s doc comment) is dropped rather than left pending to
+        // fire against a later install.
+        if let Some((anchored, anchor)) = self.pending_anchor.take()
+            && anchored == oid
+        {
             let row = resolve_anchor(&anchor, &self.diff_lines, &self.diff_files);
             self.diff_scroll_to = Some(row);
             // stash_current_diff just wrote the OUTGOING top row into
@@ -4388,6 +4401,10 @@ impl GitkApp {
         // scroll position included — and just clear the loading state. Nothing
         // moved, so a pending anchor has nothing to correct; dropping it here
         // keeps consumption exhaustive rather than leaving one to fire later.
+        // Belt-and-braces, not load-bearing: this path returns without ever
+        // calling `apply_loaded_diff`, so an anchor left here would otherwise
+        // sit dangling until some LATER same-oid install consumed it — the oid
+        // tag alone can't catch that, since the oid would still match.
         if self.current_diff_key.as_ref() == Some(&key) {
             self.diff_load_started_at = None;
             self.pending_anchor = None;
@@ -10086,7 +10103,7 @@ mod tests {
     /// row that means nothing there. `ScrollPlan::of` is the single place that
     /// distinction is made, so it is the single place worth pinning.
     #[test]
-    fn only_a_same_oid_rebuild_anchors() {
+    fn scroll_plan_anchors_only_on_the_same_oid() {
         let a = git2::Oid::from_bytes(&[1u8; 20]).unwrap();
         let b = git2::Oid::from_bytes(&[2u8; 20]).unwrap();
 
