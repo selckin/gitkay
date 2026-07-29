@@ -2381,6 +2381,39 @@ struct StatsJob {
     ctx: egui::Context,
 }
 
+/// Report every target in a batch as failed, then wake the UI once.
+///
+/// `stats_inflight` is UI-owned: a claim is taken at dispatch and released only
+/// by `drain_commit_stats` installing that oid's result. So a target the worker
+/// never reports is a claim nothing can free — and dispatch is gated on that
+/// set being empty, which makes one silent exit enough to kill the column for
+/// the rest of the session, with only a `debug!` line to show for it. Every
+/// worker exit that skips the per-target loop comes through here, so "every
+/// dispatched target reports back" is true by construction rather than by
+/// inspection of each `return`.
+///
+/// On the panic path this re-reports targets that had already sent good
+/// results, and `drain_commit_stats` overwrites them — a row that succeeded
+/// becomes permanently `Some(None)` and `stats_targets` skips it for good.
+/// That is the deliberate trade: the worker thread cannot release the claims
+/// itself (the set is UI-owned and not shared), so the choice is a lost number
+/// or a dead column, and a lost number is far cheaper.
+fn report_batch_failed(
+    tx: &mpsc::Sender<StatsResult>,
+    epoch: u64,
+    targets: &[git2::Oid],
+    ctx: &egui::Context,
+) {
+    for &oid in targets {
+        let _ = tx.send(StatsResult {
+            epoch,
+            oid,
+            stats: None,
+        });
+    }
+    ctx.request_repaint();
+}
+
 /// Compute the commit-list stats for a batch of rows, off the frame loop.
 ///
 /// Sends ONE result per target as it finishes, so rows fill in progressively
@@ -2404,7 +2437,13 @@ fn stats_worker(job: StatsJob) {
     let repo = match Repository::discover(&repo_path) {
         Ok(r) => r,
         Err(e) => {
+            // The claims are already taken and not one target has reported, so
+            // returning silently here would strand the whole batch — see
+            // `report_batch_failed`. Reachable in practice: the repo can be
+            // moved, unmounted or `git worktree remove`d with gitkay open.
             log::debug!("stats: repo discover failed: {e}");
+            let oids: Vec<git2::Oid> = targets.iter().map(|&(oid, _)| oid).collect();
+            report_batch_failed(&tx, epoch, &oids, &ctx);
             return;
         }
     };
@@ -4495,20 +4534,12 @@ impl GitkApp {
             tx: self.stats_tx.clone(),
             ctx: ctx.clone(),
         };
-        // Every target must report back or the dispatcher re-queues it forever,
-        // so a panic reports the whole batch as failed rather than dying quietly.
+        // Every target must report back or its claim on `stats_inflight` is
+        // never released, so a panic reports the whole batch as failed rather
+        // than dying quietly — the same exit the worker's own bail-outs take.
         let on_panic = {
             let (tx, ctx, oids) = (self.stats_tx.clone(), ctx.clone(), targets.clone());
-            move || {
-                for oid in oids {
-                    let _ = tx.send(StatsResult {
-                        epoch,
-                        oid,
-                        stats: None,
-                    });
-                }
-                ctx.request_repaint();
-            }
+            move || report_batch_failed(&tx, epoch, &oids, &ctx)
         };
         if spawn_reporting(
             "gitkay-stats",
@@ -5954,9 +5985,15 @@ impl GitkApp {
                 if stats_relevant(before_settings) != stats_relevant(self.diff_settings) {
                     self.invalidate_commit_stats();
                 }
-                // Config owns the column's shape; enabling line_count means the
-                // cached entries (computed FilesOnly) have no lines to show.
+                // Config owns the column's shape, and two changes to it make the
+                // cache wrong or pointless. Switching the column off entirely:
+                // nothing will read the map again, so there is no reason to hold
+                // the memory, and a later re-enable should recompute against
+                // whatever the settings are then rather than serve entries built
+                // under these.
                 let stats_off = !cfg.commit_list.any();
+                // Enabling line_count: the cached entries were computed
+                // FilesOnly and carry no lines to show.
                 let lines_switched_on =
                     cfg.commit_list.line_count && !self.commit_list_cfg.line_count;
                 self.commit_list_cfg = cfg.commit_list;
@@ -8185,6 +8222,63 @@ mod tests {
             ctx: egui::Context::default(),
         });
         assert_eq!(rx.into_iter().count(), 0);
+    }
+
+    /// A worker that cannot even OPEN the repo must still report every target.
+    ///
+    /// The claims were taken at dispatch and only the drain releases them, so a
+    /// silent return here strands the whole batch in `stats_inflight` — and
+    /// dispatch is gated on that set being empty, so the column would go dead
+    /// for the rest of the session on one `debug!` line. Real enough to test:
+    /// the repo can be moved, unmounted or `git worktree remove`d while gitkay
+    /// is open.
+    #[test]
+    fn stats_worker_reports_every_target_when_the_repo_cannot_be_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        // A path that does not EXIST, so `discover` cannot walk upwards and
+        // succeed against some enclosing repo by accident (it walks up from the
+        // start path, and /tmp being repo-free is not something to rely on).
+        let missing = dir.path().join("gone");
+        assert!(
+            Repository::discover(&missing).is_err(),
+            "precondition: the worker must actually fail to open this"
+        );
+
+        let (tx, rx) = mpsc::channel();
+        let epoch = Epoch::default();
+        let dispatched = epoch.current();
+        let batch = [oid(1), oid(2), oid(3)];
+        stats_worker(StatsJob {
+            repo_path: missing.to_string_lossy().into_owned(),
+            targets: batch.iter().map(|&o| (o, Vec::new())).collect(),
+            settings: ds(),
+            want: StatsWant::FilesAndLines,
+            epoch: dispatched,
+            current_epoch: epoch,
+            tx,
+            ctx: egui::Context::default(),
+        });
+
+        let got: Vec<StatsResult> = rx.into_iter().collect();
+        assert_eq!(
+            got.len(),
+            batch.len(),
+            "every target must report back, or its claim is never released"
+        );
+        assert!(
+            got.iter().all(|r| r.stats.is_none()),
+            "an unopenable repo yields no numbers"
+        );
+        assert!(
+            got.iter().all(|r| r.epoch == dispatched),
+            "results must carry the dispatched epoch, or the drain discards them \
+             and the claims stay put anyway"
+        );
+        assert_eq!(
+            got.iter().map(|r| r.oid).collect::<HashSet<_>>(),
+            batch.into_iter().collect::<HashSet<_>>(),
+            "and they must be the oids we dispatched"
+        );
     }
 
     fn scope(all: bool, revs: &[&str]) -> cli::Scope {
