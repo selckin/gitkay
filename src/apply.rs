@@ -298,19 +298,29 @@ pub const fn hunk_fit(clicked: &HunkRange, generated: &HunkRange, reversed: bool
 }
 
 use crate::diff::{
-    DiffSettings, commit_diff_against, detect_similar, staged_diff_against, worktree_git_diff,
+    DiffSettings, commit_diff_against, detect_similar, diff_opts, staged_diff_against,
+    worktree_git_diff,
 };
 use git2::{ApplyLocation, ApplyOptions, DiffOptions, Repository};
 use std::cell::Cell;
 
-/// Diff options for an action — deliberately not the display's options.
+/// Diff options for an action — the display's options, with `ignore_whitespace`
+/// overridden and the action's own pathspec.
 ///
-/// `ignore_whitespace` is forced off: a whitespace-ignored diff does not describe
-/// the real content and is unsafe to apply. `context` follows the display so hunk
-/// boundaries line up one-for-one in the common case. The pathspec carries BOTH
-/// sides of a rename — `apply_pathspec` filters deltas before `detect_similar`
-/// runs, so a one-path pathspec would drop the delete side, leave the rename
-/// undetected, and add the new file without removing the old.
+/// It starts from `diff::diff_opts`, the very builder the pane's diff went
+/// through, rather than re-spelling its calls. `hunk_fit`'s whole correctness
+/// argument is that **exactly one** option diverges (`ignore_whitespace`, forced
+/// off here: a whitespace-ignored diff does not describe the real content and is
+/// unsafe to apply) — written twice, a future shaping flag added to `diff_opts`
+/// would quietly make that false and turn every hunk click on an affected file
+/// into a plausible-but-wrong refusal. Built this way the divergence list IS the
+/// code: whatever `diff_opts` shapes, both sides get.
+///
+/// `context` therefore follows the display, so hunk boundaries line up
+/// one-for-one in the common case. The pathspec carries BOTH sides of a rename —
+/// `apply_pathspec` filters deltas before `detect_similar` runs, so a one-path
+/// pathspec would drop the delete side, leave the rename undetected, and add the
+/// new file without removing the old.
 ///
 /// A rename, and only a rename: `req.rename_source()` is `None` for a copy (see
 /// `ApplyRequest::rename_source`). Widening the pathspec to a copy's source would
@@ -323,10 +333,11 @@ fn action_diff_opts(
     reversed: bool,
     ignore_ws: bool,
 ) -> DiffOptions {
-    let mut opts = DiffOptions::new();
-    opts.context_lines(settings.context)
-        .ignore_whitespace(ignore_ws)
-        .reverse(reversed);
+    let mut opts = diff_opts(DiffSettings {
+        ignore_ws,
+        ..settings
+    });
+    opts.reverse(reversed);
     // req.path/rename_source are literal paths lifted straight from the diff's own
     // file list (FileEntry::path), never a user-typed glob — disable fnmatch so
     // a filename containing `[`, `*` or `?` cannot also match an unrelated
@@ -698,6 +709,27 @@ fn safe_to_overwrite(existing: &WorktreeContent, blob: Option<&git2::Blob<'_>>) 
     }
 }
 
+/// One side of a diff delta as a blob, or `None` when that side has no file.
+/// `Ok(None)` ONLY for the zero oid, which is how a diff says "this side has no
+/// file" — nothing here is specific to the commit side or the parent side, and
+/// both of `restore_binary`'s go through it.
+///
+/// `find_blob(...).ok()` cannot be used. `content_matches` treats
+/// `(Absent, None)` as a MATCH — the commit-deleted-it case — so folding a load
+/// failure into `None` makes the guard answer "the worktree still holds the
+/// commit's content" for a comparison it never performed, and the write proceeds
+/// against unverified state. On the parent side the same fold is just as bad the
+/// other way round: the delete branch would run for a file the parent actually
+/// had. A non-zero id that will not load (a missing or corrupt object, or the
+/// gitlink oid of a submodule the commit replaced with a file) is a real failure
+/// and must surface.
+fn side_blob(repo: &Repository, id: git2::Oid) -> Result<Option<git2::Blob<'_>>, ApplyError> {
+    if id.is_zero() {
+        return Ok(None);
+    }
+    Ok(Some(repo.find_blob(id)?))
+}
+
 /// Write a binary delta's parent-side blob back into the worktree, or delete the
 /// file when the commit added it. `delta` comes from the REVERSED diff, so its NEW
 /// side is the parent's content and its OLD side is the commit's.
@@ -717,27 +749,9 @@ fn safe_to_overwrite(existing: &WorktreeContent, blob: Option<&git2::Blob<'_>>) 
 /// commit-side path is NOT removed: for a `Copied` delta that path is the copy's
 /// source, a file that predates the commit and must survive the revert — only a
 /// `Renamed` delta's old path is safe to delete (see the removal site below).
-/// The commit side's blob for a guard: `Ok(None)` ONLY for the zero oid, which is
-/// how a diff says "this side has no file".
 ///
-/// `find_blob(...).ok()` cannot be used here. `content_matches` treats
-/// `(Absent, None)` as a MATCH — the commit-deleted-it case — so folding a load
-/// failure into `None` makes the guard answer "the worktree still holds the
-/// commit's content" for a comparison it never performed, and the write proceeds
-/// against unverified state. A non-zero id that will not load (a missing or
-/// corrupt object, or the gitlink oid of a submodule the commit replaced with a
-/// file) is a real failure and must surface. Same split the parent side already
-/// makes in `restore_binary`.
-fn commit_side_blob(
-    repo: &Repository,
-    id: git2::Oid,
-) -> Result<Option<git2::Blob<'_>>, ApplyError> {
-    if id.is_zero() {
-        return Ok(None);
-    }
-    Ok(Some(repo.find_blob(id)?))
-}
-
+/// Both sides' blobs load through `side_blob`, which distinguishes "this side has
+/// no file" from "this side would not load" — see there.
 fn restore_binary(
     repo: &Repository,
     trees: &RevertTrees<'_>,
@@ -755,7 +769,7 @@ fn restore_binary(
         .map(worktree_content)
         .transpose()?
         .unwrap_or(WorktreeContent::Absent);
-    let commit_blob = commit_side_blob(repo, commit_side.id())?;
+    let commit_blob = side_blob(repo, commit_side.id())?;
     if !content_matches(&current, commit_blob.as_ref()) {
         return Err(ApplyError::ChangedSinceCommit);
     }
@@ -764,17 +778,9 @@ fn restore_binary(
         return Err(ApplyError::Unsupported);
     };
     let parent_path = workdir.join(parent_rel);
-    // The zero oid means the parent genuinely had no file — reverting means
-    // deleting (the `None` arm below). A non-zero id that still fails to load
-    // (missing/corrupt object, or — reachably — a commit that replaced a
-    // submodule with this binary file, so the reversed parent side is a gitlink
-    // oid that is not a blob in this odb) must NOT be folded into the same
-    // `None`, or the delete branch runs for a file the parent actually had.
-    let parent_blob = if parent_side.id().is_zero() {
-        None
-    } else {
-        Some(repo.find_blob(parent_side.id())?)
-    };
+    // `None` here means the parent genuinely had no file — reverting means
+    // deleting (the `None` arm below).
+    let parent_blob = side_blob(repo, parent_side.id())?;
     let paths_differ = commit_path.as_deref() != Some(parent_path.as_path());
     // Did the parent-side path hold nothing before this call? Then the write
     // below is what creates it, and a later failure can take it back — see the
@@ -938,7 +944,7 @@ fn guard_workdir_deletions(repo: &Repository, diff: &git2::Diff<'_>) -> Result<(
             return Err(ApplyError::Unsupported);
         };
         let current = worktree_content(&workdir.join(rel))?;
-        let commit_blob = commit_side_blob(repo, commit_side.id())?;
+        let commit_blob = side_blob(repo, commit_side.id())?;
         if !content_matches(&current, commit_blob.as_ref()) {
             return Err(ApplyError::ChangedSinceCommit);
         }
@@ -1329,8 +1335,8 @@ mod tests {
     use super::*;
     use crate::diff::{DiffSettings, hunk_at_line, oid_staged, oid_uncommitted};
     use crate::test_repo::{
-        commit_bytes, commit_file, commit_index, commit_rename, index_blob, read_file, stage,
-        temp_repo, write_file,
+        commit_bytes, commit_file, commit_index, commit_rename, corrupt_head, index_blob,
+        read_file, remove_loose_object, stage, temp_repo, write_file,
     };
 
     fn hr(old_start: u32, old_lines: u32, new_start: u32, new_lines: u32) -> HunkRange {
@@ -1918,7 +1924,6 @@ mod tests {
     /// follows links by default, so a link into a shared store makes the revert
     /// clobber and chmod a file outside the working tree while the repo path
     /// itself is left untouched and still reported as reverted.
-    #[cfg(unix)]
     #[test]
     fn revert_file_refuses_a_binary_behind_a_symlink() {
         let (_d, repo) = temp_repo();
@@ -2042,12 +2047,7 @@ mod tests {
         // pre-rename path AND remove the post-rename one, or the revert
         // duplicates the file instead of moving it back.
         let (_d, repo) = temp_repo();
-        std::fs::write(repo.workdir().unwrap().join("a.bin"), [0u8, 1, 2, 3]).unwrap();
-        stage(&repo, "a.bin");
-        {
-            let mut index = repo.index().unwrap();
-            commit_index(&repo, &mut index, "add binary");
-        }
+        commit_bytes(&repo, "a.bin", &[0u8, 1, 2, 3], "add binary");
         std::fs::rename(
             repo.workdir().unwrap().join("a.bin"),
             repo.workdir().unwrap().join("b.bin"),
@@ -2102,30 +2102,17 @@ mod tests {
         // MATCH rather than a mismatch.
         std::fs::remove_file(repo.workdir().unwrap().join("f.txt")).unwrap();
         drop(repo);
-        let hex = blob.to_string();
-        std::fs::remove_file(
-            dir.path()
-                .join(".git/objects")
-                .join(&hex[..2])
-                .join(&hex[2..]),
-        )
-        .unwrap();
+        remove_loose_object(dir.path(), blob);
 
         let repo = git2::Repository::open(dir.path()).unwrap();
-        let tree = repo
-            .head()
-            .unwrap()
-            .peel_to_commit()
-            .unwrap()
-            .tree()
-            .unwrap();
-        // The revert diff's shape: the commit added the file, reversed to a
-        // `Deleted` delta whose OLD side is the commit's (now unreadable) blob.
+        let commit = repo.head().unwrap().peel_to_commit().unwrap();
+        // The revert diff's shape, built by the same `commit_diff_against` the
+        // production revert route uses (a root commit, so `None` for the parent
+        // tree): the commit added the file, reversed to a `Deleted` delta whose
+        // OLD side is the commit's (now unreadable) blob.
         let mut opts = DiffOptions::new();
         opts.reverse(true);
-        let diff = repo
-            .diff_tree_to_tree(None, Some(&tree), Some(&mut opts))
-            .unwrap();
+        let diff = commit_diff_against(&repo, &commit, None, Some(&mut opts)).unwrap();
         assert_eq!(
             diff.deltas().next().map(|d| d.status()),
             Some(git2::Delta::Deleted)
@@ -2196,7 +2183,6 @@ mod tests {
     ///
     /// Forcing the removal to fail needs a read-only directory, which root
     /// ignores — so the fixture probes first and skips rather than failing there.
-    #[cfg(unix)]
     #[test]
     fn a_binary_rename_revert_undoes_its_write_when_the_removal_fails() {
         use std::os::unix::fs::PermissionsExt;
@@ -2258,12 +2244,7 @@ mod tests {
         // lands on a path the first (commit-side) guard never inspected. Deleting
         // that guard block leaves all other tests green; only this one catches it.
         let (_d, repo) = temp_repo();
-        std::fs::write(repo.workdir().unwrap().join("a.bin"), [0u8, 1, 2, 3]).unwrap();
-        stage(&repo, "a.bin");
-        {
-            let mut index = repo.index().unwrap();
-            commit_index(&repo, &mut index, "add binary");
-        }
+        commit_bytes(&repo, "a.bin", &[0u8, 1, 2, 3], "add binary");
         std::fs::rename(
             repo.workdir().unwrap().join("a.bin"),
             repo.workdir().unwrap().join("b.bin"),
@@ -2768,7 +2749,6 @@ mod tests {
     /// a real filesystem path and pathspec, so every lookup missed: `remove_path`
     /// tolerates `GIT_ENOTFOUND`, `index.write()` wrote an unchanged index, and the
     /// status line reported a successful stage that never happened.
-    #[cfg(unix)]
     #[test]
     fn stage_file_handles_a_non_utf8_filename() {
         use std::os::unix::ffi::OsStrExt;
@@ -2926,7 +2906,6 @@ mod tests {
     /// symlink cycle in a parent component gives a deterministic ELOOP with no
     /// permission games — so it works the same whether or not the suite runs as
     /// root, unlike a `chmod 000` directory.
-    #[cfg(unix)]
     #[test]
     fn stage_file_refuses_when_the_path_cannot_be_read_at_all() {
         let (_d, repo) = temp_repo();
@@ -3005,7 +2984,6 @@ mod tests {
     /// context can never match. That surfaced as `Stale` — "has changed since
     /// this diff was shown" — for a symlink byte-identical to what the commit
     /// recorded, i.e. a permanent failure with a false reason.
-    #[cfg(unix)]
     #[test]
     fn revert_refuses_a_symlink_rather_than_blaming_the_diff() {
         let (_d, repo) = temp_repo();
@@ -3122,7 +3100,7 @@ mod tests {
         drop(repo);
 
         // A corrupt HEAD — distinct from unborn, which reports `UnbornBranch`.
-        std::fs::write(dir.path().join(".git/HEAD"), "this is not a ref\n").unwrap();
+        corrupt_head(dir.path());
         let repo = git2::Repository::open(dir.path()).unwrap();
 
         let err = apply_request(&repo, &req(oid_staged(), "f.txt", None), settings())
@@ -3164,7 +3142,7 @@ mod tests {
         drop(repo);
 
         // A corrupt HEAD — distinct from unborn, which reports `UnbornBranch`.
-        std::fs::write(dir.path().join(".git/HEAD"), "this is not a ref\n").unwrap();
+        corrupt_head(dir.path());
         let repo = git2::Repository::open(dir.path()).unwrap();
 
         let err = apply_request(&repo, &req(oid_staged(), "f.txt", Some(hunk)), settings())
@@ -3207,14 +3185,7 @@ mod tests {
             .unwrap()
             .id();
         drop(repo);
-        let hex = sub.to_string();
-        std::fs::remove_file(
-            dir.path()
-                .join(".git/objects")
-                .join(&hex[..2])
-                .join(&hex[2..]),
-        )
-        .unwrap();
+        remove_loose_object(dir.path(), sub);
         let repo = git2::Repository::open(dir.path()).unwrap();
 
         let err = apply_request(&repo, &req(oid_staged(), "sub/f.txt", None), settings())
@@ -3245,14 +3216,7 @@ mod tests {
         let target = commit_file(&repo, "f.txt", "changed one\n", "change");
         drop(repo);
 
-        let hex = first.to_string();
-        std::fs::remove_file(
-            dir.path()
-                .join(".git/objects")
-                .join(&hex[..2])
-                .join(&hex[2..]),
-        )
-        .unwrap();
+        remove_loose_object(dir.path(), first);
         let repo = git2::Repository::open(dir.path()).unwrap();
 
         let err = apply_request(&repo, &req(target, "f.txt", None), settings())
@@ -3368,25 +3332,9 @@ mod tests {
     fn unstage_file_normalizes_a_non_canonical_head_filemode() {
         let (_d, repo) = temp_repo();
         commit_file(&repo, "f.txt", "base\n", "base");
-        let blob = repo.blob(b"base\n").unwrap();
-
-        // A tree recording the blob with a real-world but non-canonical mode.
-        // Written straight to the odb: libgit2's own treebuilder refuses the
-        // mode, which is precisely why such trees only ever arrive from
-        // elsewhere — and why reading one back has to cope.
-        let mut raw = Vec::new();
-        raw.extend_from_slice(b"100664 f.txt\0");
-        raw.extend_from_slice(blob.as_bytes());
-        let tree_oid = repo
-            .odb()
-            .unwrap()
-            .write(git2::ObjectType::Tree, &raw)
-            .unwrap();
-        let tree = repo.find_tree(tree_oid).unwrap();
-        let sig = repo.signature().unwrap();
-        let parent = repo.head().unwrap().peel_to_commit().unwrap();
-        repo.commit(Some("HEAD"), &sig, &sig, "odd mode", &tree, &[&parent])
-            .unwrap();
+        // A tree recording the blob with a real-world but non-canonical mode —
+        // see `commit_tree_with_mode` for why it goes straight to the odb.
+        commit_tree_with_mode(&repo, "100664", "f.txt", b"base\n", "odd mode");
         assert_eq!(
             repo.head()
                 .unwrap()

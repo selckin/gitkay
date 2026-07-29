@@ -574,12 +574,45 @@ pub fn append_diff_body(
     .unwrap_or_else(|e| log::warn!("gitkay: error rendering diff patch: {e}"));
 }
 
-/// Shared pipeline tail for every diff build (commit, working-tree, staged): build the
-/// pathspec- and settings-scoped `DiffOptions`, run `build` to produce the git diff,
-/// coalesce renames/copies, and append the stats + patch body under the caller's
-/// `header` lines. A diff error is logged (with `what`) and yields an empty `DiffData`
-/// so a transient failure never aborts the view. A new pipeline stage (like
-/// `detect_similar` was) lands in all three builders by construction.
+/// A settings- and pathspec-scoped git diff, rename/copy-coalesced: `scoped_diff_opts`
+/// → `build` → `detect_similar`, the prologue every diff in the app shares.
+///
+/// The one place that sequence is written. `build_diff_data` (the pane, the file list)
+/// and `commit_stats` (the commit-list column) both run it, and the column's whole
+/// promise is that it cannot disagree with the pane — a post-pass added to one and not
+/// the other would break that silently, with nothing for the compiler to catch. Here a
+/// new stage reaches both by construction.
+///
+/// Errors come back as errors: `build_diff_data` folds them into an empty `DiffData`,
+/// `commit_stats` propagates them, and neither decision belongs to the pipeline.
+///
+/// (`apply.rs`'s `action_diff` deliberately stays out: it needs `reverse`, byte
+/// pathspecs and `disable_pathspec_match`, none of which fit here — it builds on
+/// `diff_opts` instead, which is where its own no-drift argument lives.)
+fn scoped_diff<'r>(
+    repo: &'r Repository,
+    settings: DiffSettings,
+    paths: &[String],
+    build: impl FnOnce(&'r Repository, &mut DiffOptions) -> Result<git2::Diff<'r>, git2::Error>,
+) -> Result<git2::Diff<'r>, git2::Error> {
+    let mut opts = scoped_diff_opts(settings, paths);
+    let mut diff = build(repo, &mut opts)?;
+    // Rename/copy coalescing is a post-pass, not a DiffOptions flag: without it a
+    // rename counts as two changed files in the column and one in the pane.
+    detect_similar(&mut diff, settings);
+    Ok(diff)
+}
+
+/// Shared pipeline tail for every diff build (commit, working-tree, staged): run
+/// `scoped_diff` — the settings/pathspec options, `build`, and the rename post-pass —
+/// then append the stats + patch body under the caller's `header` lines. A diff error
+/// is logged (with `what`) and yields an empty `DiffData` so a transient failure never
+/// aborts the view.
+///
+/// A new *rendering* stage added here lands in all three builders by construction; a
+/// new *diff-shaping* one goes in `scoped_diff`, which additionally reaches
+/// `commit_stats` — the commit-list column shares the pipeline precisely so it can
+/// never disagree with what this renders.
 pub fn build_diff_data<'r>(
     repo: &'r Repository,
     settings: DiffSettings,
@@ -588,15 +621,13 @@ pub fn build_diff_data<'r>(
     what: &str,
     build: impl FnOnce(&'r Repository, &mut DiffOptions) -> Result<git2::Diff<'r>, git2::Error>,
 ) -> DiffData {
-    let mut opts = scoped_diff_opts(settings, paths);
-    let mut diff = match build(repo, &mut opts) {
+    let diff = match scoped_diff(repo, settings, paths, build) {
         Ok(d) => d,
         Err(e) => {
             log::warn!("gitkay: cannot diff {what}: {e}");
             return DiffData::empty();
         }
     };
-    detect_similar(&mut diff, settings);
     let mut lines = header;
     let mut files = Vec::new();
     append_diff_body(&mut lines, &mut files, &diff, settings.show_stats);
@@ -752,11 +783,11 @@ pub struct CommitStats {
 
 /// The diffstat for one commit-list row.
 ///
-/// Built from the SAME builders, options and rename post-pass `get_diff_data`
-/// uses, so the commit-list column can never disagree with the diff pane or the
-/// file-list sidebar — it is the same diff with the patch text thrown away.
-/// Dispatches on `CommitKind` exhaustively, like `get_diff_data`, so a new row
-/// kind can't silently fall through to the commit path.
+/// Runs the SAME `scoped_diff` pipeline `build_diff_data` does — the same options,
+/// the same builders, the same rename post-pass — so the commit-list column can never
+/// disagree with the diff pane or the file-list sidebar. It is that diff with the
+/// patch text thrown away. Dispatches on `CommitKind` exhaustively, like
+/// `get_diff_data`, so a new row kind can't silently fall through to the commit path.
 pub fn commit_stats(
     repo: &Repository,
     oid: git2::Oid,
@@ -764,18 +795,16 @@ pub fn commit_stats(
     paths: &[String],
     want: StatsWant,
 ) -> Result<CommitStats, git2::Error> {
-    let mut opts = scoped_diff_opts(settings, paths);
-    let mut diff = match CommitKind::of(oid) {
-        CommitKind::Uncommitted => worktree_git_diff(repo, &mut opts)?,
-        CommitKind::Staged => staged_git_diff(repo, &mut opts)?,
-        CommitKind::Real => {
-            let commit = repo.find_commit(oid)?;
-            commit_parent_diff(repo, &commit, Some(&mut opts))?
+    let diff = scoped_diff(repo, settings, paths, |repo, opts| {
+        match CommitKind::of(oid) {
+            CommitKind::Uncommitted => worktree_git_diff(repo, opts),
+            CommitKind::Staged => staged_git_diff(repo, opts),
+            CommitKind::Real => {
+                let commit = repo.find_commit(oid)?;
+                commit_parent_diff(repo, &commit, Some(opts))
+            }
         }
-    };
-    // The pane's own post-pass: without it a rename counts as two changed files
-    // here and one there.
-    detect_similar(&mut diff, settings);
+    })?;
     Ok(match want {
         StatsWant::FilesOnly => CommitStats {
             files: diff.deltas().len(),

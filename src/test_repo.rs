@@ -91,6 +91,25 @@ pub fn commit_rename(repo: &git2::Repository, old: &str, new: &str, msg: &str) -
     commit_index(repo, &mut index, msg)
 }
 
+/// Delete one loose object from `dir`'s odb, making it unreadable — a pruned or
+/// corrupt odb, a treeless partial clone, a shallow clone's boundary commit.
+///
+/// `dir` is the repo's working directory (the `TempDir` `temp_repo` returns);
+/// the object lives at `.git/objects/<first 2 hex>/<rest>`. Drop the
+/// `Repository` first: libgit2 caches odb contents, so an open handle can still
+/// serve the object this just removed.
+pub fn remove_loose_object(dir: &Path, oid: git2::Oid) {
+    let hex = oid.to_string();
+    std::fs::remove_file(dir.join(".git/objects").join(&hex[..2]).join(&hex[2..])).unwrap();
+}
+
+/// Make `dir`'s HEAD unreadable — deliberately distinct from an UNBORN HEAD,
+/// which is a legitimate `None` the write layer reports as `UnbornBranch`.
+/// Drop the `Repository` before calling, and reopen after.
+pub fn corrupt_head(dir: &Path) {
+    std::fs::write(dir.join(".git/HEAD"), "this is not a ref\n").unwrap();
+}
+
 /// The worktree content of `path`.
 pub fn read_file(repo: &git2::Repository, path: &str) -> String {
     std::fs::read_to_string(repo.workdir().unwrap().join(path)).unwrap()

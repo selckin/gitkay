@@ -62,8 +62,10 @@ struct. `src/main.rs` (commit history/graph layout, the workers, and the UI)
 plus extracted modules: `src/diff.rs` (the diff **data** layer: `DiffLine` /
 `DiffData` / `FileEntry` / `DiffSettings`, `CommitKind` + the sentinel oids,
 `get_diff_data` and the commit/staged/worktree builders (all three run through
-one `build_diff_data` pipeline, and every "commit vs its first parent" diff —
-the pane, the path filter, the `--follow` tracer — goes through
+one `build_diff_data` pipeline, whose diff-building prologue — scoped options,
+build, `detect_similar` — is `scoped_diff`, shared with `commit_stats` so the
+commit-list column cannot drift from the pane; and every "commit vs its first
+parent" diff — the pane, the path filter, the `--follow` tracer — goes through
 `commit_parent_diff`), the diff-shaping `DiffOptions` helpers, the word-diff
 emphasis driver, the content hash, and
 the pure line/file lookups — git2-facing and egui-free; cache keying,
@@ -187,8 +189,10 @@ parts run off the window-creation critical path:
 - **Top panel**: search bar (SHA/author/message/ref), Enter cycles matches, any keypress focuses search, graph auto-scrolls to match. A changed keystroke selects and centers its match instantly but defers the diff load behind `SEARCH_DIFF_DEBOUNCE` (120ms of typing pause), so typing a word doesn't spawn a diff worker per keystroke; Enter/arrow match-cycling and clicks load immediately, and any direct `load_selected_diff` cancels the pending debounced load
 - **Central panel**: commit graph + list (`show_commit_list`), virtualized with egui `show_rows` (same mechanism as the diff pane). Lazy loading: 200 initial, +500 on scroll-near-bottom — computed on a `gitkay-history-load` worker (never the frame loop), appended incrementally via `load_commits_tail` in the common plain scope, full background rebuild otherwise. The debounced git-watcher reload takes the same worker path. `history_epoch` supersedes stale results; both land in `drain_history_results`. An append installs through `append_commits` — O(tail), not O(history): the graph layout **resumes** from the stored `GraphLayoutState` (pipes + colour counter) and the lookup maps / search matches extend in place, leaving selection and scroll untouched. The resume is unsound when a previously out-of-scope merge parent lands in the tail (its already-laid-out merge row would gain a diagonal only a relayout can add) — `deferred_parents` tracks those and forces a full `resync_commits` then; `layout_resume_matches_full_layout` pins the parity. A rebuild arrives with its `DerivedHistory` already computed on the worker (`rebuild_load`), so the frame loop only installs it and restores the selection (`install_derived` + `finish_resync`)
 - **Commit-list stats column**: each row's files-changed / `+`/`-` counts, from
-  `diff::commit_stats` — the same builders, options and rename post-pass the pane
-  uses, so the column can never disagree with the sidebar. Computed lazily by the
+  `diff::commit_stats` — the same `scoped_diff` prologue the pane's own
+  `build_diff_data` runs (options, builder, rename post-pass), so the column can
+  never disagree with the sidebar and a new pipeline stage reaches both by
+  construction. Computed lazily by the
   `gitkay-stats` worker for the **visible rows only**, one batch at a time (a
   fling-scroll would otherwise spawn a thread per frame), and cached in an
   oid-keyed map that survives history rebuilds because a real commit's diff is
@@ -227,6 +231,13 @@ parts run off the window-creation critical path:
   (either enables the column, `stats_cell_count` turns them into reserved width);
   `line_count = false` is markedly cheaper, since the file count comes from the
   tree walk while line counts need every changed blob diffed (`StatsWant`).
+  "Already computed" is therefore relative to the `StatsWant` being asked for,
+  and `stats_targets` is where that lives: it skips a cached entry only when that
+  entry *satisfies* the want (`CommitStats::lines` is `None` exactly when only
+  `FilesOnly` was asked for), so switching `line_count` on re-queues the rows
+  instead of blanking the map — the file counts stay on screen while the line
+  counts fill in. Switching the whole column OFF still clears the map, since
+  nothing will read it again.
 - **Bottom panel**: diff view (left, syntax-highlighted) + file list sidebar (right, dynamic width). Both remember their scroll position per commit for the session (`scroll_memory`, oid-keyed: saved by `stash_current_diff` when the displayed diff is replaced, restore queued by `load_selected_diff` on a commit switch — an unvisited commit opens at the top, a same-oid re-diff keeps the live position)
 - **Rename/copy detection**: `detect_similar` (`git2::Diff::find_similar`) post-passes
   `get_diff_data`/`get_working_tree_diff`/`get_staged_diff`, coalescing an add+delete pair
@@ -311,7 +322,11 @@ libgit2 will not take them for us:
 - **A hunk is matched by containment, not overlap** (`hunk_fit`). The clicked range is
   always a whole displayed hunk header and the action diff uses the display's `context`,
   so the two ranges are normally identical. Exactly one option diverges —
-  `ignore_whitespace`, forced off for the action — and it only ever makes the generated
+  `ignore_whitespace`, forced off for the action — and that is true **by construction**,
+  not by inspection: `action_diff_opts` builds on `diff::diff_opts`, the display's own
+  options builder, and overrides only that one flag, so a shaping option added to
+  `diff_opts` later reaches both sides rather than quietly widening this list.
+  The divergence only ever makes the generated
   hunk WIDER, because ignoring whitespace turns changed lines into context and so *splits*
   the display; it can never merge it. (Measured: edits at lines 10 and 22 with a
   whitespace-only change at 16 display as `@@ -7,7 @@` + `@@ -19,7 @@` but generate one
@@ -431,7 +446,8 @@ libgit2 will not take them for us:
     `diff::commit_diff_against` — a revert diff is the commit's diff REVERSED, so an empty
     parent tree makes it "delete every file this commit has". `parent_count` is what tells a
     root commit apart from an unreadable parent.
-  - `commit_side_blob`, not `find_blob(..).ok()` — `content_matches` counts
+  - `side_blob` (both sides of a delta, `restore_binary`'s parent side included), not
+    `find_blob(..).ok()` — `content_matches` counts
     `(Absent, None)` as a MATCH, so a folded load failure makes the guards answer "the
     worktree still holds the commit's content" for an object they never read. Only the zero
     oid means "this side has no file".
@@ -511,7 +527,9 @@ file modes and symlinks, so without that the developer's own `~/.gitconfig` deci
 
 `src/test_repo.rs` (`#[cfg(test)]`, so nothing lands in the binary) holds the temp-repo
 helpers the `apply` and `main` suites share — `temp_repo`, `write_file`/`stage`/
-`commit_index`/`commit_file`/`commit_rename` to build history, and `read_file`/`index_blob`
+`commit_index`/`commit_file`/`commit_bytes`/`commit_rename` to build history,
+`remove_loose_object`/`corrupt_head` to break a repo the way a pruned odb or a bad HEAD
+does (the failure-to-read guards need them), and `read_file`/`index_blob`
 to assert on the worktree vs. the index separately. Add fixtures there rather than
 re-rolling them per module.
 
