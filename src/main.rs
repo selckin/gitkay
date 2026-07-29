@@ -655,40 +655,51 @@ fn invalidate_stats_state(
     epoch.bump();
 }
 
-/// Record the key a virtual row's freshly computed diff came back under, and drop
-/// that row's cached stats when its CONTENT changed.
+/// Record the content hash a virtual row's freshly computed diff came back with,
+/// and drop that row's cached stats whenever it moved.
 ///
 /// The stats map is keyed by oid alone, which is right for a real commit (its
 /// diff is immutable) and wrong for the two virtual rows: they keep one sentinel
 /// oid forever. `handle_git_reload` evicts them, but a worktree-only edit never
 /// touches `.git`, so that reload never fires and the column would keep pre-edit
 /// numbers while the pane — content-keyed via `finalize_diff_key`, so it
-/// recomputes every time — shows the edit. A changed content hash under an
-/// otherwise identical key is the one signal the app gets that the working tree
-/// moved; act on it and the ordinary dispatch path recomputes exactly that row.
+/// recomputes every time — shows the edit. The hash is the one signal the app
+/// gets that the working tree moved; act on it and the ordinary dispatch path
+/// recomputes exactly that row.
 ///
-/// Only under identical `DiffSettings`, though. The same working tree laid out
-/// with more context lines hashes differently (`hash_diff_content` covers every
-/// line), and evicting on that would blank and recompute the virtual rows every
-/// time the toolbar's `+`/`-` is clicked — the flicker `stats_relevant` exists
-/// to avoid. The rest of the key is deliberately not compared: `theme`/`enabled`
-/// only recolour, and the hash is over line text and kind, so two keys differing
-/// in those describe the same content and a change between them is a real one.
+/// Any move counts, including one that arrives alongside a settings change.
+/// Guarding on unchanged `DiffSettings` looks tempting — the same working tree
+/// laid out with more context hashes differently, and evicting for that alone is
+/// pure waste — but the two are indistinguishable from here, and one interleaving
+/// makes the guard unsafe: edit the file in an editor, then click the toolbar's
+/// context `+`. That click is what triggers the re-diff, so the install carries a
+/// new hash AND new settings at once; a guard would absorb it while still
+/// recording the post-edit hash, and no later install could ever detect that
+/// edit. An ambiguous hash change has to resolve toward recomputing — the
+/// alternative is keeping a number that may be wrong, forever. The price is that
+/// the two virtual rows blank briefly on a context change (two diffs, and only
+/// while they're on screen) where the real commits don't.
+///
+/// **Known gap:** this doesn't bump `stats_epoch`, so a batch already in flight
+/// can still install its pre-edit value afterwards, and `stats_targets` then
+/// never re-queues the row. It needs two edits inside one batch's lifetime, so
+/// it is left alone; the cheap fix if it ever bites is to record the evicted oid
+/// and have `drain_commit_stats` drop the next result for it.
 ///
 /// Free rather than a method, and taking the two maps rather than `&mut self`,
 /// so the regression is pinned against the real function instead of a model of
 /// it — no repo, no worker, no `egui::Context`.
 fn sync_virtual_stats(
-    seen: &mut HashMap<git2::Oid, DiffCacheKey>,
+    seen: &mut HashMap<git2::Oid, u64>,
     known: &mut HashMap<git2::Oid, Option<CommitStats>>,
     key: &DiffCacheKey,
 ) {
     if !CommitKind::of(key.oid).is_virtual() {
         return;
     }
-    if let Some(prev) = seen.insert(key.oid, key.clone())
-        && prev.settings == key.settings
-        && prev.content != key.content
+    if seen
+        .insert(key.oid, key.content)
+        .is_some_and(|prev| prev != key.content)
     {
         known.remove(&key.oid);
     }
@@ -1408,13 +1419,27 @@ const STATS_CELL_CHARS: &str = "-99999";
 const STATS_CELL_GAP: f32 = 6.0;
 
 /// A count in at most five characters, so a fixed-width cell can never
-/// overflow: plain digits below 100 000, then thousands, then millions.
+/// overflow: plain digits below 100 000, then thousands, then millions, and on
+/// up the ladder.
+///
+/// The cap holds for EVERY `usize`, not just the plausible ones. A ladder that
+/// stopped at `M` would render `usize::MAX` as `18446744073709M` while three
+/// doc comments and a cell width promised five characters — unreachable for a
+/// real diff, but a promise a caller cannot check is worth nothing. Stepping to
+/// exa is enough for any 64-bit count: `usize::MAX / 10^18` is 18.
 fn compact_count(n: usize) -> String {
-    match n {
-        n if n < 100_000 => n.to_string(),
-        n if n < 10_000_000 => format!("{}k", n / 1_000),
-        n => format!("{}M", n / 1_000_000),
+    const UNITS: [&str; 7] = ["", "k", "M", "G", "T", "P", "E"];
+    let mut n = n;
+    let mut unit = 0;
+    // Five plain digits fit the cell; a suffixed value only gets four, so the
+    // first step down is at 100 000 and every later one at 10 000.
+    let mut limit = 100_000;
+    while n >= limit && unit + 1 < UNITS.len() {
+        n /= 1_000;
+        unit += 1;
+        limit = 10_000;
     }
+    format!("{n}{}", UNITS[unit])
 }
 
 /// How many stats cells a row reserves — the file count is one, the line counts
@@ -3275,12 +3300,12 @@ struct GitkApp {
     /// every `CommitInfo`, and these survive it, correctly — a real commit's
     /// diff cannot change.
     commit_stats: HashMap<git2::Oid, Option<CommitStats>>,
-    /// The key each virtual row's diff was last computed under — two entries at
-    /// most. Its content hash is the only signal a worktree-only edit gives the
-    /// app (nothing under `.git` changes, so the watcher stays quiet), and
+    /// The content hash each virtual row's diff was last computed with — two
+    /// entries at most. It is the only signal a worktree-only edit gives the app
+    /// (nothing under `.git` changes, so the watcher stays quiet), and
     /// `sync_virtual_stats` turns a change in it into an eviction from
     /// `commit_stats`.
-    virtual_diff_keys: HashMap<git2::Oid, DiffCacheKey>,
+    virtual_diff_content: HashMap<git2::Oid, u64>,
     /// Oids the stats worker is computing right now. Doubles as the "a batch is
     /// running" flag, so the two can never disagree — which makes emptying it
     /// load-bearing: see `invalidate_commit_stats`.
@@ -3802,7 +3827,7 @@ impl GitkApp {
             // overwrites this with the exact visible range every frame.
             commit_view_range: 0..64,
             commit_stats: HashMap::new(),
-            virtual_diff_keys: HashMap::new(),
+            virtual_diff_content: HashMap::new(),
             stats_inflight: HashSet::new(),
             stats_epoch: Epoch::default(),
             stats_tx,
@@ -4179,7 +4204,7 @@ impl GitkApp {
         // becomes visible to the stats column. Before the early return: an
         // unchanged key is exactly the "content did not move" case, and it must
         // still be recorded as seen.
-        sync_virtual_stats(&mut self.virtual_diff_keys, &mut self.commit_stats, &key);
+        sync_virtual_stats(&mut self.virtual_diff_content, &mut self.commit_stats, &key);
         // Same key ⇒ same content (real commits are oid+settings-keyed; virtual
         // entries carry a content hash), so keep the on-screen copy — spans and
         // scroll position included — and just clear the loading state.
@@ -5402,12 +5427,19 @@ impl GitkApp {
     /// Draw a row's change counts, right-aligned in fixed-width cells ending at
     /// `end_x`, and return the x where they begin (where the summary must stop).
     ///
-    /// Fixed width, not per-row natural width: digits line up down the list
-    /// instead of going ragged, and the slot is reserved BEFORE the number
-    /// arrives, so nothing reflows when the worker's result lands. A blank cell
-    /// is what "not computed yet" looks like — no spinner, no placeholder. A
-    /// zero side is omitted rather than drawn as `+0`, matching the file-list
-    /// sidebar.
+    /// Fixed width, not per-row natural width, for stability WITHIN the row: the
+    /// slot is reserved before the number arrives, so nothing reflows when the
+    /// worker's result lands, and a `+` count that gains a digit cannot shove
+    /// the `-` count sideways. It does **not** line the column up down the list
+    /// — the cells hang off `author_date_x`, which moves row to row with the
+    /// author name's width. Anchoring them on a per-frame constant (the widest
+    /// meta group over the visible rows) would fix that, and would straighten
+    /// the existing SHA/author/date group with it: a change to layout that
+    /// predates this column, not part of it.
+    ///
+    /// A blank cell is what "not computed yet" looks like — no spinner, no
+    /// placeholder. A zero side is omitted rather than drawn as `+0`, matching
+    /// the file-list sidebar.
     fn draw_stats_cells(
         &self,
         painter: &egui::Painter,
@@ -8258,9 +8290,29 @@ mod tests {
         assert_eq!(compact_count(9_999_999), "9999k");
         assert_eq!(compact_count(10_000_000), "10M");
         assert_eq!(compact_count(12_345_678), "12M");
+        // Past anything a diff can reach, but the promise is unconditional, so
+        // the ladder has to keep climbing. `pow` rather than a literal: a
+        // 10-digit literal doesn't fit a 32-bit `usize` and wouldn't compile.
+        assert_eq!(compact_count(10usize.pow(10)), "10G");
+        assert_eq!(compact_count(10usize.pow(13)), "10T");
+        assert_eq!(compact_count(10usize.pow(16)), "10P");
+        assert_eq!(compact_count(10usize.pow(19)), "10E");
         for n in [0, 1, 99_999, 100_000, 9_999_999, 10_000_000, 999_999_999] {
             assert!(compact_count(n).len() <= 5, "{n} → {}", compact_count(n));
         }
+        // Every magnitude the type can hold, up to its maximum — a cap that
+        // stops being true somewhere above the test data is not a cap, and the
+        // cell width is derived from it.
+        let mut n: usize = 1;
+        while let Some(next) = n.checked_mul(10) {
+            assert!(compact_count(n).len() <= 5, "{n} → {}", compact_count(n));
+            n = next;
+        }
+        assert!(
+            compact_count(usize::MAX).len() <= 5,
+            "usize::MAX → {}",
+            compact_count(usize::MAX)
+        );
     }
 
     /// `[commit_list]` decides how many cells a row reserves, and so how much
@@ -8355,7 +8407,7 @@ mod tests {
                 lines: Some((1, 0)),
             })
         };
-        let mut seen: HashMap<git2::Oid, DiffCacheKey> = HashMap::new();
+        let mut seen: HashMap<git2::Oid, u64> = HashMap::new();
         let mut known: HashMap<git2::Oid, Option<CommitStats>> = HashMap::new();
         known.insert(oid_uncommitted(), st(1));
         known.insert(oid_staged(), st(2));
@@ -8399,22 +8451,38 @@ mod tests {
         );
 
         // Widening the toolbar's context re-hashes the SAME working tree (more
-        // context lines in the diff text). That is not a content change, and
-        // evicting on it would blank the virtual rows every time `+`/`-` is
-        // clicked — the flicker `stats_relevant` exists to avoid.
+        // context lines in the diff text), so this eviction is pure waste — and
+        // it is still the right answer, because the case below is the same
+        // install seen from here and absorbing it is permanent.
         let wider = DiffCacheKey {
             settings: DiffSettings { context: 9, ..ds() },
             ..k(oid_staged(), 21)
         };
         sync_virtual_stats(&mut seen, &mut known, &wider);
         assert!(
-            known.contains_key(&oid_staged()),
-            "a settings change is not a working-tree change"
+            !known.contains_key(&oid_staged()),
+            "a moved hash always recomputes — settings changed or not"
         );
 
-        // A re-theme is not a settings change: it only recolours, and the hash
-        // is over line text and kind. An edit landing across one is still an
-        // edit, and must not be masked by the theme having moved with it.
+        // The interleaving that makes a settings guard unsafe: the user edits
+        // the file, THEN clicks the toolbar's context `+`. That click is the
+        // re-diff trigger, so one install carries both a new hash and new
+        // settings, and it is indistinguishable from the pure re-layout above.
+        // Absorbing it would leave the row permanently wrong: the post-edit
+        // hash is recorded either way, so no later install could detect it.
+        known.insert(oid_uncommitted(), st(1));
+        let edited_and_widened = DiffCacheKey {
+            settings: DiffSettings { context: 9, ..ds() },
+            ..k(oid_uncommitted(), 12)
+        };
+        sync_virtual_stats(&mut seen, &mut known, &edited_and_widened);
+        assert!(
+            !known.contains_key(&oid_uncommitted()),
+            "an edit arriving with a settings change must not be absorbed"
+        );
+
+        // Same for a re-theme, which doesn't even reshape the diff.
+        known.insert(oid_staged(), st(2));
         let retimed = DiffCacheKey {
             theme: highlight::EmbeddedThemeName::CatppuccinLatte,
             settings: DiffSettings { context: 9, ..ds() },
@@ -8424,6 +8492,18 @@ mod tests {
         assert!(
             !known.contains_key(&oid_staged()),
             "a re-theme must not mask a working-tree change"
+        );
+
+        // The only thing that holds an eviction back is an unmoved hash — so
+        // the last install of each row, repeated, still changes nothing.
+        known.insert(oid_uncommitted(), st(1));
+        known.insert(oid_staged(), st(2));
+        sync_virtual_stats(&mut seen, &mut known, &edited_and_widened);
+        sync_virtual_stats(&mut seen, &mut known, &retimed);
+        assert_eq!(
+            known.len(),
+            3,
+            "a repeat of the same content is not a change"
         );
     }
 

@@ -204,14 +204,21 @@ parts run off the window-creation critical path:
   never touches `.git`, so the watcher's reload (which does evict them) never
   fires, and they would show pre-edit numbers beside a pane that recomputed. Their
   diff key carries a content hash, and `sync_virtual_stats` — called where a
-  freshly computed diff installs — evicts a virtual row whose hash moved under
-  unchanged `DiffSettings`, costing one recomputed row per actual edit.
+  freshly computed diff installs — evicts a virtual row whose hash moved, **whatever
+  else moved with it**. A hash change under changed `DiffSettings` is ambiguous (a
+  re-layout, or an edit the toolbar click merely triggered the re-diff for), and
+  ambiguity resolves toward recomputing rather than toward a number that may be
+  wrong forever. So the two virtual rows do blank briefly on a context change,
+  unlike the real commits — two diffs, and only while those rows are visible.
   Rendering is `draw_stats_cells`: fixed-width cells (`STATS_CELL_CHARS` measured
-  once a frame) right-aligned between the summary and the SHA, so digits line up
-  down the list and a landing result never reflows the row — a blank cell is what
-  "not computed yet" looks like. A zero side is omitted rather than drawn as `+0`,
-  and `compact_count` caps a number at five characters (`123k`, `12M`) so a cell
-  cannot overflow. `[commit_list] file_count` / `line_count` choose the cells
+  once a frame) right-aligned between the summary and the SHA. Fixed width buys
+  stability *within* a row — the slot exists before the number does, so a landing
+  result never reflows the row and a growing `+` never shifts the `-` — not
+  alignment down the list, since the cells hang off the per-row `author_date_x`.
+  A blank cell is what "not computed yet" looks like. A zero side is omitted rather
+  than drawn as `+0`, and `compact_count` caps a number at five characters (`123k`,
+  `12M`, and on up to `E` so no `usize` can overflow the cell).
+  `[commit_list] file_count` / `line_count` choose the cells
   (either enables the column, `stats_cell_count` turns them into reserved width);
   `line_count = false` is markedly cheaper, since the file count comes from the
   tree walk while line counts need every changed blob diffed (`StatsWant`).
