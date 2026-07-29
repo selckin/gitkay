@@ -280,10 +280,11 @@ parts run off the window-creation critical path:
 - **Rename/copy detection**: `detect_similar` (`git2::Diff::find_similar`) post-passes
   `get_diff_data`/`get_working_tree_diff`/`get_staged_diff`, coalescing an add+delete pair
   into one `old → new` entry. `[diff].detect_renames` (default on, git `-M`) and
-  `[diff].detect_copies` (default off, git `-C`; a copy source is not required to be
-  modified — libgit2 accepts any delta already in the diff as a source, deleted files
-  included, and excludes only an unmodified one, which needs `--find-copies-harder`)
-  are mirrored by hover-toolbar checkboxes. **Config is authoritative**:
+  `[diff].detect_copies` (default off, git `-C`; a copy source is **not** required to
+  be modified — `is_rename_source` takes a deleted or typechanged delta outright, a
+  modified one under `-C`, an unmodified one only under `--find-copies-harder`, and
+  rejects the rest: added, untracked, ignored, unreadable, conflicted, and anything
+  whose old mode is not a blob) are mirrored by hover-toolbar checkboxes. **Config is authoritative**:
   the checkboxes are a session override seeded at `GitkApp::new`, a live config reload
   re-asserts the config value over any toggle, and neither is persisted (unlike
   `diff_ignore_ws`). Sidebar rendering goes through `rename_brace` git-style braces

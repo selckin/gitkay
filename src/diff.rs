@@ -421,12 +421,15 @@ pub fn scoped_diff_opts(settings: DiffSettings, paths: &[String]) -> DiffOptions
 
 /// Coalesce renamed/copied files in a freshly built diff, per the diff settings.
 /// No-op when both toggles are off. Renames are cheap; copies use plain `-C`
-/// (`DiffFindOptions::copies`, no `copies_from_unmodified`): libgit2 accepts
-/// any delta already present in the diff as a copy source EXCEPT one that is
-/// itself unmodified (that needs `--find-copies-harder`, not requested here)
-/// or newly added (`diff_tform.c`'s `is_rename_source`) — a deleted file is an
-/// ordinary, unconditionally eligible source, not a special case requiring
-/// modification. The same deleted entry can be claimed as an exact rename's
+/// (`DiffFindOptions::copies`, no `copies_from_unmodified`): a deleted file is
+/// an ordinary, unconditionally eligible copy source, not a special case
+/// requiring modification. `diff_tform.c`'s `is_rename_source` takes `Deleted`
+/// and `Typechange` outright, takes `Modified` only under `-C`, admits an
+/// unmodified one only under `--find-copies-harder` (not requested here), and
+/// rejects the rest — `Added`, `Untracked`, `Ignored`, `Unreadable`,
+/// `Conflicted`, plus anything whose old mode is not a blob. Only the first
+/// three statuses arise on the commit path; the others matter for the workdir
+/// and index diffs. The same deleted entry can be claimed as an exact rename's
 /// source AND, separately, as a copy source for a second, less-similar
 /// addition (`tgt2src_copy` is filled from every eligible source regardless of
 /// what else claims it), so a copy's `old_path_bytes` can name a source that
@@ -2193,12 +2196,22 @@ mod tests {
     /// Fixture: `sss.txt` (`c1`..`c100`) is deleted; `zz.txt` is added with
     /// `sss.txt`'s content verbatim (an exact rename); `aa.txt` is added with
     /// `sss.txt`'s content but lines 1-15 replaced by `mmm.txt`'s first 15
-    /// lines (similar enough to pair as a copy, from the same deleted
-    /// source). `mmm.txt` also gets an unrelated one-line edit, purely so the
-    /// diff has an ordinary `Modified` entry alongside the other two. An
-    /// anchor captured in `sss.txt`'s own (pre-detection) entry must resolve
+    /// lines; `mmm.txt` itself gets a one-line edit.
+    ///
+    /// **Both of those last two are load-bearing, not scenery.** The rewrite
+    /// pass prefers `tgt2src[t]` and only falls back to `tgt2src_copy[t]`
+    /// (`diff_tform.c`), so `aa.txt` becomes a *copy* only because its borrowed
+    /// `m1`..`m15` prefix gives it a small non-zero match against the
+    /// still-present `mmm.txt`, routing it into the `FIND_COPIES` arm. Drop
+    /// either the prefix or `mmm.txt`'s edit and libgit2 emits a second
+    /// `Renamed` instead, and the test stops testing what it says it does. The
+    /// precondition asserts below fail loudly if that ever drifts.
+    ///
+    /// An anchor captured in `sss.txt`'s own (pre-detection) entry must resolve
     /// into `zz.txt` (the rename) and never into `aa.txt` (the copy), even
-    /// though both share `old_path_bytes == b"sss.txt"`.
+    /// though both share `old_path_bytes == b"sss.txt"`. `aa.txt` sorting
+    /// before `zz.txt` is what makes that discriminating: an ungated
+    /// `position` takes the first entry whose old path matches, i.e. the copy.
     #[test]
     fn a_deleted_copy_source_consumed_by_a_rename_keeps_its_anchor_out_of_the_copy() {
         use crate::test_repo::{commit_index, stage, temp_repo, write_file};
