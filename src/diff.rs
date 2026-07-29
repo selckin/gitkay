@@ -728,6 +728,72 @@ pub fn commit_diff_against<'r>(
     repo.diff_tree_to_tree(parent_tree, Some(&tree), opts)
 }
 
+/// How much of a commit's diffstat the caller needs.
+///
+/// `FilesOnly` skips the expensive half: the delta list falls out of the tree
+/// walk, while insertions and deletions require reading and diffing every
+/// changed blob. (`detect_similar` reads content too when rename detection is
+/// on, so `FilesOnly` is cheaper, not free.)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)] // consumed by the stats worker in the next task
+pub enum StatsWant {
+    FilesOnly,
+    FilesAndLines,
+}
+
+/// One commit-list row's change counts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)] // consumed by the stats worker in the next task
+pub struct CommitStats {
+    pub files: usize,
+    /// `(additions, deletions)`, or `None` when only `StatsWant::FilesOnly` was
+    /// asked for — NOT "zero lines changed". An `Option` rather than a pair of
+    /// zeros so a reader cannot mistake "not asked for" for "nothing changed".
+    pub lines: Option<(usize, usize)>,
+}
+
+/// The diffstat for one commit-list row.
+///
+/// Built from the SAME builders, options and rename post-pass `get_diff_data`
+/// uses, so the commit-list column can never disagree with the diff pane or the
+/// file-list sidebar — it is the same diff with the patch text thrown away.
+/// Dispatches on `CommitKind` exhaustively, like `get_diff_data`, so a new row
+/// kind can't silently fall through to the commit path.
+#[allow(dead_code)] // consumed by the stats worker in the next task
+pub fn commit_stats(
+    repo: &Repository,
+    oid: git2::Oid,
+    settings: DiffSettings,
+    paths: &[String],
+    want: StatsWant,
+) -> Result<CommitStats, git2::Error> {
+    let mut opts = scoped_diff_opts(settings, paths);
+    let mut diff = match CommitKind::of(oid) {
+        CommitKind::Uncommitted => worktree_git_diff(repo, &mut opts)?,
+        CommitKind::Staged => staged_git_diff(repo, &mut opts)?,
+        CommitKind::Real => {
+            let commit = repo.find_commit(oid)?;
+            commit_parent_diff(repo, &commit, Some(&mut opts))?
+        }
+    };
+    // The pane's own post-pass: without it a rename counts as two changed files
+    // here and one there.
+    detect_similar(&mut diff, settings);
+    Ok(match want {
+        StatsWant::FilesOnly => CommitStats {
+            files: diff.deltas().len(),
+            lines: None,
+        },
+        StatsWant::FilesAndLines => {
+            let st = diff.stats()?;
+            CommitStats {
+                files: st.files_changed(),
+                lines: Some((st.insertions(), st.deletions())),
+            }
+        }
+    })
+}
+
 /// Each file's `(file index, start, end)` line range, ordered by start. File
 /// boundaries come from the structured `files` list (clean paths), not the
 /// `--- /+++` display lines. Files with no patch body (`diff_line_idx` is `None`)
@@ -865,6 +931,189 @@ mod tests {
     use super::*;
 
     use crate::test_repo::file_entry as fe;
+
+    /// One commit carrying every shape the two counters could disagree on: a
+    /// modify, an add, a delete, a rename, a binary change and a mode-only
+    /// change. Returns the repo and that commit's oid.
+    fn everything_repo() -> (tempfile::TempDir, Repository, git2::Oid) {
+        use crate::test_repo::{commit_index, stage, temp_repo, write_file};
+        let (d, repo) = temp_repo();
+        write_file(&repo, "text.txt", "one\ntwo\nthree\n");
+        std::fs::write(repo.workdir().unwrap().join("bin.dat"), [0u8, 1, 2, 3]).unwrap();
+        write_file(&repo, "old.txt", "move me\nsecond line\nthird line\n");
+        write_file(&repo, "gone.txt", "delete me\n");
+        write_file(&repo, "mode.sh", "#!/bin/sh\necho hi\n");
+        for p in ["text.txt", "bin.dat", "old.txt", "gone.txt", "mode.sh"] {
+            stage(&repo, p);
+        }
+        {
+            let mut index = repo.index().unwrap();
+            commit_index(&repo, &mut index, "base");
+        }
+
+        write_file(&repo, "text.txt", "one\nTWO\nthree\nfour\n");
+        std::fs::write(repo.workdir().unwrap().join("bin.dat"), [0u8, 9, 9, 9, 9]).unwrap();
+        std::fs::rename(
+            repo.workdir().unwrap().join("old.txt"),
+            repo.workdir().unwrap().join("new.txt"),
+        )
+        .unwrap();
+        std::fs::remove_file(repo.workdir().unwrap().join("gone.txt")).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                repo.workdir().unwrap().join("mode.sh"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        write_file(&repo, "added.txt", "brand new\n");
+        let oid = {
+            let mut index = repo.index().unwrap();
+            index.remove_path(std::path::Path::new("old.txt")).unwrap();
+            index.remove_path(std::path::Path::new("gone.txt")).unwrap();
+            for p in ["text.txt", "bin.dat", "new.txt", "mode.sh", "added.txt"] {
+                index.add_path(std::path::Path::new(p)).unwrap();
+            }
+            commit_index(&repo, &mut index, "everything at once")
+        };
+        (d, repo, oid)
+    }
+
+    fn stats_settings(detect_renames: bool) -> DiffSettings {
+        DiffSettings {
+            context: 3,
+            ignore_ws: false,
+            show_stats: false,
+            detect_renames,
+            detect_copies: false,
+        }
+    }
+
+    /// The column and the file-list sidebar must never show different numbers
+    /// for the same commit. They can't, by construction — `commit_stats` runs
+    /// the same builders, options and rename post-pass `get_diff_data` does —
+    /// and this is what pins that. Measured during design: a binary change and
+    /// a mode-only change each count as one changed file with zero lines on
+    /// BOTH sides, which is the case most likely to drift.
+    #[test]
+    fn commit_stats_agrees_with_the_panes_own_per_file_counts() {
+        let (_d, repo, oid) = everything_repo();
+        for detect_renames in [false, true] {
+            let s = stats_settings(detect_renames);
+            let got = commit_stats(&repo, oid, s, &[], StatsWant::FilesAndLines).unwrap();
+
+            let data = get_diff_data(&repo, oid, CommitKind::Real, s, &[]);
+            let want = CommitStats {
+                files: data.files.len(),
+                lines: Some((
+                    data.files.iter().map(|f| f.additions).sum(),
+                    data.files.iter().map(|f| f.deletions).sum(),
+                )),
+            };
+            assert_eq!(got, want, "detect_renames = {detect_renames}");
+        }
+    }
+
+    /// The fast path must change only the WORK, never the answer: the delta
+    /// count and libgit2's `files_changed` are the same number, which is what
+    /// makes `FilesOnly` equivalent rather than merely close.
+    #[test]
+    fn files_only_matches_the_full_file_count_and_omits_lines() {
+        let (_d, repo, oid) = everything_repo();
+        for detect_renames in [false, true] {
+            let s = stats_settings(detect_renames);
+            let full = commit_stats(&repo, oid, s, &[], StatsWant::FilesAndLines).unwrap();
+            let fast = commit_stats(&repo, oid, s, &[], StatsWant::FilesOnly).unwrap();
+            assert_eq!(fast.files, full.files, "detect_renames = {detect_renames}");
+            assert_eq!(fast.lines, None, "FilesOnly must not report line counts");
+        }
+    }
+
+    /// Rename detection collapses the add+delete pair into ONE changed file —
+    /// the pane does this too, so the column must agree.
+    #[test]
+    fn commit_stats_counts_a_rename_as_one_file_when_detection_is_on() {
+        let (_d, repo, oid) = everything_repo();
+        let off = commit_stats(
+            &repo,
+            oid,
+            stats_settings(false),
+            &[],
+            StatsWant::FilesAndLines,
+        )
+        .unwrap();
+        let on = commit_stats(
+            &repo,
+            oid,
+            stats_settings(true),
+            &[],
+            StatsWant::FilesAndLines,
+        )
+        .unwrap();
+        assert_eq!(
+            off.files,
+            on.files + 1,
+            "detection removes exactly one entry"
+        );
+    }
+
+    /// A root commit has no parent: `commit_parent_diff` diffs against the empty
+    /// tree, so everything it contains counts as added.
+    #[test]
+    fn commit_stats_counts_a_root_commit_as_all_added() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        let root = commit_file(&repo, "f.txt", "one\ntwo\n", "root");
+        let got = commit_stats(
+            &repo,
+            root,
+            stats_settings(true),
+            &[],
+            StatsWant::FilesAndLines,
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            CommitStats {
+                files: 1,
+                lines: Some((2, 0))
+            }
+        );
+    }
+
+    /// The virtual rows are diffs like any other, and must route to the same
+    /// builders `get_diff_data` uses for them.
+    #[test]
+    fn commit_stats_covers_the_virtual_rows() {
+        use crate::test_repo::{commit_file, stage, temp_repo, write_file};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", "one\n", "base");
+        // Staged: one added line on top of HEAD.
+        write_file(&repo, "f.txt", "one\ntwo\n");
+        stage(&repo, "f.txt");
+        // Uncommitted: one more line, not staged.
+        write_file(&repo, "f.txt", "one\ntwo\nthree\n");
+
+        let s = stats_settings(true);
+        let staged = commit_stats(&repo, oid_staged(), s, &[], StatsWant::FilesAndLines).unwrap();
+        assert_eq!(
+            staged,
+            CommitStats {
+                files: 1,
+                lines: Some((1, 0))
+            }
+        );
+        let uncommitted =
+            commit_stats(&repo, oid_uncommitted(), s, &[], StatsWant::FilesAndLines).unwrap();
+        assert_eq!(
+            uncommitted,
+            CommitStats {
+                files: 1,
+                lines: Some((1, 0))
+            }
+        );
+    }
 
     #[test]
     fn file_ranges_and_index_lookup() {
