@@ -4,7 +4,9 @@ Native Wayland git history viewer — gitk, but okay. Built with Rust + egui.
 
 This is the single agent guide for the repo (`CLAUDE.md` is a symlink to it).
 When a change affects documented behavior or architecture, update this file in
-the same change.
+the same change. Edit and `git add` **`AGENTS.md`** — staging `CLAUDE.md` records an
+unchanged symlink and silently drops the change. `docs/` is excluded via
+`.git/info/exclude`: specs and plans are deliberately untracked, so don't `git add -f` them.
 
 ## Build / Test / Run
 
@@ -23,6 +25,16 @@ cp target/release/gitkay ~/.local/bin/   # install
 ```
 
 - Binary crate, not a lib: `cargo test --lib` fails — filter by test name instead.
+- `cargo test` takes ONE filter: `cargo test foo bar` errors out. Use `cargo test foo` or a
+  module (`cargo test apply::`).
+- **The two clippy gates differ and both must pass.** CI runs `cargo clippy -- -D warnings`
+  (bin target only); `./build.sh` adds `--all-targets` (test target too). A lint attribute
+  can satisfy one and fail the other: `#[expect(dead_code)]` on an item that is dead in the
+  bin but used by its own `#[cfg(test)]` tests is *unfulfilled* under `--all-targets`. Use
+  `#[allow(dead_code)]` — silent in both — and delete it when a real consumer lands.
+- Editor/IDE diagnostics can lag mid-edit and report phantom errors (walls of `dead_code`, a
+  bogus `E0004`). Confirm with a forced recompile before acting:
+  `touch src/*.rs && cargo clippy --all-targets -- -D warnings`.
 - System deps (Ubuntu/Debian): `libgtk-4-dev libgraphene-1.0-dev libssl-dev pkg-config cmake`
   (openSUSE: `gtk4-devel libgraphene-devel openssl-devel`).
 - Rust deps of note: `fontdb` (system-font name → file lookup), `dirs` (XDG paths),
@@ -214,6 +226,35 @@ Patch application is the mechanism for **hunks**, not for everything:
   select hunks (`ApplyOptions::hunk_callback`). No patch text is ever built or parsed.
   `repo.apply` commits its own index writer, so this path must NOT call `index.write()`.
 
+A rename's old path, and **only** a rename's. `FileEntry::old_path` is also set for a
+`Copied` delta, where it names the copy's SOURCE — a bystander that predates the change.
+Every route asks `ApplyRequest::rename_source()` rather than reading `old_path`, so the
+copy source never enters a pathspec or an index call. It is not a display concern:
+widening the pathspec pulls that file's own delta into the diff, and each route applies
+the diff whole.
+
+The request carries the displayed delta's `status` **whole** rather than pre-digested
+flags, because more than one decision needs a different part of it —
+`rename_source()` and `shown_deleted()` are both methods over it. Reducing it to booleans
+at the menu would mean a new field, and a sweep of every construction site, for the next
+status the write layer has to tell apart. `ApplyRequest::for_entry` is the single place a
+displayed `FileEntry` becomes a write; build requests with it (the tests do too, so they
+exercise the real mapping instead of a copy that can drift).
+
+Paths are carried as **raw bytes** (`ApplyRequest::path`, `FileEntry::path_bytes`), never
+the `String`. The display strings go through `from_utf8_lossy`, so a non-UTF-8 filename —
+legal in git and on Linux — comes back with U+FFFD where its bytes were; used as a path or
+pathspec it matches nothing, and `index.remove_path` tolerates the miss, so the write
+reported success having done nothing. `ApplyRequest::display_path` derives the message
+string from the bytes so the two cannot drift.
+
+That is what makes the crate **unix-only**, stated once as a `compile_error!` at the top
+of `main.rs`. `path_from_bytes` is a free reinterpret of git's bytes as an `OsStr`, which
+has no portable equivalent — and the portable fallback (lossy) is exactly the bug above,
+silently. gitkay was already unix-only in practice (`arboard::SetExtLinux`, the mode
+handling in `restore_binary`, the symlink tests); this makes it explicit instead of
+letting each function degrade on its own.
+
 Because nothing prompts, **every decision is taken before anything is written**, and
 libgit2 will not take them for us:
 
@@ -222,10 +263,79 @@ libgit2 will not take them for us:
   `DELETED`/`RENAMED` old paths before it ever looks at the postimage. So an acceptance
   count of zero does *not* mean nothing happened: unguarded, a stale click could delete a
   file / stage a deletion / unstage an added entry and still report failure. The hunk path
-  therefore **pre-matches** with `git2::Patch::from_diff` + `hunk_matches` and returns
+  therefore **pre-matches** with `git2::Patch::from_diff` + `hunk_fit` and returns
   `Stale` without calling `repo.apply` at all when nothing matches. The acceptance counter
   stays as a second line of defence, skipped when the diff holds a delta that bypasses the
   callback (`bypasses_hunk_callback`), where zero is the expected count of a *success*.
+- **A hunk is matched by containment, not overlap** (`hunk_fit`). The clicked range is
+  always a whole displayed hunk header and the action diff uses the display's `context`,
+  so the two ranges are normally identical. Exactly one option diverges —
+  `ignore_whitespace`, forced off for the action — and it only ever makes the generated
+  hunk WIDER, because ignoring whitespace turns changed lines into context and so *splits*
+  the display; it can never merge it. (Measured: edits at lines 10 and 22 with a
+  whitespace-only change at 16 display as `@@ -7,7 @@` + `@@ -19,7 @@` but generate one
+  `@@ -7,19 @@`.) An overlapping-but-wider hunk is therefore never "more of what the user
+  pointed at" — it is another hunk's edits fused onto the clicked one by the whitespace the
+  display was hiding. A hunk is indivisible, so it is refused with `HiddenByWhitespace`,
+  which names the toggle to turn off; with whitespace not ignored the same shape means the
+  diff moved on, and is `Stale`.
+- **The hunk callback has no file identity.** libgit2 hands it a bare `DiffHunk` with no
+  delta, while `hunk_fit` compares line numbers only — so a clicked range can be satisfied
+  by an equally-numbered hunk in a *different* file whenever the action diff holds more
+  than one delta (the pathspec carries two paths for a rename, and they do not always come
+  back coalesced: if the old path exists again by the time the worker runs, `find_similar`
+  has no deletion to pair up). `ApplyOptions::delta_callback` gates on the clicked path
+  before any of it: returning false makes `apply_one` skip that delta whole, before it
+  touches the preimage, so it never reaches the deletion/rename shortcuts either. The
+  pre-check applies the same gate, or the two would disagree.
+- **Whole-file Stage compares against what was displayed.** It records whatever the
+  worktree holds when the worker runs, so a file removed in the gap between the display and
+  the click would be staged as a DELETION the pane never showed. `ApplyRequest::shown_deleted()`
+  (from the delta status) is what tells that apart from a deletion the user is deliberately
+  staging; without a match it is `Stale`. Relatedly, only `NotFound` counts as "gone" —
+  lstat also fails with EACCES/ELOOP/ESTALE on a file that is still there, and folding
+  those in would stage its deletion (same split `read_if_present` already makes).
+- **The worktree is touched only through lstat-first helpers.** `std::fs::read`,
+  `write` and `set_permissions` all follow symlinks, so a guard that reads through a
+  link validates one file while the write lands on another — with a link into a shared
+  store the guard passes and the restore clobbers a file OUTSIDE the working tree while
+  the repo path is reported as reverted. `worktree_content` lstats first and answers
+  `Absent` / `Blob(oid)` / `Other`; `Other` matches nothing, so a symlink can never be
+  written through. It identifies a file by hashing it (`Oid::hash_file`) rather than
+  reading it, so guarding a multi-GB asset costs constant memory.
+- **A hunk click never performs a whole-file mutation.** libgit2 carries out a
+  `Renamed` delta's move outside the patch machinery, so applying it relocates the file
+  however few hunks the callback accepts — "Revert hunk" would move the file back.
+  Refused as `RenameNeedsWholeFile`, which names the whole-file action that does work.
+  The Added/Deleted carve-out stays: there the delta IS the whole file.
+- **Symlinks and gitlinks are refused on the worktree routes** (`refuse_unwritable_modes`).
+  libgit2's workdir reader resolves a link, so it reads the target's bytes where the
+  patch expects the link text and the apply fails as `Stale` — a false reason, forever.
+  A gitlink has no blob at all. Index routes are unaffected: `index.add_path` records
+  both correctly.
+
+  Reverting either is **deliberately out of scope**, not a gap waiting to be filled.
+  Both are implementable — recreate the link at the parent's target, run a submodule
+  update — but each is a new write mechanism with its own destructive edge cases, and
+  the defect being fixed here was the *false reason*, not the missing feature. Refusing
+  is the answer that neither lies nor destroys anything. Reopen it as a feature with its
+  own guards and tests, or leave it alone; do not turn it into a quiet special case.
+- **`Stale` means the diff moved on, and is checked in both directions.** Whole-file
+  Stage compares presence now against `shown_deleted()`: gone-but-shown-present would
+  stage a deletion the user never saw, present-but-shown-deleted would stage content
+  they never saw (a build script regenerating a file in the gap). An oversized hunk asks
+  before blaming whitespace — it regenerates the diff *as displayed* and only reports
+  `HiddenByWhitespace` if the click still fits there.
+- **Unstaging clears conflict stages first.** `index.add` replaces an entry with the same
+  path *and stage*, so on a path left unmerged by a merge it would add a stage-0 entry
+  beside the surviving stages 1/2/3 — an index that reads as both resolved and conflicted,
+  which `git status` still calls unmerged, while the write reported success. `stage_file`
+  needs no equivalent (`index.add_path` moves conflict entries to the REUC itself).
+- **`head_tree_for_write`, not `diff::head_tree`.** The latter folds every failure into
+  `None`, which for a write means "HEAD has no such file" — so an unreadable HEAD would
+  stage the deletion of a tracked file. Only `UnbornBranch` is a legitimate `None`.
+  Relatedly, restore HEAD's entry with `filemode()`, not `filemode_raw()`: trees in the
+  wild carry modes outside git's canonical five and `git_index_add` rejects them.
 - **A worktree deletion has no context to refuse on.** `apply_one` reads the preimage from
   the worktree and never compares it to `delta->old_file.id`; `git_apply__to_workdir` then
   checks out with `baseline_index = preimage`, so the baseline matches the worktree by
@@ -241,9 +351,25 @@ The context menu takes its oid from `current_diff_key` (the diff **on screen**),
 `selected_oid()`: during a diff load the sidebar and pane still render the outgoing diff, so
 the selection and the displayed paths belong to two different diffs.
 
+Both menus are **pinned to the diff they were opened over** by mixing `diff_menu_salt`
+(a hash of the whole `DiffCacheKey`) into the row's widget id. egui keeps a popup open
+across frames and keys it on that id, so without the salt an open menu survives the diff
+being replaced underneath it — by the debounced reload, the post-apply refresh, an arrow
+key — and its closure then re-resolves the row against the NEW content, writing a file the
+user never right-clicked. A changed salt makes the row a different widget, which orphans
+the popup. The whole key, not the oid: the virtual rows keep one sentinel oid forever and
+are told apart only by `content`.
+
 Applies run on a `gitkay-apply` worker, one at a time; on success they arm the same
 debounced reload the git watcher arms (every action rewrites `.git/index` — `git_apply`
-commits an index writer for `WorkDir` too — so both triggers fire and coalesce).
+commits an index writer for `WorkDir` too — so both triggers fire and coalesce). That
+armed reload is the *only* refresh: `drain_apply_results` must NOT also call
+`load_selected_diff`, because `drain_history_results` already ends with one, and for a
+content-keyed virtual row the extra call always misses the cache and pays a second full
+`get_diff_data`. It must, however, `request_repaint_after(RELOAD_DEBOUNCE)` — it runs
+*after* `handle_git_reload` in the frame, so nothing else schedules the wake-up that runs
+what it just armed. Usually the watcher covers it, but not for the binary blob restore:
+`restore_binary` only touches the worktree, so nothing under `.git` changes.
 
 ## Tests
 
@@ -272,11 +398,23 @@ each destructive guard is pinned by a test that was **demonstrated to fail witho
 nothing, a whole-file revert keeping a later change to the same file). Keep that standard:
 a new guard without a test proven to catch its removal is not covered.
 
+Assert through a **reopened** `Repository` when the thing under test is that a mutation
+reached `.git/index`. `repo.index()` returns the repo's cached in-memory index — the very
+object `stage_file`/`unstage_file` just mutated — so a test that reads it back passes with
+or without the `index.write()`. That blind spot is why the whole-file routes went
+unpinned; `stage_file_persists_to_the_index_file_on_disk` and its unstage twin are the
+ones that actually fail when the write is removed.
+
 ## Common Pitfalls
 
 - Both scrolled lists (commit list + diff pane) virtualize with egui `show_rows`. An early-egui bottom-gap bug once forced manual pre/post spacers on the commit list; that's fixed as of 0.34 (verified — no gap at end-of-list / few commits / on resize), so `show_rows` is used throughout. Don't reintroduce manual spacers.
 - `layout_no_wrap` + `with_clip_rect` for text truncation (egui `layout()` wraps)
 - egui tooltips (`show_tooltip_text` / `on_hover_*`) live on an **interactable** layer: if one lands over the pointer (likely at the right window edge, where a wide tooltip flips across the cursor), it wins the hit-test and the ScrollArea underneath silently drops wheel input until the mouse moves. The file-list path tooltip is therefore a hand-rolled `Area` with `.interactable(false)` (plus an `is_scrolling` guard so it doesn't churn mid-wheel) — don't swap it back to the convenience API
+- A bare `Area` reports a tiny `available_width`, so a default-wrapped label inside one shreds into a one-word-per-line column. Use `Label::new(..).extend()` — the file-list path tooltip and the apply status line both do
+- `Response::context_menu` commits to opening on secondary-click, and `Frame::popup` paints its fill/stroke/shadow even when the content closure draws nothing — so a menu that decides it has no items still shows an empty box. Gate the **attachment** (`row_menu_target` returning `None`), not what the closure draws
+- `Response::context_menu` is not a cheap no-op when the menu is closed: it allocates a style modifier and takes several `Context` locks *before* it checks whether anything is open. Both row lists call it per row per frame, so attachment is additionally gated on `resp.hovered() || any_menu_open` (probed once per frame). A menu can only *open* on a hovered row, and while one IS open every row must keep attaching — egui closes a popup whose owner stops calling in — so the fallback restores the old unconditional behaviour exactly when it matters
+- Rows that are inert (diff padding, directory headers) use `ui.allocate_space`, not `allocate_exact_size`: the latter also registers a widget and builds a `Response`, and the sidebar is not row-virtualized
+- egui's auto-generated widget ids are positional, so a menu opened on a row migrates to a different row as soon as the list under it changes — the diff pane when it scrolls (virtualized `show_rows`), the sidebar when `rebuild_file_rows` produces a different list. Neither may keep the auto id: interact with a stable one built from the row index AND `diff_menu_salt` — `ui.id().with(("diff_row", menu_salt, i))`. The index stops the row moving under the popup; the salt stops the whole *diff* changing under it (see **Write actions**)
 - Lane colors: track per-pipe, not per-column, or colors change on shifts
 - Two branches → same parent: both keep lanes, convergence at parent row
 - New merge lanes: skip vertical (diagonal already connects, no source above)

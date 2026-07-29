@@ -231,8 +231,24 @@ pub struct FileEntry {
     pub path: String,
     /// For a `Renamed`/`Copied` delta, the source path (old side) when it differs
     /// from `path`; `None` otherwise. Display-only — `path` (the new side) stays
-    /// the identity/patch-boundary key.
+    /// the identity/patch-boundary key. A write must NOT act on this without
+    /// first asking `ApplyRequest::rename_source`: for a copy it names a
+    /// bystander file. (Not the same thing as `main.rs`'s free `rename_source`,
+    /// which is the `--follow` tracer.)
     pub old_path: Option<String>,
+    /// `path` and `old_path` as raw bytes — the real filesystem/git identity.
+    /// The display strings above go through `from_utf8_lossy`, which is fine for
+    /// drawing but useless for acting: a non-UTF-8 name comes back with U+FFFD
+    /// where its bytes were, so using it as a path or pathspec silently matches
+    /// nothing. Every write goes through these.
+    pub path_bytes: Vec<u8>,
+    pub old_path_bytes: Option<Vec<u8>>,
+    /// The delta's status, as the pane displayed it. Carried because a write
+    /// cannot be decided from the paths alone: `old_path` means "the file moved
+    /// from here" for a `Renamed` delta but "this was copied from that unrelated
+    /// file" for a `Copied` one, and a whole-file Stage must know whether the
+    /// pane showed a deletion before it records one.
+    pub status: git2::Delta,
     pub additions: usize,
     pub deletions: usize,
     /// `Some(n)`: this file's patch starts at `diff_lines[n]`. `None`: the file
@@ -442,28 +458,31 @@ pub fn append_diff_body(
     diff: &git2::Diff,
     show_stats: bool,
 ) {
-    // Collect file stats. `byte_paths` mirrors `files` and is the identity key for
-    // matching patch lines back to their file below — `files[i].path` is a lossy
-    // display string, so two non-UTF-8 names could share one and collide.
-    let mut byte_paths: Vec<Vec<u8>> = Vec::new();
+    // Collect file stats. `FileEntry::path_bytes` is the identity key for matching
+    // patch lines back to their file below — `files[i].path` is a lossy display
+    // string, so two non-UTF-8 names could share one and collide.
     for delta in diff.deltas() {
         let bytes = delta_path_bytes(&delta);
-        let old_path = match delta.status() {
+        let old_bytes = match delta.status() {
             git2::Delta::Renamed | git2::Delta::Copied => delta
                 .old_file()
                 .path_bytes()
                 .filter(|old| *old != bytes)
-                .map(|old| String::from_utf8_lossy(old).into_owned()),
+                .map(<[u8]>::to_vec),
             _ => None,
         };
         files.push(FileEntry {
             path: String::from_utf8_lossy(bytes).into_owned(),
-            old_path,
+            old_path: old_bytes
+                .as_deref()
+                .map(|old| String::from_utf8_lossy(old).into_owned()),
+            path_bytes: bytes.to_vec(),
+            old_path_bytes: old_bytes,
+            status: delta.status(),
             additions: 0,
             deletions: 0,
             diff_line_idx: None,
         });
-        byte_paths.push(bytes.to_vec());
     }
 
     // Stats — the diffstat block (per-file list + summary) plus its trailing
@@ -480,24 +499,24 @@ pub fn append_diff_body(
     }
 
     // Patch — track which file we're in (by byte path, so non-UTF-8 names don't
-    // collide; see byte_paths above).
+    // collide; see path_bytes above).
     let mut current_file_idx: Option<usize> = None;
     diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
         // Detect file boundary
         let path = delta_path_bytes(&delta);
         let on_current_file = current_file_idx
-            .and_then(|i| byte_paths.get(i))
-            .is_some_and(|p| p.as_slice() == path);
+            .and_then(|i| files.get(i))
+            .is_some_and(|f| f.path_bytes == path);
         if !on_current_file {
             // Deltas print in order, so the boundary is almost always the next
             // entry — check it first; the full scan is a fallback so a surprise
             // ordering degrades to a rescan, not a mis-attributed file.
             let next = current_file_idx.map_or(0, |i| i + 1);
-            current_file_idx = byte_paths
+            current_file_idx = files
                 .get(next)
-                .is_some_and(|p| p.as_slice() == path)
+                .is_some_and(|f| f.path_bytes == path)
                 .then_some(next)
-                .or_else(|| byte_paths.iter().position(|p| p.as_slice() == path));
+                .or_else(|| files.iter().position(|f| f.path_bytes == path));
             if let Some(fi) = current_file_idx {
                 files[fi].diff_line_idx = Some(lines.len());
             }
@@ -732,6 +751,20 @@ pub struct HunkRange {
     pub new_lines: u32,
 }
 
+impl From<&git2::DiffHunk<'_>> for HunkRange {
+    /// The write layer reads a generated hunk's ranges in two places that AGENTS.md
+    /// requires to agree — the pre-check and the apply callback — so the copy-out
+    /// lives here rather than being spelled twice.
+    fn from(hunk: &git2::DiffHunk<'_>) -> Self {
+        Self {
+            old_start: hunk.old_start(),
+            old_lines: hunk.old_lines(),
+            new_start: hunk.new_start(),
+            new_lines: hunk.new_lines(),
+        }
+    }
+}
+
 /// Parse a unified-diff hunk header. git omits a range's count when it is 1
 /// (`@@ -1 +1 @@`), so an absent count reads as 1. Returns `None` for anything that
 /// isn't a well-formed header — the caller then treats the row as hunkless rather
@@ -797,16 +830,7 @@ pub fn next_file_line(starts: &[(usize, usize)], top: usize, down: bool) -> Opti
 mod tests {
     use super::*;
 
-    /// A `FileEntry` with the given path + patch start, zero stats.
-    fn fe(path: &str, diff_line_idx: Option<usize>) -> FileEntry {
-        FileEntry {
-            path: path.to_string(),
-            old_path: None,
-            additions: 0,
-            deletions: 0,
-            diff_line_idx,
-        }
-    }
+    use crate::test_repo::file_entry as fe;
 
     #[test]
     fn file_ranges_and_index_lookup() {
