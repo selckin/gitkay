@@ -199,7 +199,13 @@ parts run off the window-creation critical path:
   those claims and dispatch (gated on the set being empty) would stop for the
   session. Invalidation is keyed on `stats_relevant` — `ignore_ws` /
   `detect_renames` / `detect_copies` — not the whole `DiffSettings`, so bumping
-  the toolbar's context doesn't blank the column.
+  the toolbar's context doesn't blank the column. The oid key is wrong for the two
+  **virtual rows**, which keep one sentinel oid forever: a worktree-only edit
+  never touches `.git`, so the watcher's reload (which does evict them) never
+  fires, and they would show pre-edit numbers beside a pane that recomputed. Their
+  diff key carries a content hash, and `sync_virtual_stats` — called where a
+  freshly computed diff installs — evicts a virtual row whose hash moved under
+  unchanged `DiffSettings`, costing one recomputed row per actual edit.
   Rendering is `draw_stats_cells`: fixed-width cells (`STATS_CELL_CHARS` measured
   once a frame) right-aligned between the summary and the SHA, so digits line up
   down the list and a landing result never reflows the row — a blank cell is what
