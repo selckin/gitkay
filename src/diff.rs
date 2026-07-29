@@ -1056,11 +1056,30 @@ pub fn capture_anchor(
 /// bin build, so `#[expect]` would fail `--all-targets`.
 #[allow(dead_code)]
 pub fn resolve_anchor(anchor: &DiffAnchor, lines: &[DiffLine], files: &[FileEntry]) -> usize {
-    // A rename's surviving entry carries both paths, so matching on EITHER is
-    // what makes the anchor survive a detection toggle in both directions.
-    let matched = files.iter().position(|f| {
-        f.path_bytes == anchor.path || f.old_path_bytes.as_deref() == Some(anchor.path.as_slice())
-    });
+    // The exact path match must run FIRST and win outright: a file's own entry
+    // is always the correct identity when one exists, and checking it first is
+    // what keeps a `Copied` delta's `old_path_bytes` from ever being consulted
+    // for a path that has its own entry. `old_path_bytes` is a fallback, and
+    // gated on `Renamed` specifically — it is set for `Copied` too, but there it
+    // names the copy's SOURCE, a bystander file that predates the change and
+    // has its own entry in the same diff (AGENTS.md: "A rename's old path, and
+    // only a rename's"). Without the status gate, an anchor in a copy's source
+    // file would match the copy's entry before its own — whichever sorts first
+    // in path order — and resolve into the copy instead. A rename's surviving
+    // entry carries both paths, so this still lets the anchor survive a
+    // detection toggle in both directions: ON -> OFF finds the exact path
+    // directly (the coalesced entry split back into its own two), OFF -> ON has
+    // no exact entry for the old name anymore and falls through to the rename
+    // match.
+    let matched = files
+        .iter()
+        .position(|f| f.path_bytes == anchor.path)
+        .or_else(|| {
+            files.iter().position(|f| {
+                f.status == git2::Delta::Renamed
+                    && f.old_path_bytes.as_deref() == Some(anchor.path.as_slice())
+            })
+        });
     if let Some(fi) = matched
         && let Some(header) = files[fi].diff_line_idx
     {
@@ -1898,6 +1917,77 @@ mod tests {
         );
     }
 
+    /// `ws_only_repo`, but with the bodyless file sorting FIRST instead of
+    /// last: `a.txt` changes only in whitespace, `b.txt` for real. Rung 4's
+    /// "previous, else next" fallback has no previous survivor to find here —
+    /// `a_file_without_a_patch_body_falls_to_the_previous_header` only ever
+    /// exercises the "previous" half, since its bodyless file sorts last.
+    fn ws_only_repo_leading() -> (tempfile::TempDir, Repository, git2::Oid) {
+        use crate::test_repo::{commit_file, commit_index, stage, temp_repo, write_file};
+        let (d, repo) = temp_repo();
+        commit_file(&repo, "a.txt", "x\ny\nz\n", "base a");
+        commit_file(&repo, "b.txt", "aaa\n", "base b");
+        write_file(&repo, "a.txt", "x\ny   \nz\n");
+        write_file(&repo, "b.txt", "aaa\nbbb\n");
+        stage(&repo, "a.txt");
+        stage(&repo, "b.txt");
+        let oid = {
+            let mut index = repo.index().unwrap();
+            commit_index(&repo, &mut index, "whitespace change + real change")
+        };
+        (d, repo, oid)
+    }
+
+    /// Rung 4, the "no previous survivor" half. `a.txt` (whitespace-only)
+    /// sorts before `b.txt` (the real change), so under `ignore_ws` there is
+    /// nothing earlier in `files` with a body to fall back to — the resolve
+    /// must step FORWARD to `b.txt`'s header instead.
+    #[test]
+    fn a_leading_file_without_a_patch_body_falls_to_the_next_header() {
+        let (_d, repo, oid) = ws_only_repo_leading();
+        let shown = diff_at(&repo, oid, base_settings());
+        let hidden = diff_at(
+            &repo,
+            oid,
+            DiffSettings {
+                ignore_ws: true,
+                ..base_settings()
+            },
+        );
+
+        assert_eq!(
+            hidden.files[0].path, "a.txt",
+            "the bodyless file must sort first, or this doesn't test rung 4's forward half"
+        );
+        assert_eq!(
+            hidden.files[0].diff_line_idx, None,
+            "a whitespace-only change leaves no patch body"
+        );
+
+        let row = row_of(&shown, "a.txt", AnchorSide::New, 2);
+        let captured = capture_anchor(&shown.lines, &shown.files, row).expect("an anchor");
+        assert_eq!(captured.path, b"a.txt".to_vec());
+        // Same non-zero-delta pin as the "previous" test: a leaked delta would
+        // scroll above the header this rung chose.
+        let anchor = DiffAnchor {
+            delta: 2,
+            ..captured
+        };
+
+        let b_header = hidden
+            .files
+            .iter()
+            .find(|f| f.path == "b.txt")
+            .unwrap()
+            .diff_line_idx
+            .expect("b.txt kept its body");
+        assert_eq!(
+            resolve_anchor(&anchor, &hidden.lines, &hidden.files),
+            b_header,
+            "rung 4: no previous survivor, falls forward to the next file's header"
+        );
+    }
+
     /// Rung 5. The anchored file is the only file and has lost its body, so
     /// there is no neighbouring header either side — the top is all that's left.
     #[test]
@@ -1976,6 +2066,64 @@ mod tests {
             resolve_anchor(&b, &on.lines, &on.files),
             row_of(&on, "z.txt", AnchorSide::Old, 4),
             "matched through the rename entry's old path"
+        );
+    }
+
+    /// Rung 1, under `detect_copies` rather than `detect_renames`. A `Copied`
+    /// delta's `old_path_bytes` names its SOURCE, not a vacated name — the
+    /// source is a bystander file that predates the change and keeps its OWN
+    /// entry in the same diff (a copy source must itself be modified for `-C`
+    /// to consider it one at all, per `detect_similar`'s doc comment). Here
+    /// `z.txt` is copied to `a.txt` in the same commit that edits `z.txt`
+    /// itself, so `files` (path order) is `[a.txt (Copied, old=z.txt), z.txt
+    /// (Modified)]` — the copy's target sorts before its source. An anchor
+    /// captured in `z.txt`'s own patch must resolve back into `z.txt`, not
+    /// into `a.txt` just because `a.txt.old_path_bytes == b"z.txt"`.
+    #[test]
+    fn a_copy_source_does_not_steal_an_anchor_meant_for_itself() {
+        use crate::test_repo::{commit_file, commit_index, stage, temp_repo, write_file};
+        let (_d, repo) = temp_repo();
+        let base = "aaa\nbbb\nccc\nddd\neee\n";
+        commit_file(&repo, "z.txt", base, "base");
+        // a.txt: an exact copy of z.txt's OLD content, so `-C` pairs it with
+        // z.txt as the copy source. z.txt itself changes too, which is what
+        // makes it eligible as a source in the first place.
+        write_file(&repo, "a.txt", base);
+        write_file(&repo, "z.txt", "aaa\nbbb\nCCC\nddd\neee\n");
+        stage(&repo, "a.txt");
+        stage(&repo, "z.txt");
+        let oid = {
+            let mut index = repo.index().unwrap();
+            commit_index(&repo, &mut index, "copy z.txt to a.txt and edit z.txt")
+        };
+
+        let data = diff_at(
+            &repo,
+            oid,
+            DiffSettings {
+                detect_copies: true,
+                ..base_settings()
+            },
+        );
+        assert_eq!(data.files.len(), 2, "the copy pairs off, nothing extra");
+        assert_eq!(data.files[0].path, "a.txt", "the target sorts first");
+        assert_eq!(data.files[0].status, git2::Delta::Copied);
+        assert_eq!(data.files[0].old_path_bytes.as_deref(), Some(&b"z.txt"[..]));
+        assert_eq!(data.files[1].path, "z.txt");
+
+        let row = row_of(&data, "z.txt", AnchorSide::New, 3);
+        let anchor = capture_anchor(&data.lines, &data.files, row).expect("an anchor");
+        assert_eq!(anchor.path, b"z.txt".to_vec());
+
+        let (_, z_start, z_end) = file_line_ranges(&data.files, data.lines.len())
+            .into_iter()
+            .find(|&(i, _, _)| data.files[i].path == "z.txt")
+            .expect("z.txt has a patch body");
+        let got = resolve_anchor(&anchor, &data.lines, &data.files);
+        assert_eq!(got, row, "rung 1: the anchored line in z.txt itself");
+        assert!(
+            (z_start..z_end).contains(&got),
+            "resolved into z.txt's own row range, not the copy's"
         );
     }
 
