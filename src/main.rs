@@ -27,11 +27,12 @@ mod test_repo;
 mod word_diff;
 use config::{FileListLayout, Fonts, Role};
 use diff::{
-    CommitKind, CommitStats, DiffData, DiffLine, DiffSettings, FileEntry, LineKind, StatsWant,
-    commit_parent_diff, commit_stats, emphasize_rows, file_index_at_line, file_index_at_line_opt,
-    file_line_ranges, file_line_starts, format_commit_time, get_diff_data, hash_diff_content,
-    is_real_commit, local_tz_offset_min, next_file_line, oid_staged, oid_uncommitted,
-    pathspec_opts, staged_git_diff, worktree_git_diff,
+    CommitKind, CommitStats, DiffAnchor, DiffData, DiffLine, DiffSettings, FileEntry, LineKind,
+    StatsWant, capture_anchor, commit_parent_diff, commit_stats, emphasize_rows,
+    file_index_at_line, file_index_at_line_opt, file_line_ranges, file_line_starts,
+    format_commit_time, get_diff_data, hash_diff_content, is_real_commit, local_tz_offset_min,
+    next_file_line, oid_staged, oid_uncommitted, pathspec_opts, resolve_anchor, staged_git_diff,
+    worktree_git_diff,
 };
 use diff_cache::DiffCache;
 use highlight::{DiffBg, HighlightLines, Highlighter};
@@ -3277,6 +3278,33 @@ struct ScrollMemory {
     file_list_y: f32,
 }
 
+/// What a (re)load owes the diff pane's scroll state, decided from the key of the
+/// diff ON SCREEN and the oid being loaded — the single place that distinction is
+/// made, and pure so the pairing it enforces is testable without a `GitkApp`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ScrollPlan {
+    /// Same commit, rebuilt content: a toolbar toggle, a config reload, the
+    /// virtual rows' refresh after a worktree edit. The remembered position is
+    /// older than what is on screen, and the live row offset now names a
+    /// different line — so capture an anchor and put the reader back on THEIR
+    /// line once the rebuild lands.
+    Anchor,
+    /// A different commit: queue its remembered position from `scroll_memory`,
+    /// and drop any pending anchor, which belongs to a diff being navigated away
+    /// from.
+    Restore,
+}
+
+impl ScrollPlan {
+    fn of(displayed: Option<git2::Oid>, wanted: git2::Oid) -> Self {
+        if displayed == Some(wanted) {
+            Self::Anchor
+        } else {
+            Self::Restore
+        }
+    }
+}
+
 struct GitkApp {
     commits: Vec<CommitInfo>,
     graph_rows: Vec<GraphRow>,
@@ -3308,6 +3336,14 @@ struct GitkApp {
     /// analogue: set on selection, consumed by the sidebar render once no diff
     /// load is in flight (mid-load the sidebar still shows the outgoing diff).
     file_list_scroll_to: Option<f32>,
+    /// Where the diff pane was reading when a same-oid rebuild was dispatched:
+    /// captured by `load_selected_diff` from the content still on screen, and
+    /// consumed by `apply_loaded_diff` once the rebuilt content is installed.
+    /// Mutually exclusive with a `scroll_memory` restore by construction — only
+    /// the `ScrollPlan::Anchor` branch ever sets it — and cleared by both of
+    /// `load_selected_diff`'s bail-out paths, so it can never fire against a
+    /// diff it was not measured against.
+    pending_anchor: Option<DiffAnchor>,
     /// The sidebar's live scroll offset, recorded each frame it renders — what
     /// `stash_current_diff` saves into `scroll_memory` for the outgoing commit.
     file_list_scroll: f32,
@@ -3864,6 +3900,7 @@ impl GitkApp {
             diff_scroll_to: None,
             scroll_memory: std::collections::HashMap::new(),
             file_list_scroll_to: None,
+            pending_anchor: None,
             file_list_scroll: 0.0,
             diff_top_line: Arc::new(AtomicUsize::new(0)),
             diff_visible_rows: Arc::new(AtomicUsize::new(1)),
@@ -4084,9 +4121,12 @@ impl GitkApp {
             }
             // Drop any restore target queued for the abandoned navigation — left
             // pending, it would fire against this diff once the load state clears
-            // and yank it to the *other* commit's remembered position.
+            // and yank it to the *other* commit's remembered position. Same for a
+            // pending anchor: it was measured against content this call is
+            // declining to replace.
             self.diff_scroll_to = None;
             self.file_list_scroll_to = None;
+            self.pending_anchor = None;
             return;
         }
 
@@ -4097,6 +4137,7 @@ impl GitkApp {
         // render path doesn't consume targets mid-load).
         self.diff_scroll_to = None;
         self.file_list_scroll_to = None;
+        self.pending_anchor = None;
 
         let Some(sel) = sel else {
             // No selection: supersede any in-flight load, stash the outgoing diff for a
@@ -4110,17 +4151,41 @@ impl GitkApp {
 
         let oid = self.commits[sel].oid;
         log::debug!("select: commit {oid} (#{sel})");
-        // Queue the scroll restore for the incoming commit: its remembered position
-        // (saved by stash_current_diff when it was last replaced), or the top for one
-        // not visited this session. Only on an actual commit switch — a same-oid
-        // re-diff (settings change, virtual-row refresh) keeps the live position via
-        // the untouched egui scroll offsets, and the remembered one is older than
-        // what's on screen. The targets survive an in-flight load (see the render
-        // path), so they apply once the new content lands.
-        if self.current_diff_key.as_ref().map(|k| k.oid) != Some(oid) {
-            let mem = self.scroll_memory.get(&oid);
-            self.diff_scroll_to = Some(mem.map_or(0, |m| m.diff_row));
-            self.file_list_scroll_to = Some(mem.map_or(0.0, |m| m.file_list_y));
+        // Queue the scroll restore for the incoming commit, or anchor the
+        // outgoing one. On a COMMIT SWITCH the remembered position (saved by
+        // stash_current_diff when it was last replaced) is right, and an
+        // unvisited commit opens at the top; the targets survive an in-flight
+        // load (see the render path), so they apply once the new content lands.
+        // On a SAME-OID REBUILD the egui scroll offsets are untouched, which used
+        // to be treated as good enough — but every setting in the toolbar
+        // reshapes the content under that fixed row offset, so capture where the
+        // reader actually is and resolve it back after the rebuild.
+        //
+        // Capturing HERE, ahead of the synchronous cache-hit install below, is
+        // load-bearing: that branch calls apply_loaded_diff in this same call, so
+        // a reordering would leave every cache-hit rebuild resolving a stale or
+        // absent anchor.
+        match ScrollPlan::of(self.current_diff_key.as_ref().map(|k| k.oid), oid) {
+            ScrollPlan::Restore => {
+                let mem = self.scroll_memory.get(&oid);
+                self.diff_scroll_to = Some(mem.map_or(0, |m| m.diff_row));
+                self.file_list_scroll_to = Some(mem.map_or(0.0, |m| m.file_list_y));
+            }
+            ScrollPlan::Anchor => {
+                // Safe even while the pane shows the "Loading diff…" placeholder:
+                // the render's closure does not run then, so diff_top_line keeps
+                // its last real value and diff_lines still holds the outgoing
+                // content — the two stay mutually consistent, which is all the
+                // anchor needs. Unconditional on every same-oid call, and
+                // consumption clears it, so rapid clicking needs no epoch of its
+                // own: each capture reads what is genuinely on screen at that
+                // moment, and a superseded load's anchor is simply replaced.
+                self.pending_anchor = capture_anchor(
+                    &self.diff_lines,
+                    &self.diff_files,
+                    self.diff_top_line.load(Ordering::Relaxed),
+                );
+            }
         }
         // Identical for the synchronous hit-install and the async miss-dispatch below, so
         // build the cache key once here.
@@ -4279,12 +4344,30 @@ impl GitkApp {
     /// `load_selected_diff`) survives an in-flight load and overrides the reset top
     /// for the new diff.
     fn apply_loaded_diff(&mut self, key: DiffCacheKey, data: DiffData) {
+        let oid = key.oid;
         // Stash whatever was on screen (the previous commit kept visible during the
         // load, or nothing if the pane already blanked to a placeholder) before it's
         // replaced, so a later revisit restores it instantly.
         self.stash_current_diff();
         self.diff_load_started_at = None;
         self.set_diff_content(Some(key), data);
+        // Put the reader back on the line they were reading, for a same-oid
+        // rebuild. Only when an anchor is actually pending: on a commit switch
+        // the caller set diff_scroll_to before the content arrived and the render
+        // preserves it across the in-flight load, so an unconditional write here
+        // would destroy the very restore it exists to perform.
+        if let Some(anchor) = self.pending_anchor.take() {
+            let row = resolve_anchor(&anchor, &self.diff_lines, &self.diff_files);
+            self.diff_scroll_to = Some(row);
+            // stash_current_diff just wrote the OUTGOING top row into
+            // scroll_memory, in the pre-rebuild coordinate system. Left there, it
+            // would undo this on the next navigate-away-and-back — the anchor is
+            // what makes that long-standing inconsistency reachable, so it is
+            // this change's to fix.
+            if let Some(mem) = self.scroll_memory.get_mut(&oid) {
+                mem.diff_row = row;
+            }
+        }
     }
 
     /// Install a freshly computed diff, but prefer an already-available copy of the
@@ -4302,9 +4385,12 @@ impl GitkApp {
         sync_virtual_stats(&mut self.virtual_diff_content, &mut self.commit_stats, &key);
         // Same key ⇒ same content (real commits are oid+settings-keyed; virtual
         // entries carry a content hash), so keep the on-screen copy — spans and
-        // scroll position included — and just clear the loading state.
+        // scroll position included — and just clear the loading state. Nothing
+        // moved, so a pending anchor has nothing to correct; dropping it here
+        // keeps consumption exhaustive rather than leaving one to fire later.
         if self.current_diff_key.as_ref() == Some(&key) {
             self.diff_load_started_at = None;
+            self.pending_anchor = None;
             return;
         }
         let data = self.diff_cache.remove(&key).unwrap_or(data);
@@ -9992,5 +10078,34 @@ mod tests {
         let out = right_elide("αβγδε.rs", 4.0, char_count);
         assert!(out.ends_with('…'));
         assert!(char_count(&out) <= 4.0);
+    }
+
+    /// A pending anchor may only ever be captured on `Anchor`, and `Restore`
+    /// must drop one: it would name a line in a diff the user has navigated away
+    /// from, and firing it against the incoming commit would yank the view to a
+    /// row that means nothing there. `ScrollPlan::of` is the single place that
+    /// distinction is made, so it is the single place worth pinning.
+    #[test]
+    fn only_a_same_oid_rebuild_anchors() {
+        let a = git2::Oid::from_bytes(&[1u8; 20]).unwrap();
+        let b = git2::Oid::from_bytes(&[2u8; 20]).unwrap();
+
+        assert_eq!(ScrollPlan::of(Some(a), a), ScrollPlan::Anchor);
+        assert_eq!(
+            ScrollPlan::of(Some(b), a),
+            ScrollPlan::Restore,
+            "a commit switch restores the remembered position instead"
+        );
+        assert_eq!(
+            ScrollPlan::of(None, a),
+            ScrollPlan::Restore,
+            "nothing on screen means nothing to anchor to"
+        );
+        // The virtual rows keep one sentinel oid forever, so a working-tree
+        // refresh is a same-oid rebuild and anchors like any other.
+        assert_eq!(
+            ScrollPlan::of(Some(oid_uncommitted()), oid_uncommitted()),
+            ScrollPlan::Anchor
+        );
     }
 }
