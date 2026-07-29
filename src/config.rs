@@ -199,9 +199,6 @@ impl Default for CommitListSection {
 
 impl CommitListSection {
     /// Is the column shown at all? No third key: either count enables it.
-    // Unused until Task 3 wires it into the commit-list column; `#[allow]` (not
-    // `#[expect]`) because it stays dead under `--all-targets` too — no test calls it.
-    #[allow(dead_code)]
     pub(crate) const fn any(self) -> bool {
         self.file_count || self.line_count
     }

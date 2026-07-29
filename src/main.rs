@@ -11,7 +11,7 @@ use arboard::SetExtLinux;
 use eframe::egui;
 use git2::{Repository, Sort};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -27,10 +27,11 @@ mod test_repo;
 mod word_diff;
 use config::{FileListLayout, Fonts, Role};
 use diff::{
-    CommitKind, DiffData, DiffLine, DiffSettings, FileEntry, LineKind, commit_parent_diff,
-    emphasize_rows, file_index_at_line, file_index_at_line_opt, file_line_ranges, file_line_starts,
-    format_commit_time, get_diff_data, hash_diff_content, is_real_commit, local_tz_offset_min,
-    next_file_line, oid_staged, oid_uncommitted, pathspec_opts, staged_git_diff, worktree_git_diff,
+    CommitKind, CommitStats, DiffData, DiffLine, DiffSettings, FileEntry, LineKind, StatsWant,
+    commit_parent_diff, commit_stats, emphasize_rows, file_index_at_line, file_index_at_line_opt,
+    file_line_ranges, file_line_starts, format_commit_time, get_diff_data, hash_diff_content,
+    is_real_commit, local_tz_offset_min, next_file_line, oid_staged, oid_uncommitted,
+    pathspec_opts, staged_git_diff, worktree_git_diff,
 };
 use diff_cache::DiffCache;
 use highlight::{DiffBg, HighlightLines, Highlighter};
@@ -581,6 +582,77 @@ fn prefetch_targets(
     // Closest to the selection first; tie → the row below (larger index) first.
     idxs.sort_by_key(|&i| (i.abs_diff(selected), i < selected));
     idxs.into_iter().take(max).map(|i| commits[i].oid).collect()
+}
+
+/// The settings that can change a diffstat COUNT — deliberately not the whole
+/// `DiffSettings` comparison the config reload uses elsewhere.
+///
+/// `context` changes how much surrounding text a patch carries, never how many
+/// lines changed, and `show_stats` is presentation-only. Clearing the stats map
+/// on either would blank the entire column and recompute a screenful of diffs
+/// every time the toolbar's `+`/`-` buttons are clicked — visible flicker
+/// bought with real work. A field added to `DiffSettings` later gets classified
+/// here, in one place.
+const fn stats_relevant(s: DiffSettings) -> (bool, bool, bool) {
+    (s.ignore_ws, s.detect_renames, s.detect_copies)
+}
+
+/// Which visible rows still need their stats computed.
+///
+/// Exactly the visible window, no margin: each target costs a diff, and rows
+/// the user has scrolled past are not worth computing. Rows already known —
+/// **including those recorded as failed (`Some(None)`)** — are skipped, which is
+/// what stops a broken object being re-queued every frame forever.
+///
+/// No in-flight parameter: `dispatch_commit_stats` is already a no-op while a
+/// batch is running, so a skip-in-flight branch here could never execute.
+fn stats_targets(
+    commits: &[CommitInfo],
+    view: std::ops::Range<usize>,
+    known: &HashMap<git2::Oid, Option<CommitStats>>,
+) -> Vec<git2::Oid> {
+    commits
+        .get(view.start.min(commits.len())..view.end.min(commits.len()))
+        .unwrap_or_default()
+        .iter()
+        .map(|c| c.oid)
+        .filter(|oid| !known.contains_key(oid))
+        .collect()
+}
+
+/// What a landing stats result does to the app's state. Pure so the
+/// stale-epoch path — the one that used to wedge the feature — is testable
+/// without a worker or an `egui::Context`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StatsAction {
+    /// Clear the oid's in-flight entry and record the outcome.
+    Install,
+    /// Drop it: the entry it belongs to was cleared by an invalidation, which
+    /// also cleared the in-flight set.
+    Discard,
+}
+
+const fn stats_result_action(result_epoch: u64, current_epoch: u64) -> StatsAction {
+    if result_epoch == current_epoch {
+        StatsAction::Install
+    } else {
+        StatsAction::Discard
+    }
+}
+
+/// Drop every cached stat and release every claim, then supersede the batch in
+/// flight. Free rather than a method so the regression test drives the real
+/// thing — the in-flight clear is the load-bearing line (see
+/// `GitkApp::invalidate_commit_stats`), and a test that reimplemented these
+/// three steps would stay green with it deleted.
+fn invalidate_stats_state(
+    known: &mut HashMap<git2::Oid, Option<CommitStats>>,
+    inflight: &mut HashSet<git2::Oid>,
+    epoch: &Epoch,
+) {
+    known.clear();
+    inflight.clear();
+    epoch.bump();
 }
 
 /// Apply one `<rev>` token to the revwalk: `^X` hides, `A..B` hides A + pushes B,
@@ -2287,6 +2359,69 @@ fn history_worker(job: HistoryJob) {
     }
 }
 
+/// One commit's finished stats, worker → UI. `stats: None` means the diff could
+/// not be computed — recorded as a failure rather than left unknown, or the
+/// dispatcher would ask again every frame.
+struct StatsResult {
+    epoch: u64,
+    oid: git2::Oid,
+    stats: Option<CommitStats>,
+}
+
+struct StatsJob {
+    repo_path: String,
+    /// Per-oid pathspec: under `--follow` each commit is asked about the name
+    /// the file had AT that commit, matching the diff the pane would show.
+    targets: Vec<(git2::Oid, Vec<String>)>,
+    settings: DiffSettings,
+    want: StatsWant,
+    epoch: u64,
+    current_epoch: Epoch,
+    tx: mpsc::Sender<StatsResult>,
+    ctx: egui::Context,
+}
+
+/// Compute the commit-list stats for a batch of rows, off the frame loop.
+///
+/// Sends ONE result per target as it finishes, so rows fill in progressively
+/// rather than a screenful arriving at once. Every target it processes reports
+/// back — success or failure — because an oid left "unknown" is re-queued by
+/// the dispatcher on the next frame.
+fn stats_worker(job: StatsJob) {
+    let StatsJob {
+        repo_path,
+        targets,
+        settings,
+        want,
+        epoch,
+        current_epoch,
+        tx,
+        ctx,
+    } = job;
+    if !current_epoch.is_current(epoch) {
+        return; // superseded before we ran — the UI already cleared its in-flight set
+    }
+    let repo = match Repository::discover(&repo_path) {
+        Ok(r) => r,
+        Err(e) => {
+            log::debug!("stats: repo discover failed: {e}");
+            return;
+        }
+    };
+    for (oid, paths) in targets {
+        if !current_epoch.is_current(epoch) {
+            return; // invalidated; the UI cleared the in-flight set with the map
+        }
+        let stats = commit_stats(&repo, oid, settings, &paths, want)
+            .inspect_err(|e| log::debug!("stats: {oid} failed: {e}"))
+            .ok();
+        if tx.send(StatsResult { epoch, oid, stats }).is_err() {
+            return; // UI gone
+        }
+        ctx.request_repaint();
+    }
+}
+
 /// Resolve the visual config — the diff theme slug and the `[diff.bands]`
 /// background — logging any warnings and reporting whether one fired (the caller
 /// flashes the config-error toast). The single resolve-and-warn point, shared by
@@ -3029,6 +3164,26 @@ struct GitkApp {
     inflight_diffs: InflightKeys,
     last_highlight_check_gen: u64, // diff_generation we last ran diff_fully_highlighted for
     commit_view_range: std::ops::Range<usize>, // visible commit-list rows (set each frame)
+    /// Per-commit change counts for the commit-list column. `Some(None)` means
+    /// "computed and failed" — distinct from a missing key ("not asked yet"),
+    /// which is what stops a broken object being re-queued every frame.
+    /// A side map rather than a `CommitInfo` field: a history rebuild replaces
+    /// every `CommitInfo`, and these survive it, correctly — a real commit's
+    /// diff cannot change.
+    commit_stats: HashMap<git2::Oid, Option<CommitStats>>,
+    /// Oids the stats worker is computing right now. Doubles as the "a batch is
+    /// running" flag, so the two can never disagree — which makes emptying it
+    /// load-bearing: see `invalidate_commit_stats`.
+    stats_inflight: HashSet<git2::Oid>,
+    /// Bumped by `invalidate_commit_stats`. Its ONLY job is stopping a batch
+    /// that outlived an invalidation from writing stale numbers into the
+    /// freshly cleared map — with one batch at a time there is nothing to
+    /// order. Don't remove it on the grounds that nothing overlaps.
+    stats_epoch: Epoch,
+    stats_tx: mpsc::Sender<StatsResult>,
+    stats_rx: mpsc::Receiver<StatsResult>,
+    /// `[commit_list]` — which counts to show, and whether to compute at all.
+    commit_list_cfg: config::CommitListSection,
     // A cache miss (or virtual entry) computes get_diff_data on a worker so a large
     // diff / rename+copy detection can't freeze the window; the pane shows a
     // placeholder until the result lands (see load_selected_diff / dispatch_diff_load).
@@ -3313,6 +3468,9 @@ impl GitkApp {
                 }
             })
             .unwrap_or_default();
+        // Copied out here, next to the read: `cfg` is consumed piecemeal on the
+        // way to the struct literal, and this is `Copy`.
+        let commit_list_cfg = cfg.commit_list;
         let syntax_enabled = cfg.diff.syntax;
         // Theme + band validation happens here at startup regardless of syntax
         // mode — everything downstream (palette, prewarm, cache keys) carries the
@@ -3445,6 +3603,7 @@ impl GitkApp {
         let (prefetch_tx, prefetch_rx) = mpsc::channel();
         let (diff_load_tx, diff_load_rx) = mpsc::channel();
         let (history_load_tx, history_load_rx) = mpsc::channel();
+        let (stats_tx, stats_rx) = mpsc::channel();
         let (apply_tx, apply_rx) = mpsc::channel();
         let egui_ctx = cc.egui_ctx.clone();
         let diff_max_chars = 0; // no diff yet — set_diff_content installs the real width
@@ -3532,6 +3691,12 @@ impl GitkApp {
             // commit panel has rendered once still warms the top commits; the panel
             // overwrites this with the exact visible range every frame.
             commit_view_range: 0..64,
+            commit_stats: HashMap::new(),
+            stats_inflight: HashSet::new(),
+            stats_epoch: Epoch::default(),
+            stats_tx,
+            stats_rx,
+            commit_list_cfg,
             diff_load_tx,
             diff_load_rx,
             diff_load_epoch: Epoch::default(),
@@ -4288,6 +4453,109 @@ impl GitkApp {
             self.highlight_priority = None;
             highlight_diff(&mut self.diff_lines, &self.diff_files, hl);
         }
+    }
+
+    /// Compute the visible rows' stats on the `gitkay-stats` worker.
+    ///
+    /// One batch at a time: while `stats_inflight` is non-empty nothing new is
+    /// dispatched, so a fling-scroll spawns one worker rather than one per
+    /// frame each computing rows the user has already passed. Waiting is also
+    /// more useful — the next dispatch takes whatever is on screen when the
+    /// batch lands, which is where the user actually stopped.
+    fn dispatch_commit_stats(&mut self, ctx: &egui::Context) {
+        if !self.commit_list_cfg.any() || !self.stats_inflight.is_empty() {
+            return;
+        }
+        let targets = stats_targets(
+            &self.commits,
+            self.commit_view_range.clone(),
+            &self.commit_stats,
+        );
+        if targets.is_empty() {
+            return;
+        }
+        let want = if self.commit_list_cfg.line_count {
+            StatsWant::FilesAndLines
+        } else {
+            StatsWant::FilesOnly
+        };
+        let jobs: Vec<(git2::Oid, Vec<String>)> = targets
+            .iter()
+            .map(|&oid| (oid, self.diff_paths_for_oid(oid)))
+            .collect();
+        self.stats_inflight.extend(targets.iter().copied());
+        let epoch = self.stats_epoch.current();
+        let job = StatsJob {
+            repo_path: self.repo_path.clone(),
+            targets: jobs,
+            settings: self.diff_settings,
+            want,
+            epoch,
+            current_epoch: self.stats_epoch.clone(),
+            tx: self.stats_tx.clone(),
+            ctx: ctx.clone(),
+        };
+        // Every target must report back or the dispatcher re-queues it forever,
+        // so a panic reports the whole batch as failed rather than dying quietly.
+        let on_panic = {
+            let (tx, ctx, oids) = (self.stats_tx.clone(), ctx.clone(), targets.clone());
+            move || {
+                for oid in oids {
+                    let _ = tx.send(StatsResult {
+                        epoch,
+                        oid,
+                        stats: None,
+                    });
+                }
+                ctx.request_repaint();
+            }
+        };
+        if spawn_reporting(
+            "gitkay-stats",
+            "stats worker panicked; reporting the batch as failed",
+            move || stats_worker(job),
+            on_panic,
+        )
+        .is_err()
+        {
+            // Never inline: that would stall the frame loop, which is the whole
+            // reason this is a worker. Drop the claims so a later frame retries.
+            log::warn!("stats thread spawn failed");
+            for oid in &targets {
+                self.stats_inflight.remove(oid);
+            }
+        }
+    }
+
+    /// Install finished stats. A result from before an invalidation is dropped —
+    /// its in-flight entry went with the map.
+    fn drain_commit_stats(&mut self) {
+        while let Ok(StatsResult { epoch, oid, stats }) = self.stats_rx.try_recv() {
+            match stats_result_action(epoch, self.stats_epoch.current()) {
+                StatsAction::Install => {
+                    self.stats_inflight.remove(&oid);
+                    self.commit_stats.insert(oid, stats);
+                }
+                StatsAction::Discard => {}
+            }
+        }
+    }
+
+    /// Drop every cached stat, because the question they answer changed.
+    ///
+    /// Clears the in-flight set TOO, and that is not optional. A batch that is
+    /// running when this fires has its results discarded by the epoch check, so
+    /// nothing would ever remove those oids from `stats_inflight` — and dispatch
+    /// is gated on that set being empty. Miss this and the column silently stops
+    /// updating for the rest of the session, with nothing logged. The three
+    /// steps live in `invalidate_stats_state` so the test that pins that pins
+    /// this code, not a copy of it.
+    fn invalidate_commit_stats(&mut self) {
+        invalidate_stats_state(
+            &mut self.commit_stats,
+            &mut self.stats_inflight,
+            &self.stats_epoch,
+        );
     }
 
     /// Spawn a background prefetch of the cacheable commits in (and just past) the
@@ -5292,6 +5560,8 @@ impl GitkApp {
             &mut self.commit_panel_height,
             commit_panel.response.rect.height(),
         );
+        // After the panel has rendered, so `commit_view_range` is this frame's.
+        self.dispatch_commit_stats(ctx);
     }
 
     /// The diff-options hover toolbar: hidden until the pointer is near the top of
@@ -5318,6 +5588,7 @@ impl GitkApp {
                     .is_some_and(|r| r.expand(2.0).contains(p))
         });
         let mut diff_opts_changed = false;
+        let before = self.diff_settings;
         if show_toolbar {
             let area = egui::Area::new(egui::Id::new("diff_opts_toolbar"))
                 .order(egui::Order::Foreground)
@@ -5368,6 +5639,9 @@ impl GitkApp {
             self.diff_toolbar_rect = None;
         }
         if diff_opts_changed {
+            if stats_relevant(before) != stats_relevant(self.diff_settings) {
+                self.invalidate_commit_stats();
+            }
             self.load_selected_diff();
         }
     }
@@ -5534,6 +5808,10 @@ impl GitkApp {
             let elapsed = armed.elapsed();
             if elapsed >= RELOAD_DEBOUNCE {
                 self.reload_armed_at = None;
+                // The virtual rows' content moved; every real commit's stats
+                // stay valid, so drop exactly those two rather than the map.
+                self.commit_stats.remove(&oid_uncommitted());
+                self.commit_stats.remove(&oid_staged());
                 // Rebuild on a worker (the walk stalls the frame loop on a
                 // long-loaded history); the result lands in drain_history_results,
                 // which re-anchors the selection and refreshes the diff.
@@ -5665,6 +5943,7 @@ impl GitkApp {
                 // toolbar-owned, so the current values pass through (the ownership split
                 // lives in config_diff_settings). Comparing the whole DiffSettings means
                 // a field added to it can't silently skip the reload.
+                let before_settings = self.diff_settings;
                 let new_settings = config_diff_settings(
                     &cfg.diff,
                     self.diff_settings.context,
@@ -5672,6 +5951,18 @@ impl GitkApp {
                 );
                 let reload_diff = new_settings != self.diff_settings;
                 self.diff_settings = new_settings;
+                if stats_relevant(before_settings) != stats_relevant(self.diff_settings) {
+                    self.invalidate_commit_stats();
+                }
+                // Config owns the column's shape; enabling line_count means the
+                // cached entries (computed FilesOnly) have no lines to show.
+                let stats_off = !cfg.commit_list.any();
+                let lines_switched_on =
+                    cfg.commit_list.line_count && !self.commit_list_cfg.line_count;
+                self.commit_list_cfg = cfg.commit_list;
+                if stats_off || lines_switched_on {
+                    self.invalidate_commit_stats();
+                }
                 // The file-list layout is render-only (it doesn't touch diff data).
                 // Update it before any reload so the reload rebuilds the rows under
                 // the new layout in one pass; if nothing reloads, rebuild the rows
@@ -6011,6 +6302,7 @@ impl eframe::App for GitkApp {
         self.drain_history_results();
         self.drain_worker_results(&ctx);
         self.drain_apply_results();
+        self.drain_commit_stats();
         let t_drains = std::time::Instant::now();
 
         let search_id = egui::Id::new("search_field");
@@ -7682,6 +7974,217 @@ mod tests {
         // selected = 2 (first real), whole list visible. Virtual rows 0,1 excluded;
         // candidates 3,4,5,6 by distance; capped at 2.
         assert_eq!(prefetch_targets(&commits, 2, 0..7, 2), vec![oid(3), oid(4)]);
+    }
+
+    /// Only what can change a COUNT invalidates cached stats. `context` cannot
+    /// — clearing on it would blank the whole column and recompute a screenful
+    /// of diffs every time the toolbar's +/- buttons are clicked.
+    #[test]
+    fn stats_relevant_ignores_presentation_only_settings() {
+        let base = ds();
+        assert_eq!(
+            stats_relevant(base),
+            stats_relevant(DiffSettings {
+                context: 12,
+                ..base
+            }),
+            "context changes no count"
+        );
+        assert_eq!(
+            stats_relevant(base),
+            stats_relevant(DiffSettings {
+                show_stats: true,
+                ..base
+            }),
+            "show_stats is presentation-only"
+        );
+        assert_ne!(
+            stats_relevant(base),
+            stats_relevant(DiffSettings {
+                ignore_ws: true,
+                ..base
+            })
+        );
+        assert_ne!(
+            stats_relevant(base),
+            stats_relevant(DiffSettings {
+                detect_renames: true,
+                ..base
+            })
+        );
+        assert_ne!(
+            stats_relevant(base),
+            stats_relevant(DiffSettings {
+                detect_copies: true,
+                ..base
+            })
+        );
+    }
+
+    /// A failed commit is recorded as `None` and must NOT be asked again: the
+    /// dispatcher would re-queue it every frame, busy-looping against a broken
+    /// object.
+    #[test]
+    fn stats_targets_skips_known_and_failed_rows() {
+        let commits = vec![ci(oid(1)), ci(oid(2)), ci(oid(3)), ci(oid(4))];
+        let mut known: HashMap<git2::Oid, Option<CommitStats>> = HashMap::new();
+        known.insert(
+            oid(2),
+            Some(CommitStats {
+                files: 1,
+                lines: Some((1, 0)),
+            }),
+        );
+        known.insert(oid(3), None); // tried, failed
+
+        let got = stats_targets(&commits, 0..4, &known);
+        assert_eq!(got, vec![oid(1), oid(4)]);
+    }
+
+    /// Only the visible window is computed — no margin.
+    #[test]
+    fn stats_targets_is_limited_to_the_visible_rows() {
+        let commits = vec![ci(oid(1)), ci(oid(2)), ci(oid(3)), ci(oid(4))];
+        let known = HashMap::new();
+        assert_eq!(stats_targets(&commits, 1..3, &known), vec![oid(2), oid(3)]);
+        // A range past the end must clamp, not panic.
+        assert_eq!(stats_targets(&commits, 3..99, &known), vec![oid(4)]);
+    }
+
+    /// A result from before an invalidation must be discarded — and the caller
+    /// must still clear its in-flight entry, which is what `Discard` means here.
+    #[test]
+    fn stale_stats_results_are_discarded() {
+        assert_eq!(stats_result_action(7, 7), StatsAction::Install);
+        assert_eq!(stats_result_action(6, 7), StatsAction::Discard);
+    }
+
+    /// Invalidating WHILE a batch is running must clear the in-flight set too.
+    ///
+    /// The batch's results are discarded by the epoch check, so nothing else
+    /// ever removes those oids — and dispatch is gated on the set being empty.
+    /// Without the clear, the column stops updating for the rest of the
+    /// session, silently. Simulated here as the real sequence: claim a batch,
+    /// invalidate through the SAME function the app calls, deliver the
+    /// now-stale results, and assert we can dispatch again.
+    #[test]
+    fn invalidating_during_a_batch_leaves_the_dispatcher_free() {
+        let mut inflight: HashSet<git2::Oid> = HashSet::new();
+        let mut known: HashMap<git2::Oid, Option<CommitStats>> = HashMap::new();
+        let epoch = Epoch::default();
+        let batch = [oid(1), oid(2), oid(3)];
+
+        // Dispatch: claim the batch under the current epoch.
+        let dispatched_epoch = epoch.current();
+        inflight.extend(batch);
+
+        // Invalidate mid-flight — the production function, not a copy of it, so
+        // dropping `inflight.clear()` from it turns this test red.
+        invalidate_stats_state(&mut known, &mut inflight, &epoch);
+
+        // The worker's already-sent results land, and are stale.
+        for oid in batch {
+            match stats_result_action(dispatched_epoch, epoch.current()) {
+                StatsAction::Install => {
+                    inflight.remove(&oid);
+                    known.insert(oid, None);
+                }
+                StatsAction::Discard => {}
+            }
+        }
+
+        assert!(
+            inflight.is_empty(),
+            "a stale batch must not leave claims behind — dispatch is gated on this"
+        );
+        assert!(known.is_empty(), "and no stale numbers may be installed");
+    }
+
+    /// The worker end-to-end over a real repo: every dispatched target reports
+    /// back with real numbers, none as a failure. Pins what the by-hand run
+    /// ("no `stats: … failed` lines during normal scrolling") checks — and
+    /// unlike that run it works without a display server.
+    #[test]
+    fn stats_worker_reports_every_target_it_is_given() {
+        let (dir, repo) = temp_repo();
+        let c1 = commit_file(&repo, "a.txt", "1\n", "c1");
+        let c2 = commit_file(&repo, "a.txt", "1\n2\n", "c2");
+        // An uncommitted change, so a virtual row is in the batch too.
+        write_file(&repo, "a.txt", "1\n2\n3\n");
+
+        let (tx, rx) = mpsc::channel();
+        let targets = vec![
+            (c1, Vec::new()),
+            (c2, Vec::new()),
+            (oid_uncommitted(), Vec::new()),
+        ];
+        let epoch = Epoch::default();
+        stats_worker(StatsJob {
+            repo_path: dir.path().to_string_lossy().into_owned(),
+            targets,
+            settings: ds(),
+            want: StatsWant::FilesAndLines,
+            epoch: epoch.current(),
+            current_epoch: epoch,
+            tx,
+            ctx: egui::Context::default(),
+        });
+
+        let got: HashMap<git2::Oid, Option<CommitStats>> = rx
+            .into_iter()
+            .map(|StatsResult { oid, stats, .. }| (oid, stats))
+            .collect();
+        assert_eq!(got.len(), 3, "every target must report back");
+        assert!(
+            got.values().all(Option::is_some),
+            "no target may come back as a failure: {got:?}"
+        );
+        // Root commit: the whole file is an addition.
+        assert_eq!(
+            got[&c1],
+            Some(CommitStats {
+                files: 1,
+                lines: Some((1, 0))
+            })
+        );
+        assert_eq!(
+            got[&c2],
+            Some(CommitStats {
+                files: 1,
+                lines: Some((1, 0))
+            })
+        );
+        assert_eq!(
+            got[&oid_uncommitted()],
+            Some(CommitStats {
+                files: 1,
+                lines: Some((1, 0))
+            })
+        );
+    }
+
+    /// A batch superseded mid-flight stops sending: the epoch check is what
+    /// keeps a stale worker from filling the channel behind an invalidation.
+    #[test]
+    fn stats_worker_bails_once_its_epoch_is_superseded() {
+        let (dir, repo) = temp_repo();
+        let c1 = commit_file(&repo, "a.txt", "1\n", "c1");
+
+        let (tx, rx) = mpsc::channel();
+        let epoch = Epoch::default();
+        let dispatched = epoch.current();
+        epoch.bump(); // an invalidation lands before the worker runs
+        stats_worker(StatsJob {
+            repo_path: dir.path().to_string_lossy().into_owned(),
+            targets: vec![(c1, Vec::new())],
+            settings: ds(),
+            want: StatsWant::FilesAndLines,
+            epoch: dispatched,
+            current_epoch: epoch,
+            tx,
+            ctx: egui::Context::default(),
+        });
+        assert_eq!(rx.into_iter().count(), 0);
     }
 
     fn scope(all: bool, revs: &[&str]) -> cli::Scope {
