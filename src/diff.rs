@@ -6,6 +6,7 @@
 //! all rendering stay in `main.rs`.
 
 use git2::{DiffOptions, Repository};
+use std::num::NonZeroU32;
 
 use crate::highlight;
 use crate::word_diff;
@@ -106,6 +107,26 @@ pub struct DiffLine {
     pub kind: LineKind,
     pub spans: Option<Vec<highlight::Span>>, // None ⇒ not highlighted yet; Some(..) ⇒ highlighted (maybe empty)
     pub emphasis: Option<Vec<std::ops::Range<usize>>>, // word-diff changed byte ranges in body(); None ⇒ not computed yet
+    /// This row's line numbers in the pre- and post-image, straight from git2's
+    /// own `DiffLine` — the stable identity a scroll anchor re-finds a line by
+    /// after a settings change reshapes the diff. `NonZeroU32` because git's
+    /// line numbers are 1-based, so the niche keeps each `Option` at 4 bytes
+    /// rather than 8 on the hottest struct in the program.
+    ///
+    /// `Context` carries both, `Add` only `new_lineno`, `Del` only `old_lineno`.
+    /// Structural rows carry `None` on both — and so do git's EOF/binary marker
+    /// rows, which are `LineKind::Context` but are filtered out by origin in
+    /// `append_diff_body`.
+    ///
+    /// Not yet read by any production code — only this module's own tests —
+    /// until the scroll-anchor resolver (a later task) becomes their consumer.
+    /// `#[allow(dead_code)]`, not `#[expect]`: the latter is unfulfilled under
+    /// `./build.sh`'s `--all-targets`, which sees the test-only usage and
+    /// disagrees with CI's bin-only gate about whether the item is dead.
+    #[allow(dead_code)]
+    pub old_lineno: Option<NonZeroU32>,
+    #[allow(dead_code)]
+    pub new_lineno: Option<NonZeroU32>,
 }
 
 impl DiffLine {
@@ -117,6 +138,26 @@ impl DiffLine {
             kind,
             spans: None,
             emphasis: None,
+            old_lineno: None,
+            new_lineno: None,
+        }
+    }
+
+    /// `new` plus git's line numbers for a patch row. Only `append_diff_body`
+    /// calls it — every structural construction site (the header builders, the
+    /// stat block, the blanks, the test fixtures) keeps `new` and its
+    /// `None`/`None`, which is what keeps a two-field addition from becoming a
+    /// sweep of the whole module.
+    pub fn with_linenos(
+        text: impl Into<String>,
+        kind: LineKind,
+        old_lineno: Option<NonZeroU32>,
+        new_lineno: Option<NonZeroU32>,
+    ) -> Self {
+        Self {
+            old_lineno,
+            new_lineno,
+            ..Self::new(text, kind)
         }
     }
 
@@ -202,7 +243,7 @@ pub fn emphasize_rows(lines: &mut [DiffLine], rows: std::ops::Range<usize>) {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LineKind {
     Context,
     Add,
@@ -548,6 +589,20 @@ pub fn append_diff_body(
             '-' => "-",
             _ => "",
         };
+        // Line numbers are recorded for real patch rows only, and the filter is
+        // on the ORIGIN char rather than on `kind`. git2 reports a number on its
+        // EOF markers too — `\ No newline at end of file` arrives as origin '<'
+        // carrying the number of the line it annotates (measured, not assumed) —
+        // and the `_ =>` arm above has already folded those origins into
+        // LineKind::Context, so by the time only the kind is left the
+        // information needed to exclude them is gone.
+        let (old_lineno, new_lineno) = match line.origin() {
+            '+' | '-' | ' ' => (
+                line.old_lineno().and_then(NonZeroU32::new),
+                line.new_lineno().and_then(NonZeroU32::new),
+            ),
+            _ => (None, None),
+        };
         // Lossy: legacy-encoded (e.g. Latin-1) content must render with
         // replacement chars, not as blank rows (from_utf8().unwrap_or("")
         // would also make distinct working-tree states hash identically).
@@ -567,7 +622,15 @@ pub fn append_diff_body(
             } else {
                 kind
             };
-            lines.push(DiffLine::new(format!("{prefix}{piece}"), piece_kind));
+            // A content row is always a single piece — git splits the patch on
+            // newlines — so the per-piece loop only ever multiplies header rows,
+            // which carry no numbers anyway.
+            lines.push(DiffLine::with_linenos(
+                format!("{prefix}{piece}"),
+                piece_kind,
+                old_lineno,
+                new_lineno,
+            ));
         }
         true
     })
@@ -1006,14 +1069,101 @@ mod tests {
         (d, repo, oid)
     }
 
-    fn stats_settings(detect_renames: bool) -> DiffSettings {
+    /// Baseline `DiffSettings` for every fixture in this module: git's default
+    /// context, every toggle off. Tests override the one flag under test with
+    /// struct-update syntax: `DiffSettings { ignore_ws: true, ..base_settings() }`.
+    fn base_settings() -> DiffSettings {
         DiffSettings {
             context: 3,
             ignore_ws: false,
             show_stats: false,
-            detect_renames,
+            detect_renames: false,
             detect_copies: false,
         }
+    }
+
+    fn stats_settings(detect_renames: bool) -> DiffSettings {
+        DiffSettings {
+            detect_renames,
+            ..base_settings()
+        }
+    }
+
+    /// git's line numbers ride along on every patch row: a context row carries
+    /// both sides, an addition only the new side, a deletion only the old — and
+    /// nothing structural claims either.
+    #[test]
+    fn patch_rows_carry_gits_line_numbers() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", "one\ntwo\nthree\n", "base");
+        let oid = commit_file(&repo, "f.txt", "one\nTWO\nthree\n", "edit");
+        let data = get_diff_data(&repo, oid, CommitKind::Real, base_settings(), &[]);
+
+        // Context rows carry no marker prefix in gitkay (the origin char is
+        // excluded from git2's context content), so " one" would find nothing.
+        let row = |text: &str| -> &DiffLine {
+            data.lines
+                .iter()
+                .find(|l| l.text.as_str() == text)
+                .unwrap_or_else(|| panic!("no {text:?} row in the patch"))
+        };
+        let n = std::num::NonZeroU32::new;
+
+        assert_eq!(row("one").kind, LineKind::Context);
+        assert_eq!((row("one").old_lineno, row("one").new_lineno), (n(1), n(1)));
+        assert_eq!(row("-two").kind, LineKind::Del);
+        assert_eq!(
+            (row("-two").old_lineno, row("-two").new_lineno),
+            (n(2), None)
+        );
+        assert_eq!(row("+TWO").kind, LineKind::Add);
+        assert_eq!(
+            (row("+TWO").old_lineno, row("+TWO").new_lineno),
+            (None, n(2))
+        );
+
+        for l in data.lines.iter().filter(|l| !l.kind.is_code()) {
+            assert_eq!(
+                (l.old_lineno, l.new_lineno),
+                (None, None),
+                "structural row {:?} must claim no line number",
+                l.text
+            );
+        }
+    }
+
+    /// git2 reports a line number on its EOF marker rows — `\ No newline at end
+    /// of file` arrives as origin '<' carrying the number of the line it
+    /// annotates — and `append_diff_body` folds those origins into
+    /// `LineKind::Context`, so no kind-based filter could tell them apart.
+    /// Recording numbers by ORIGIN is what keeps them out; without that filter
+    /// this fails with the annotated line's number. The binary marker ('B') is
+    /// the one that git2 already reports as `None`/`None`.
+    #[test]
+    fn eof_and_binary_marker_rows_carry_no_line_number() {
+        use crate::test_repo::{commit_bytes, commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", "one\ntwo\n", "base");
+        let oid = commit_file(&repo, "f.txt", "one\ntwo\nthree", "no trailing newline");
+        let data = get_diff_data(&repo, oid, CommitKind::Real, base_settings(), &[]);
+        let marker = data
+            .lines
+            .iter()
+            .find(|l| l.text.contains("No newline at end of file"))
+            .expect("the EOF marker row is in the patch");
+        assert_eq!((marker.old_lineno, marker.new_lineno), (None, None));
+
+        let (_d2, repo2) = temp_repo();
+        commit_bytes(&repo2, "b.dat", &[0, 1, 2, 3], "base");
+        let oid2 = commit_bytes(&repo2, "b.dat", &[0, 9, 9, 9], "edit");
+        let data2 = get_diff_data(&repo2, oid2, CommitKind::Real, base_settings(), &[]);
+        let bin = data2
+            .lines
+            .iter()
+            .find(|l| l.text.starts_with("Binary files"))
+            .expect("the binary marker row is in the patch");
+        assert_eq!((bin.old_lineno, bin.new_lineno), (None, None));
     }
 
     /// The column and the file-list sidebar must never show different numbers
