@@ -597,12 +597,24 @@ const fn stats_relevant(s: DiffSettings) -> (bool, bool, bool) {
     (s.ignore_ws, s.detect_renames, s.detect_copies)
 }
 
-/// Which visible rows still need their stats computed.
+/// Which visible rows still need their stats computed, for the `want` the
+/// column is currently asking for.
 ///
 /// Exactly the visible window, no margin: each target costs a diff, and rows
-/// the user has scrolled past are not worth computing. Rows already known —
-/// **including those recorded as failed (`Some(None)`)** — are skipped, which is
-/// what stops a broken object being re-queued every frame forever.
+/// the user has scrolled past are not worth computing.
+///
+/// A row is skipped only when what is already cached **satisfies `want`** —
+/// "known" is not a property of the map alone. A `FilesOnly` entry carries
+/// `lines: None` (see `CommitStats::lines`: that `Option` encodes "not asked
+/// for", and nothing else reads it), so it answers a `FilesOnly` want and not a
+/// `FilesAndLines` one; without this the row would keep its file count and
+/// never grow line counts. A failed row (`Some(None)`) is skipped whatever the
+/// want, which is what stops a broken object being re-queued every frame
+/// forever.
+///
+/// Keeping the want here rather than blanking the map when `line_count` is
+/// switched on is what lets the file counts stay on screen while the line
+/// counts fill in.
 ///
 /// No in-flight parameter: `dispatch_commit_stats` is already a no-op while a
 /// batch is running, so a skip-in-flight branch here could never execute.
@@ -621,36 +633,26 @@ fn stats_targets(
     commits: &[CommitInfo],
     view: std::ops::Range<usize>,
     known: &HashMap<git2::Oid, Option<CommitStats>>,
+    want: StatsWant,
 ) -> Vec<git2::Oid> {
+    let satisfied = |oid: &git2::Oid| match known.get(oid) {
+        // Never computed — it needs computing.
+        None => false,
+        // Recorded as failed: re-queueing it every frame is exactly what that
+        // record exists to prevent. `handle_git_reload` is what retries it.
+        Some(None) => true,
+        // Computed: enough only if it holds what is being asked for.
+        Some(Some(s)) => want == StatsWant::FilesOnly || s.lines.is_some(),
+    };
     let mut seen = HashSet::new();
     commits
         .get(view.start.min(commits.len())..view.end.min(commits.len()))
         .unwrap_or_default()
         .iter()
         .map(|c| c.oid)
-        .filter(|oid| !known.contains_key(oid))
+        .filter(|oid| !satisfied(oid))
         .filter(|oid| seen.insert(*oid))
         .collect()
-}
-
-/// What a landing stats result does to the app's state. Pure so the
-/// stale-epoch path — the one that used to wedge the feature — is testable
-/// without a worker or an `egui::Context`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum StatsAction {
-    /// Clear the oid's in-flight entry and record the outcome.
-    Install,
-    /// Drop it: the entry it belongs to was cleared by an invalidation, which
-    /// also cleared the in-flight set.
-    Discard,
-}
-
-const fn stats_result_action(result_epoch: u64, current_epoch: u64) -> StatsAction {
-    if result_epoch == current_epoch {
-        StatsAction::Install
-    } else {
-        StatsAction::Discard
-    }
 }
 
 /// Drop every cached stat and release every claim, then supersede the batch in
@@ -1469,16 +1471,22 @@ const STATS_CELL_CHARS: &str = "-99999";
 /// Gap between adjacent stats cells, in points.
 const STATS_CELL_GAP: f32 = 6.0;
 
-/// A count in at most five characters, so a fixed-width cell can never
-/// overflow: plain digits below 100 000, then thousands, then millions, and on
-/// up the ladder.
+/// Append a count in at most five characters to `out`, so a fixed-width cell can
+/// never overflow: plain digits below 100 000, then thousands, then millions,
+/// and on up the ladder.
 ///
 /// The cap holds for EVERY `usize`, not just the plausible ones. A ladder that
 /// stopped at `M` would render `usize::MAX` as `18446744073709M` while three
 /// doc comments and a cell width promised five characters — unreachable for a
 /// real diff, but a promise a caller cannot check is worth nothing. Stepping to
 /// exa is enough for any 64-bit count: `usize::MAX / 10^18` is 18.
-fn compact_count(n: usize) -> String {
+///
+/// Appends rather than returning, because every caller wants the number inside
+/// a `+`/`-`/`f` decoration: `draw_stats_cells` runs per cell, per visible row,
+/// per frame, and a returning form makes each of those two allocations (the
+/// number, then the wrapping `format!`) instead of one.
+fn compact_count_into(out: &mut String, n: usize) {
+    use std::fmt::Write as _;
     const UNITS: [&str; 7] = ["", "k", "M", "G", "T", "P", "E"];
     let mut n = n;
     let mut unit = 0;
@@ -1490,7 +1498,18 @@ fn compact_count(n: usize) -> String {
         unit += 1;
         limit = 10_000;
     }
-    format!("{n}{}", UNITS[unit])
+    // Writing into a `String` is infallible.
+    let _ = write!(out, "{n}{}", UNITS[unit]);
+}
+
+/// `compact_count_into` on its own, so the five-character cap can be asserted on
+/// a value rather than through a painter. Test-only: every real caller
+/// decorates the number, and none of them wants a second allocation to do it.
+#[cfg(test)]
+fn compact_count(n: usize) -> String {
+    let mut s = String::with_capacity(STATS_CELL_CHARS.len());
+    compact_count_into(&mut s, n);
+    s
 }
 
 /// How many stats cells a row reserves — the file count is one, the line counts
@@ -1582,6 +1601,12 @@ fn show_virtualized_diff(
     } = view;
     let row_h = ui.fonts_mut(|f| f.row_height(font_id));
     let any_menu_open = egui::Popup::is_any_open(ui.ctx());
+    // The pointer, read ONCE per frame rather than once per visible row.
+    // `Ui::rect_contains_pointer` takes a `memory()` lock (for the layer
+    // transform) and an `input()` lock before it gets as far as its cheap
+    // `rect.contains` — two `Context` locks × ~50 visible rows, every frame,
+    // to answer a question one point settles. See the pre-filter below.
+    let pointer = ui.input(|i| i.pointer.interact_pos());
     ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
     // Bottom padding: empty rows below the diff so the deepest file's start can scroll
     // to the top of the viewport — without it the scroll clamps a near-end line partway
@@ -1647,8 +1672,23 @@ fn show_virtualized_diff(
             // registers no widget at all. `rect_contains_pointer` answers the hover
             // question without one; going through `ui.interact` first would register
             // every visible row every frame just to ask.
+            //
+            // Ordered cheapest-first. `any_menu_open` is a `bool` read once a frame,
+            // so the open-menu case — the one where every row must attach — never
+            // touches the pointer at all. Then `pointer` (hoisted above) pre-filters:
+            // only the row the pointer is actually inside pays for the real
+            // `rect_contains_pointer`, which still decides, because it is the call
+            // that accounts for the clip rect and any layer transform.
+            //
+            // The pre-filter compares UNTRANSFORMED coordinates, which agrees with
+            // `rect_contains_pointer` exactly as long as this layer carries no
+            // transform — gitkay sets none. Were one ever set, the disagreement is a
+            // false NEGATIVE: a menu that fails to attach. Never a menu attached to
+            // the wrong row, and so never a wrong write.
             if let Some(file_idx) = row_menu_target(i)
-                && (ui.rect_contains_pointer(rect) || any_menu_open)
+                && (any_menu_open
+                    || (pointer.is_some_and(|p| rect.contains(p))
+                        && ui.rect_contains_pointer(rect)))
             {
                 // `Sense::CLICK`, not `Sense::click()` — the latter is
                 // `CLICK | FOCUSABLE`, which enters every diff row into the tab
@@ -4498,7 +4538,12 @@ impl GitkApp {
     /// so that dead zone could last as long as the message is showing.
     fn show_apply_status(&mut self, panel_rect: egui::Rect, ctx: &egui::Context) {
         const FADE: std::time::Duration = std::time::Duration::from_secs(3);
-        let Some((text, is_error, posted)) = self.apply_status.clone() else {
+        // The two `Copy` fields first, and the expiry mutation with them — so the
+        // message itself is only ever *borrowed* below. This runs every frame the
+        // overlay is up, and an error stays until the next action, so cloning the
+        // string here would be an unbounded per-frame allocation for a value
+        // nothing mutates.
+        let Some(&(_, is_error, posted)) = self.apply_status.as_ref() else {
             return;
         };
         if !is_error {
@@ -4509,6 +4554,10 @@ impl GitkApp {
             }
             ctx.request_repaint_after(FADE.saturating_sub(elapsed));
         }
+        // The `&mut self` write is behind us, so a shared borrow reaches the label.
+        let Some((text, ..)) = &self.apply_status else {
+            return;
+        };
         let pos = egui::pos2(panel_rect.min.x + 8.0, panel_rect.max.y - 30.0);
         egui::Area::new(egui::Id::new("apply_status"))
             .order(egui::Order::Foreground)
@@ -4523,7 +4572,7 @@ impl GitkApp {
                     // Extend keeps it at its natural width on a single line.
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(&text)
+                            egui::RichText::new(text)
                                 .font(self.fonts.font_id(Role::Ui))
                                 .color(color),
                         )
@@ -4664,19 +4713,20 @@ impl GitkApp {
         if !self.commit_list_cfg.any() || !self.stats_inflight.is_empty() {
             return;
         }
-        let targets = stats_targets(
-            &self.commits,
-            self.commit_view_range.clone(),
-            &self.commit_stats,
-        );
-        if targets.is_empty() {
-            return;
-        }
         let want = if self.commit_list_cfg.line_count {
             StatsWant::FilesAndLines
         } else {
             StatsWant::FilesOnly
         };
+        let targets = stats_targets(
+            &self.commits,
+            self.commit_view_range.clone(),
+            &self.commit_stats,
+            want,
+        );
+        if targets.is_empty() {
+            return;
+        }
         let jobs: Vec<(git2::Oid, Vec<String>)> = targets
             .iter()
             .map(|&oid| (oid, self.diff_paths_for_oid(oid)))
@@ -4725,13 +4775,15 @@ impl GitkApp {
     /// succeeded.
     fn drain_commit_stats(&mut self) {
         while let Ok(StatsResult { epoch, oid, stats }) = self.stats_rx.try_recv() {
-            match stats_result_action(epoch, self.stats_epoch.current()) {
-                StatsAction::Install => {
-                    self.stats_inflight.remove(&oid);
-                    install_stats_result(&mut self.commit_stats, oid, stats);
-                }
-                StatsAction::Discard => {}
+            // The same question `stats_worker` asks before and after each diff:
+            // is this batch still the current one? A stale result's in-flight
+            // entry went with the map that was cleared, so there is nothing to
+            // release and nothing to install.
+            if !self.stats_epoch.is_current(epoch) {
+                continue;
             }
+            self.stats_inflight.remove(&oid);
+            install_stats_result(&mut self.commit_stats, oid, stats);
         }
     }
 
@@ -4750,6 +4802,21 @@ impl GitkApp {
             &mut self.stats_inflight,
             &self.stats_epoch,
         );
+    }
+
+    /// Drop the cached stats iff the settings change that just landed is one the
+    /// counts depend on (`stats_relevant`). Both places `diff_settings` moves —
+    /// the toolbar mutating it in place, a config reload assigning it — owe this
+    /// comparison, and neither may guess at it: the toolbar's `+`/`-` buttons
+    /// change `context` on nearly every click, and blanking the column for that
+    /// would recompute a screenful of diffs for numbers that cannot have moved.
+    ///
+    /// The `before` capture stays at the call site, since only the caller knows
+    /// where its own snapshot has to be taken.
+    fn invalidate_stats_if_counts_changed(&mut self, before: DiffSettings) {
+        if stats_relevant(before) != stats_relevant(self.diff_settings) {
+            self.invalidate_commit_stats();
+        }
     }
 
     /// Spawn a background prefetch of the cacheable commits in (and just past) the
@@ -5529,24 +5596,39 @@ impl GitkApp {
             }
             x += cell_w + STATS_CELL_GAP;
         };
+        // One `String` per drawn cell, not two: the count is written straight
+        // into the decorated buffer rather than allocated and then wrapped in a
+        // `format!`. This runs per cell, per visible row, every frame. The
+        // capacity is the cell's own widest value, so none of them ever grows.
         if self.commit_list_cfg.file_count {
             cell(
-                stats.map(|s| format!("{}f", compact_count(s.files))),
+                stats.map(|s| {
+                    let mut t = String::with_capacity(STATS_CELL_CHARS.len());
+                    compact_count_into(&mut t, s.files);
+                    t.push('f');
+                    t
+                }),
                 SUBTEXT,
             );
         }
         if self.commit_list_cfg.line_count {
             let lines = stats.and_then(|s| s.lines);
+            let signed = |sign: char, n: usize| {
+                let mut t = String::with_capacity(STATS_CELL_CHARS.len());
+                t.push(sign);
+                compact_count_into(&mut t, n);
+                t
+            };
             cell(
                 lines
                     .filter(|&(add, _)| add > 0)
-                    .map(|(add, _)| format!("+{}", compact_count(add))),
+                    .map(|(add, _)| signed('+', add)),
                 GREEN,
             );
             cell(
                 lines
                     .filter(|&(_, del)| del > 0)
-                    .map(|(_, del)| format!("-{}", compact_count(del))),
+                    .map(|(_, del)| signed('-', del)),
                 RED,
             );
         }
@@ -5919,9 +6001,7 @@ impl GitkApp {
             self.diff_toolbar_rect = None;
         }
         if diff_opts_changed {
-            if stats_relevant(before) != stats_relevant(self.diff_settings) {
-                self.invalidate_commit_stats();
-            }
+            self.invalidate_stats_if_counts_changed(before);
             self.load_selected_diff();
         }
     }
@@ -6089,9 +6169,11 @@ impl GitkApp {
             if elapsed >= RELOAD_DEBOUNCE {
                 self.reload_armed_at = None;
                 // The virtual rows' content moved; every real commit's stats
-                // stay valid, so drop exactly those two rather than the map.
-                self.commit_stats.remove(&oid_uncommitted());
-                self.commit_stats.remove(&oid_staged());
+                // stay valid, so drop exactly those rather than the map. Asked
+                // through `CommitKind::of`, the single oid → kind mapping —
+                // never by comparing the sentinel oids here.
+                self.commit_stats
+                    .retain(|oid, _| !CommitKind::of(*oid).is_virtual());
                 // Retry failed rows: a reload is exactly when a previously
                 // unreadable object may have become readable again. See
                 // `retry_failed_stats`.
@@ -6235,22 +6317,20 @@ impl GitkApp {
                 );
                 let reload_diff = new_settings != self.diff_settings;
                 self.diff_settings = new_settings;
-                if stats_relevant(before_settings) != stats_relevant(self.diff_settings) {
-                    self.invalidate_commit_stats();
-                }
-                // Config owns the column's shape, and two changes to it make the
-                // cache wrong or pointless. Switching the column off entirely:
+                self.invalidate_stats_if_counts_changed(before_settings);
+                // Config owns the column's shape. Switching it off entirely:
                 // nothing will read the map again, so there is no reason to hold
                 // the memory, and a later re-enable should recompute against
                 // whatever the settings are then rather than serve entries built
                 // under these.
+                //
+                // Switching line_count ON needs nothing here: `stats_targets`
+                // asks whether a cached entry satisfies the current `StatsWant`,
+                // so the FilesOnly entries re-queue themselves and the file
+                // counts stay on screen while the line counts fill in.
                 let stats_off = !cfg.commit_list.any();
-                // Enabling line_count: the cached entries were computed
-                // FilesOnly and carry no lines to show.
-                let lines_switched_on =
-                    cfg.commit_list.line_count && !self.commit_list_cfg.line_count;
                 self.commit_list_cfg = cfg.commit_list;
-                if stats_off || lines_switched_on {
+                if stats_off {
                     self.invalidate_commit_stats();
                 }
                 // The file-list layout is render-only (it doesn't touch diff data).
@@ -8327,8 +8407,48 @@ mod tests {
         );
         known.insert(oid(3), None); // tried, failed
 
-        let got = stats_targets(&commits, 0..4, &known);
+        let got = stats_targets(&commits, 0..4, &known, StatsWant::FilesAndLines);
         assert_eq!(got, vec![oid(1), oid(4)]);
+        // A failed row stays skipped for the cheaper want too.
+        assert_eq!(
+            stats_targets(&commits, 0..4, &known, StatsWant::FilesOnly),
+            vec![oid(1), oid(4)]
+        );
+    }
+
+    /// A `FilesOnly` entry carries `lines: None`, which is "not asked for", not
+    /// "nothing changed". It satisfies a `FilesOnly` want and must NOT satisfy a
+    /// `FilesAndLines` one, or turning `line_count` on would leave every cached
+    /// row with a permanently blank `+`/`-` pair — the reason this used to be
+    /// patched over by blanking the whole map from the config reload.
+    #[test]
+    fn stats_targets_requeues_a_files_only_row_when_lines_are_wanted() {
+        let commits = vec![ci(oid(1)), ci(oid(2))];
+        let mut known: HashMap<git2::Oid, Option<CommitStats>> = HashMap::new();
+        known.insert(
+            oid(1),
+            Some(CommitStats {
+                files: 3,
+                lines: None, // computed under StatsWant::FilesOnly
+            }),
+        );
+        known.insert(
+            oid(2),
+            Some(CommitStats {
+                files: 3,
+                lines: Some((7, 2)),
+            }),
+        );
+
+        assert_eq!(
+            stats_targets(&commits, 0..2, &known, StatsWant::FilesAndLines),
+            vec![oid(1)],
+            "the FilesOnly entry has no lines to show, so it must be recomputed"
+        );
+        assert!(
+            stats_targets(&commits, 0..2, &known, StatsWant::FilesOnly).is_empty(),
+            "and it fully answers a FilesOnly want — as does the richer entry"
+        );
     }
 
     /// Only the visible window is computed — no margin.
@@ -8336,9 +8456,15 @@ mod tests {
     fn stats_targets_is_limited_to_the_visible_rows() {
         let commits = vec![ci(oid(1)), ci(oid(2)), ci(oid(3)), ci(oid(4))];
         let known = HashMap::new();
-        assert_eq!(stats_targets(&commits, 1..3, &known), vec![oid(2), oid(3)]);
+        assert_eq!(
+            stats_targets(&commits, 1..3, &known, StatsWant::FilesAndLines),
+            vec![oid(2), oid(3)]
+        );
         // A range past the end must clamp, not panic.
-        assert_eq!(stats_targets(&commits, 3..99, &known), vec![oid(4)]);
+        assert_eq!(
+            stats_targets(&commits, 3..99, &known, StatsWant::FilesAndLines),
+            vec![oid(4)]
+        );
     }
 
     /// A `--reflog` view shows the same oid at several visible indices
@@ -8355,7 +8481,7 @@ mod tests {
         let commits = vec![ci(oid(1)), ci(oid(2)), ci(oid(1)), ci(oid(3)), ci(oid(1))];
         let known = HashMap::new();
         assert_eq!(
-            stats_targets(&commits, 0..5, &known),
+            stats_targets(&commits, 0..5, &known, StatsWant::FilesAndLines),
             vec![oid(1), oid(2), oid(3)]
         );
     }
@@ -8419,14 +8545,6 @@ mod tests {
         );
     }
 
-    /// A result from before an invalidation must be discarded — and the caller
-    /// must still clear its in-flight entry, which is what `Discard` means here.
-    #[test]
-    fn stale_stats_results_are_discarded() {
-        assert_eq!(stats_result_action(7, 7), StatsAction::Install);
-        assert_eq!(stats_result_action(6, 7), StatsAction::Discard);
-    }
-
     /// Invalidating WHILE a batch is running must clear the in-flight set too.
     ///
     /// The batch's results are discarded by the epoch check, so nothing else
@@ -8450,15 +8568,14 @@ mod tests {
         // dropping `inflight.clear()` from it turns this test red.
         invalidate_stats_state(&mut known, &mut inflight, &epoch);
 
-        // The worker's already-sent results land, and are stale.
+        // The worker's already-sent results land, and are stale — the same
+        // `is_current` gate `drain_commit_stats` runs, over the same `Epoch`.
         for oid in batch {
-            match stats_result_action(dispatched_epoch, epoch.current()) {
-                StatsAction::Install => {
-                    inflight.remove(&oid);
-                    known.insert(oid, None);
-                }
-                StatsAction::Discard => {}
+            if !epoch.is_current(dispatched_epoch) {
+                continue;
             }
+            inflight.remove(&oid);
+            known.insert(oid, None);
         }
 
         assert!(
@@ -8485,7 +8602,7 @@ mod tests {
         known.insert(oid(1), Some(stats));
 
         // Simulate the drain installing the re-reported failure — same two
-        // lines `drain_commit_stats` runs for `StatsAction::Install`.
+        // lines `drain_commit_stats` runs once the epoch check passes.
         inflight.remove(&oid(1));
         install_stats_result(&mut known, oid(1), None);
 
