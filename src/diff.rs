@@ -1032,6 +1032,76 @@ pub fn capture_anchor(
     })
 }
 
+/// The row to scroll the diff pane to so `anchor`'s line lands back where it
+/// was, against freshly rebuilt `lines`/`files` — i.e. exactly what goes into
+/// `diff_scroll_to`. `delta` is applied inside, so the caller does no arithmetic
+/// and every rung is exercised through one entry point.
+///
+/// The ladder: (1) the anchored line; (2) the next surviving line at or after
+/// it, same file, same side; (3) that file's header row; (4) the nearest
+/// surviving file's header, previous then next; (5) the top.
+///
+/// `delta` applies to rungs 1-2 only. Those land on a line, so the height on
+/// screen is meaningful and worth preserving. Rungs 3-5 land on a structural row
+/// precisely BECAUSE the reading position was lost, and subtracting `delta`
+/// there would scroll above the header the rung just chose.
+///
+/// It never scrolls backwards past what the user was reading: rung 2 takes the
+/// next surviving line rather than the nearest in either direction, which is
+/// marginally further in line-number terms but does not read as the view jumping
+/// the wrong way.
+///
+/// Removed in Task 4, when `load_selected_diff` becomes the first production
+/// caller. Read only from `#[cfg(test)]` code until then, which is dead in the
+/// bin build, so `#[expect]` would fail `--all-targets`.
+#[allow(dead_code)]
+pub fn resolve_anchor(anchor: &DiffAnchor, lines: &[DiffLine], files: &[FileEntry]) -> usize {
+    // A rename's surviving entry carries both paths, so matching on EITHER is
+    // what makes the anchor survive a detection toggle in both directions.
+    let matched = files.iter().position(|f| {
+        f.path_bytes == anchor.path || f.old_path_bytes.as_deref() == Some(anchor.path.as_slice())
+    });
+    if let Some(fi) = matched
+        && let Some(header) = files[fi].diff_line_idx
+    {
+        // Rungs 1-2 in one scan: line numbers are monotonic per side within a
+        // file, so the first row that reaches the anchor's number IS the
+        // anchored line when it survived, and the next surviving one when it
+        // didn't. The scan is bounded by this one file's rows, not the diff's,
+        // and runs once per rebuild rather than per frame.
+        let (start, end) = file_line_ranges(files, lines.len())
+            .into_iter()
+            .find_map(|(i, s, e)| (i == fi).then_some((s, e)))
+            .unwrap_or_else(|| (header.min(lines.len()), lines.len()));
+        if let Some(row) = (start..end).find(|&r| {
+            lines[r]
+                .lineno_on(anchor.side)
+                .is_some_and(|n| n >= anchor.lineno)
+        }) {
+            return row.saturating_sub(anchor.delta);
+        }
+        // Rung 3: the file is still here, but everything at or after the
+        // anchored line is gone. Its header is the closest honest answer, and
+        // `file_line_ranges` could not have supplied it — that helper skips
+        // bodyless files, so the header row is `diff_line_idx` itself.
+        return header;
+    }
+    // Rung 4: the file lost its patch body (a whitespace-only change under
+    // `ignore_ws`, a binary or mode-only entry) or left the diff altogether.
+    // Deltas come back in path order, so an absent path's partition point is
+    // where it would have sat among its neighbours.
+    let at = matched.unwrap_or_else(|| {
+        files.partition_point(|f| f.path_bytes.as_slice() < anchor.path.as_slice())
+    });
+    files[..at]
+        .iter()
+        .rev()
+        .find_map(|f| f.diff_line_idx)
+        .or_else(|| files[at..].iter().find_map(|f| f.diff_line_idx))
+        // Rung 5.
+        .unwrap_or(0)
+}
+
 /// One hunk's two line ranges, as spelled in its `@@ -old_start,old_lines
 /// +new_start,new_lines @@` header. Copied out of the display's `DiffLine`s so an
 /// action can be matched against a freshly generated diff's hunks later, when the
@@ -1593,6 +1663,375 @@ mod tests {
             "a binary diff still has header rows"
         );
         assert_eq!(capture_anchor(&data.lines, &data.files, 0), None);
+    }
+
+    /// `f.txt`: 80 lines, edited at line 10 and line 70 in one commit — two
+    /// hunks far enough apart that a context change moves the second one by a
+    /// visible number of rows.
+    fn two_hunk_repo() -> (tempfile::TempDir, Repository, git2::Oid) {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (d, repo) = temp_repo();
+        let base: String = (1..=80).fold(String::new(), |mut acc, i| {
+            use std::fmt::Write as _;
+            let _ = writeln!(acc, "line {i}");
+            acc
+        });
+        commit_file(&repo, "f.txt", &base, "base");
+        let edited: String = (1..=80)
+            .map(|i| match i {
+                10 | 70 => format!("line {i} CHANGED\n"),
+                _ => format!("line {i}\n"),
+            })
+            .collect();
+        let oid = commit_file(&repo, "f.txt", &edited, "edit two spots");
+        (d, repo, oid)
+    }
+
+    /// One commit that changes `a.txt` for real and `b.txt` only in whitespace,
+    /// so `ignore_ws` leaves b.txt listed with no patch body at all.
+    fn ws_only_repo() -> (tempfile::TempDir, Repository, git2::Oid) {
+        use crate::test_repo::{commit_file, commit_index, stage, temp_repo, write_file};
+        let (d, repo) = temp_repo();
+        commit_file(&repo, "a.txt", "aaa\n", "base a");
+        commit_file(&repo, "b.txt", "x\ny\nz\n", "base b");
+        write_file(&repo, "a.txt", "aaa\nbbb\n");
+        write_file(&repo, "b.txt", "x\ny   \nz\n");
+        stage(&repo, "a.txt");
+        stage(&repo, "b.txt");
+        let oid = {
+            let mut index = repo.index().unwrap();
+            commit_index(&repo, &mut index, "real change + whitespace change")
+        };
+        (d, repo, oid)
+    }
+
+    fn diff_at(repo: &Repository, oid: git2::Oid, settings: DiffSettings) -> DiffData {
+        get_diff_data(repo, oid, CommitKind::Real, settings, &[])
+    }
+
+    /// The row index of `path`'s line numbered `n` on `side`. Always file-scoped:
+    /// line numbers repeat across files, so a whole-diff search would silently
+    /// answer for the wrong one.
+    fn row_of(data: &DiffData, path: &str, side: AnchorSide, n: u32) -> usize {
+        let (_, start, end) = file_line_ranges(&data.files, data.lines.len())
+            .into_iter()
+            .find(|&(i, _, _)| data.files[i].path == path)
+            .unwrap_or_else(|| panic!("{path} has no patch body"));
+        (start..end)
+            .find(|&r| data.lines[r].lineno_on(side) == std::num::NonZeroU32::new(n))
+            .unwrap_or_else(|| panic!("no row for {path} {side:?} line {n}"))
+    }
+
+    /// Rung 1. Widening context only ever ADDS rows, so the anchored line always
+    /// survives exactly — and lands further down, because lines were inserted
+    /// above it. This is the common case: every `+` click on the context stepper.
+    #[test]
+    fn widening_context_keeps_the_anchored_line_and_moves_it_down() {
+        let (_d, repo, oid) = two_hunk_repo();
+        let narrow = diff_at(
+            &repo,
+            oid,
+            DiffSettings {
+                context: 1,
+                ..base_settings()
+            },
+        );
+        let wide = diff_at(
+            &repo,
+            oid,
+            DiffSettings {
+                context: 6,
+                ..base_settings()
+            },
+        );
+
+        let row = row_of(&narrow, "f.txt", AnchorSide::New, 70);
+        let anchor = capture_anchor(&narrow.lines, &narrow.files, row).expect("an anchor");
+        assert_eq!(anchor.lineno.get(), 70);
+        assert_eq!(anchor.delta, 0);
+
+        let got = resolve_anchor(&anchor, &wide.lines, &wide.files);
+        assert_eq!(got, row_of(&wide, "f.txt", AnchorSide::New, 70), "rung 1");
+        assert!(got > row, "widening inserts rows above it: {got} vs {row}");
+
+        // A delta puts the line back at the SAME HEIGHT, not at the top of the
+        // viewport — so the view doesn't jump by a hunk header when the headers
+        // above it survive, which is the common case.
+        let offset = DiffAnchor { delta: 5, ..anchor };
+        assert_eq!(resolve_anchor(&offset, &wide.lines, &wide.files), got - 5);
+    }
+
+    /// Rung 2. Narrowing past the anchored context line drops it; the resolve
+    /// takes the next surviving line at or after it, never an earlier one — a
+    /// view that jumps backwards reads as a bug even when it is closer.
+    #[test]
+    fn narrowing_context_lands_on_the_next_surviving_line() {
+        let (_d, repo, oid) = two_hunk_repo();
+        let wide = diff_at(
+            &repo,
+            oid,
+            DiffSettings {
+                context: 6,
+                ..base_settings()
+            },
+        );
+        let narrow = diff_at(
+            &repo,
+            oid,
+            DiffSettings {
+                context: 1,
+                ..base_settings()
+            },
+        );
+
+        // Line 64 is context only at 6 columns; at 1 the second hunk starts at 69.
+        let row = row_of(&wide, "f.txt", AnchorSide::New, 64);
+        let anchor = capture_anchor(&wide.lines, &wide.files, row).expect("an anchor");
+        assert_eq!(anchor.lineno.get(), 64);
+
+        let got = resolve_anchor(&anchor, &narrow.lines, &narrow.files);
+        assert_eq!(
+            narrow.lines[got].new_lineno,
+            std::num::NonZeroU32::new(69),
+            "rung 2: the first surviving line at or after 64"
+        );
+        assert_eq!(got, row_of(&narrow, "f.txt", AnchorSide::New, 69));
+    }
+
+    /// Rung 3. `f.txt`'s second hunk reaches line 76 at 6 columns of context but
+    /// only line 71 at 1 (measured: `file_line_ranges` over `two_hunk_repo`'s
+    /// narrow diff tops out there) — narrowing shrinks the trailing context far
+    /// enough that no surviving row reaches the anchored line at all, unlike
+    /// rung 2's line 64 -> 69 case where a later row still does. The file is
+    /// still here and still has a body, so this is not rung 4; its header is
+    /// the honest answer, and it is NOT the same row `capture_anchor` started
+    /// from, so a resolver that quietly fell through to rung 4/5 or returned a
+    /// stale index would be caught here rather than by coincidence.
+    #[test]
+    fn a_shrunk_trailing_hunk_falls_to_its_own_files_header() {
+        let (_d, repo, oid) = two_hunk_repo();
+        let wide = diff_at(
+            &repo,
+            oid,
+            DiffSettings {
+                context: 6,
+                ..base_settings()
+            },
+        );
+        let narrow = diff_at(
+            &repo,
+            oid,
+            DiffSettings {
+                context: 1,
+                ..base_settings()
+            },
+        );
+
+        let row = row_of(&wide, "f.txt", AnchorSide::New, 76);
+        let captured = capture_anchor(&wide.lines, &wide.files, row).expect("an anchor");
+        assert_eq!(captured.lineno.get(), 76);
+        // A non-zero delta pins that rung 3 does NOT apply it, same as rung 4.
+        let anchor = DiffAnchor {
+            delta: 4,
+            ..captured
+        };
+
+        let header = narrow.files[0]
+            .diff_line_idx
+            .expect("f.txt kept its body at 1 column of context");
+        assert_eq!(
+            resolve_anchor(&anchor, &narrow.lines, &narrow.files),
+            header,
+            "rung 3: the file survived but nothing in it reaches line 76 anymore"
+        );
+    }
+
+    /// Rung 4. Under `ignore_ws` the whitespace-only file keeps its entry but
+    /// loses its patch body, so there is no row in it to land on; the resolve
+    /// falls to the previous surviving file's header — and does NOT apply
+    /// `delta`, which would scroll above the header it just chose.
+    #[test]
+    fn a_file_without_a_patch_body_falls_to_the_previous_header() {
+        let (_d, repo, oid) = ws_only_repo();
+        let shown = diff_at(&repo, oid, base_settings());
+        let hidden = diff_at(
+            &repo,
+            oid,
+            DiffSettings {
+                ignore_ws: true,
+                ..base_settings()
+            },
+        );
+
+        let b = hidden
+            .files
+            .iter()
+            .find(|f| f.path == "b.txt")
+            .expect("b.txt is still listed");
+        assert_eq!(
+            b.diff_line_idx, None,
+            "a whitespace-only change leaves no patch body"
+        );
+
+        let row = row_of(&shown, "b.txt", AnchorSide::New, 2);
+        let captured = capture_anchor(&shown.lines, &shown.files, row).expect("an anchor");
+        assert_eq!(captured.path, b"b.txt".to_vec());
+        // Carry a non-zero delta, so a delta that leaked into rungs 3-5 — which
+        // would scroll ABOVE the header the rung just chose — shows up here as an
+        // off-by-three rather than passing unnoticed.
+        let anchor = DiffAnchor {
+            delta: 3,
+            ..captured
+        };
+
+        let a_header = hidden
+            .files
+            .iter()
+            .find(|f| f.path == "a.txt")
+            .unwrap()
+            .diff_line_idx
+            .expect("a.txt kept its body");
+        assert_eq!(
+            resolve_anchor(&anchor, &hidden.lines, &hidden.files),
+            a_header,
+            "rung 4: the previous surviving file's header, delta not applied"
+        );
+    }
+
+    /// Rung 5. The anchored file is the only file and has lost its body, so
+    /// there is no neighbouring header either side — the top is all that's left.
+    #[test]
+    fn an_anchor_with_no_surviving_file_falls_to_the_top() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "b.txt", "x\ny\nz\n", "base");
+        let oid = commit_file(&repo, "b.txt", "x\ny   \nz\n", "whitespace only");
+        let shown = diff_at(&repo, oid, base_settings());
+        let hidden = diff_at(
+            &repo,
+            oid,
+            DiffSettings {
+                ignore_ws: true,
+                ..base_settings()
+            },
+        );
+
+        let row = row_of(&shown, "b.txt", AnchorSide::New, 2);
+        let anchor = capture_anchor(&shown.lines, &shown.files, row).expect("an anchor");
+        assert_eq!(resolve_anchor(&anchor, &hidden.lines, &hidden.files), 0);
+        assert_eq!(
+            resolve_anchor(&anchor, &[], &[]),
+            0,
+            "an empty diff has nowhere to land"
+        );
+    }
+
+    /// Rung 1 across a rename-detection toggle, in both directions. With
+    /// detection ON the surviving entry carries both paths, so an anchor named
+    /// after either one still matches it — that two-sided match is what makes
+    /// the toggle survivable at all.
+    #[test]
+    fn a_rename_toggle_matches_the_anchor_on_either_path() {
+        use crate::test_repo::{commit_file, commit_rename, temp_repo, write_file};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "m.txt", "1\n2\n3\n4\n5\n6\n7\n8\n", "base");
+        std::fs::rename(
+            repo.workdir().unwrap().join("m.txt"),
+            repo.workdir().unwrap().join("z.txt"),
+        )
+        .unwrap();
+        write_file(&repo, "z.txt", "1\n2\n3\nFOUR\n5\n6\n7\n8\n");
+        let oid = commit_rename(&repo, "m.txt", "z.txt", "rename and edit");
+
+        let off = diff_at(&repo, oid, base_settings());
+        let on = diff_at(
+            &repo,
+            oid,
+            DiffSettings {
+                detect_renames: true,
+                ..base_settings()
+            },
+        );
+        assert_eq!(on.files.len(), 1, "detection collapses the pair");
+        assert_eq!(on.files[0].old_path_bytes.as_deref(), Some(&b"m.txt"[..]));
+
+        // ON -> OFF, matched on path_bytes: the rename entry's new side is the
+        // added file's own entry once detection is off.
+        let on_row = row_of(&on, "z.txt", AnchorSide::New, 4);
+        let a = capture_anchor(&on.lines, &on.files, on_row).expect("an anchor");
+        assert_eq!(a.path, b"z.txt".to_vec());
+        assert_eq!(a.side, AnchorSide::New);
+        assert_eq!(
+            resolve_anchor(&a, &off.lines, &off.files),
+            row_of(&off, "z.txt", AnchorSide::New, 4)
+        );
+
+        // OFF -> ON, matched on old_path_bytes: with detection off m.txt is its
+        // own delete entry, whose rows are Del — old side only.
+        let off_row = row_of(&off, "m.txt", AnchorSide::Old, 4);
+        let b = capture_anchor(&off.lines, &off.files, off_row).expect("an anchor");
+        assert_eq!(b.path, b"m.txt".to_vec());
+        assert_eq!(b.side, AnchorSide::Old);
+        assert_eq!(
+            resolve_anchor(&b, &on.lines, &on.files),
+            row_of(&on, "z.txt", AnchorSide::Old, 4),
+            "matched through the rename entry's old path"
+        );
+    }
+
+    /// Two files whose display strings collide under `from_utf8_lossy` but whose
+    /// bytes differ. This is the test that pins why the anchor carries bytes:
+    /// resolve on the display `String` and it lands in the wrong file.
+    #[test]
+    fn a_lossy_path_collision_resolves_to_the_right_file() {
+        use crate::test_repo::{commit_index, temp_repo};
+        use std::os::unix::ffi::OsStrExt;
+        let (_d, repo) = temp_repo();
+        // Both are invalid UTF-8 and both lossy-render as "\u{FFFD}.txt".
+        let names: [&[u8]; 2] = [b"\xfe.txt", b"\xff.txt"];
+        let root = repo.workdir().unwrap();
+        let path_of = |raw: &[u8]| root.join(std::ffi::OsStr::from_bytes(raw));
+        let add_all = |msg: &str| {
+            let mut index = repo.index().unwrap();
+            for raw in names {
+                index
+                    .add_path(std::path::Path::new(std::ffi::OsStr::from_bytes(raw)))
+                    .unwrap();
+            }
+            commit_index(&repo, &mut index, msg)
+        };
+        for raw in names {
+            std::fs::write(path_of(raw), "1\n2\n3\n").unwrap();
+        }
+        add_all("base");
+        for raw in names {
+            std::fs::write(path_of(raw), "1\nEDIT\n3\n").unwrap();
+        }
+        let oid = add_all("edit both");
+
+        let data = diff_at(&repo, oid, base_settings());
+        assert_eq!(data.files.len(), 2);
+        assert_eq!(
+            data.files[0].path, data.files[1].path,
+            "the fixture must actually collide, or this proves nothing"
+        );
+        assert_ne!(data.files[0].path_bytes, data.files[1].path_bytes);
+
+        // Anchor inside the SECOND entry: a match on the display string would
+        // find the first and resolve into it.
+        let (fi, start, end) = file_line_ranges(&data.files, data.lines.len())[1];
+        let row = (start..end)
+            .find(|&r| data.lines[r].new_lineno == std::num::NonZeroU32::new(2))
+            .expect("the second file's changed line");
+        let anchor = capture_anchor(&data.lines, &data.files, row).expect("an anchor");
+        assert_eq!(anchor.path, data.files[fi].path_bytes);
+
+        let got = resolve_anchor(&anchor, &data.lines, &data.files);
+        assert_eq!(got, row);
+        assert!(
+            (start..end).contains(&got),
+            "resolved into the anchored file, not its lossy twin"
+        );
     }
 
     #[test]
