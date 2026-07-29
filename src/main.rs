@@ -606,17 +606,30 @@ const fn stats_relevant(s: DiffSettings) -> (bool, bool, bool) {
 ///
 /// No in-flight parameter: `dispatch_commit_stats` is already a no-op while a
 /// batch is running, so a skip-in-flight branch here could never execute.
+///
+/// Deduped by oid (first appearance wins, order otherwise preserved) — a
+/// `--reflog` view routinely shows the same oid at several visible indices
+/// (reset-and-back, amends; see `finish_resync`). That dedupe is load-bearing,
+/// not a micro-optimisation: `stats_inflight` is a `HashSet`, so it takes one
+/// claim per oid no matter how many targets carry it. A duplicated target
+/// would make the worker compute that commit's diff N times, and the FIRST
+/// of those N results releases the claim — letting `dispatch_commit_stats`
+/// spawn a second batch while the first one is still running, exactly the
+/// thread-per-frame fling-scroll behaviour the one-batch-at-a-time gate
+/// exists to prevent.
 fn stats_targets(
     commits: &[CommitInfo],
     view: std::ops::Range<usize>,
     known: &HashMap<git2::Oid, Option<CommitStats>>,
 ) -> Vec<git2::Oid> {
+    let mut seen = HashSet::new();
     commits
         .get(view.start.min(commits.len())..view.end.min(commits.len()))
         .unwrap_or_default()
         .iter()
         .map(|c| c.oid)
         .filter(|oid| !known.contains_key(oid))
+        .filter(|oid| seen.insert(*oid))
         .collect()
 }
 
@@ -653,6 +666,44 @@ fn invalidate_stats_state(
     known.clear();
     inflight.clear();
     epoch.bump();
+}
+
+/// Install one landed stats result. A `None` (failed) result must never
+/// clobber an existing `Some(_)`: on the normal path each oid is reported
+/// exactly once, so the only way a `None` can arrive for an oid that already
+/// holds a success is `report_batch_failed`'s panic path, which re-reports
+/// every target in the batch — including ones the worker had already sent
+/// good results for before it panicked. A `Some(_)` result always overwrites,
+/// which is the normal one-report-per-oid path; the only way an oid gets a
+/// second `Some` is a fresh dispatch after `handle_git_reload` retries a
+/// failed entry. Free rather than inline in `drain_commit_stats` so the
+/// regression test drives the real decision, not a model of it.
+fn install_stats_result(
+    known: &mut HashMap<git2::Oid, Option<CommitStats>>,
+    oid: git2::Oid,
+    stats: Option<CommitStats>,
+) {
+    match stats {
+        Some(_) => {
+            known.insert(oid, stats);
+        }
+        None => {
+            known.entry(oid).or_insert(None);
+        }
+    }
+}
+
+/// Drop every failed stats entry, keeping successes untouched, so a reload
+/// retries them instead of leaving the row blank for the rest of the session.
+///
+/// Called from `handle_git_reload`: a `.git` write is precisely when a
+/// previously-unreadable object may have become readable again — an NFS
+/// blip, a `git worktree` shuffle, a path briefly moved. This cannot loop: a
+/// genuinely broken object simply re-fails once per reload, same as any
+/// other cache miss. Free rather than inline so it's testable without a
+/// `GitkApp` (constructing one needs a real `eframe::CreationContext`).
+fn retry_failed_stats(known: &mut HashMap<git2::Oid, Option<CommitStats>>) {
+    known.retain(|_, v| v.is_some());
 }
 
 /// Record the content hash a virtual row's freshly computed diff came back with,
@@ -2482,12 +2533,12 @@ struct StatsJob {
 /// dispatched target reports back" is true by construction rather than by
 /// inspection of each `return`.
 ///
-/// On the panic path this re-reports targets that had already sent good
-/// results, and `drain_commit_stats` overwrites them — a row that succeeded
-/// becomes permanently `Some(None)` and `stats_targets` skips it for good.
-/// That is the deliberate trade: the worker thread cannot release the claims
-/// itself (the set is UI-owned and not shared), so the choice is a lost number
-/// or a dead column, and a lost number is far cheaper.
+/// On the panic path this re-reports every target in the batch, including
+/// ones the worker had already sent good results for before it panicked.
+/// That double-report is harmless: `drain_commit_stats` installs through
+/// `install_stats_result`, which never lets a `None` here overwrite an
+/// already-landed `Some(_)` — so a row that succeeded keeps its number, and
+/// only the targets that genuinely never reported end up `Some(None)`.
 fn report_batch_failed(
     tx: &mpsc::Sender<StatsResult>,
     epoch: u64,
@@ -3298,7 +3349,11 @@ struct GitkApp {
     /// which is what stops a broken object being re-queued every frame.
     /// A side map rather than a `CommitInfo` field: a history rebuild replaces
     /// every `CommitInfo`, and these survive it, correctly — a real commit's
-    /// diff cannot change.
+    /// diff cannot change. The pathspec `commit_stats` diffs against
+    /// (`paths` — under `--follow`, `CommitInfo::follow_path`, recomputed on
+    /// every rebuild) is an input to the cached value but is part of neither
+    /// this map's key nor `stats_relevant`; a future scope-mutating feature
+    /// must classify that deliberately rather than inherit this guarantee.
     commit_stats: HashMap<git2::Oid, Option<CommitStats>>,
     /// The content hash each virtual row's diff was last computed with — two
     /// entries at most. It is the only signal a worktree-only edit gives the app
@@ -4663,13 +4718,17 @@ impl GitkApp {
     }
 
     /// Install finished stats. A result from before an invalidation is dropped —
-    /// its in-flight entry went with the map.
+    /// its in-flight entry went with the map. The claim is released
+    /// unconditionally (`stats_inflight.remove`), but the map write goes
+    /// through `install_stats_result` so a re-reported failure (see
+    /// `report_batch_failed`'s panic path) can't overwrite a row that already
+    /// succeeded.
     fn drain_commit_stats(&mut self) {
         while let Ok(StatsResult { epoch, oid, stats }) = self.stats_rx.try_recv() {
             match stats_result_action(epoch, self.stats_epoch.current()) {
                 StatsAction::Install => {
                     self.stats_inflight.remove(&oid);
-                    self.commit_stats.insert(oid, stats);
+                    install_stats_result(&mut self.commit_stats, oid, stats);
                 }
                 StatsAction::Discard => {}
             }
@@ -6033,6 +6092,10 @@ impl GitkApp {
                 // stay valid, so drop exactly those two rather than the map.
                 self.commit_stats.remove(&oid_uncommitted());
                 self.commit_stats.remove(&oid_staged());
+                // Retry failed rows: a reload is exactly when a previously
+                // unreadable object may have become readable again. See
+                // `retry_failed_stats`.
+                retry_failed_stats(&mut self.commit_stats);
                 // Rebuild on a worker (the walk stalls the frame loop on a
                 // long-loaded history); the result lands in drain_history_results,
                 // which re-anchors the selection and refreshes the diff.
@@ -8278,6 +8341,25 @@ mod tests {
         assert_eq!(stats_targets(&commits, 3..99, &known), vec![oid(4)]);
     }
 
+    /// A `--reflog` view shows the same oid at several visible indices
+    /// (reset-and-back, amends). `stats_targets` must yield exactly one
+    /// target per distinct oid, in first-appearance order — not one per row —
+    /// because `stats_inflight` is a `HashSet`: a duplicated target would take
+    /// one claim but release it on the first of the worker's several results
+    /// for that oid, letting a second batch dispatch while the first is still
+    /// computing (the one-batch-at-a-time invariant `dispatch_commit_stats`
+    /// relies on).
+    #[test]
+    fn stats_targets_dedupes_reflog_repeated_oids() {
+        // reset-and-back: oid(1) shows up again a couple of entries later.
+        let commits = vec![ci(oid(1)), ci(oid(2)), ci(oid(1)), ci(oid(3)), ci(oid(1))];
+        let known = HashMap::new();
+        assert_eq!(
+            stats_targets(&commits, 0..5, &known),
+            vec![oid(1), oid(2), oid(3)]
+        );
+    }
+
     /// Counts are compacted so a fixed-width cell can never overflow: at most
     /// five characters, which with a sign fits the six-character cell.
     #[test]
@@ -8384,6 +8466,38 @@ mod tests {
             "a stale batch must not leave claims behind — dispatch is gated on this"
         );
         assert!(known.is_empty(), "and no stale numbers may be installed");
+    }
+
+    /// A panicking worker's `report_batch_failed` re-reports EVERY target,
+    /// including ones it had already sent good results for — so a `None`
+    /// landing for an oid that already holds `Some(_)` must not clobber it.
+    /// The claim must still be released either way, or the panic path would
+    /// wedge the dispatcher on top of losing the number.
+    #[test]
+    fn a_none_result_does_not_clobber_an_already_succeeded_row() {
+        let stats = CommitStats {
+            files: 2,
+            lines: Some((3, 1)),
+        };
+        let mut inflight: HashSet<git2::Oid> = HashSet::new();
+        let mut known: HashMap<git2::Oid, Option<CommitStats>> = HashMap::new();
+        inflight.insert(oid(1));
+        known.insert(oid(1), Some(stats));
+
+        // Simulate the drain installing the re-reported failure — same two
+        // lines `drain_commit_stats` runs for `StatsAction::Install`.
+        inflight.remove(&oid(1));
+        install_stats_result(&mut known, oid(1), None);
+
+        assert_eq!(
+            known.get(&oid(1)),
+            Some(&Some(stats)),
+            "a re-reported failure must not overwrite an already-succeeded row"
+        );
+        assert!(
+            !inflight.contains(&oid(1)),
+            "the claim must still be released even though the result was dropped"
+        );
     }
 
     /// A worktree-only edit never touches `.git`, so the watcher's debounced
@@ -8504,6 +8618,35 @@ mod tests {
             known.len(),
             3,
             "a repeat of the same content is not a change"
+        );
+    }
+
+    /// `handle_git_reload` retries failed stats rows through this, because a
+    /// `.git` write (an NFS blip clearing, a `git worktree` shuffle finishing,
+    /// a moved repo path coming back) is precisely when a previously
+    /// unreadable object may have become readable again. A succeeded row must
+    /// survive untouched — this is a retry, not a second `invalidate_commit_stats`.
+    #[test]
+    fn retry_failed_stats_drops_only_the_failures() {
+        let mut known: HashMap<git2::Oid, Option<CommitStats>> = HashMap::new();
+        known.insert(
+            oid(1),
+            Some(CommitStats {
+                files: 1,
+                lines: Some((2, 0)),
+            }),
+        );
+        known.insert(oid(2), None); // previously failed
+
+        retry_failed_stats(&mut known);
+
+        assert!(
+            known.contains_key(&oid(1)),
+            "a succeeded row must survive a reload"
+        );
+        assert!(
+            !known.contains_key(&oid(2)),
+            "a failed row must be retried after a reload"
         );
     }
 

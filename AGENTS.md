@@ -192,7 +192,12 @@ parts run off the window-creation critical path:
   `gitkay-stats` worker for the **visible rows only**, one batch at a time (a
   fling-scroll would otherwise spawn a thread per frame), and cached in an
   oid-keyed map that survives history rebuilds because a real commit's diff is
-  immutable. A commit whose diff fails is recorded as failed, not left unknown —
+  immutable. The pathspec `commit_stats` diffs against (`paths` — under
+  `--follow`, `CommitInfo::follow_path`, recomputed on every rebuild) is an
+  input to the cached value but is part of neither the map's key nor
+  `stats_relevant`; a scope-mutating feature must classify that deliberately
+  rather than inherit this guarantee. A commit whose diff fails is recorded as
+  failed, not left unknown —
   otherwise the dispatcher re-queues it every frame. `invalidate_commit_stats`
   clears the map, **the in-flight set**, and bumps the epoch: a batch running
   across an invalidation has its results discarded, so nothing else would release
