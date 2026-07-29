@@ -172,12 +172,48 @@ impl Default for DiffSection {
     }
 }
 
+/// `[commit_list]`: which per-commit change counts the commit-list column shows.
+///
+/// Two independent booleans rather than an on/off key plus a shape key: the
+/// column appears when EITHER is true, so all four combinations mean something
+/// and none has to be documented as "ignored when…".
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CommitListSection {
+    /// Number of files the commit touched ("5f").
+    pub(crate) file_count: bool,
+    /// Lines added and removed ("+42  -7"). Turning this off is a real cost
+    /// saving, not just a shorter column: the file count comes out of the tree
+    /// walk, while line counts require diffing every changed blob.
+    pub(crate) line_count: bool,
+}
+
+impl Default for CommitListSection {
+    fn default() -> Self {
+        Self {
+            file_count: true,
+            line_count: true,
+        }
+    }
+}
+
+impl CommitListSection {
+    /// Is the column shown at all? No third key: either count enables it.
+    // Unused until Task 3 wires it into the commit-list column; `#[allow]` (not
+    // `#[expect]`) because it stays dead under `--all-targets` too — no test calls it.
+    #[allow(dead_code)]
+    pub(crate) const fn any(self) -> bool {
+        self.file_count || self.line_count
+    }
+}
+
 #[derive(Deserialize, Clone, Debug, PartialEq, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub(crate) fonts: FontsSection,
     pub(crate) text: TextSection,
     pub(crate) diff: DiffSection,
+    pub(crate) commit_list: CommitListSection,
 }
 
 /// Read + parse the config. A missing file is not an error (returns defaults);
@@ -349,7 +385,17 @@ fn default_template() -> String {
          # derives them from the active theme's own diff colours.\n\
          # source = \"fixed\"\n\
          # added = \"{added_band}\"\n\
-         # deleted = \"{deleted_band}\"\n",
+         # deleted = \"{deleted_band}\"\n\
+         \n\
+         [commit_list]\n\
+         # Per-commit change counts, shown as a column in the commit list.\n\
+         # The column appears when either is enabled.\n\
+         # Number of files the commit touched (\"5f\"):\n\
+         # file_count = true\n\
+         # Lines added and removed (\"+42  -7\"). Turning this off is markedly\n\
+         # cheaper: file counts come from the tree walk, line counts require\n\
+         # diffing every changed blob.\n\
+         # line_count = true\n",
         default_theme = crate::highlight::DEFAULT_THEME_SLUG,
         added_band = hex(crate::highlight::DEFAULT_ADDED_BAND_DARK),
         deleted_band = hex(crate::highlight::DEFAULT_DELETED_BAND_DARK),
@@ -1083,5 +1129,36 @@ mod tests {
         std::fs::write(&p, "not valid [ toml").unwrap();
         assert!(read_config(&p).is_err());
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn commit_list_counts_default_on() {
+        let cfg = Config::default();
+        assert!(cfg.commit_list.file_count);
+        assert!(cfg.commit_list.line_count);
+    }
+
+    #[test]
+    fn commit_list_counts_parse_independently() {
+        let cfg: Config = toml::from_str("[commit_list]\nline_count = false\n").unwrap();
+        assert!(
+            cfg.commit_list.file_count,
+            "untouched key keeps its default"
+        );
+        assert!(!cfg.commit_list.line_count);
+    }
+
+    #[test]
+    fn commit_list_rejects_unknown_keys() {
+        // deny_unknown_fields: a typo is an error, not a silently ignored line.
+        assert!(toml::from_str::<Config>("[commit_list]\nline_counts = false\n").is_err());
+    }
+
+    #[test]
+    fn template_mentions_commit_list_counts() {
+        let t = default_template();
+        assert!(t.contains("[commit_list]"));
+        assert!(t.contains("file_count ="));
+        assert!(t.contains("line_count ="));
     }
 }
