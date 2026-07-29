@@ -1360,6 +1360,32 @@ const GRAPH_COL_W: f32 = 12.0;
 /// Radius of a commit's graph dot; lines touching the node split around it.
 const GRAPH_DOT_R: f32 = 3.5;
 
+/// Width of a stats cell, in characters — `99999f`, `+99999`, `-99999` are the
+/// longest values `compact_count` can produce with a prefix or suffix. Measured
+/// rather than multiplied out by a digit count, so a proportional
+/// `[text] commit_meta` font still fits.
+const STATS_CELL_CHARS: &str = "-99999";
+/// Gap between adjacent stats cells, in points.
+const STATS_CELL_GAP: f32 = 6.0;
+
+/// A count in at most five characters, so a fixed-width cell can never
+/// overflow: plain digits below 100 000, then thousands, then millions.
+fn compact_count(n: usize) -> String {
+    match n {
+        n if n < 100_000 => n.to_string(),
+        n if n < 10_000_000 => format!("{}k", n / 1_000),
+        n => format!("{}M", n / 1_000_000),
+    }
+}
+
+/// How many stats cells a row reserves — the file count is one, the line counts
+/// are a `+`/`-` pair (two cells, so a long `+` can't shift the `-` out of
+/// line). Zero when `[commit_list]` turns both off, which is the whole column
+/// gone and the width handed back to the summary.
+fn stats_cell_count(cfg: config::CommitListSection) -> usize {
+    usize::from(cfg.file_count) + 2 * usize::from(cfg.line_count)
+}
+
 /// Bottom-padding rows for the diff so the deepest file (`last_top_anchor`, its start
 /// line) can scroll to the top of a `viewport_rows`-tall viewport: only the rows that
 /// file leaves short of a screenful, so a last file that already fills the viewport gets
@@ -5320,9 +5346,74 @@ impl GitkApp {
         cursor_x
     }
 
+    /// Draw a row's change counts, right-aligned in fixed-width cells ending at
+    /// `end_x`, and return the x where they begin (where the summary must stop).
+    ///
+    /// Fixed width, not per-row natural width: digits line up down the list
+    /// instead of going ragged, and the slot is reserved BEFORE the number
+    /// arrives, so nothing reflows when the worker's result lands. A blank cell
+    /// is what "not computed yet" looks like — no spinner, no placeholder. A
+    /// zero side is omitted rather than drawn as `+0`, matching the file-list
+    /// sidebar.
+    fn draw_stats_cells(
+        &self,
+        painter: &egui::Painter,
+        oid: git2::Oid,
+        end_x: f32,
+        y_center: f32,
+        cell_w: f32,
+    ) -> f32 {
+        let cells = stats_cell_count(self.commit_list_cfg);
+        if cells == 0 {
+            return end_x;
+        }
+        let start_x = end_x - cells as f32 * (cell_w + STATS_CELL_GAP);
+        let stats = self.commit_stats.get(&oid).copied().flatten();
+        let font = self.fonts.font_id(Role::CommitMeta);
+        let mut x = start_x;
+        let mut cell = |text: Option<String>, color: egui::Color32| {
+            if let Some(text) = text {
+                let galley = painter.layout_no_wrap(text, font.clone(), color);
+                painter.galley(
+                    egui::pos2(
+                        x + cell_w - galley.size().x,
+                        y_center - galley.size().y / 2.0,
+                    ),
+                    galley,
+                    color,
+                );
+            }
+            x += cell_w + STATS_CELL_GAP;
+        };
+        if self.commit_list_cfg.file_count {
+            cell(
+                stats.map(|s| format!("{}f", compact_count(s.files))),
+                SUBTEXT,
+            );
+        }
+        if self.commit_list_cfg.line_count {
+            let lines = stats.and_then(|s| s.lines);
+            cell(
+                lines
+                    .filter(|&(add, _)| add > 0)
+                    .map(|(add, _)| format!("+{}", compact_count(add))),
+                GREEN,
+            );
+            cell(
+                lines
+                    .filter(|&(_, del)| del > 0)
+                    .map(|(_, del)| format!("-{}", compact_count(del))),
+                RED,
+            );
+        }
+        start_x
+    }
+
     /// Draw a commit row's text: the summary (clipped so it can't overflow into the
     /// right-aligned block) plus short SHA, author, and date. `cursor_x` is where
     /// the ref chips ended; `is_branch_member` drives the branch-highlight dimming.
+    /// `stats_cell_w` is the stats column's per-cell width, measured once a frame
+    /// by `show_commit_list`.
     fn draw_row_text(
         &self,
         painter: &egui::Painter,
@@ -5330,6 +5421,7 @@ impl GitkApp {
         row_rect: egui::Rect,
         cursor_x: f32,
         is_branch_member: bool,
+        stats_cell_w: f32,
     ) {
         let y_center = row_rect.center().y;
 
@@ -5354,8 +5446,13 @@ impl GitkApp {
 
         let author_date_x = right_x - date_w - author_w - sha_w - 40.0;
 
-        // Summary — truncate to available space before author
-        let summary_max_w = (author_date_x - cursor_x - 12.0).max(20.0);
+        // The counts sit between the summary and the SHA; the summary clips to
+        // where they start, exactly as it already clips to the meta group.
+        let stats_x =
+            self.draw_stats_cells(painter, commit.oid, author_date_x, y_center, stats_cell_w);
+
+        // Summary — truncate to available space before the counts
+        let summary_max_w = (stats_x - cursor_x - 12.0).max(20.0);
         let has_highlight = !self.branch_highlight.is_empty();
         let search_active = !self.search_matches.is_empty();
         let summary_color = if search_active || !has_highlight || is_branch_member {
@@ -5404,6 +5501,13 @@ impl GitkApp {
                 .max(f.row_height(&self.fonts.font_id(Role::CommitMeta)))
         });
         let row_height = 20.0f32.max(text_h + 4.0);
+        // Every stats cell is this wide, whatever it holds — measured from the
+        // widest value one can carry, once a frame rather than per row.
+        let stats_cell_w = text_width(
+            ui.painter(),
+            STATS_CELL_CHARS,
+            &self.fonts.font_id(Role::CommitMeta),
+        );
         let max_graph_cols = 20;
 
         // ── Commit list: a resizable top panel. egui remembers its height
@@ -5546,6 +5650,7 @@ impl GitkApp {
                                 row_rect,
                                 cursor_x,
                                 is_branch_member,
+                                stats_cell_w,
                             );
                         }
 
@@ -8086,6 +8191,45 @@ mod tests {
         assert_eq!(stats_targets(&commits, 1..3, &known), vec![oid(2), oid(3)]);
         // A range past the end must clamp, not panic.
         assert_eq!(stats_targets(&commits, 3..99, &known), vec![oid(4)]);
+    }
+
+    /// Counts are compacted so a fixed-width cell can never overflow: at most
+    /// five characters, which with a sign fits the six-character cell.
+    #[test]
+    fn compact_count_never_exceeds_five_characters() {
+        assert_eq!(compact_count(0), "0");
+        assert_eq!(compact_count(42), "42");
+        assert_eq!(compact_count(99_999), "99999");
+        assert_eq!(compact_count(100_000), "100k");
+        assert_eq!(compact_count(123_456), "123k");
+        assert_eq!(compact_count(9_999_999), "9999k");
+        assert_eq!(compact_count(10_000_000), "10M");
+        assert_eq!(compact_count(12_345_678), "12M");
+        for n in [0, 1, 99_999, 100_000, 9_999_999, 10_000_000, 999_999_999] {
+            assert!(compact_count(n).len() <= 5, "{n} → {}", compact_count(n));
+        }
+    }
+
+    /// `[commit_list]` decides how many cells a row reserves, and so how much
+    /// width the summary loses to them. Both keys off is no column at all — not
+    /// a blank gap where one would have been.
+    #[test]
+    fn stats_cell_count_follows_the_config() {
+        let cfg = |file_count, line_count| config::CommitListSection {
+            file_count,
+            line_count,
+        };
+        assert_eq!(stats_cell_count(cfg(true, true)), 3);
+        assert_eq!(stats_cell_count(cfg(true, false)), 1);
+        // The line counts are a pair: `+n` and `-n` are separate cells, so a
+        // long `+` count can never push the `-` count out of alignment.
+        assert_eq!(stats_cell_count(cfg(false, true)), 2);
+        assert_eq!(stats_cell_count(cfg(false, false)), 0);
+        assert_eq!(
+            stats_cell_count(config::CommitListSection::default()),
+            3,
+            "the default shows all three"
+        );
     }
 
     /// A result from before an invalidation must be discarded — and the caller
