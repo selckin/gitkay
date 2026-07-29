@@ -1083,36 +1083,52 @@ mod tests {
     }
 
     /// The virtual rows are diffs like any other, and must route to the same
-    /// builders `get_diff_data` uses for them.
+    /// builders `get_diff_data` uses for them. The staged and uncommitted edits
+    /// are sized DIFFERENTLY on purpose: HEAD-vs-index (staged) adds two lines,
+    /// index-vs-workdir (uncommitted) adds a further one, so the two asserted
+    /// results are numerically distinct — swapping the `Staged`/`Uncommitted`
+    /// match arms in `commit_stats` would make one of the two assertions below
+    /// fail instead of silently agreeing.
     #[test]
     fn commit_stats_covers_the_virtual_rows() {
         use crate::test_repo::{commit_file, stage, temp_repo, write_file};
         let (_d, repo) = temp_repo();
         commit_file(&repo, "f.txt", "one\n", "base");
-        // Staged: one added line on top of HEAD.
-        write_file(&repo, "f.txt", "one\ntwo\n");
-        stage(&repo, "f.txt");
-        // Uncommitted: one more line, not staged.
+        // Staged: two added lines on top of HEAD.
         write_file(&repo, "f.txt", "one\ntwo\nthree\n");
+        stage(&repo, "f.txt");
+        // Uncommitted: one more line on top of the index.
+        write_file(&repo, "f.txt", "one\ntwo\nthree\nfour\n");
 
         let s = stats_settings(true);
-        let staged = commit_stats(&repo, oid_staged(), s, &[], StatsWant::FilesAndLines).unwrap();
+        let staged_full =
+            commit_stats(&repo, oid_staged(), s, &[], StatsWant::FilesAndLines).unwrap();
         assert_eq!(
-            staged,
+            staged_full,
             CommitStats {
                 files: 1,
-                lines: Some((1, 0))
+                lines: Some((2, 0))
             }
         );
-        let uncommitted =
+        let uncommitted_full =
             commit_stats(&repo, oid_uncommitted(), s, &[], StatsWant::FilesAndLines).unwrap();
         assert_eq!(
-            uncommitted,
+            uncommitted_full,
             CommitStats {
                 files: 1,
                 lines: Some((1, 0))
             }
         );
+
+        // FilesOnly must agree with the full path's file count and omit lines,
+        // for both virtual rows.
+        let staged_fast = commit_stats(&repo, oid_staged(), s, &[], StatsWant::FilesOnly).unwrap();
+        assert_eq!(staged_fast.files, staged_full.files);
+        assert_eq!(staged_fast.lines, None);
+        let uncommitted_fast =
+            commit_stats(&repo, oid_uncommitted(), s, &[], StatsWant::FilesOnly).unwrap();
+        assert_eq!(uncommitted_fast.files, uncommitted_full.files);
+        assert_eq!(uncommitted_fast.lines, None);
     }
 
     #[test]
