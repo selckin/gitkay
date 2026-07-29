@@ -171,6 +171,68 @@ impl DiffLine {
             _ => &self.text,
         }
     }
+
+    /// This row's number on `side`, or `None` when it has none there.
+    ///
+    /// Removed in Task 4, when `load_selected_diff` becomes the first
+    /// production caller. Read only from `#[cfg(test)]` code until then, which
+    /// is dead in the bin build, so `#[expect]` would fail `--all-targets`.
+    #[allow(dead_code)]
+    pub const fn lineno_on(&self, side: AnchorSide) -> Option<NonZeroU32> {
+        match side {
+            AnchorSide::Old => self.old_lineno,
+            AnchorSide::New => self.new_lineno,
+        }
+    }
+
+    /// The row's preferred anchor identity: its post-image number when it has
+    /// one (context and additions), else its pre-image one (deletions). `None`
+    /// for every row that carries no number — the structural rows and git's
+    /// EOF/binary markers — which is exactly the set anchoring must skip, stated
+    /// once as a property of the data rather than as a second classification
+    /// that could drift from it.
+    ///
+    /// Removed in Task 4, when `load_selected_diff` becomes the first
+    /// production caller. Read only from `#[cfg(test)]` code until then, which
+    /// is dead in the bin build, so `#[expect]` would fail `--all-targets`.
+    #[allow(dead_code)]
+    pub const fn anchor_point(&self) -> Option<(AnchorSide, NonZeroU32)> {
+        match (self.new_lineno, self.old_lineno) {
+            (Some(n), _) => Some((AnchorSide::New, n)),
+            (None, Some(o)) => Some((AnchorSide::Old, o)),
+            (None, None) => None,
+        }
+    }
+}
+
+/// Which side of the diff an anchor's line number names. A context row has both
+/// and prefers `New`: the post-image is the file as it looks now, which is what
+/// the reader is oriented on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AnchorSide {
+    Old,
+    New,
+}
+
+/// Where the diff pane was reading, in terms that survive a rebuild: a file, one
+/// line of it, and how far below the viewport's top row that line sat. Captured
+/// before a same-oid re-diff and resolved back to a row after it, so a toolbar
+/// toggle keeps the line under the reader's eye instead of the raw row offset.
+///
+/// Removed in Task 4, when `load_selected_diff` becomes the first production
+/// caller. Read only from `#[cfg(test)]` code until then, which is dead in the
+/// bin build, so `#[expect]` would fail `--all-targets`.
+#[allow(dead_code)]
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DiffAnchor {
+    /// The file's byte path — never the lossy display `String`, which can
+    /// collapse two distinct non-UTF-8 names onto one and match the wrong file.
+    /// The same rule `append_diff_body` keys patch lines to files by.
+    pub path: Vec<u8>,
+    pub side: AnchorSide,
+    pub lineno: NonZeroU32,
+    /// Rows from the viewport's top row down to the anchored line.
+    pub delta: usize,
 }
 
 /// Max body length (bytes) for which word-diff is computed; above this the LCS
@@ -928,6 +990,48 @@ pub fn file_index_at_line(starts: &[(usize, usize)], line: usize) -> usize {
     file_index_at_line_opt(starts, line).unwrap_or(0)
 }
 
+/// The anchor for a diff pane whose top visible row is `top_row`: the first row
+/// at or after it that carries a line number, and how far below the top that row
+/// sits.
+///
+/// "Carries a line number" rather than "is a code line" is deliberate — it
+/// excludes the structural rows AND git's EOF/binary markers in one rule, using
+/// the very data the anchor is built from. When nothing at or after `top_row` is
+/// numbered (the viewport is parked in a trailing marker), it falls back to the
+/// last numbered row above at `delta` 0: the reader is at the end of the diff,
+/// so landing on its last line is the honest answer.
+///
+/// `None` when the diff holds no numbered row at all — an empty pane, or a
+/// binary-only diff — because there is then nothing to re-find.
+///
+/// Removed in Task 4, when `load_selected_diff` becomes the first production
+/// caller. Read only from `#[cfg(test)]` code until then, which is dead in the
+/// bin build, so `#[expect]` would fail `--all-targets`.
+#[allow(dead_code)]
+pub fn capture_anchor(
+    lines: &[DiffLine],
+    files: &[FileEntry],
+    top_row: usize,
+) -> Option<DiffAnchor> {
+    // Clamp: `diff_top_line` is written by the render a frame behind, so it can
+    // outlive the content it was measured against.
+    let top = top_row.min(lines.len().checked_sub(1)?);
+    let numbered = |r: usize| lines[r].anchor_point().is_some();
+    let row = (top..lines.len())
+        .find(|&r| numbered(r))
+        .or_else(|| (0..top).rev().find(|&r| numbered(r)))?;
+    // Rows found above `top` give 0, which is the fallback's rule.
+    let delta = row.saturating_sub(top);
+    let (side, lineno) = lines[row].anchor_point()?;
+    let fi = file_index_at_line_opt(&file_line_starts(files), row)?;
+    Some(DiffAnchor {
+        path: files.get(fi)?.path_bytes.clone(),
+        side,
+        lineno,
+        delta,
+    })
+}
+
 /// One hunk's two line ranges, as spelled in its `@@ -old_start,old_lines
 /// +new_start,new_lines @@` header. Copied out of the display's `DiffLine`s so an
 /// action can be matched against a freshly generated diff's hunks later, when the
@@ -1366,6 +1470,129 @@ mod tests {
         assert_eq!(file_line_ranges(&files, 9), vec![(1, 2, 5), (0, 5, 9)]);
         // total_lines below a start clamps both ends to total.
         assert_eq!(file_line_ranges(&files, 3), vec![(1, 2, 3), (0, 3, 3)]);
+    }
+
+    /// The capture skips every row that carries no line number — the commit
+    /// header, the file header, the hunk header — and records how far below the
+    /// viewport's top row the line it settled on sits, so the restore can put it
+    /// back at the same height rather than at the very top.
+    #[test]
+    fn capture_anchor_skips_unnumbered_rows_and_records_the_offset() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", "one\ntwo\nthree\n", "base");
+        let oid = commit_file(&repo, "f.txt", "one\nTWO\nthree\n", "edit");
+        let data = get_diff_data(
+            &repo,
+            oid,
+            CommitKind::Real,
+            DiffSettings {
+                show_stats: true,
+                ..base_settings()
+            },
+            &[],
+        );
+
+        // From the very top: past the commit header, the stat block and the file
+        // and hunk headers, onto the patch's first numbered row.
+        let first = data
+            .lines
+            .iter()
+            .position(|l| l.new_lineno.is_some() || l.old_lineno.is_some())
+            .expect("the patch has numbered rows");
+        assert!(
+            first > 0,
+            "the fixture must have header rows above the patch"
+        );
+
+        let got = capture_anchor(&data.lines, &data.files, 0).expect("an anchor");
+        assert_eq!(got.path, b"f.txt".to_vec());
+        assert_eq!(got.side, AnchorSide::New);
+        assert_eq!(got.lineno, std::num::NonZeroU32::new(1).unwrap());
+        assert_eq!(got.delta, first, "delta is rows below the viewport top");
+
+        // Starting ON a numbered row gives delta 0.
+        let on_it = capture_anchor(&data.lines, &data.files, first).expect("an anchor");
+        assert_eq!(on_it.delta, 0);
+        assert_eq!(on_it.lineno, got.lineno);
+    }
+
+    /// A deletion has no post-image line, so it anchors on the old side; a
+    /// context row has both and prefers the new one, because the post-image is
+    /// the file as it looks now and that is what the reader is oriented on.
+    #[test]
+    fn capture_anchor_prefers_the_new_side_and_falls_back_to_the_old() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", "one\ntwo\nthree\n", "base");
+        let oid = commit_file(&repo, "f.txt", "one\nthree\n", "drop line two");
+        let data = get_diff_data(&repo, oid, CommitKind::Real, base_settings(), &[]);
+
+        let del = data
+            .lines
+            .iter()
+            .position(|l| l.kind == LineKind::Del)
+            .expect("the patch has a deletion");
+        let got = capture_anchor(&data.lines, &data.files, del).expect("an anchor");
+        assert_eq!(got.side, AnchorSide::Old);
+        assert_eq!(got.lineno, std::num::NonZeroU32::new(2).unwrap());
+
+        let ctx = data
+            .lines
+            .iter()
+            .position(|l| l.kind == LineKind::Context && l.new_lineno.is_some())
+            .expect("the patch has context");
+        assert_eq!(
+            capture_anchor(&data.lines, &data.files, ctx).unwrap().side,
+            AnchorSide::New
+        );
+    }
+
+    /// Parked past the last numbered row — the viewport sitting in a trailing
+    /// EOF marker — anchors on the last numbered row ABOVE, at delta 0. The
+    /// reader is at the end of the diff, so landing on its last line is the
+    /// honest answer.
+    #[test]
+    fn capture_anchor_falls_back_to_the_last_numbered_row_above() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", "one\ntwo\n", "base");
+        let oid = commit_file(&repo, "f.txt", "one\ntwo\nthree", "no trailing newline");
+        let data = get_diff_data(&repo, oid, CommitKind::Real, base_settings(), &[]);
+
+        let last = data.lines.len() - 1;
+        assert!(
+            data.lines[last].new_lineno.is_none() && data.lines[last].old_lineno.is_none(),
+            "fixture must end on an unnumbered marker row"
+        );
+        let got = capture_anchor(&data.lines, &data.files, last).expect("an anchor");
+        assert_eq!(got.delta, 0);
+        assert_eq!(got.lineno, std::num::NonZeroU32::new(3).unwrap());
+        assert_eq!(got.side, AnchorSide::New);
+
+        // A top row past the end (a stale tracker) clamps rather than panicking.
+        assert_eq!(
+            capture_anchor(&data.lines, &data.files, data.lines.len() + 99),
+            Some(got)
+        );
+    }
+
+    /// Nothing to re-find: an empty pane, and a binary-only diff whose every row
+    /// is a header or a marker.
+    #[test]
+    fn capture_anchor_is_none_without_a_numbered_row() {
+        use crate::test_repo::{commit_bytes, temp_repo};
+        assert_eq!(capture_anchor(&[], &[], 0), None);
+
+        let (_d, repo) = temp_repo();
+        commit_bytes(&repo, "b.dat", &[0, 1, 2, 3], "base");
+        let oid = commit_bytes(&repo, "b.dat", &[0, 9, 9, 9], "edit");
+        let data = get_diff_data(&repo, oid, CommitKind::Real, base_settings(), &[]);
+        assert!(
+            !data.lines.is_empty(),
+            "a binary diff still has header rows"
+        );
+        assert_eq!(capture_anchor(&data.lines, &data.files, 0), None);
     }
 
     #[test]
