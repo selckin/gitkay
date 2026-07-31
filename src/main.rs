@@ -31,8 +31,8 @@ use diff::{
     StatsWant, anchor_hint, capture_anchor, commit_parent_diff, commit_stats, emphasize_rows,
     file_index_at_line, file_index_at_line_opt, file_line_ranges, file_line_starts,
     format_commit_time, get_diff_data, hash_diff_content, is_real_commit, local_tz_offset_min,
-    next_file_line, oid_staged, oid_uncommitted, pathspec_opts, resolve_anchor, staged_git_diff,
-    worktree_git_diff,
+    next_file_line, oid_range, oid_staged, oid_uncommitted, pathspec_opts, resolve_anchor,
+    staged_git_diff, worktree_git_diff,
 };
 use diff_cache::DiffCache;
 use highlight::{DiffBg, HighlightLines, Highlighter};
@@ -131,6 +131,10 @@ struct CommitInfo {
     parents: Vec<git2::Oid>,
     refs: Vec<(String, RefKind)>,
     follow_path: Option<String>, // in --follow mode, the file's name at this commit
+    /// On the combined range row only: the two commits whose trees it diffs. Per-row
+    /// scope data, recomputed on every rebuild — the same arrangement as `follow_path`,
+    /// so the endpoints cannot drift from the list that describes them.
+    range: Option<diff::RangeEnds>,
     // Derived once here, immutable per commit, so the hot paths don't recompute them:
     // the row render runs every frame, and search scans every commit each keystroke.
     // `time`/`tz_offset_min` aren't stored — they're only needed to format `date_str`.
@@ -155,6 +159,7 @@ impl CommitInfo {
         parents: Vec<git2::Oid>,
         refs: Vec<(String, RefKind)>,
         follow_path: Option<String>,
+        range: Option<diff::RangeEnds>,
     ) -> Self {
         Self {
             summary_lc: summary.to_lowercase(),
@@ -172,6 +177,7 @@ impl CommitInfo {
             parents,
             refs,
             follow_path,
+            range,
         }
     }
 }
@@ -185,6 +191,7 @@ enum RefKind {
     Reflog,      // the @{n} selector chip in reflog view
     WorkingTree, // the virtual "working tree" (uncommitted) row's chip
     Index,       // the virtual "index" (staged) row's chip
+    Range,       // the virtual "combined range" row's chip
 }
 
 /// Total cached diff lines before the LRU starts evicting. ~50–100 MB at this
@@ -1122,6 +1129,7 @@ fn build_commit_info(
         parents,
         ref_map.get(&oid).cloned().unwrap_or_default(),
         None,
+        None,
     )
 }
 
@@ -1155,6 +1163,84 @@ fn build_commits_from_walk(
         }
     }
     commits
+}
+
+/// Resolve a scope's lone range token to concrete endpoint oids, returning the token
+/// as typed alongside them. `None` when the scope has no combined row to build, or
+/// when an endpoint does not resolve.
+///
+/// `peel_to_commit` rather than `revparse_single(..).id()`: an annotated tag's oid is
+/// the tag object's, and the tree lookups downstream want the commit.
+///
+/// A resolution failure yields no row and a warning, never a partial one — the commit
+/// list itself is unaffected. `cli::validate` cannot catch this case, because
+/// resolution needs a repo and `validate` is pure: `--combined` over a syntactically
+/// valid range whose endpoints are gone simply lands on the newest commit instead.
+fn range_ends(repo: &Repository, scope: &cli::Scope) -> Option<(String, diff::RangeEnds)> {
+    let toks = cli::combined_range(scope)?;
+    let token = toks.token;
+    let resolve = |s: &str| match repo.revparse_single(s).and_then(|o| o.peel_to_commit()) {
+        Ok(c) => Some(c.id()),
+        Err(e) => {
+            log::warn!("gitkay: --combined: cannot resolve {s:?}: {e}");
+            None
+        }
+    };
+    let (a, head) = (resolve(&toks.base)?, resolve(&toks.head)?);
+    let base = if toks.symmetric {
+        match repo.merge_base(a, head) {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("gitkay: --combined: no merge base for {token:?}: {e}");
+                return None;
+            }
+        }
+    } else {
+        a
+    };
+    Some((token, diff::RangeEnds { base, head }))
+}
+
+/// Which row the window opens on: the combined range row when `--combined` asked for
+/// it, otherwise the first row that is NOT it.
+///
+/// Skipping the range row in the `false` case is the whole point of the flag existing.
+/// The row is always present for a range scope, but landing on it by default would
+/// change what `gitkay a..b` opens on for everyone already using it; the flag is how
+/// you ask for it.
+///
+/// Pure and index-based so the rule is unit-testable without a repo or an egui context.
+/// `combined` is only ever true for a scope `cli::validate` accepted, but the row can
+/// still be absent (endpoints that no longer resolve), so the fallback is not dead code
+/// — it is the honest answer when there is nothing to select.
+fn startup_selection(commits: &[CommitInfo], combined: bool) -> Option<usize> {
+    let range_at = commits
+        .iter()
+        .position(|c| CommitKind::of(c.oid) == CommitKind::Range);
+    if combined && let Some(i) = range_at {
+        return Some(i);
+    }
+    (0..commits.len()).find(|&i| Some(i) != range_at)
+}
+
+/// The range endpoints a row's diff needs — `Some` only for the combined range row.
+/// The mirror of `diff_paths_for`: per-row scope data read off the row itself, so a
+/// rebuild cannot leave the endpoints describing a list that has moved on.
+fn diff_range_for(commit: Option<&CommitInfo>) -> Option<diff::RangeEnds> {
+    commit.and_then(|c| c.range)
+}
+
+/// The per-row scope a diff needs beyond its cache key: the pathspec, and — for the
+/// combined range row — its endpoints.
+///
+/// One struct rather than two parallel fields on each of the three job types, so a new
+/// worker cannot pick up the pathspec and quietly forget the endpoints. That failure is
+/// silent rather than loud: `get_diff_data` would compute an EMPTY diff and
+/// `finalize_diff_key` would then cache it under a content hash.
+#[derive(Clone, Default)]
+struct RowScope {
+    paths: Vec<String>,
+    range: Option<diff::RangeEnds>,
 }
 
 fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitInfo> {
@@ -1214,8 +1300,31 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
                 parents,
                 vec![(chip.0.to_string(), chip.1)],
                 None,
+                None,
             )
         };
+
+    // The combined range row, first. It cannot collide with the uncommitted/staged
+    // rows below: `show_local` requires `scope.all || scope.revs.is_empty()`, and a
+    // range scope has revs — so at most one of the two groups is ever present.
+    if let Some((token, ends)) = range_ends(repo, scope) {
+        // The head endpoint's author date, not `now()` — real information, where the
+        // working-tree rows have none to offer.
+        let when = repo.find_commit(ends.head).map(|c| c.author().when()).ok();
+        commits.push(CommitInfo::new(
+            oid_range(),
+            token,
+            String::new(),
+            when.map_or(0, |t| t.seconds()),
+            when.map_or_else(local_tz_offset_min, |t| t.offset_minutes()),
+            // No parents: the row CONTAINS the head commit, it is not its child, and a
+            // lane down to it would draw the opposite.
+            Vec::new(),
+            vec![("range".to_string(), RefKind::Range)],
+            None,
+            Some(ends),
+        ));
+    }
 
     // Add virtual entries at the top
     if has_uncommitted {
@@ -1443,6 +1552,7 @@ fn load_reflog(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitI
             committer.when().offset_minutes(),
             Vec::new(),
             vec![(format!("{refname}@{{{i}}}"), RefKind::Reflog)],
+            None,
             None,
         ));
     }
@@ -2260,8 +2370,8 @@ impl Drop for InflightClaim {
 /// Everything the background prefetch worker owns for one dispatch.
 struct PrefetchJob {
     repo_path: String,
-    /// Each neighbour to warm: its cache key plus the pathspec to diff it under.
-    targets: Vec<(DiffCacheKey, Vec<String>)>,
+    /// Each neighbour to warm: its cache key plus the per-row scope to diff it under.
+    targets: Vec<(DiffCacheKey, RowScope)>,
     hl: Arc<Highlighter>,
     /// This dispatch's epoch; the worker bails once `current_epoch` moves past it.
     epoch: u64,
@@ -2395,7 +2505,7 @@ fn prefetch_worker(job: PrefetchJob) {
             return;
         }
     };
-    for (key, paths) in targets {
+    for (key, scope) in targets {
         if !current_epoch.is_current(epoch) {
             return; // user moved on
         }
@@ -2413,7 +2523,8 @@ fn prefetch_worker(job: PrefetchJob) {
             key.oid,
             CommitKind::of(key.oid),
             key.settings,
-            &paths,
+            &scope.paths,
+            scope.range,
         );
         highlight_diff(&mut data.lines, &data.files, &hl);
         let (oid, lines) = (key.oid, data.lines.len());
@@ -2469,7 +2580,7 @@ struct PreHighlight {
 struct DiffLoadJob {
     repo_path: String,
     key: DiffCacheKey,
-    paths: Vec<String>,
+    scope: RowScope,
     epoch: u64,
     current_epoch: Epoch,
     tx: mpsc::Sender<DiffLoadResult>,
@@ -2506,7 +2617,7 @@ fn diff_load_worker(job: DiffLoadJob) {
     let DiffLoadJob {
         repo_path,
         key,
-        paths,
+        scope,
         epoch,
         current_epoch,
         tx,
@@ -2536,7 +2647,14 @@ fn diff_load_worker(job: DiffLoadJob) {
     }
     let t = std::time::Instant::now();
     let kind = CommitKind::of(key.oid);
-    let mut data = get_diff_data(&repo, key.oid, kind, key.settings, &paths);
+    let mut data = get_diff_data(
+        &repo,
+        key.oid,
+        kind,
+        key.settings,
+        &scope.paths,
+        scope.range,
+    );
     // Content-key a virtual row off-thread here so an unchanged working tree hits the
     // cache and reuses its highlighting.
     let key = finalize_diff_key(key, kind, &data);
@@ -2751,9 +2869,10 @@ struct StatsResult {
 
 struct StatsJob {
     repo_path: String,
-    /// Per-oid pathspec: under `--follow` each commit is asked about the name
-    /// the file had AT that commit, matching the diff the pane would show.
-    targets: Vec<(git2::Oid, Vec<String>)>,
+    /// Per-oid scope: under `--follow` each commit is asked about the name the file
+    /// had AT that commit, matching the diff the pane would show; the range row is
+    /// asked about its endpoints.
+    targets: Vec<(git2::Oid, RowScope)>,
     settings: DiffSettings,
     want: StatsWant,
     epoch: u64,
@@ -2828,11 +2947,11 @@ fn stats_worker(job: StatsJob) {
             return;
         }
     };
-    for (oid, paths) in targets {
+    for (oid, scope) in targets {
         if !current_epoch.is_current(epoch) {
             return; // invalidated; the UI cleared the in-flight set with the map
         }
-        let stats = commit_stats(&repo, oid, settings, &paths, want)
+        let stats = commit_stats(&repo, oid, settings, &scope.paths, scope.range, want)
             .inspect_err(|e| log::debug!("stats: {oid} failed: {e}"))
             .ok();
         if tx.send(StatsResult { epoch, oid, stats }).is_err() {
@@ -4054,9 +4173,13 @@ impl GitkApp {
             t_layout.elapsed()
         );
 
-        // Restore persisted diff options. The first commit is auto-selected, but its
-        // diff is generated lazily on the first update() frame (see StartupDiff) — not
-        // here — so window creation isn't blocked on a potentially slow get_diff_data.
+        // Which row to open on: the combined range row under `--combined`, otherwise
+        // the first row that is not it. Its diff is generated lazily on the first
+        // update() frame (see StartupDiff) — not here — so window creation isn't
+        // blocked on a potentially slow get_diff_data.
+        let selected = startup_selection(&commits, scope.combined);
+
+        // Restore persisted diff options.
         // clamp a stale/hand-edited value to the UI range
         let diff_context: u32 = stored(cc.storage, "diff_context", 3u32).min(99);
         let diff_ignore_ws: bool = stored(cc.storage, "diff_ignore_ws", false);
@@ -4068,7 +4191,7 @@ impl GitkApp {
         let diff_lines: Vec<DiffLine> = Vec::new();
         let diff_files: Vec<FileEntry> = Vec::new();
         let current_diff_key: Option<DiffCacheKey> = None;
-        let startup_diff = if commits.is_empty() {
+        let startup_diff = if selected.is_none() {
             StartupDiff::Done
         } else {
             StartupDiff::NeedsPaint
@@ -4111,7 +4234,7 @@ impl GitkApp {
             commit_index_by_oid,
             first_child_of,
             graph_layout_state: layout_state,
-            selected: Some(0),
+            selected,
             startup_diff,
             diff_lines,
             diff_files,
@@ -4286,15 +4409,19 @@ impl GitkApp {
             .map(|c| c.oid)
     }
 
-    /// Pathspec to scope a commit's diff to (delegates to the pure `diff_paths_for`).
-    /// Both diff entry points — the selected diff and the prefetch worker — call this,
-    /// so neither can drift from the --follow path resolution.
-    fn diff_paths_for_oid(&self, oid: git2::Oid) -> Vec<String> {
+    /// The per-row diff scope for `oid` (delegates to the pure `diff_paths_for` /
+    /// `diff_range_for`). Every diff entry point — the selected diff, the prefetch
+    /// worker, the stats worker — calls this, so none can drift from the --follow path
+    /// resolution or the range row's endpoints.
+    fn row_scope(&self, oid: git2::Oid) -> RowScope {
         let commit = self
             .commit_index_by_oid
             .get(&oid)
             .and_then(|&i| self.commits.get(i));
-        diff_paths_for(&self.scope, commit)
+        RowScope {
+            paths: diff_paths_for(&self.scope, commit),
+            range: diff_range_for(commit),
+        }
     }
 
     /// The cache key for a real commit (its immutable oid pins the content). The
@@ -4432,12 +4559,12 @@ impl GitkApp {
 
         // Cache miss (or a virtual entry): compute off the UI thread, keeping the
         // previous diff on screen until the result lands (see dispatch_diff_load).
-        // Resolve the pathspec only here — a hit above must do no work, and under
+        // Resolve the row scope only here — a hit above must do no work, and under
         // --follow diff_paths_for is an O(commits) scan.
-        let paths = self.diff_paths_for_oid(oid);
+        let scope = self.row_scope(oid);
         // Pre-highlight only on a same-oid rebuild: on a commit switch, holding a
         // DIFFERENT commit's diff on screen longer is worse than a plain flash.
-        self.dispatch_diff_load(key, paths, plan == ScrollPlan::Anchor);
+        self.dispatch_diff_load(key, scope, plan == ScrollPlan::Anchor);
     }
 
     /// Move the currently-displayed diff into the cache under its stored key (a move,
@@ -4639,12 +4766,7 @@ impl GitkApp {
     /// delay (see the render path). On thread-spawn failure, fall back to computing
     /// synchronously so the diff still loads (accepting the old UI-thread stall in that
     /// rare case).
-    fn dispatch_diff_load(
-        &mut self,
-        key: DiffCacheKey,
-        paths: Vec<String>,
-        same_oid_rebuild: bool,
-    ) {
+    fn dispatch_diff_load(&mut self, key: DiffCacheKey, scope: RowScope, same_oid_rebuild: bool) {
         let epoch = self.diff_load_epoch.bump();
         // Drives both the pre-highlight gate below and the placeholder suppression
         // in the render. Written on every dispatch, not just the first of a burst,
@@ -4722,7 +4844,7 @@ impl GitkApp {
         let job = DiffLoadJob {
             repo_path,
             key,
-            paths,
+            scope,
             epoch,
             current_epoch: self.diff_load_epoch.clone(),
             tx: self.diff_load_tx.clone(),
@@ -4753,14 +4875,21 @@ impl GitkApp {
             }
         } else {
             log::warn!("diff-load thread spawn failed; loading synchronously");
-            // paths/key were moved into the (dropped) closure; re-resolve them for the
+            // scope/key were moved into the (dropped) closure; re-resolve them for the
             // synchronous fallback. Only this rare path needs a repo handle, so discover
             // it here rather than on every navigation.
             match Repository::discover(&self.repo_path) {
                 Ok(repo) => {
                     let kind = CommitKind::of(oid);
-                    let paths = self.diff_paths_for_oid(oid);
-                    let data = get_diff_data(&repo, oid, kind, self.diff_settings, &paths);
+                    let scope = self.row_scope(oid);
+                    let data = get_diff_data(
+                        &repo,
+                        oid,
+                        kind,
+                        self.diff_settings,
+                        &scope.paths,
+                        scope.range,
+                    );
                     let key = finalize_diff_key(self.diff_cache_key(oid), kind, &data);
                     self.install_preferring_cache(key, data);
                 }
@@ -5101,9 +5230,9 @@ impl GitkApp {
         if targets.is_empty() {
             return;
         }
-        let jobs: Vec<(git2::Oid, Vec<String>)> = targets
+        let jobs: Vec<(git2::Oid, RowScope)> = targets
             .iter()
-            .map(|&oid| (oid, self.diff_paths_for_oid(oid)))
+            .map(|&oid| (oid, self.row_scope(oid)))
             .collect();
         self.stats_inflight.extend(targets.iter().copied());
         let epoch = self.stats_epoch.current();
@@ -5213,14 +5342,14 @@ impl GitkApp {
         // oid-keyed cache can't be poisoned by a wrong-path prefetch.
         let view = self.commit_view_range.start.saturating_sub(PREFETCH_MARGIN)
             ..self.commit_view_range.end + PREFETCH_MARGIN;
-        let jobs: Vec<(DiffCacheKey, Vec<String>)> = {
+        let jobs: Vec<(DiffCacheKey, RowScope)> = {
             // Also drop targets some worker is already computing — their results
             // arrive regardless, so queueing them would only burn PREFETCH_MAX slots
             // (the worker re-checks at start time; this filter is just the early cut).
             let inflight = lock_inflight(&self.inflight_diffs);
             prefetch_targets(&self.commits, sel, view, PREFETCH_MAX)
                 .into_iter()
-                .map(|oid| (self.diff_cache_key(oid), self.diff_paths_for_oid(oid)))
+                .map(|oid| (self.diff_cache_key(oid), self.row_scope(oid)))
                 .filter(|(k, _)| {
                     !self.diff_cache.contains(k)
                         && self.current_diff_key.as_ref() != Some(k)
@@ -5570,6 +5699,10 @@ impl GitkApp {
     ) -> Option<apply::ApplyRequest> {
         let oid = self.current_diff_key.as_ref().map(|k| k.oid)?;
         let file = self.diff_files.get(file_idx)?;
+        // From the row the displayed diff belongs to, like `oid` above — the range
+        // row's sentinel oid names no commit, so the endpoints are the only thing
+        // that says which trees a revert works between.
+        let range = self.row_scope(oid).range;
         let verb = apply::ApplyAction::of(oid).verb();
         let busy = self.apply_in_flight;
         let mut chosen = None;
@@ -5582,7 +5715,7 @@ impl GitkApp {
             if hunk.is_none() {
                 let _ = hunk_item.on_disabled_hover_text("this row is not inside a hunk");
             } else if hunk_item.clicked() {
-                chosen = Some(apply::ApplyRequest::for_entry(oid, file, hunk));
+                chosen = Some(apply::ApplyRequest::for_entry(oid, file, hunk).with_range(range));
                 ui.close();
             }
         }
@@ -5591,7 +5724,7 @@ impl GitkApp {
             .add_enabled(!busy, egui::Button::new(format!("{verb} file")))
             .clicked()
         {
-            chosen = Some(apply::ApplyRequest::for_entry(oid, file, None));
+            chosen = Some(apply::ApplyRequest::for_entry(oid, file, None).with_range(range));
             ui.close();
         }
         chosen
@@ -5890,6 +6023,10 @@ impl GitkApp {
                 #[allow(clippy::match_same_arms)]
                 // deliberately identical to Tag, not merged (see above)
                 RefKind::Index => (egui::Color32::from_rgb(60, 55, 30), YELLOW),
+                // Neutral, so it reads as structural rather than as another
+                // uncommitted-state row.
+                #[allow(clippy::match_same_arms)]
+                RefKind::Range => (SURFACE0, SUBTEXT),
                 RefKind::Branch | RefKind::Remote => {
                     // Unique color per branch/remote name
                     let color = ref_color(ref_name);
@@ -6211,6 +6348,11 @@ impl GitkApp {
                                 }
                                 CommitKind::Staged => {
                                     painter.rect_filled(row_rect, 0.0, tinted(GREEN, 18));
+                                }
+                                // Neutral, like its chip: the range row is structural,
+                                // not another uncommitted-state row.
+                                CommitKind::Range => {
+                                    painter.rect_filled(row_rect, 0.0, tinted(SUBTEXT, 18));
                                 }
                                 CommitKind::Real => {}
                             }
@@ -7417,18 +7559,19 @@ fn main() -> eframe::Result {
             .collect(),
         None => raw_paths, // bare repo: no worktree to anchor paths against
     };
-    // Reject flag/positional misuse (--follow needs exactly one path, etc.).
-    if let Err(e) = cli::validate(raw.reflog, raw.follow, revs.len(), paths.len()) {
-        eprintln!("gitkay: {e}");
-        std::process::exit(2);
-    }
     let scope = cli::Scope {
         all: raw.all,
         revs,
         paths,
         reflog: raw.reflog,
         follow: raw.follow,
+        combined: raw.combined,
     };
+    // Reject flag/positional misuse (--follow needs exactly one path, etc.).
+    if let Err(e) = cli::validate(&scope) {
+        eprintln!("gitkay: {e}");
+        std::process::exit(2);
+    }
 
     // Build the window title from the repo we already discovered, before dropping
     // it — re-discovering here and unwrapping would panic on a TOCTOU removal.
@@ -7565,6 +7708,7 @@ mod tests {
             0,
             parents.iter().map(|p| oid(*p)).collect(),
             vec![],
+            None,
             None,
         )
     }
@@ -8891,6 +9035,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             None,
+            None,
         )
     }
 
@@ -9354,9 +9499,9 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let targets = vec![
-            (c1, Vec::new()),
-            (c2, Vec::new()),
-            (oid_uncommitted(), Vec::new()),
+            (c1, RowScope::default()),
+            (c2, RowScope::default()),
+            (oid_uncommitted(), RowScope::default()),
         ];
         let epoch = Epoch::default();
         stats_worker(StatsJob {
@@ -9416,7 +9561,7 @@ mod tests {
         epoch.bump(); // an invalidation lands before the worker runs
         stats_worker(StatsJob {
             repo_path: dir.path().to_string_lossy().into_owned(),
-            targets: vec![(c1, Vec::new())],
+            targets: vec![(c1, RowScope::default())],
             settings: ds(),
             want: StatsWant::FilesAndLines,
             epoch: dispatched,
@@ -9453,7 +9598,7 @@ mod tests {
         let batch = [oid(1), oid(2), oid(3)];
         stats_worker(StatsJob {
             repo_path: missing.to_string_lossy().into_owned(),
-            targets: batch.iter().map(|&o| (o, Vec::new())).collect(),
+            targets: batch.iter().map(|&o| (o, RowScope::default())).collect(),
             settings: ds(),
             want: StatsWant::FilesAndLines,
             epoch: dispatched,
@@ -9826,6 +9971,7 @@ mod tests {
                 ..ds()
             },
             &s.paths,
+            None,
         );
         let files: Vec<&str> = data.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(files, vec!["a.txt"]);
@@ -9850,13 +9996,14 @@ mod tests {
                 ..ds()
             },
             &[],
+            None,
         );
         assert!(
             on.lines.iter().any(|l| l.kind == LineKind::Stat),
             "show_stats=true must include the diffstat block"
         );
 
-        let off = get_diff_data(&repo, c2, CommitKind::Real, ds(), &[]);
+        let off = get_diff_data(&repo, c2, CommitKind::Real, ds(), &[], None);
         assert!(
             !off.lines.iter().any(|l| l.kind == LineKind::Stat),
             "show_stats=false must omit the diffstat block"
@@ -9884,7 +10031,7 @@ mod tests {
             detect_renames: true,
             ..ds()
         };
-        let files: Vec<String> = get_diff_data(&repo, oid, CommitKind::Real, on, &[])
+        let files: Vec<String> = get_diff_data(&repo, oid, CommitKind::Real, on, &[], None)
             .files
             .iter()
             .map(|f| f.path.clone())
@@ -9895,7 +10042,7 @@ mod tests {
             "rename detected ⇒ one entry"
         );
 
-        let mut files: Vec<String> = get_diff_data(&repo, oid, CommitKind::Real, ds(), &[])
+        let mut files: Vec<String> = get_diff_data(&repo, oid, CommitKind::Real, ds(), &[], None)
             .files
             .iter()
             .map(|f| f.path.clone())
@@ -9923,7 +10070,7 @@ mod tests {
             detect_renames: true,
             ..ds()
         };
-        let data = get_diff_data(&repo, oid, CommitKind::Real, s, &[]);
+        let data = get_diff_data(&repo, oid, CommitKind::Real, s, &[], None);
         assert_eq!(data.files.len(), 1);
         assert_eq!(data.files[0].path, "new.txt");
         assert_eq!(data.files[0].old_path.as_deref(), Some("old.txt"));
@@ -9963,7 +10110,7 @@ mod tests {
             detect_copies: true,
             ..ds()
         };
-        let data = get_diff_data(&repo, oid, CommitKind::Real, s, &[]);
+        let data = get_diff_data(&repo, oid, CommitKind::Real, s, &[], None);
         let b = data
             .files
             .iter()
@@ -10238,6 +10385,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 fp.map(String::from),
+                None,
             )
         };
         let newer = mk(oid(2), Some("new.txt"));
@@ -10264,6 +10412,180 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(diff_paths_for(&plain, Some(&older)), vec!["x".to_string()]);
+    }
+
+    /// The `--combined` row's endpoints, resolved the way `git diff` resolves them.
+    #[test]
+    fn range_ends_resolves_two_dot_endpoints() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        let base = commit_file(&repo, "f.txt", "a\n", "base");
+        let head = commit_file(&repo, "f.txt", "a\nb\n", "head");
+
+        let sc = cli::Scope {
+            revs: vec![format!("{base}..{head}")],
+            ..Default::default()
+        };
+        let (token, ends) = range_ends(&repo, &sc).unwrap();
+        assert_eq!(token, format!("{base}..{head}"));
+        assert_eq!(ends, diff::RangeEnds { base, head });
+    }
+
+    /// `A...B` diffs from the MERGE BASE of the two, not from `A` — `git diff A...B`.
+    #[test]
+    fn range_ends_resolves_three_dot_through_the_merge_base() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        let root = commit_file(&repo, "f.txt", "a\n", "root");
+        repo.branch("side", &repo.find_commit(root).unwrap(), false)
+            .unwrap();
+        let master_tip = commit_file(&repo, "f.txt", "a\nmaster\n", "on master");
+        repo.set_head("refs/heads/side").unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        let side_tip = commit_file(&repo, "s.txt", "s\n", "on side");
+
+        let sc = cli::Scope {
+            revs: vec![format!("{master_tip}...{side_tip}")],
+            ..Default::default()
+        };
+        let (_, ends) = range_ends(&repo, &sc).unwrap();
+        assert_eq!(
+            ends,
+            diff::RangeEnds {
+                base: root,
+                head: side_tip
+            },
+            "A...B is merge-base(A,B)..B"
+        );
+    }
+
+    #[test]
+    fn range_ends_is_none_for_scopes_without_a_lone_range() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        let a = commit_file(&repo, "f.txt", "a\n", "a");
+        let b = commit_file(&repo, "f.txt", "a\nb\n", "b");
+        let range = format!("{a}..{b}");
+
+        assert!(range_ends(&repo, &cli::Scope::default()).is_none());
+        assert!(
+            range_ends(
+                &repo,
+                &cli::Scope {
+                    revs: vec![b.to_string()],
+                    ..Default::default()
+                }
+            )
+            .is_none()
+        );
+        assert!(
+            range_ends(
+                &repo,
+                &cli::Scope {
+                    all: true,
+                    revs: vec![range.clone()],
+                    ..Default::default()
+                }
+            )
+            .is_none()
+        );
+        assert!(
+            range_ends(
+                &repo,
+                &cli::Scope {
+                    reflog: true,
+                    revs: vec![range],
+                    ..Default::default()
+                }
+            )
+            .is_none()
+        );
+        // An endpoint that does not resolve yields no row rather than a bad one.
+        assert!(
+            range_ends(
+                &repo,
+                &cli::Scope {
+                    revs: vec!["nope..alsonope".into()],
+                    ..Default::default()
+                }
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn load_commits_puts_a_combined_row_first_for_a_range_scope() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        let base = commit_file(&repo, "f.txt", "a\n", "base");
+        commit_file(&repo, "f.txt", "a\nb\n", "mid");
+        let head = commit_file(&repo, "f.txt", "a\nb\nc\n", "head");
+
+        let token = format!("{base}..{head}");
+        let sc = cli::Scope {
+            revs: vec![token.clone()],
+            ..Default::default()
+        };
+        let got = load_commits(&repo, 100, &sc);
+
+        assert_eq!(got[0].oid, diff::oid_range());
+        assert_eq!(
+            got[0].summary, token,
+            "the row is labelled with the token as typed"
+        );
+        assert_eq!(got[0].range, Some(diff::RangeEnds { base, head }));
+        assert!(
+            got[0].parents.is_empty(),
+            "the row contains B, it is not B's child"
+        );
+        assert!(
+            got[0].short_sha.is_empty(),
+            "a sentinel has no abbreviation to show"
+        );
+        // The walked commits are still there, and carry no endpoints.
+        let real: Vec<&CommitInfo> = got.iter().filter(|c| is_real_commit(c.oid)).collect();
+        assert_eq!(real.len(), 2, "A..B excludes A");
+        assert!(real.iter().all(|c| c.range.is_none()));
+    }
+
+    #[test]
+    fn load_commits_has_no_combined_row_without_a_lone_range() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", "a\n", "base");
+        commit_file(&repo, "f.txt", "a\nb\n", "head");
+
+        let got = load_commits(&repo, 100, &cli::Scope::default());
+        assert!(got.iter().all(|c| c.oid != diff::oid_range()));
+    }
+
+    /// `--combined` selects the row; without it the launch selection is unchanged.
+    #[test]
+    fn combined_flag_selects_the_range_row_at_startup() {
+        let commits = vec![ci(diff::oid_range()), ci(oid(1)), ci(oid(2))];
+        assert_eq!(startup_selection(&commits, true), Some(0));
+        assert_eq!(startup_selection(&commits, false), Some(1));
+
+        // No range row: the flag has nothing to select and must not shift anything.
+        let plain = vec![ci(oid(1)), ci(oid(2))];
+        assert_eq!(startup_selection(&plain, true), Some(0));
+        assert_eq!(startup_selection(&plain, false), Some(0));
+
+        assert_eq!(startup_selection(&[], true), None);
+    }
+
+    #[test]
+    fn diff_range_for_reads_the_row() {
+        let ends = diff::RangeEnds {
+            base: oid(1),
+            head: oid(2),
+        };
+        let mut row = ci(diff::oid_range());
+        row.range = Some(ends);
+        assert_eq!(diff_range_for(Some(&row)), Some(ends));
+        assert_eq!(diff_range_for(Some(&ci(oid(3)))), None);
+        assert_eq!(diff_range_for(None), None);
     }
 
     #[test]

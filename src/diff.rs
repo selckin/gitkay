@@ -21,9 +21,27 @@ pub fn oid_staged() -> git2::Oid {
     git2::Oid::from_bytes(&[0xFE; 20]).expect("a 20-byte array is always a valid SHA-1 oid")
 }
 
+/// Sentinel OID for the "combined range" virtual entry.
+pub fn oid_range() -> git2::Oid {
+    git2::Oid::from_bytes(&[0xFD; 20]).expect("a 20-byte array is always a valid SHA-1 oid")
+}
+
+/// The resolved endpoints of a revision range: the combined row diffs `base`'s tree
+/// against `head`'s, exactly like `git diff <base> <head>`.
+///
+/// For `A...B` the resolver folds the merge base into `base` before building this, so
+/// the type always names the two trees to diff and no downstream reader has to know
+/// which spelling produced it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RangeEnds {
+    pub base: git2::Oid,
+    pub head: git2::Oid,
+}
+
 /// What a commit-list row represents. `Real` rows are keyed in the diff cache by their
-/// immutable oid; the virtual `Uncommitted`/`Staged` rows track the working tree, so
-/// they're content-keyed instead (see `DiffCacheKey::content` / `finalize_diff_key`).
+/// immutable oid; every other kind is virtual — its sentinel oid is fixed while what it
+/// shows moves under it — so they're content-keyed instead (see `DiffCacheKey::content` /
+/// `finalize_diff_key`).
 /// `CommitKind::of` is the single place a row is classified from its oid — every other
 /// layer (the diff pipeline, the row tint) asks it rather than comparing the sentinel
 /// oids itself, and `get_diff_data` dispatches on the enum so a new kind can't be missed.
@@ -32,6 +50,10 @@ pub enum CommitKind {
     Real,
     Uncommitted,
     Staged,
+    /// The combined `A..B` row. Its sentinel oid is fixed while its endpoints move
+    /// with `HEAD`, so it is content-keyed like the working-tree rows — see
+    /// `is_virtual`.
+    Range,
 }
 
 impl CommitKind {
@@ -40,21 +62,24 @@ impl CommitKind {
             Self::Uncommitted
         } else if oid == oid_staged() {
             Self::Staged
+        } else if oid == oid_range() {
+            Self::Range
         } else {
             Self::Real
         }
     }
 
-    /// Virtual rows (uncommitted/staged) are content-keyed in the diff cache; a real
-    /// commit's oid already pins its content.
+    /// Virtual rows — uncommitted, staged, and the combined range — are content-keyed
+    /// in the diff cache; a real commit's oid already pins its content.
     pub const fn is_virtual(self) -> bool {
         !matches!(self, Self::Real)
     }
 }
 
 /// A real commit (keyed in the diff cache by its immutable oid) vs the virtual
-/// uncommitted/staged entries (whose content tracks the working tree, so they're
-/// keyed by a content hash instead — see `DiffCacheKey::content`).
+/// entries — uncommitted, staged, and the combined range — whose content moves under a
+/// fixed sentinel oid, so they're keyed by a content hash instead (see
+/// `DiffCacheKey::content`).
 pub fn is_real_commit(oid: git2::Oid) -> bool {
     CommitKind::of(oid) == CommitKind::Real
 }
@@ -478,13 +503,26 @@ pub fn get_diff_data(
     kind: CommitKind,
     settings: DiffSettings,
     paths: &[String],
+    range: Option<RangeEnds>,
 ) -> DiffData {
-    // Virtual rows diff the working tree / index; a real commit diffs against its parent.
-    // Matching the kind (not re-sniffing the oid) keeps this exhaustive — a new kind can't
-    // silently fall through to the commit path.
+    // Virtual rows diff the working tree / index; the range row diffs its two trees;
+    // a real commit diffs against its parent. Matching the kind (not re-sniffing the
+    // oid) keeps this exhaustive — a new kind can't silently fall through to the
+    // commit path.
     match kind {
         CommitKind::Uncommitted => return get_working_tree_diff(repo, settings, paths),
         CommitKind::Staged => return get_staged_diff(repo, settings, paths),
+        CommitKind::Range => {
+            let Some(ends) = range else {
+                // The row carries its own endpoints (`CommitInfo::range`), so arriving
+                // without them is a wiring bug, not a repo state. Empty + warn, like an
+                // unloadable commit — never a silent fall-through to `oid`, which is the
+                // sentinel and names no commit at all.
+                log::warn!("gitkay: combined range row reached the diff with no endpoints");
+                return DiffData::empty();
+            };
+            return get_range_diff(repo, ends, settings, paths);
+        }
         CommitKind::Real => {}
     }
 
@@ -858,14 +896,89 @@ pub fn commit_parent_diff<'r>(
     commit_diff_against(repo, commit, parent_tree.as_ref(), opts)
 }
 
+/// The `(base, head)` trees a range is diffed over — the ONE place a `RangeEnds`
+/// becomes a tree pair, so the diff the pane rendered and the diff a revert
+/// regenerates (`apply::RevertTrees`) can never come off different trees.
+///
+/// Neither side is optional. Unlike a root commit's parent, a range always has a
+/// base, so a failure to read one is an error rather than an empty tree — which
+/// downstream would read as "delete everything the range added".
+pub fn range_trees(
+    repo: &Repository,
+    ends: RangeEnds,
+) -> Result<(git2::Tree<'_>, git2::Tree<'_>), git2::Error> {
+    Ok((
+        repo.find_commit(ends.base)?.tree()?,
+        repo.find_commit(ends.head)?.tree()?,
+    ))
+}
+
+/// The git diff that defines a range's combined change: `base`'s tree against
+/// `head`'s. The single definition shared by the diff pane (`get_range_diff`) and
+/// the commit-list stats column (`commit_stats`), exactly as `commit_parent_diff` is
+/// for a commit — so the column can never disagree with the pane.
+pub fn range_git_diff<'r>(
+    repo: &'r Repository,
+    ends: RangeEnds,
+    opts: &mut DiffOptions,
+) -> Result<git2::Diff<'r>, git2::Error> {
+    let (base, head) = range_trees(repo, ends)?;
+    repo.diff_tree_to_tree(Some(&base), Some(&head), Some(opts))
+}
+
+/// Generate the combined diff for a revision range — the `A..B` row's pane content.
+///
+/// Runs the same `build_diff_data` pipeline as the commit and virtual-row builders,
+/// so the pathspec, the rename post-pass and the diffstat block cannot drift from
+/// what a commit's diff shows.
+pub fn get_range_diff(
+    repo: &Repository,
+    ends: RangeEnds,
+    settings: DiffSettings,
+    paths: &[String],
+) -> DiffData {
+    // Lossy, like every other summary here: a legacy-encoded subject should render
+    // with replacement chars rather than vanish.
+    let subject = |oid: git2::Oid| {
+        repo.find_commit(oid).ok().map_or_else(String::new, |c| {
+            c.summary_bytes()
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .unwrap_or_default()
+        })
+    };
+    let header = vec![
+        DiffLine::new(
+            format!("Range {:.12}..{:.12}", ends.base, ends.head),
+            LineKind::Meta,
+        ),
+        DiffLine::new(
+            format!("  from  {:.8}  {}", ends.base, subject(ends.base)),
+            LineKind::Meta,
+        ),
+        DiffLine::new(
+            format!("  to    {:.8}  {}", ends.head, subject(ends.head)),
+            LineKind::Meta,
+        ),
+        DiffLine::new("", LineKind::Blank),
+    ];
+    build_diff_data(
+        repo,
+        settings,
+        paths,
+        header,
+        &format!("range {}..{}", ends.base, ends.head),
+        |repo, opts| range_git_diff(repo, ends, opts),
+    )
+}
+
 /// The same commit diff, against a parent tree the caller resolved.
 ///
 /// Split out for the write layer, for the same reason as `staged_diff_against`:
-/// the `None` above folds "root commit" together with "the first parent could not
-/// be read", which for a *revert* turns the reversed diff into "delete every file
-/// this commit has" — it would delete the worktree copy instead of restoring the
-/// parent's version. `apply::parent_tree_for_write` tells the two apart and hands
-/// the answer in here.
+/// the `None` in `commit_parent_diff` folds "root commit" together with "the first
+/// parent could not be read", which for a *revert* turns the reversed diff into
+/// "delete every file this commit has" — it would delete the worktree copy instead
+/// of restoring the parent's version. `apply::parent_tree_for_write` tells the two
+/// apart and hands the answer in here.
 pub fn commit_diff_against<'r>(
     repo: &'r Repository,
     commit: &git2::Commit<'_>,
@@ -910,12 +1023,21 @@ pub fn commit_stats(
     oid: git2::Oid,
     settings: DiffSettings,
     paths: &[String],
+    range: Option<RangeEnds>,
     want: StatsWant,
 ) -> Result<CommitStats, git2::Error> {
     let diff = scoped_diff(repo, settings, paths, |repo, opts| {
         match CommitKind::of(oid) {
             CommitKind::Uncommitted => worktree_git_diff(repo, opts),
             CommitKind::Staged => staged_git_diff(repo, opts),
+            CommitKind::Range => {
+                // An error, not an empty diff: the column records a failed row rather
+                // than showing a confident zero it never computed.
+                let ends = range.ok_or_else(|| {
+                    git2::Error::from_str("range row reached stats with no endpoints")
+                })?;
+                range_git_diff(repo, ends, opts)
+            }
             CommitKind::Real => {
                 let commit = repo.find_commit(oid)?;
                 commit_parent_diff(repo, &commit, Some(opts))
@@ -1313,6 +1435,141 @@ mod tests {
     }
 
     /// git's line numbers ride along on every patch row: a context row carries
+    #[test]
+    fn range_diff_collapses_two_edits_to_one_file() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        let base = commit_file(&repo, "f.txt", "a\nb\nc\n", "base");
+        commit_file(&repo, "f.txt", "a\nB\nc\n", "second");
+        let head = commit_file(&repo, "f.txt", "a\nB\nC\n", "third");
+
+        let data = get_range_diff(&repo, RangeEnds { base, head }, base_settings(), &[]);
+
+        assert_eq!(
+            data.files.len(),
+            1,
+            "two commits touched one file; the range shows it once"
+        );
+        assert_eq!(data.files[0].path, "f.txt");
+        assert_eq!((data.files[0].additions, data.files[0].deletions), (2, 2));
+    }
+
+    /// The property that makes a range diff different from replaying its commits:
+    /// work that cancels out inside the range is not a change OF the range.
+    #[test]
+    fn range_diff_omits_a_file_added_and_deleted_inside_the_range() {
+        use crate::test_repo::{commit_file, commit_index, temp_repo};
+        let (_d, repo) = temp_repo();
+        let base = commit_file(&repo, "keep.txt", "k\n", "base");
+        commit_file(&repo, "temp.txt", "t\n", "add temp");
+        std::fs::remove_file(repo.workdir().unwrap().join("temp.txt")).unwrap();
+        let head = {
+            let mut index = repo.index().unwrap();
+            index.remove_path(std::path::Path::new("temp.txt")).unwrap();
+            commit_index(&repo, &mut index, "drop temp")
+        };
+
+        let data = get_range_diff(&repo, RangeEnds { base, head }, base_settings(), &[]);
+
+        assert!(
+            data.files.is_empty(),
+            "added and deleted inside the range cancels out, got {:?}",
+            data.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn range_diff_shows_an_added_then_modified_file_once_with_final_content() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        let base = commit_file(&repo, "keep.txt", "k\n", "base");
+        commit_file(&repo, "new.txt", "one\n", "add");
+        let head = commit_file(&repo, "new.txt", "one\ntwo\n", "extend");
+
+        let data = get_range_diff(&repo, RangeEnds { base, head }, base_settings(), &[]);
+
+        assert_eq!(data.files.len(), 1);
+        assert_eq!(data.files[0].path, "new.txt");
+        assert_eq!(data.files[0].status, git2::Delta::Added);
+        assert_eq!((data.files[0].additions, data.files[0].deletions), (2, 0));
+    }
+
+    #[test]
+    fn get_diff_data_dispatches_the_range_kind() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        let base = commit_file(&repo, "f.txt", "a\n", "base");
+        let head = commit_file(&repo, "f.txt", "a\nb\n", "more");
+
+        let data = get_diff_data(
+            &repo,
+            oid_range(),
+            CommitKind::Range,
+            base_settings(),
+            &[],
+            Some(RangeEnds { base, head }),
+        );
+        assert_eq!(data.files.len(), 1);
+        assert_eq!(data.files[0].path, "f.txt");
+
+        // No endpoints is a wiring bug, not a repo state: empty, never a commit diff.
+        let empty = get_diff_data(
+            &repo,
+            oid_range(),
+            CommitKind::Range,
+            base_settings(),
+            &[],
+            None,
+        );
+        assert!(empty.files.is_empty());
+        assert!(empty.lines.is_empty());
+    }
+
+    #[test]
+    fn commit_stats_counts_a_range() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        let base = commit_file(&repo, "f.txt", "a\n", "base");
+        commit_file(&repo, "f.txt", "a\nb\n", "second");
+        let head = commit_file(&repo, "g.txt", "g\n", "third");
+
+        let s = commit_stats(
+            &repo,
+            oid_range(),
+            base_settings(),
+            &[],
+            Some(RangeEnds { base, head }),
+            StatsWant::FilesAndLines,
+        )
+        .unwrap();
+        assert_eq!(s.files, 2);
+        assert_eq!(s.lines, Some((2, 0)));
+
+        // Missing endpoints must be an error, so the row records as failed rather
+        // than showing a confident zero.
+        assert!(
+            commit_stats(
+                &repo,
+                oid_range(),
+                base_settings(),
+                &[],
+                None,
+                StatsWant::FilesAndLines
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn commit_kind_classifies_the_range_sentinel() {
+        assert_eq!(CommitKind::of(oid_range()), CommitKind::Range);
+        assert!(CommitKind::of(oid_range()).is_virtual());
+        assert!(!is_real_commit(oid_range()));
+        // The three sentinels stay distinct.
+        assert_ne!(oid_range(), oid_staged());
+        assert_ne!(oid_range(), oid_uncommitted());
+    }
+
     /// both sides, an addition only the new side, a deletion only the old — and
     /// nothing structural claims either.
     #[test]
@@ -1321,7 +1578,7 @@ mod tests {
         let (_d, repo) = temp_repo();
         commit_file(&repo, "f.txt", "one\ntwo\nthree\n", "base");
         let oid = commit_file(&repo, "f.txt", "one\nTWO\nthree\n", "edit");
-        let data = get_diff_data(&repo, oid, CommitKind::Real, base_settings(), &[]);
+        let data = get_diff_data(&repo, oid, CommitKind::Real, base_settings(), &[], None);
 
         // Context rows carry no marker prefix in gitkay (the origin char is
         // excluded from git2's context content), so " one" would find nothing.
@@ -1369,7 +1626,7 @@ mod tests {
         let (_d, repo) = temp_repo();
         commit_file(&repo, "f.txt", "one\ntwo\n", "base");
         let oid = commit_file(&repo, "f.txt", "one\ntwo\nthree", "no trailing newline");
-        let data = get_diff_data(&repo, oid, CommitKind::Real, base_settings(), &[]);
+        let data = get_diff_data(&repo, oid, CommitKind::Real, base_settings(), &[], None);
         let marker = data
             .lines
             .iter()
@@ -1380,7 +1637,7 @@ mod tests {
         let (_d2, repo2) = temp_repo();
         commit_bytes(&repo2, "b.dat", &[0, 1, 2, 3], "base");
         let oid2 = commit_bytes(&repo2, "b.dat", &[0, 9, 9, 9], "edit");
-        let data2 = get_diff_data(&repo2, oid2, CommitKind::Real, base_settings(), &[]);
+        let data2 = get_diff_data(&repo2, oid2, CommitKind::Real, base_settings(), &[], None);
         let bin = data2
             .lines
             .iter()
@@ -1400,9 +1657,9 @@ mod tests {
         let (_d, repo, oid) = everything_repo();
         for detect_renames in [false, true] {
             let s = stats_settings(detect_renames);
-            let got = commit_stats(&repo, oid, s, &[], StatsWant::FilesAndLines).unwrap();
+            let got = commit_stats(&repo, oid, s, &[], None, StatsWant::FilesAndLines).unwrap();
 
-            let data = get_diff_data(&repo, oid, CommitKind::Real, s, &[]);
+            let data = get_diff_data(&repo, oid, CommitKind::Real, s, &[], None);
             let want = CommitStats {
                 files: data.files.len(),
                 lines: Some((
@@ -1422,8 +1679,8 @@ mod tests {
         let (_d, repo, oid) = everything_repo();
         for detect_renames in [false, true] {
             let s = stats_settings(detect_renames);
-            let full = commit_stats(&repo, oid, s, &[], StatsWant::FilesAndLines).unwrap();
-            let fast = commit_stats(&repo, oid, s, &[], StatsWant::FilesOnly).unwrap();
+            let full = commit_stats(&repo, oid, s, &[], None, StatsWant::FilesAndLines).unwrap();
+            let fast = commit_stats(&repo, oid, s, &[], None, StatsWant::FilesOnly).unwrap();
             assert_eq!(fast.files, full.files, "detect_renames = {detect_renames}");
             assert_eq!(fast.lines, None, "FilesOnly must not report line counts");
         }
@@ -1439,6 +1696,7 @@ mod tests {
             oid,
             stats_settings(false),
             &[],
+            None,
             StatsWant::FilesAndLines,
         )
         .unwrap();
@@ -1447,6 +1705,7 @@ mod tests {
             oid,
             stats_settings(true),
             &[],
+            None,
             StatsWant::FilesAndLines,
         )
         .unwrap();
@@ -1469,6 +1728,7 @@ mod tests {
             root,
             stats_settings(true),
             &[],
+            None,
             StatsWant::FilesAndLines,
         )
         .unwrap();
@@ -1501,7 +1761,7 @@ mod tests {
 
         let s = stats_settings(true);
         let staged_full =
-            commit_stats(&repo, oid_staged(), s, &[], StatsWant::FilesAndLines).unwrap();
+            commit_stats(&repo, oid_staged(), s, &[], None, StatsWant::FilesAndLines).unwrap();
         assert_eq!(
             staged_full,
             CommitStats {
@@ -1509,8 +1769,15 @@ mod tests {
                 lines: Some((2, 0))
             }
         );
-        let uncommitted_full =
-            commit_stats(&repo, oid_uncommitted(), s, &[], StatsWant::FilesAndLines).unwrap();
+        let uncommitted_full = commit_stats(
+            &repo,
+            oid_uncommitted(),
+            s,
+            &[],
+            None,
+            StatsWant::FilesAndLines,
+        )
+        .unwrap();
         assert_eq!(
             uncommitted_full,
             CommitStats {
@@ -1521,11 +1788,12 @@ mod tests {
 
         // FilesOnly must agree with the full path's file count and omit lines,
         // for both virtual rows.
-        let staged_fast = commit_stats(&repo, oid_staged(), s, &[], StatsWant::FilesOnly).unwrap();
+        let staged_fast =
+            commit_stats(&repo, oid_staged(), s, &[], None, StatsWant::FilesOnly).unwrap();
         assert_eq!(staged_fast.files, staged_full.files);
         assert_eq!(staged_fast.lines, None);
         let uncommitted_fast =
-            commit_stats(&repo, oid_uncommitted(), s, &[], StatsWant::FilesOnly).unwrap();
+            commit_stats(&repo, oid_uncommitted(), s, &[], None, StatsWant::FilesOnly).unwrap();
         assert_eq!(uncommitted_fast.files, uncommitted_full.files);
         assert_eq!(uncommitted_fast.lines, None);
     }
@@ -1610,6 +1878,7 @@ mod tests {
                 ..base_settings()
             },
             &[],
+            None,
         );
 
         // From the very top: past the commit header, the stat block and the file
@@ -1645,7 +1914,7 @@ mod tests {
         let (_d, repo) = temp_repo();
         commit_file(&repo, "f.txt", "one\ntwo\nthree\n", "base");
         let oid = commit_file(&repo, "f.txt", "one\nthree\n", "drop line two");
-        let data = get_diff_data(&repo, oid, CommitKind::Real, base_settings(), &[]);
+        let data = get_diff_data(&repo, oid, CommitKind::Real, base_settings(), &[], None);
 
         let del = data
             .lines
@@ -1679,7 +1948,7 @@ mod tests {
         let (_d, repo) = temp_repo();
         commit_file(&repo, "f.txt", "one\ntwo\n", "base");
         let oid = commit_file(&repo, "f.txt", "one\ntwo\nthree", "no trailing newline");
-        let data = get_diff_data(&repo, oid, CommitKind::Real, base_settings(), &[]);
+        let data = get_diff_data(&repo, oid, CommitKind::Real, base_settings(), &[], None);
 
         let last = data.lines.len() - 1;
         assert!(
@@ -1708,7 +1977,7 @@ mod tests {
         let (_d, repo) = temp_repo();
         commit_bytes(&repo, "b.dat", &[0, 1, 2, 3], "base");
         let oid = commit_bytes(&repo, "b.dat", &[0, 9, 9, 9], "edit");
-        let data = get_diff_data(&repo, oid, CommitKind::Real, base_settings(), &[]);
+        let data = get_diff_data(&repo, oid, CommitKind::Real, base_settings(), &[], None);
         assert!(
             !data.lines.is_empty(),
             "a binary diff still has header rows"
@@ -1844,7 +2113,7 @@ mod tests {
     }
 
     fn diff_at(repo: &Repository, oid: git2::Oid, settings: DiffSettings) -> DiffData {
-        get_diff_data(repo, oid, CommitKind::Real, settings, &[])
+        get_diff_data(repo, oid, CommitKind::Real, settings, &[], None)
     }
 
     /// The row index of `path`'s line numbered `n` on `side`. Always file-scoped:

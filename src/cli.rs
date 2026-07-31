@@ -2,7 +2,7 @@
 //! helpers around it (pathspec resolution, the window-title suffix, help/version
 //! text). Knows nothing of git or egui: `classify` takes `is_rev`/`is_path`
 //! predicates so it's testable without a repo.
-//! Grammar: `gitkay [-C <dir>] [--all] [<rev>...] [-- <path>...]`.
+//! Grammar: `gitkay [-C <dir>] [--all] [--combined] [<rev>...] [-- <path>...]`.
 
 /// The resolved command-line scope.
 #[derive(Default, Clone)]
@@ -10,8 +10,9 @@ pub struct Scope {
     pub all: bool,
     pub revs: Vec<String>,
     pub paths: Vec<String>,
-    pub reflog: bool, // --reflog: show the ref's reflog instead of its history
-    pub follow: bool, // --follow: follow a single path across renames
+    pub reflog: bool,   // --reflog: show the ref's reflog instead of its history
+    pub follow: bool,   // --follow: follow a single path across renames
+    pub combined: bool, // --combined: open on the combined range row
 }
 
 /// Flags + raw positional tokens, before rev/path classification.
@@ -21,6 +22,7 @@ pub struct RawArgs {
     pub all: bool,
     pub reflog: bool,      // --reflog: show the reflog instead of history
     pub follow: bool,      // --follow: follow a single path across renames
+    pub combined: bool,    // --combined: open on the combined range row
     pub help: bool,        // -h / --help: print usage and exit
     pub version: bool,     // -V / --version: print version and exit
     pub pre: Vec<String>,  // positional tokens before `--`
@@ -43,6 +45,7 @@ pub fn parse_flags(args: impl Iterator<Item = String>) -> Result<RawArgs, String
     let mut all = false;
     let mut reflog = false;
     let mut follow = false;
+    let mut combined = false;
     let mut pre = Vec::new();
     let mut post = Vec::new();
     let mut after_dashdash = false;
@@ -71,6 +74,8 @@ pub fn parse_flags(args: impl Iterator<Item = String>) -> Result<RawArgs, String
             reflog = true;
         } else if arg == "--follow" {
             follow = true;
+        } else if arg == "--combined" {
+            combined = true;
         } else if arg == "-C" {
             repo_dir = Some(iter.next().ok_or("-C requires a directory argument")?);
         } else if let Some(dir) = arg.strip_prefix("-C") {
@@ -86,6 +91,7 @@ pub fn parse_flags(args: impl Iterator<Item = String>) -> Result<RawArgs, String
         all,
         reflog,
         follow,
+        combined,
         pre,
         post,
         ..Default::default()
@@ -138,16 +144,33 @@ pub fn classify(
 
 /// Validate the flag/positional combination. Pure (no repo, no process exit) so
 /// the rules are unit-testable; the caller maps `Err` to a usage message + exit.
-/// `n_revs`/`n_paths` are the counts after classification.
-pub fn validate(reflog: bool, follow: bool, n_revs: usize, n_paths: usize) -> Result<(), String> {
-    if follow && reflog {
+///
+/// Takes the whole `Scope` rather than a handful of primitives: it needs `all`,
+/// `reflog`, `follow`, `combined` AND the rev strings, and four bool parameters would
+/// trip `clippy::fn_params_excessive_bools` (a struct may carry them —
+/// `struct_excessive_bools` is allowed for exactly this crate's config/scope types).
+/// It also removes the chance of being handed a "has a range" answer that disagrees
+/// with the revs it was derived from: `combined_range` is consulted here, not passed in.
+pub fn validate(scope: &Scope) -> Result<(), String> {
+    if scope.follow && scope.reflog {
         return Err("--follow and --reflog cannot be combined".to_string());
     }
-    if follow && n_paths != 1 {
+    if scope.follow && scope.paths.len() != 1 {
         return Err("--follow requires exactly one path".to_string());
     }
-    if reflog && (n_paths > 0 || n_revs > 1) {
+    if scope.reflog && (!scope.paths.is_empty() || scope.revs.len() > 1) {
         return Err("--reflog takes at most one ref and no paths".to_string());
+    }
+    if scope.combined {
+        // Name the conflicting flag rather than silently ignoring --combined.
+        if let Some(flag) = combined_conflict(scope) {
+            return Err(format!("--combined and {flag} cannot be combined"));
+        }
+        if combined_range(scope).is_none() {
+            return Err(
+                "--combined requires a single <a>..<b> or <a>...<b> revision range".to_string(),
+            );
+        }
     }
     Ok(())
 }
@@ -183,6 +206,77 @@ pub fn rev_token_kind(tok: &str) -> RevTokenKind {
         return RevTokenKind::Range(a, b);
     }
     RevTokenKind::Single(tok.to_string())
+}
+
+/// The two endpoints of a revision range token, before any repo resolution.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct RangeTokens {
+    /// The whole token exactly as typed — what the combined row is labelled with.
+    /// Carried here rather than fished back out of `revs` by the caller, so "which
+    /// token is the range" is decided once, where it is matched.
+    pub token: String,
+    pub base: String,
+    pub head: String,
+    /// `A...B` — the caller resolves `base` through a merge base with `head`.
+    pub symmetric: bool,
+}
+
+/// The endpoints of a LONE range token, or `None` when the scope is not a single range.
+///
+/// `Some` requires exactly one rev token that `rev_token_kind` calls `Range` or
+/// `Symmetric`, with both endpoints non-empty. That last clause is not redundant:
+/// `rev_token_kind("..")` yields `Range("", "")` by design, so a bare `..` can still
+/// classify as the parent-directory path. It normally never reaches `revs` for that
+/// reason, but this answers for itself rather than depending on `classify` having
+/// gotten there first.
+pub fn range_tokens(revs: &[String]) -> Option<RangeTokens> {
+    let [tok] = revs else { return None };
+    let (base, head, symmetric) = match rev_token_kind(tok) {
+        RevTokenKind::Range(a, b) => (a, b, false),
+        RevTokenKind::Symmetric(a, b) => (a, b, true),
+        RevTokenKind::Single(_) | RevTokenKind::Exclude(_) => return None,
+    };
+    if base.is_empty() || head.is_empty() {
+        return None;
+    }
+    Some(RangeTokens {
+        token: tok.clone(),
+        base,
+        head,
+        symmetric,
+    })
+}
+
+/// Which flag, if any, denies this scope a combined range row — `None` when nothing
+/// stands in the way. The single list `combined_range` filters on and `validate` names
+/// in its error, so the usage message can never disagree with what actually happens.
+///
+/// `--all` overrides the walk entirely and the revs are never consulted. `--reflog` is
+/// not a range. `--follow` retraces its pathspec per commit (`CommitInfo::follow_path`),
+/// so a whole-range diff has no single path to use, and diffing the post-rename name
+/// alone would silently drop everything before the rename — the opposite of what
+/// `--follow` was asked for.
+fn combined_conflict(scope: &Scope) -> Option<&'static str> {
+    [
+        (scope.all, "--all"),
+        (scope.reflog, "--reflog"),
+        (scope.follow, "--follow"),
+    ]
+    .into_iter()
+    .find_map(|(hit, flag)| hit.then_some(flag))
+}
+
+/// Does this scope get a combined range row, and over which endpoints?
+///
+/// The single predicate the whole app asks — `validate` for the usage error, and
+/// `load_commits` for whether to build the row — so the flag can never be accepted
+/// for a scope that then produces no row. Which flags stand in the way is
+/// `combined_conflict`'s answer, not a second list.
+pub fn combined_range(scope: &Scope) -> Option<RangeTokens> {
+    if combined_conflict(scope).is_some() {
+        return None;
+    }
+    range_tokens(&scope.revs)
 }
 
 /// Lexically normalize a `/`-separated relative path: drop `.` and empty segments,
@@ -233,6 +327,9 @@ pub fn scope_title_suffix(scope: &Scope) -> String {
             .map_or_else(|| "reflog".to_string(), |r| format!("reflog {r}"));
     }
     let mut head: Vec<String> = Vec::new();
+    if scope.combined {
+        head.push("combined".to_string());
+    }
     if scope.all {
         head.push("--all".to_string());
     }
@@ -253,13 +350,15 @@ pub fn print_help() {
         r"gitkay — a git history viewer
 
 USAGE:
-    gitkay [-C <dir>] [--all] [<rev>...] [-- <path>...]
+    gitkay [-C <dir>] [--all] [--combined] [<rev>...] [-- <path>...]
     gitkay [-C <dir>] --reflog [<ref>]
     gitkay [-C <dir>] --follow [<rev>...] <path>
 
 OPTIONS:
     -C <dir>        Run as if started in <dir>
     --all           Show all refs (branches, remotes, tags), not just the current branch
+    --combined      Open on the combined diff of a single <a>..<b> range
+                    (the row is always present for a range; this selects it)
     --reflog        Show <ref>'s reflog (default HEAD) instead of its history
     --follow        Follow a single <path> across renames (exactly one path)
     -h, --help      Print this help and exit
@@ -413,18 +512,224 @@ mod tests {
         assert!(!parse_flags(v(&["src/foo.rs"]).into_iter()).unwrap().follow);
     }
 
+    fn range_scope(revs: &[&str]) -> Scope {
+        Scope {
+            revs: revs.iter().map(std::string::ToString::to_string).collect(),
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn validate_flag_combinations() {
-        // validate(reflog, follow, n_revs, n_paths)
-        assert!(validate(false, false, 1, 2).is_ok()); // ordinary scope
-        assert!(validate(false, true, 0, 1).is_ok()); // --follow one path
-        assert!(validate(false, true, 0, 0).is_err()); // --follow needs a path
-        assert!(validate(false, true, 0, 2).is_err()); // --follow rejects two paths
-        assert!(validate(true, true, 0, 1).is_err()); // can't combine
-        assert!(validate(true, false, 0, 0).is_ok()); // --reflog HEAD
-        assert!(validate(true, false, 1, 0).is_ok()); // --reflog <ref>
-        assert!(validate(true, false, 2, 0).is_err()); // --reflog rejects two refs
-        assert!(validate(true, false, 1, 1).is_err()); // --reflog rejects a path
+    fn range_tokens_accepts_a_lone_range() {
+        let t = range_tokens(&v(&["a..b"])).unwrap();
+        assert_eq!(
+            (t.base.as_str(), t.head.as_str(), t.symmetric),
+            ("a", "b", false)
+        );
+
+        let t = range_tokens(&v(&["a...b"])).unwrap();
+        assert_eq!(
+            (t.base.as_str(), t.head.as_str(), t.symmetric),
+            ("a", "b", true)
+        );
+
+        // rev_token_kind fills open-ended forms with HEAD, like git.
+        let t = range_tokens(&v(&["main.."])).unwrap();
+        assert_eq!((t.base.as_str(), t.head.as_str()), ("main", "HEAD"));
+
+        let t = range_tokens(&v(&["..main"])).unwrap();
+        assert_eq!((t.base.as_str(), t.head.as_str()), ("HEAD", "main"));
+    }
+
+    #[test]
+    fn range_tokens_rejects_everything_that_is_not_a_lone_range() {
+        assert!(range_tokens(&[]).is_none());
+        assert!(range_tokens(&v(&["main"])).is_none());
+        assert!(range_tokens(&v(&["^main"])).is_none());
+        assert!(range_tokens(&v(&["a..b", "c..d"])).is_none());
+        assert!(range_tokens(&v(&["a..b", "^side"])).is_none());
+    }
+
+    /// `rev_token_kind("..")` yields `Range("", "")` on purpose, so a bare `..`
+    /// can still classify as the parent directory. `range_tokens` must answer for
+    /// itself rather than trusting `classify` to have caught it first.
+    #[test]
+    fn range_tokens_rejects_a_bare_dotdot() {
+        assert!(range_tokens(&v(&[".."])).is_none());
+    }
+
+    #[test]
+    fn combined_range_is_offered_only_for_a_plain_lone_range() {
+        assert!(combined_range(&range_scope(&["a..b"])).is_some());
+        assert!(combined_range(&range_scope(&["main"])).is_none());
+
+        let with_all = Scope {
+            all: true,
+            ..range_scope(&["a..b"])
+        };
+        assert!(
+            combined_range(&with_all).is_none(),
+            "--all overrides the walk"
+        );
+
+        let with_reflog = Scope {
+            reflog: true,
+            ..range_scope(&["a..b"])
+        };
+        assert!(combined_range(&with_reflog).is_none());
+
+        let with_follow = Scope {
+            follow: true,
+            paths: v(&["f.rs"]),
+            ..range_scope(&["a..b"])
+        };
+        assert!(
+            combined_range(&with_follow).is_none(),
+            "--follow has no single path for a range"
+        );
+    }
+
+    #[test]
+    fn validate_combined_requires_a_lone_range() {
+        let ok = Scope {
+            combined: true,
+            ..range_scope(&["a..b"])
+        };
+        assert!(validate(&ok).is_ok());
+
+        let with_paths = Scope {
+            paths: v(&["src"]),
+            ..ok.clone()
+        };
+        assert!(
+            validate(&with_paths).is_ok(),
+            "a pathspec is fine alongside --combined"
+        );
+
+        let bare_rev = Scope {
+            combined: true,
+            ..range_scope(&["main"])
+        };
+        assert!(validate(&bare_rev).is_err());
+
+        let no_revs = Scope {
+            combined: true,
+            ..Default::default()
+        };
+        assert!(validate(&no_revs).is_err());
+
+        let with_all = Scope {
+            all: true,
+            ..ok.clone()
+        };
+        assert!(validate(&with_all).is_err());
+
+        let with_reflog = Scope {
+            reflog: true,
+            revs: v(&["a..b"]),
+            combined: true,
+            ..Default::default()
+        };
+        assert!(validate(&with_reflog).is_err());
+
+        let with_follow = Scope {
+            follow: true,
+            paths: v(&["f.rs"]),
+            ..ok
+        };
+        assert!(validate(&with_follow).is_err());
+    }
+
+    #[test]
+    fn validate_still_enforces_the_existing_rules() {
+        assert!(
+            validate(&Scope {
+                revs: v(&["main"]),
+                paths: v(&["a", "b"]),
+                ..Default::default()
+            })
+            .is_ok()
+        );
+        assert!(
+            validate(&Scope {
+                follow: true,
+                paths: v(&["a"]),
+                ..Default::default()
+            })
+            .is_ok()
+        );
+        assert!(
+            validate(&Scope {
+                follow: true,
+                ..Default::default()
+            })
+            .is_err()
+        );
+        assert!(
+            validate(&Scope {
+                follow: true,
+                paths: v(&["a", "b"]),
+                ..Default::default()
+            })
+            .is_err()
+        );
+        assert!(
+            validate(&Scope {
+                follow: true,
+                reflog: true,
+                paths: v(&["a"]),
+                ..Default::default()
+            })
+            .is_err()
+        );
+        assert!(
+            validate(&Scope {
+                reflog: true,
+                ..Default::default()
+            })
+            .is_ok()
+        );
+        assert!(
+            validate(&Scope {
+                reflog: true,
+                revs: v(&["main"]),
+                ..Default::default()
+            })
+            .is_ok()
+        );
+        assert!(
+            validate(&Scope {
+                reflog: true,
+                revs: v(&["a", "b"]),
+                ..Default::default()
+            })
+            .is_err()
+        );
+        assert!(
+            validate(&Scope {
+                reflog: true,
+                paths: v(&["a"]),
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_flags_combined() {
+        let r = parse_flags(v(&["--combined", "a..b"]).into_iter()).unwrap();
+        assert!(r.combined);
+        assert_eq!(r.pre, v(&["a..b"]));
+        assert!(!parse_flags(v(&["a..b"]).into_iter()).unwrap().combined);
+    }
+
+    #[test]
+    fn scope_title_suffix_marks_combined() {
+        let s = Scope {
+            combined: true,
+            ..range_scope(&["a..b"])
+        };
+        assert_eq!(scope_title_suffix(&s), "combined a..b");
     }
 
     #[test]
