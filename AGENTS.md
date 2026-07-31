@@ -149,7 +149,18 @@ parts run off the window-creation critical path:
   content-keyed virtual entry, computes on a worker returning over `diff_load_rx`. The
   **previous diff stays on screen**; only once the load outlives `DIFF_PLACEHOLDER_DELAY`
   (100ms) does the pane blank to the "Loading diff…" placeholder, so fast loads swap with
-  no strobe. `diff_load_started_at: Option<Instant>` is the *only* in-flight flag —
+  no strobe. **A same-oid rebuild never blanks at all** (`diff_load_is_rebuild`, set by
+  every `dispatch_diff_load` from `ScrollPlan::Anchor`, and only meaningful while a load
+  is armed): the outgoing diff is the same commit in a different shape, so holding it
+  says strictly more than the placeholder does — and pre-highlighting deliberately pushes
+  those loads past the threshold (measured 118–154ms: ~80ms compute plus 40–60ms
+  colouring a screenful) so they arrive coloured. Blanking them would trade the plain
+  flash pre-highlighting exists to remove for a placeholder flash instead. A commit
+  switch still blanks, because there the outgoing content is a *different commit* and
+  holding it longer is the worse lie. Both the pane and the sidebar read one snapshot
+  (`showing_placeholder`) so they cannot disagree mid-frame, and a rebuild also skips the
+  wake-at-threshold repaint, having no threshold to flip at.
+  `diff_load_started_at: Option<Instant>` is the *only* in-flight flag —
   preserved across rapid re-dispatch (`get_or_insert`), cleared on apply/fail/cancel. A
   monotonic `diff_load_epoch` (bumped per selection and by every synchronous install)
   supersedes stale workers; a superseded result is still **cached** (real commits only —
@@ -170,7 +181,64 @@ parts run off the window-creation critical path:
   key installs directly, superseding the parallel load. Highlighting stays a separate
   downstream step
   (`ensure_diff_highlighted`); an arriving result prefers an existing cache entry (a
-  prefetch may have highlighted the same commit meanwhile). Selecting the already-shown
+  prefetch may have highlighted the same commit meanwhile). That step **seeds the
+  worker's priority window from where the view is** — `VisibleRange::window`, shared
+  with the render's `on_visible` closure so the two cannot drift, fed by a pending
+  `diff_scroll_to` when there is one (the anchor's target, or a restore) and the live
+  `diff_top_line` otherwise. Left at zeros — as it was — `pick_file` chooses **file
+  0** however deep in the diff the reader is, and the worker only corrects itself
+  after finishing a whole `HIGHLIGHT_CHUNK` and seeing the render's update: ~128ms of
+  colouring the wrong end at the ~0.5ms/line syntect costs on a loaded machine. That
+  was the unstyled flash left on the cache-hit path, where a **part-highlighted diff
+  can be served**: a superseded highlight worker's diff still gets stashed and
+  cached, so `diff_fully_highlighted` is false on the way back in and the pass
+  re-runs (`pending_files` re-queues whole files rather than resuming). On a
+  **same-oid rebuild**
+  the worker also **pre-highlights** before sending (`highlight_diff_until`), so a
+  toolbar toggle swaps in already coloured instead of flashing plain frames — the gap
+  that used to exist between this worker and `prefetch_worker`, which always
+  highlighted before display. Gated on `self.syntax_enabled`, not just on the rebuild
+  being same-oid: `self.highlighter` outlives a syntax-off toggle (a live config
+  reload keeps rebuilding it under the new theme whenever the theme changed too,
+  whatever `enabled` ends up as), so `highlight_first` alone would still spend the
+  budget tokenizing spans that `diff_row_job`, gated on the `syntax` bool, never
+  reads. **Bounded by ROWS, not by the clock:** it colours the landing screenful
+  (`landing_row + diff_visible_rows`) and stops, with `PREHIGHLIGHT_CEILING` (120ms)
+  only as a backstop for a screenful that needs tokenizing thousands of rows from
+  its file's start. `PREHIGHLIGHT_CHUNK` (16 lines, vs `HIGHLIGHT_CHUNK`'s 256)
+  keeps that ceiling honest, since a bound is only honoured to within one chunk and
+  a 256-line chunk is ~85ms of overrun at the ~0.3ms/line syntect costs here. A
+  `const` block by the constants asserts what must hold.
+  **Two clock-bounded versions failed first, and the reasons are worth keeping.**
+  (1) Ending the budget AT `DIFF_PLACEHOLDER_DELAY` guarantees arriving exactly when
+  the pane blanks, because after the budget expires the worker still has to send,
+  the UI to drain and install, and the render to paint — measured, a 16.7ms diff
+  whose pre-highlight ran 115ms, swapping at ~132ms against the 100ms threshold, so
+  it traded the plain flash for a blank pane. (2) Subtracting a 40ms margin fixed
+  the overshoot but opened a 40ms **dead band**: a compute landing between 60ms and
+  100ms was too late to colour and too early to blank, so it coloured nothing and
+  flashed plain — measured nine times in one session at 74–96ms, the ordinary range
+  for a 1–2k-line diff here. A row bound has no band, and its cost is accepted
+  deliberately: a slow screenful can push a load past the threshold into a brief
+  blank, but that blank ends **styled**, where the dead band ended plain. Rows are
+  also the right unit on their own terms — the goal is "what the reader sees when
+  this lands", and a fixed time budget buys wildly variable colour, since syntect
+  runs 0.7–2.7ms/line on a machine saturated by superseded highlight workers and
+  prefetches against ~0.3ms/line idle. It colours the
+  file the restored scroll position will land in first (`diff::anchor_hint`, which
+  returns the landing file AND row — both scheduling hints, never a scroll
+  position: `apply_loaded_diff` resolves the anchor itself and owns that);
+  a partial result needs no special handling because
+  `spans` is an `Option` per line, so `pending_files` picks up the rest. A theme
+  change racing an in-flight pre-highlighted load — the config reload's theme branch
+  bumps only the highlight generation, not `diff_load_epoch`, so the worker keeps
+  colouring under the OLD highlighter it captured at dispatch — is caught in the
+  drain: it compares the dispatch-time key's `theme`/`enabled` against the current
+  ones and blanks every line's spans on a mismatch, the same `spans = None` reset
+  the reload uses for the live diff, because the re-key trick's old premise that
+  diff-load data is theme-independent no longer holds now that the worker can bake
+  spans. Commit switches deliberately do NOT pre-highlight: holding a different
+  commit's diff on screen longer is worse than a flash. Selecting the already-shown
   key early-returns and cancels any in-flight load — no re-dispatch or placeholder flash
   on refresh/back-navigation.
 - **Perf timing** — key startup phases log at `debug` (`perf: startup: …` / `perf:
@@ -254,7 +322,20 @@ parts run off the window-creation critical path:
   `apply_loaded_diff` resolves it back to a row through a five-rung ladder
   (the line, the next surviving line at or after it, its file's header, the
   nearest surviving file's header, the top) into the existing
-  `diff_scroll_to`. Capture lives in `load_selected_diff` because that is the
+  `diff_scroll_to`. The **bearing is taken from the middle of the viewport**
+  (`diff_visible_rows / 2` below the top), not its top edge: the reader's
+  attention is mid-screen, and a structural row — a hunk header parked at the
+  top while reading it — is far less likely to land there, so the anchor lands
+  on a row that represents what is being read. `delta` is nonetheless measured
+  from the top, because that is what the restore reconstructs; measuring it from
+  the centre would restore the centre. A `visible_rows` of 0, before the first
+  render has stored a height, collapses the centre onto the top and gives the
+  pre-centring behaviour, which is what the unit tests pass. Note this does NOT
+  keep a hunk header parked at the top from moving when the context width
+  changes, and cannot: widening inserts context lines *between* the header and
+  whatever line is pinned, so the two cannot both hold still — measured, and
+  accepted. Pinning the header itself is the only thing that would, and is
+  deliberately not built. Capture lives in `load_selected_diff` because that is the
   one choke point every rebuild passes through, so the toolbar toggles, the
   config reload and the virtual-row refresh all get it without per-trigger
   wiring — and it must stay ABOVE the synchronous cache-hit install, which

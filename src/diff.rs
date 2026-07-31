@@ -999,15 +999,27 @@ pub fn capture_anchor(
     lines: &[DiffLine],
     files: &[FileEntry],
     top_row: usize,
+    visible_rows: usize,
 ) -> Option<DiffAnchor> {
     // Clamp: `diff_top_line` is written by the render a frame behind, so it can
     // outlive the content it was measured against.
-    let top = top_row.min(lines.len().checked_sub(1)?);
+    let last = lines.len().checked_sub(1)?;
+    let top = top_row.min(last);
+    // Take the bearing from the MIDDLE of the viewport, not its top edge. The
+    // reader's attention is mid-screen, and a structural row — a hunk header
+    // parked at the top while reading it — is far less likely to land there, so
+    // the anchor lands on a row that represents what is actually being read.
+    // `visible_rows` is 0 until the first render has stored a height, and the
+    // centre then collapses onto `top`, which is the pre-centring behaviour.
+    let centre = top.saturating_add(visible_rows / 2).min(last);
     let numbered = |r: usize| lines[r].anchor_point().is_some();
-    let row = (top..lines.len())
+    let row = (centre..lines.len())
         .find(|&r| numbered(r))
-        .or_else(|| (0..top).rev().find(|&r| numbered(r)))?;
-    // Rows found above `top` give 0, which is the fallback's rule.
+        .or_else(|| (0..centre).rev().find(|&r| numbered(r)))?;
+    // Measured from the viewport TOP, not from the centre, because the restore
+    // reconstructs the top (`resolved_row - delta`). A row found above `top` —
+    // only possible when nothing at or after it is numbered — gives 0, which is
+    // the fallback's rule.
     let delta = row.saturating_sub(top);
     let (side, lineno) = lines[row].anchor_point()?;
     let fi = file_index_at_line_opt(&file_line_starts(files), row)?;
@@ -1111,6 +1123,32 @@ pub fn resolve_anchor(anchor: &DiffAnchor, lines: &[DiffLine], files: &[FileEntr
         .or_else(|| files[at..].iter().find_map(|f| f.diff_line_idx))
         // Rung 5.
         .unwrap_or(0)
+}
+
+/// Where `anchor` will land — `(index in `files`, row)` — as a **hint for
+/// scheduling work, never a position to act on.**
+///
+/// Both values are hints and neither may become the scroll position.
+/// `apply_loaded_diff` calls `resolve_anchor` itself and owns that decision;
+/// nothing may depend on the two agreeing. These decide only which file gets
+/// syntax-highlighted first and how far to colour before stopping, where being
+/// wrong costs a worse-looking first frame and nothing else. Route a scroll
+/// through `resolve_anchor` directly — never through here.
+///
+/// The row is returned rather than discarded because the pre-highlight pass
+/// bounds itself by the landing *screenful*, which needs a row to measure from.
+/// That is still scheduling: it decides how much to colour, not where to look.
+///
+/// `None` when the diff has no files, or when the resolved row falls in the
+/// pre-file header region — in both cases there is nothing to schedule around.
+pub fn anchor_hint(
+    anchor: &DiffAnchor,
+    lines: &[DiffLine],
+    files: &[FileEntry],
+) -> Option<(usize, usize)> {
+    let row = resolve_anchor(anchor, lines, files);
+    let fi = file_index_at_line_opt(&file_line_starts(files), row)?;
+    Some((fi, row))
 }
 
 /// One hunk's two line ranges, as spelled in its `@@ -old_start,old_lines
@@ -1586,14 +1624,14 @@ mod tests {
             "the fixture must have header rows above the patch"
         );
 
-        let got = capture_anchor(&data.lines, &data.files, 0).expect("an anchor");
+        let got = capture_anchor(&data.lines, &data.files, 0, 0).expect("an anchor");
         assert_eq!(got.path, b"f.txt".to_vec());
         assert_eq!(got.side, AnchorSide::New);
         assert_eq!(got.lineno, std::num::NonZeroU32::new(1).unwrap());
         assert_eq!(got.delta, first, "delta is rows below the viewport top");
 
         // Starting ON a numbered row gives delta 0.
-        let on_it = capture_anchor(&data.lines, &data.files, first).expect("an anchor");
+        let on_it = capture_anchor(&data.lines, &data.files, first, 0).expect("an anchor");
         assert_eq!(on_it.delta, 0);
         assert_eq!(on_it.lineno, got.lineno);
     }
@@ -1614,7 +1652,7 @@ mod tests {
             .iter()
             .position(|l| l.kind == LineKind::Del)
             .expect("the patch has a deletion");
-        let got = capture_anchor(&data.lines, &data.files, del).expect("an anchor");
+        let got = capture_anchor(&data.lines, &data.files, del, 0).expect("an anchor");
         assert_eq!(got.side, AnchorSide::Old);
         assert_eq!(got.lineno, std::num::NonZeroU32::new(2).unwrap());
 
@@ -1624,7 +1662,9 @@ mod tests {
             .position(|l| l.kind == LineKind::Context && l.new_lineno.is_some())
             .expect("the patch has context");
         assert_eq!(
-            capture_anchor(&data.lines, &data.files, ctx).unwrap().side,
+            capture_anchor(&data.lines, &data.files, ctx, 0)
+                .unwrap()
+                .side,
             AnchorSide::New
         );
     }
@@ -1646,14 +1686,14 @@ mod tests {
             data.lines[last].new_lineno.is_none() && data.lines[last].old_lineno.is_none(),
             "fixture must end on an unnumbered marker row"
         );
-        let got = capture_anchor(&data.lines, &data.files, last).expect("an anchor");
+        let got = capture_anchor(&data.lines, &data.files, last, 0).expect("an anchor");
         assert_eq!(got.delta, 0);
         assert_eq!(got.lineno, std::num::NonZeroU32::new(3).unwrap());
         assert_eq!(got.side, AnchorSide::New);
 
         // A top row past the end (a stale tracker) clamps rather than panicking.
         assert_eq!(
-            capture_anchor(&data.lines, &data.files, data.lines.len() + 99),
+            capture_anchor(&data.lines, &data.files, data.lines.len() + 99, 0),
             Some(got)
         );
     }
@@ -1663,7 +1703,7 @@ mod tests {
     #[test]
     fn capture_anchor_is_none_without_a_numbered_row() {
         use crate::test_repo::{commit_bytes, temp_repo};
-        assert_eq!(capture_anchor(&[], &[], 0), None);
+        assert_eq!(capture_anchor(&[], &[], 0, 0), None);
 
         let (_d, repo) = temp_repo();
         commit_bytes(&repo, "b.dat", &[0, 1, 2, 3], "base");
@@ -1673,7 +1713,89 @@ mod tests {
             !data.lines.is_empty(),
             "a binary diff still has header rows"
         );
-        assert_eq!(capture_anchor(&data.lines, &data.files, 0), None);
+        assert_eq!(capture_anchor(&data.lines, &data.files, 0, 0), None);
+    }
+
+    /// The capture takes its bearing from the MIDDLE of the viewport, not its top
+    /// edge. The reader's attention is mid-screen, and a structural row — a hunk
+    /// header parked at the top while reading — is far less likely to land there,
+    /// so the anchor lands on a row that represents what is being read.
+    ///
+    /// `delta` is still measured from the viewport TOP, because that is what the
+    /// restore reconstructs. The round trip is the assertion that pins it: capture
+    /// against content, resolve against the same content, get the original top row
+    /// back. Measure `delta` from the centre instead and this returns the centre.
+    #[test]
+    fn capture_anchor_takes_its_bearing_from_the_viewport_centre() {
+        let (_d, repo, oid) = two_hunk_repo();
+        let data = diff_at(&repo, oid, base_settings());
+        // Park the viewport top on the second hunk's header — the case that
+        // motivated this: a structural row, carrying no line number of its own.
+        let hdr = (0..data.lines.len())
+            .filter(|&r| data.lines[r].kind == LineKind::Hunk)
+            .nth(1)
+            .expect("two hunks");
+        assert!(
+            data.lines[hdr].anchor_point().is_none(),
+            "header is unnumbered"
+        );
+
+        let top_edge = capture_anchor(&data.lines, &data.files, hdr, 0).expect("an anchor");
+        let centred = capture_anchor(&data.lines, &data.files, hdr, 20).expect("an anchor");
+
+        assert!(
+            centred.lineno > top_edge.lineno,
+            "the centre must anchor further down than the top edge: {} vs {}",
+            centred.lineno,
+            top_edge.lineno
+        );
+        assert!(
+            centred.delta > top_edge.delta,
+            "delta grows with the anchor's distance below the top"
+        );
+        assert_eq!(
+            resolve_anchor(&centred, &data.lines, &data.files),
+            hdr,
+            "resolving against unchanged content must restore the original top row"
+        );
+    }
+
+    /// Before the first render has stored a viewport height there is nothing to
+    /// take a bearing from, so the centre collapses onto the top row and the
+    /// capture behaves exactly as it did before centring — the property every
+    /// other test in this module relies on by passing 0.
+    #[test]
+    fn capture_anchor_without_a_viewport_height_anchors_at_the_top() {
+        let (_d, repo, oid) = two_hunk_repo();
+        let data = diff_at(&repo, oid, base_settings());
+        let hdr = (0..data.lines.len())
+            .filter(|&r| data.lines[r].kind == LineKind::Hunk)
+            .nth(1)
+            .expect("two hunks");
+        let got = capture_anchor(&data.lines, &data.files, hdr, 0).expect("an anchor");
+
+        let first_below = (hdr..data.lines.len())
+            .find(|&r| data.lines[r].anchor_point().is_some())
+            .expect("a numbered row below the header");
+        assert_eq!(got.delta, first_below - hdr);
+        assert_eq!(
+            Some((got.side, got.lineno)),
+            data.lines[first_below].anchor_point()
+        );
+    }
+
+    /// A viewport taller than the diff puts the centre past the end. It clamps
+    /// rather than panicking, and the round trip still restores the top row.
+    #[test]
+    fn capture_anchor_clamps_a_centre_past_the_end_of_the_diff() {
+        let (_d, repo, oid) = two_hunk_repo();
+        let data = diff_at(&repo, oid, base_settings());
+        let got = capture_anchor(&data.lines, &data.files, 0, 100_000).expect("an anchor");
+        assert_eq!(
+            resolve_anchor(&got, &data.lines, &data.files),
+            0,
+            "a clamped centre still restores the top row it was captured from"
+        );
     }
 
     /// `f.txt`: 80 lines, edited at line 10 and line 70 in one commit — two
@@ -1762,7 +1884,7 @@ mod tests {
         );
 
         let row = row_of(&narrow, "f.txt", AnchorSide::New, 70);
-        let anchor = capture_anchor(&narrow.lines, &narrow.files, row).expect("an anchor");
+        let anchor = capture_anchor(&narrow.lines, &narrow.files, row, 0).expect("an anchor");
         assert_eq!(anchor.lineno.get(), 70);
         assert_eq!(anchor.delta, 0);
 
@@ -1802,7 +1924,7 @@ mod tests {
 
         // Line 64 is context only at 6 columns; at 1 the second hunk starts at 69.
         let row = row_of(&wide, "f.txt", AnchorSide::New, 64);
-        let anchor = capture_anchor(&wide.lines, &wide.files, row).expect("an anchor");
+        let anchor = capture_anchor(&wide.lines, &wide.files, row, 0).expect("an anchor");
         assert_eq!(anchor.lineno.get(), 64);
 
         let got = resolve_anchor(&anchor, &narrow.lines, &narrow.files);
@@ -1844,7 +1966,7 @@ mod tests {
         );
 
         let row = row_of(&wide, "f.txt", AnchorSide::New, 76);
-        let captured = capture_anchor(&wide.lines, &wide.files, row).expect("an anchor");
+        let captured = capture_anchor(&wide.lines, &wide.files, row, 0).expect("an anchor");
         assert_eq!(captured.lineno.get(), 76);
         // A non-zero delta pins that rung 3 does NOT apply it, same as rung 4.
         let anchor = DiffAnchor {
@@ -1890,7 +2012,7 @@ mod tests {
         );
 
         let row = row_of(&shown, "b.txt", AnchorSide::New, 2);
-        let captured = capture_anchor(&shown.lines, &shown.files, row).expect("an anchor");
+        let captured = capture_anchor(&shown.lines, &shown.files, row, 0).expect("an anchor");
         assert_eq!(captured.path, b"b.txt".to_vec());
         // Carry a non-zero delta, so a delta that leaked into rungs 3-5 — which
         // would scroll ABOVE the header the rung just chose — shows up here as an
@@ -1962,7 +2084,7 @@ mod tests {
         );
 
         let row = row_of(&shown, "a.txt", AnchorSide::New, 2);
-        let captured = capture_anchor(&shown.lines, &shown.files, row).expect("an anchor");
+        let captured = capture_anchor(&shown.lines, &shown.files, row, 0).expect("an anchor");
         assert_eq!(captured.path, b"a.txt".to_vec());
         // Same non-zero-delta pin as the "previous" test: a leaked delta would
         // scroll above the header this rung chose.
@@ -2004,7 +2126,7 @@ mod tests {
         );
 
         let row = row_of(&shown, "b.txt", AnchorSide::New, 2);
-        let anchor = capture_anchor(&shown.lines, &shown.files, row).expect("an anchor");
+        let anchor = capture_anchor(&shown.lines, &shown.files, row, 0).expect("an anchor");
         assert_eq!(resolve_anchor(&anchor, &hidden.lines, &hidden.files), 0);
         assert_eq!(
             resolve_anchor(&anchor, &[], &[]),
@@ -2045,7 +2167,7 @@ mod tests {
         // ON -> OFF, matched on path_bytes: the rename entry's new side is the
         // added file's own entry once detection is off.
         let on_row = row_of(&on, "z.txt", AnchorSide::New, 4);
-        let a = capture_anchor(&on.lines, &on.files, on_row).expect("an anchor");
+        let a = capture_anchor(&on.lines, &on.files, on_row, 0).expect("an anchor");
         assert_eq!(a.path, b"z.txt".to_vec());
         assert_eq!(a.side, AnchorSide::New);
         assert_eq!(
@@ -2056,7 +2178,7 @@ mod tests {
         // OFF -> ON, matched on old_path_bytes: with detection off m.txt is its
         // own delete entry, whose rows are Del — old side only.
         let off_row = row_of(&off, "m.txt", AnchorSide::Old, 4);
-        let b = capture_anchor(&off.lines, &off.files, off_row).expect("an anchor");
+        let b = capture_anchor(&off.lines, &off.files, off_row, 0).expect("an anchor");
         assert_eq!(b.path, b"m.txt".to_vec());
         assert_eq!(b.side, AnchorSide::Old);
         assert_eq!(
@@ -2112,7 +2234,7 @@ mod tests {
         assert_eq!(data.files[1].path, "z.txt");
 
         let row = row_of(&data, "z.txt", AnchorSide::New, 3);
-        let anchor = capture_anchor(&data.lines, &data.files, row).expect("an anchor");
+        let anchor = capture_anchor(&data.lines, &data.files, row, 0).expect("an anchor");
         assert_eq!(anchor.path, b"z.txt".to_vec());
 
         let (_, z_start, z_end) = file_line_ranges(&data.files, data.lines.len())
@@ -2171,7 +2293,7 @@ mod tests {
         let row = (start..end)
             .find(|&r| data.lines[r].new_lineno == std::num::NonZeroU32::new(2))
             .expect("the second file's changed line");
-        let anchor = capture_anchor(&data.lines, &data.files, row).expect("an anchor");
+        let anchor = capture_anchor(&data.lines, &data.files, row, 0).expect("an anchor");
         assert_eq!(anchor.path, data.files[fi].path_bytes);
 
         let got = resolve_anchor(&anchor, &data.lines, &data.files);
@@ -2262,7 +2384,7 @@ mod tests {
         // of hand-building a DiffAnchor.
         let off = diff_at(&repo, oid, base_settings());
         let off_row = row_of(&off, "sss.txt", AnchorSide::Old, 50);
-        let anchor = capture_anchor(&off.lines, &off.files, off_row).expect("an anchor");
+        let anchor = capture_anchor(&off.lines, &off.files, off_row, 0).expect("an anchor");
         assert_eq!(anchor.path, b"sss.txt".to_vec());
         assert_eq!(anchor.side, AnchorSide::Old);
 
@@ -2315,6 +2437,72 @@ mod tests {
             !(aa_start..aa_end).contains(&got),
             "must never resolve into aa.txt's row range (the copy), got row {got}"
         );
+    }
+
+    /// The hint the pre-highlight pass prioritises by: the index in `files` of
+    /// the file the restored view will land in.
+    #[test]
+    fn anchor_hint_names_the_file_the_view_lands_in() {
+        let (_d, repo, oid) = two_hunk_repo();
+        let data = diff_at(&repo, oid, base_settings());
+        let row = row_of(&data, "f.txt", AnchorSide::New, 70);
+        let anchor = capture_anchor(&data.lines, &data.files, row, 0).expect("an anchor");
+
+        let (fi, _) = anchor_hint(&anchor, &data.lines, &data.files).expect("a hint");
+        assert_eq!(data.files[fi].path, "f.txt");
+    }
+
+    /// Multi-file: the hint must name the ANCHORED file, not the first one.
+    #[test]
+    fn anchor_hint_picks_the_anchored_file_not_the_first() {
+        let (_d, repo, oid) = ws_only_repo();
+        let data = diff_at(&repo, oid, base_settings());
+        let row = row_of(&data, "b.txt", AnchorSide::New, 2);
+        let anchor = capture_anchor(&data.lines, &data.files, row, 0).expect("an anchor");
+
+        let (fi, _) = anchor_hint(&anchor, &data.lines, &data.files).expect("a hint");
+        assert_eq!(data.files[fi].path, "b.txt");
+        assert_ne!(
+            fi, 0,
+            "a.txt sorts first, so this would pass vacuously at 0"
+        );
+    }
+
+    /// When the anchored file lost its patch body the ladder falls to a
+    /// neighbouring header, and the hint follows the ladder rather than the
+    /// anchor's own path — prioritising where the view actually lands is the
+    /// whole point.
+    #[test]
+    fn anchor_hint_follows_the_ladder_when_the_file_has_no_body() {
+        let (_d, repo, oid) = ws_only_repo();
+        let shown = diff_at(&repo, oid, base_settings());
+        let hidden = diff_at(
+            &repo,
+            oid,
+            DiffSettings {
+                ignore_ws: true,
+                ..base_settings()
+            },
+        );
+        let row = row_of(&shown, "b.txt", AnchorSide::New, 2);
+        let anchor = capture_anchor(&shown.lines, &shown.files, row, 0).expect("an anchor");
+
+        let (fi, _) = anchor_hint(&anchor, &hidden.lines, &hidden.files).expect("a hint");
+        assert_eq!(
+            hidden.files[fi].path, "a.txt",
+            "rung 4 lands on a.txt's header, so a.txt is what to colour first"
+        );
+    }
+
+    /// No files, nothing to prioritise.
+    #[test]
+    fn anchor_hint_is_none_for_an_empty_diff() {
+        let (_d, repo, oid) = two_hunk_repo();
+        let data = diff_at(&repo, oid, base_settings());
+        let row = row_of(&data, "f.txt", AnchorSide::New, 70);
+        let anchor = capture_anchor(&data.lines, &data.files, row, 0).expect("an anchor");
+
+        assert_eq!(anchor_hint(&anchor, &[], &[]), None);
     }
 
     #[test]
