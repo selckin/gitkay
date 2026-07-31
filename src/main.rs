@@ -28,7 +28,7 @@ mod word_diff;
 use config::{FileListLayout, Fonts, Role};
 use diff::{
     CommitKind, CommitStats, DiffAnchor, DiffData, DiffLine, DiffSettings, FileEntry, LineKind,
-    StatsWant, capture_anchor, commit_parent_diff, commit_stats, emphasize_rows,
+    StatsWant, anchor_hint, capture_anchor, commit_parent_diff, commit_stats, emphasize_rows,
     file_index_at_line, file_index_at_line_opt, file_line_ranges, file_line_starts,
     format_commit_time, get_diff_data, hash_diff_content, is_real_commit, local_tz_offset_min,
     next_file_line, oid_staged, oid_uncommitted, pathspec_opts, resolve_anchor, staged_git_diff,
@@ -82,6 +82,43 @@ struct VisibleRange {
     hi: AtomicUsize,
     page_lo: AtomicUsize,
     page_hi: AtomicUsize,
+}
+
+impl VisibleRange {
+    /// The file-index window for a viewport covering `rows`: the files on screen,
+    /// plus one viewport's worth either side for read-ahead.
+    ///
+    /// Shared by the render's `on_visible` closure and by
+    /// `ensure_diff_highlighted`'s seeding of a fresh window, so the two cannot
+    /// drift — and the seeding is the point. Left at zeros, a fresh window makes
+    /// `pick_file` choose file 0 whatever the reader is looking at, and the worker
+    /// only switches after finishing a whole `HIGHLIGHT_CHUNK` and noticing the
+    /// render has corrected it. At the ~0.5ms/line syntect costs on a loaded
+    /// machine that is ~128ms spent colouring the wrong end of the diff, which is
+    /// exactly the unstyled flash a cache hit of a part-highlighted diff shows.
+    fn window(
+        starts: &[(usize, usize)],
+        rows: std::ops::Range<usize>,
+    ) -> (usize, usize, usize, usize) {
+        if rows.start >= rows.end {
+            return (0, 0, 0, 0);
+        }
+        let vh = rows.end - rows.start;
+        (
+            file_index_at_line(starts, rows.start),
+            file_index_at_line(starts, rows.end - 1),
+            file_index_at_line(starts, rows.start.saturating_sub(vh)),
+            file_index_at_line(starts, rows.end - 1 + vh),
+        )
+    }
+
+    /// Publish a window for the worker to read on its next chunk boundary.
+    fn store(&self, (lo, hi, page_lo, page_hi): (usize, usize, usize, usize)) {
+        self.lo.store(lo, Ordering::Relaxed);
+        self.hi.store(hi, Ordering::Relaxed);
+        self.page_lo.store(page_lo, Ordering::Relaxed);
+        self.page_hi.store(page_hi, Ordering::Relaxed);
+    }
 }
 
 // ── Commit data ──────────────────────────────────────────────────────────
@@ -197,6 +234,57 @@ const SEARCH_DIFF_DEBOUNCE: std::time::Duration = std::time::Duration::from_mill
 /// through cold history don't strobe. Only a genuinely slow load (a large diff, or
 /// copy detection) crosses the threshold and shows the placeholder.
 const DIFF_PLACEHOLDER_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Lines per chunk between priority / cancellation re-checks in the streaming
+/// `highlight_worker`. Small enough to switch quickly, large enough that the
+/// per-chunk overhead is negligible. Those re-checks are hints — being a chunk
+/// late costs a slightly worse ordering — so this can afford to be coarse.
+const HIGHLIGHT_CHUNK: usize = 256;
+
+/// Lines per chunk for the deadline-bounded pre-highlight pass, which is much
+/// finer because a deadline is only honoured to within one chunk. Measured on a
+/// real 3.7k-line diff, syntect costs ~0.3ms/line here, which makes a 256-line
+/// chunk ~85ms of potential overrun — on its own more than enough to blow past
+/// the very threshold the budget exists to stay under. 16 lines keeps that to a
+/// few milliseconds.
+const PREHIGHLIGHT_CHUNK: usize = 16;
+
+/// Time backstop for the pre-highlight pass. The pass is bounded by **rows** —
+/// colour the landing screenful — and this only stops a pathological grammar, or
+/// a screenful that needs tokenizing thousands of rows from its file's start,
+/// from stalling the swap without limit.
+///
+/// Sized from measurement rather than taste: syntect costs ~0.3ms/line idle but
+/// 0.7–2.7ms/line on a machine already saturated by superseded highlight workers
+/// and prefetches, so a ~50-row screenful is 35–135ms. A ceiling much below that
+/// would routinely cut a legitimate screenful short, which is the failure this
+/// design has already made twice.
+///
+/// **Two earlier attempts bounded by the clock instead, and both failed.** The
+/// first ended the budget at `DIFF_PLACEHOLDER_DELAY` and so guaranteed arriving
+/// exactly when the pane blanks (measured: a 16.7ms diff whose pre-highlight ran
+/// 115ms, swapping at ~132ms against the 100ms threshold). The second subtracted
+/// a 40ms margin from that, which fixed the overshoot but opened a 40ms **dead
+/// band**: a compute landing between 60ms and 100ms was too late to colour and
+/// too early to blank, so it coloured nothing and flashed plain — measured nine
+/// times in one session at 74–96ms, the normal range for a 1–2k-line diff. Rows
+/// have no band. The cost is that a slow screenful can now push a load past the
+/// threshold into a brief blank, which is the deliberate trade: the blank ends
+/// **styled**, where the dead band ended plain.
+const PREHIGHLIGHT_CEILING: std::time::Duration = std::time::Duration::from_millis(120);
+
+// Asserted at compile time rather than in a test, so a bad edit fails the build
+// instead of one suite nobody may run.
+const _: () = {
+    assert!(
+        PREHIGHLIGHT_CHUNK < HIGHLIGHT_CHUNK,
+        "a ceiling is honoured only to within one chunk, so the bounded pass must step finer"
+    );
+    assert!(
+        PREHIGHLIGHT_CEILING.as_millis() > 0,
+        "a zero ceiling silently disables pre-highlighting entirely"
+    );
+};
 
 /// Everything a cached diff's content + spans depend on. `diff_bg` is excluded
 /// (it's a render-time tint, not baked into spans). `content` is 0 for real commits
@@ -1745,26 +1833,84 @@ fn tokenize_range(
     updates
 }
 
-/// Tokenize one whole file's code lines (fresh per-file state).
-fn tokenize_file(
-    hl: &Highlighter,
-    lines: &[DiffLine],
-    file: &FileEntry,
-    start: usize,
-    end: usize,
-) -> Vec<(usize, Vec<highlight::Span>)> {
-    let mut state = hl.new_file_state(&file.path);
-    tokenize_range(hl, lines, &mut state, start, end)
+/// `ranges` rotated to start at the entry whose file index is `first_file`: that
+/// file, then the ones after it, then the ones before.
+///
+/// Forward first because a reader scrolls down more than up, and because the
+/// rows just below the anchored line are what a small overshoot in the restored
+/// scroll position exposes.
+///
+/// `ranges` is `file_line_ranges` output, which omits files with no patch body —
+/// so `first_file` may be absent from it. The rotation then degrades to the
+/// original order rather than panicking.
+fn file_order(ranges: &[(usize, usize, usize)], first_file: usize) -> Vec<(usize, usize, usize)> {
+    let at = ranges
+        .iter()
+        .position(|&(fi, _, _)| fi == first_file)
+        .unwrap_or(0);
+    ranges[at..].iter().chain(&ranges[..at]).copied().collect()
 }
 
-/// Attach syntax-highlighted spans to each code line, synchronously. Used for
-/// small diffs; large ones go through `highlight_worker` instead.
-fn highlight_diff(lines: &mut [DiffLine], files: &[FileEntry], hl: &Highlighter) {
-    for (fi, start, end) in file_line_ranges(files, lines.len()) {
-        for (i, spans) in tokenize_file(hl, lines, &files[fi], start, end) {
-            lines[i].spans = Some(spans);
+/// Tokenize file by file, starting at `first_file` and wrapping, until
+/// `deadline` passes. `None` means no bound — the whole diff.
+///
+/// Spans are written in place, and a partial result needs no special handling
+/// anywhere because it is already a legal state: `spans` is an `Option` per
+/// line, `pending_files` lists exactly the files still holding an unhighlighted
+/// code line, and the post-install async pass re-tokenizes a half-done file from
+/// its ORIGINAL start — re-deriving the parser state, since a multi-line
+/// construct opened before the cut would otherwise mis-colour the remainder —
+/// harmlessly overwriting the prefix written here.
+///
+/// The deadline is checked every `HIGHLIGHT_CHUNK` lines rather than once per
+/// file, so a single enormous file overruns it by at most a chunk.
+fn highlight_diff_until(
+    lines: &mut [DiffLine],
+    files: &[FileEntry],
+    hl: &Highlighter,
+    deadline: Option<std::time::Instant>,
+    first_file: usize,
+    until_row: Option<usize>,
+) {
+    let expired = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
+    // A deadline is only honoured to within one chunk, so a bounded pass steps
+    // far more finely than an unbounded one — see PREHIGHLIGHT_CHUNK. An
+    // unbounded pass has nothing to overrun and keeps the coarse chunk's lower
+    // per-chunk overhead.
+    let chunk = if deadline.is_some() {
+        PREHIGHLIGHT_CHUNK
+    } else {
+        HIGHLIGHT_CHUNK
+    };
+    for (fi, start, end) in file_order(&file_line_ranges(files, lines.len()), first_file) {
+        let mut state = hl.new_file_state(&files[fi].path);
+        let mut pos = start;
+        while pos < end {
+            if expired() {
+                return;
+            }
+            let chunk_end = (pos + chunk).min(end);
+            for (i, spans) in tokenize_range(hl, lines, &mut state, pos, chunk_end) {
+                lines[i].spans = Some(spans);
+            }
+            pos = chunk_end;
+            // Row bound: stop once tokenization has passed `until_row`. The
+            // rotation starts at the landing file and rows only increase from
+            // there, so this trips inside that file or shortly after it — never
+            // after wrapping to the files before it, which would already be past
+            // the point of caring.
+            if until_row.is_some_and(|u| pos >= u) {
+                return;
+            }
         }
     }
+}
+
+/// Attach syntax-highlighted spans to every code line, synchronously and
+/// unbounded — the prefetch worker's whole-diff pass, and the UI-thread fallback
+/// when the highlight thread cannot be spawned.
+fn highlight_diff(lines: &mut [DiffLine], files: &[FileEntry], hl: &Highlighter) {
+    highlight_diff_until(lines, files, hl, None, 0, None);
 }
 
 /// Index into `pending` of the file to tokenize next, given the visible file
@@ -1882,10 +2028,6 @@ fn top_extensions(
 /// it re-queues the rest and switches — so selecting a file never waits behind a
 /// large off-screen one. It bails as soon as a newer highlight pass supersedes it.
 fn highlight_worker(job: HighlightJob) {
-    // Lines per chunk between priority/cancellation re-checks. Small enough to
-    // switch quickly, large enough that the per-chunk overhead is negligible.
-    const CHUNK: usize = 256;
-
     let HighlightJob {
         hl,
         lines,
@@ -1925,7 +2067,7 @@ fn highlight_worker(job: HighlightJob) {
         let mut state = hl.new_file_state(&files[fi].path);
         let mut pos = start;
         while pos < end {
-            let chunk_end = (pos + CHUNK).min(end);
+            let chunk_end = (pos + HIGHLIGHT_CHUNK).min(end);
             let updates = tokenize_range(&hl, &lines, &mut state, pos, chunk_end);
             if !updates.is_empty() {
                 // Receiver gone (app closing) → stop.
@@ -2305,6 +2447,22 @@ struct DiffLoadResult {
     data: Option<DiffData>,
 }
 
+/// Everything the diff-load worker needs to colour a diff before handing it
+/// over. `Some` only for a same-oid rebuild with a highlighter already built —
+/// see `dispatch_diff_load`.
+struct PreHighlight {
+    hl: Arc<Highlighter>,
+    /// The pending scroll anchor, for deciding which file to colour FIRST and how
+    /// far to colour before stopping (`diff::anchor_hint`). Both are scheduling
+    /// hints; `apply_loaded_diff` resolves the anchor itself and owns the scroll
+    /// position, and nothing here may become that.
+    anchor: Option<DiffAnchor>,
+    /// The diff pane's height in rows, which is what bounds the pass: colour the
+    /// landing screenful and stop. 0 before the first render has stored one, which
+    /// collapses the bound onto the landing row itself.
+    visible_rows: usize,
+}
+
 /// Everything a diff-load worker owns for one selection. The commit (`key.oid`), the
 /// diff-shaping settings (`key.settings`), and the row's kind (`CommitKind::of`) all
 /// come from `key` — carrying them separately could only let them disagree.
@@ -2316,6 +2474,7 @@ struct DiffLoadJob {
     current_epoch: Epoch,
     tx: mpsc::Sender<DiffLoadResult>,
     ctx: egui::Context,
+    prehighlight: Option<PreHighlight>,
 }
 
 /// Deliver a `data: None` result for a diff-load worker exiting without a diff
@@ -2352,6 +2511,7 @@ fn diff_load_worker(job: DiffLoadJob) {
         current_epoch,
         tx,
         ctx,
+        prehighlight,
     } = job;
     // Superseded before we even ran — don't open the repo.
     if !current_epoch.is_current(epoch) {
@@ -2376,7 +2536,7 @@ fn diff_load_worker(job: DiffLoadJob) {
     }
     let t = std::time::Instant::now();
     let kind = CommitKind::of(key.oid);
-    let data = get_diff_data(&repo, key.oid, kind, key.settings, &paths);
+    let mut data = get_diff_data(&repo, key.oid, kind, key.settings, &paths);
     // Content-key a virtual row off-thread here so an unchanged working tree hits the
     // cache and reuses its highlighting.
     let key = finalize_diff_key(key, kind, &data);
@@ -2386,6 +2546,45 @@ fn diff_load_worker(job: DiffLoadJob) {
         data.lines.len(),
         t.elapsed()
     );
+    // Superseded loads don't get the budget: it belongs to a diff somebody will
+    // actually look at. Checked here rather than only at entry because the
+    // compute above may have taken a while.
+    if let Some(pre) = prehighlight
+        && current_epoch.is_current(epoch)
+    {
+        let t = std::time::Instant::now();
+        // Scheduling hints only — never a scroll position; see `anchor_hint`.
+        let (first, landing) = pre
+            .anchor
+            .as_ref()
+            .and_then(|a| anchor_hint(a, &data.lines, &data.files))
+            .unwrap_or((0, 0));
+        // Bounded by ROWS — the landing screenful — with the clock only as a
+        // backstop. Two earlier versions bounded by the clock against
+        // DIFF_PLACEHOLDER_DELAY and both failed; see PREHIGHLIGHT_CEILING.
+        highlight_diff_until(
+            &mut data.lines,
+            &data.files,
+            &pre.hl,
+            Some(t + PREHIGHLIGHT_CEILING),
+            first,
+            Some(landing.saturating_add(pre.visible_rows)),
+        );
+        // Report how much got coloured, not just complete-vs-partial: when the
+        // compute alone outlives the budget the pass returns having done nothing,
+        // and "partial" reads as "did some of it" for what is really "did none of
+        // it". The counts are what make that case self-explanatory in a log.
+        let code = data.lines.iter().filter(|l| l.kind.is_code()).count();
+        let coloured = data
+            .lines
+            .iter()
+            .filter(|l| l.kind.is_code() && l.spans.is_some())
+            .count();
+        log::debug!(
+            "diff-load: pre-highlight from file {first}: {coloured}/{code} code lines in {:?}",
+            t.elapsed()
+        );
+    }
     if tx
         .send(DiffLoadResult {
             epoch,
@@ -3485,6 +3684,18 @@ struct GitkApp {
     // across rapid re-dispatch (get_or_insert) so continuous loading still crosses the
     // threshold; cleared to None when a load applies, fails, or is cancelled.
     diff_load_started_at: Option<std::time::Instant>,
+    /// Whether the in-flight load is a same-oid rebuild (`ScrollPlan::Anchor`) —
+    /// only meaningful while `diff_load_started_at` is `Some`, and rewritten by
+    /// every dispatch so a burst that changes character mid-flight (toggle the
+    /// toolbar, then arrow away before it lands) is classified by its latest
+    /// dispatch rather than its first.
+    ///
+    /// Suppresses the "Loading diff…" placeholder: on a rebuild the outgoing diff
+    /// is the SAME commit in a different shape, so holding it says more than
+    /// blanking does, and pre-highlighting deliberately pushes these loads past
+    /// the threshold (measured 118–154ms) in order to arrive coloured. A commit
+    /// switch still blanks — there the outgoing content is a different commit.
+    diff_load_is_rebuild: bool,
     egui_ctx: egui::Context, // stored Context handle so workers can request a repaint
     /// Applies run off the frame loop (a large file's diff regeneration is not
     /// frame-budget work) and one at a time — the menus disable while in flight.
@@ -3978,6 +4189,7 @@ impl GitkApp {
             diff_load_rx,
             diff_load_epoch: Epoch::default(),
             diff_load_started_at: None,
+            diff_load_is_rebuild: false,
             history_load_tx,
             history_load_rx,
             history_epoch: Epoch::default(),
@@ -4174,7 +4386,8 @@ impl GitkApp {
         // load-bearing: that branch calls apply_loaded_diff in this same call, so
         // a reordering would leave every cache-hit rebuild resolving a stale or
         // absent anchor.
-        match ScrollPlan::of(self.current_diff_key.as_ref().map(|k| k.oid), oid) {
+        let plan = ScrollPlan::of(self.current_diff_key.as_ref().map(|k| k.oid), oid);
+        match plan {
             ScrollPlan::Restore => {
                 let mem = self.scroll_memory.get(&oid);
                 self.diff_scroll_to = Some(mem.map_or(0, |m| m.diff_row));
@@ -4193,6 +4406,7 @@ impl GitkApp {
                     &self.diff_lines,
                     &self.diff_files,
                     self.diff_top_line.load(Ordering::Relaxed),
+                    self.diff_visible_rows.load(Ordering::Relaxed),
                 )
                 .map(|a| (oid, a));
             }
@@ -4221,7 +4435,9 @@ impl GitkApp {
         // Resolve the pathspec only here — a hit above must do no work, and under
         // --follow diff_paths_for is an O(commits) scan.
         let paths = self.diff_paths_for_oid(oid);
-        self.dispatch_diff_load(key, paths);
+        // Pre-highlight only on a same-oid rebuild: on a commit switch, holding a
+        // DIFFERENT commit's diff on screen longer is worse than a plain flash.
+        self.dispatch_diff_load(key, paths, plan == ScrollPlan::Anchor);
     }
 
     /// Move the currently-displayed diff into the cache under its stored key (a move,
@@ -4423,8 +4639,18 @@ impl GitkApp {
     /// delay (see the render path). On thread-spawn failure, fall back to computing
     /// synchronously so the diff still loads (accepting the old UI-thread stall in that
     /// rare case).
-    fn dispatch_diff_load(&mut self, key: DiffCacheKey, paths: Vec<String>) {
+    fn dispatch_diff_load(
+        &mut self,
+        key: DiffCacheKey,
+        paths: Vec<String>,
+        same_oid_rebuild: bool,
+    ) {
         let epoch = self.diff_load_epoch.bump();
+        // Drives both the pre-highlight gate below and the placeholder suppression
+        // in the render. Written on every dispatch, not just the first of a burst,
+        // so a load that changes character mid-flight is classified by its latest
+        // dispatch.
+        self.diff_load_is_rebuild = same_oid_rebuild;
         // Keep the previous diff on screen while the worker runs — don't clear the pane.
         // The render path only blanks to the "Loading diff…" placeholder once the load
         // outlives DIFF_PLACEHOLDER_DELAY, so a fast uncached load swaps straight to the
@@ -4465,6 +4691,34 @@ impl GitkApp {
             key.clone(),
             self.egui_ctx.clone(),
         );
+        // Colour the new content before installing it, so a same-oid rebuild
+        // swaps in already highlighted instead of flashing a few plain frames.
+        // The pass bounds itself by ROWS — the landing screenful — not by the
+        // clock; `PREHIGHLIGHT_CEILING` records why, and why two clock-bounded
+        // versions failed first.
+        //
+        // A `None` highlighter is the startup window before the prewarm thread
+        // lands, not an error: skip and behave exactly as before.
+        //
+        // Also gated on `self.syntax_enabled`: `self.highlighter` outlives a
+        // syntax-off toggle (the config-reload branch rebuilds and keeps it
+        // whenever the theme changes too, regardless of the new `enabled`
+        // value), so `same_oid_rebuild` alone is not sufficient — without this,
+        // a same-oid rebuild with syntax off would still spend up to the full
+        // budget tokenizing spans that `diff_row_job`, gated on the `syntax`
+        // bool, never reads. That would break the "syntax off is cost-free"
+        // promise every other highlight-dispatch site in this file keeps
+        // (`ensure_diff_highlighted`'s early return, `dispatch_prefetch`'s own
+        // `if self.syntax_enabled` guard at its call site) and delay the swap
+        // for nothing.
+        let prehighlight = (same_oid_rebuild && self.syntax_enabled)
+            .then(|| self.highlighter.clone())
+            .flatten()
+            .map(|hl| PreHighlight {
+                hl,
+                anchor: self.pending_anchor.as_ref().map(|(_, a)| a.clone()),
+                visible_rows: self.diff_visible_rows.load(Ordering::Relaxed),
+            });
         let job = DiffLoadJob {
             repo_path,
             key,
@@ -4473,6 +4727,7 @@ impl GitkApp {
             current_epoch: self.diff_load_epoch.clone(),
             tx: self.diff_load_tx.clone(),
             ctx: self.egui_ctx.clone(),
+            prehighlight,
         };
         let spawn = spawn_reporting(
             "gitkay-diff-load",
@@ -4774,12 +5029,25 @@ impl GitkApp {
         );
         // Tokenize off-thread, file-by-file, prioritising the files the render
         // marks visible. The diff is already shown plain.
+        // Seed the window with where the view IS (or is about to be), not zeros.
+        // A zeroed window makes `pick_file` choose file 0 regardless, and the
+        // worker only corrects itself a whole chunk later — ~128ms of colouring
+        // the wrong end of the diff on a loaded machine, which is precisely the
+        // unstyled flash a cache hit of a part-highlighted diff shows. Everything
+        // needed is already here: prefer a pending `diff_scroll_to` (a same-oid
+        // rebuild's anchor, or a commit switch's restore, so where the view is
+        // about to land) over the live top row.
+        let top = self
+            .diff_scroll_to
+            .unwrap_or_else(|| self.diff_top_line.load(Ordering::Relaxed));
+        let rows = top..top + self.diff_visible_rows.load(Ordering::Relaxed).max(1);
         let priority = Arc::new(VisibleRange {
             lo: AtomicUsize::new(0),
             hi: AtomicUsize::new(0),
             page_lo: AtomicUsize::new(0),
             page_hi: AtomicUsize::new(0),
         });
+        priority.store(VisibleRange::window(&self.file_line_starts, rows));
         self.highlight_priority = Some(Arc::clone(&priority));
         let job = HighlightJob {
             hl: Arc::clone(hl),
@@ -6479,20 +6747,40 @@ impl GitkApp {
             // adopted) load was still running. Install it like a current one.
             let awaited = !current && self.awaiting(&key);
             match data {
-                Some(data) if current || awaited => {
-                    // Re-key from CURRENT state before installing: the diff data
-                    // itself is theme-independent, but the dispatch-time key pins
-                    // theme/enabled — a config theme change while the load ran
-                    // (which bumps only the highlight generation, not this epoch)
-                    // would otherwise install (and later stash) under the stale
-                    // key, serving wrong-theme spans on a later revisit. Data-
-                    // affecting settings changes always re-dispatch (bumping the
-                    // epoch), so a current-epoch result's data is always valid.
+                Some(mut data) if current || awaited => {
+                    // Re-key from CURRENT state before installing: the dispatch-
+                    // time key pins theme/enabled — a config theme change while
+                    // the load ran (which bumps only the highlight generation,
+                    // not this epoch) would otherwise install (and later stash)
+                    // under the stale key, serving wrong-theme spans on a later
+                    // revisit. Data-affecting settings changes always re-dispatch
+                    // (bumping the epoch), so a current-epoch result's data is
+                    // always valid.
                     let fresh = finalize_diff_key(
                         self.diff_cache_key(key.oid),
                         CommitKind::of(key.oid),
                         &data,
                     );
+                    // The re-key above used to rest on "the diff data itself is
+                    // theme-independent" — true before pre-highlighting existed,
+                    // false now that a same-oid rebuild's worker can bake spans
+                    // under the highlighter it captured at dispatch time
+                    // (`PreHighlight`, see `dispatch_diff_load`). If a live
+                    // config reload's theme branch raced that worker, `data`'s
+                    // spans were coloured under `key`'s theme/enabled but are
+                    // about to be installed under `fresh`'s — wrong colours that
+                    // `diff_fully_highlighted` would then skip re-doing, and that
+                    // would get cached under the new key. Blank them exactly like
+                    // `handle_config_reload`'s own re-highlight reset does for the
+                    // live diff (`for line in &mut self.diff_lines { line.spans =
+                    // None; }`) so the post-install pass recolours from scratch —
+                    // same mechanism, applied to the arriving result instead of
+                    // the field.
+                    if key.theme != fresh.theme || key.enabled != fresh.enabled {
+                        for line in &mut data.lines {
+                            line.spans = None;
+                        }
+                    }
                     self.install_preferring_cache(fresh, data);
                 }
                 Some(data) => {
@@ -6880,8 +7168,18 @@ impl eframe::App for GitkApp {
                 // Snapshot the decision once so the sidebar and the diff pane agree even
                 // if the threshold is crossed mid-frame.
                 let diff_load_elapsed = self.diff_load_started_at.map(|t| t.elapsed());
+                // A same-oid rebuild NEVER blanks. The outgoing diff is the same
+                // commit in a different shape, so holding it says strictly more than
+                // "Loading diff…" does — and pre-highlighting deliberately pushes
+                // these loads past the threshold (measured 118–154ms: ~80ms compute
+                // plus ~40-60ms colouring a screenful) precisely so they arrive
+                // coloured. Blanking them would trade the plain-diff flash this
+                // whole feature exists to remove for a placeholder flash instead.
+                // A commit switch still blanks: there the outgoing content belongs
+                // to a different commit, and holding it longer is the worse lie.
+                let can_blank = !self.diff_load_is_rebuild;
                 let showing_placeholder =
-                    diff_load_elapsed.is_some_and(|e| e >= DIFF_PLACEHOLDER_DELAY);
+                    can_blank && diff_load_elapsed.is_some_and(|e| e >= DIFF_PLACEHOLDER_DELAY);
 
                 // Right: resizable file-list sidebar (see show_file_sidebar).
                 let divider = self.show_file_sidebar(ui, &ctx, showing_placeholder);
@@ -6907,22 +7205,29 @@ impl eframe::App for GitkApp {
                     .frame(frame)
                     .show_inside(ui, |ui| {
                         ui.style_mut().override_font_id = Some(self.fonts.font_id(Role::Diff));
-                        // A diff-load worker is in flight. Once it has outlived
-                        // DIFF_PLACEHOLDER_DELAY, blank to the "Loading diff…" text
-                        // instead of the (now stale) previous diff; before then, keep
-                        // rendering the previous diff and wake at the threshold to flip.
-                        // Returning here leaves diff_scroll_to untouched, so the diff
-                        // still opens where the caller asked once the real content lands.
+                        // A diff-load worker is in flight. On a commit switch, once it
+                        // has outlived DIFF_PLACEHOLDER_DELAY, blank to the "Loading
+                        // diff…" text instead of the (now stale, and wrong-commit)
+                        // previous diff; before then, keep rendering it and wake at
+                        // the threshold to flip. Returning here leaves diff_scroll_to
+                        // untouched, so the diff still opens where the caller asked
+                        // once the real content lands.
+                        //
+                        // A same-oid rebuild never reaches the blank at all — see
+                        // `can_blank` where it is decided — so it also has no
+                        // threshold to wake for.
                         if let Some(elapsed) = diff_load_elapsed {
-                            if elapsed >= DIFF_PLACEHOLDER_DELAY {
+                            if showing_placeholder {
                                 ui.centered_and_justified(|ui| {
                                     ui.label(egui::RichText::new("Loading diff…").color(SUBTEXT));
                                 });
                                 return;
                             }
-                            ui.ctx().request_repaint_after(
-                                DIFF_PLACEHOLDER_DELAY.saturating_sub(elapsed),
-                            );
+                            if can_blank {
+                                ui.ctx().request_repaint_after(
+                                    DIFF_PLACEHOLDER_DELAY.saturating_sub(elapsed),
+                                );
+                            }
                             // fall through: keep rendering the previous diff below
                         }
                         // Layout inputs are identical for both render branches (only the
@@ -6980,16 +7285,7 @@ impl eframe::App for GitkApp {
                                 if let Some(p) = priority
                                     && rows.start < rows.end
                                 {
-                                    let vh = rows.end - rows.start;
-                                    let lo = file_index_at_line(starts, rows.start);
-                                    let hi = file_index_at_line(starts, rows.end - 1);
-                                    let page_lo =
-                                        file_index_at_line(starts, rows.start.saturating_sub(vh));
-                                    let page_hi = file_index_at_line(starts, rows.end - 1 + vh);
-                                    p.lo.store(lo, Ordering::Relaxed);
-                                    p.hi.store(hi, Ordering::Relaxed);
-                                    p.page_lo.store(page_lo, Ordering::Relaxed);
-                                    p.page_hi.store(page_hi, Ordering::Relaxed);
+                                    p.store(VisibleRange::window(starts, rows));
                                 }
                             },
                             |i| {
@@ -8075,6 +8371,33 @@ mod tests {
         assert_eq!(diff_pad_rows(100, Some(99), 30), 29); // 1 below, need 30
     }
 
+    /// The window the highlight worker prioritises by. The load-bearing case is
+    /// the last one: a viewport deep in the diff must NOT produce file 0, because
+    /// a zeroed window is what made the worker colour the wrong end first and
+    /// leave the visible rows plain for a chunk.
+    #[test]
+    fn visible_range_window_tracks_the_viewport_not_the_start() {
+        // Four files of 100 rows each, as file_line_starts yields: (start, index).
+        let starts = &[(0usize, 0usize), (100, 1), (200, 2), (300, 3)];
+
+        // Viewport over file 2, 50 rows tall: on-screen is file 2, read-ahead
+        // reaches file 1 above and file 3 below.
+        assert_eq!(
+            VisibleRange::window(starts, 210..260),
+            (2, 2, 1, 3),
+            "deep viewport must prioritise its own file, never file 0"
+        );
+        // Straddling a boundary reports both files as on-screen.
+        assert_eq!(VisibleRange::window(starts, 90..110).0, 0);
+        assert_eq!(VisibleRange::window(starts, 90..110).1, 1);
+        // At the top, the read-ahead below still reaches forward.
+        assert_eq!(VisibleRange::window(starts, 0..50), (0, 0, 0, 0));
+        assert_eq!(VisibleRange::window(starts, 0..150), (0, 1, 0, 2));
+        // An empty range has no window to report and must not panic.
+        assert_eq!(VisibleRange::window(starts, 10..10), (0, 0, 0, 0));
+        assert_eq!(VisibleRange::window(&[], 0..50), (0, 0, 0, 0));
+    }
+
     #[test]
     fn pick_file_visible_page_below_page_above_rest() {
         // `pending` in file order: (file index, start, end).
@@ -8265,6 +8588,150 @@ mod tests {
             .map(|(fi, _, _)| fi)
             .collect();
         assert_eq!(pending, vec![1], "only file B (index 1) still needs work");
+    }
+
+    /// The rotation the pre-highlight pass walks: the anchored file, then the
+    /// ones after it, then the ones before. Pure, so the ordering claim is
+    /// pinned without a clock — a deadline-driven test of the same thing would
+    /// be timing-dependent.
+    #[test]
+    fn file_order_rotates_to_start_at_the_named_file() {
+        // (file index, start, end), as file_line_ranges yields.
+        let ranges = vec![(0, 0, 10), (1, 10, 20), (2, 20, 30), (3, 30, 40)];
+
+        assert_eq!(
+            file_order(&ranges, 2),
+            vec![(2, 20, 30), (3, 30, 40), (0, 0, 10), (1, 10, 20)],
+            "forward from the named file, then wrap"
+        );
+        assert_eq!(file_order(&ranges, 0), ranges, "already first ⇒ unchanged");
+        assert_eq!(
+            file_order(&ranges, 3),
+            vec![(3, 30, 40), (0, 0, 10), (1, 10, 20), (2, 20, 30)],
+            "last file ⇒ everything wraps behind it"
+        );
+    }
+
+    /// `file_line_ranges` omits files with no patch body, so the file index the
+    /// anchor names can be absent from `ranges`. Degrade to the original order
+    /// rather than panicking or silently dropping files.
+    #[test]
+    fn file_order_degrades_when_the_named_file_has_no_range() {
+        let ranges = vec![(0, 0, 10), (2, 10, 20)];
+        assert_eq!(file_order(&ranges, 1), ranges, "file 1 has no patch body");
+        assert_eq!(file_order(&[], 0), Vec::new());
+    }
+
+    /// A deadline already past means no work at all — the degrades-to-today
+    /// case, and the one that proves the bound is real rather than decorative.
+    #[test]
+    fn highlight_diff_until_does_nothing_once_the_deadline_has_passed() {
+        let hl = highlight::test_highlighter();
+        let mut lines = vec![
+            DiffLine::new("diff --git a/x.rs b/x.rs", LineKind::FileMeta),
+            DiffLine::new("@@ -1 +1 @@", LineKind::Hunk),
+            DiffLine::new("+fn main() {}", LineKind::Add),
+            DiffLine::new("let x = 1;", LineKind::Context),
+        ];
+        let files = vec![fe("x.rs", Some(0))];
+        let past = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        highlight_diff_until(&mut lines, &files, &hl, Some(past), 0, None);
+
+        assert!(
+            lines.iter().all(|l| l.spans.is_none()),
+            "an expired budget must tokenize nothing"
+        );
+        // And the diff is still in a legal partial state the async pass resumes from.
+        assert!(!diff_fully_highlighted(&lines, &files));
+        assert_eq!(
+            pending_files(&lines, &files).len(),
+            1,
+            "the file is still pending, so the post-install pass will colour it"
+        );
+    }
+
+    /// No deadline ⇒ the whole diff, which is what the prefetch path relies on
+    /// through `highlight_diff`'s delegation.
+    #[test]
+    fn highlight_diff_until_colors_everything_without_a_deadline() {
+        let hl = highlight::test_highlighter();
+        let mut lines = vec![
+            DiffLine::new("diff --git a/x.rs b/x.rs", LineKind::FileMeta),
+            DiffLine::new("@@ -1 +1 @@", LineKind::Hunk),
+            DiffLine::new("+fn main() {}", LineKind::Add),
+            DiffLine::new("let x = 1;", LineKind::Context),
+        ];
+        let files = vec![fe("x.rs", Some(0))];
+
+        highlight_diff_until(&mut lines, &files, &hl, None, 0, None);
+
+        assert!(diff_fully_highlighted(&lines, &files));
+        assert!(pending_files(&lines, &files).is_empty());
+    }
+
+    /// The row bound stops the pass once tokenization passes it, so an
+    /// already-blanked load colours the landing screenful instead of the whole
+    /// diff. Deterministic: no clock involved, the deadline is far away.
+    #[test]
+    fn highlight_diff_until_stops_at_the_row_bound() {
+        let hl = highlight::test_highlighter();
+        let mut lines = vec![DiffLine::new(
+            "diff --git a/x.rs b/x.rs",
+            LineKind::FileMeta,
+        )];
+        for i in 0..200 {
+            lines.push(DiffLine::new(format!("let x{i} = {i};"), LineKind::Context));
+        }
+        let files = vec![fe("x.rs", Some(0))];
+        // Far enough that the clock never bites; the row bound is what stops it.
+        let far = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(10))
+            .expect("in range");
+
+        highlight_diff_until(&mut lines, &files, &hl, Some(far), 0, Some(40));
+
+        let coloured = lines.iter().filter(|l| l.spans.is_some()).count();
+        assert!(
+            coloured > 0 && coloured < 200,
+            "stops at the bound rather than colouring nothing or everything: {coloured}"
+        );
+        assert!(
+            lines[..40].iter().any(|l| l.spans.is_some()),
+            "rows before the bound get coloured"
+        );
+        assert!(
+            lines[190..].iter().all(|l| l.spans.is_none()),
+            "rows well past the bound do not"
+        );
+    }
+
+    /// `first_file` must not change the OUTCOME when the budget is unbounded —
+    /// only the order the work happens in. A rotation that dropped or repeated a
+    /// file would show up here.
+    #[test]
+    fn highlight_diff_until_covers_every_file_whatever_the_start() {
+        let hl = highlight::test_highlighter();
+        let build = || {
+            vec![
+                DiffLine::new("diff --git a/a.rs b/a.rs", LineKind::FileMeta),
+                DiffLine::new("let a = 1;", LineKind::Context),
+                DiffLine::new("diff --git a/b.rs b/b.rs", LineKind::FileMeta),
+                DiffLine::new("let b = 2;", LineKind::Context),
+            ]
+        };
+        let files = vec![fe("a.rs", Some(0)), fe("b.rs", Some(2))];
+
+        for first in 0..files.len() {
+            let mut lines = build();
+            highlight_diff_until(&mut lines, &files, &hl, None, first, None);
+            assert!(
+                diff_fully_highlighted(&lines, &files),
+                "starting at file {first} must still cover both files"
+            );
+        }
     }
 
     #[test]
