@@ -73,6 +73,8 @@ One egui/eframe immediate-mode app — all app state lives in the `GitkApp`
 struct. `src/main.rs` (commit history/graph layout, the workers, and the UI)
 plus extracted modules: `src/diff.rs` (the diff **data** layer: `DiffLine` /
 `DiffData` / `FileEntry` / `DiffSettings`, `CommitKind` + the sentinel oids,
+`DiffSource` + `RowScope` (what a row's diff is taken over, and the pathspec —
+the one value every diff entry point receives),
 `get_diff_data` and the commit/staged/worktree builders (all three run through
 one `build_diff_data` pipeline, whose diff-building prologue — scoped options,
 build, `detect_similar` — is `scoped_diff`, shared with `commit_stats` so the
@@ -174,12 +176,14 @@ parts run off the window-creation critical path:
   holding it longer is the worse lie. Both the pane and the sidebar read one snapshot
   (`showing_placeholder`) so they cannot disagree mid-frame, and a rebuild also skips the
   wake-at-threshold repaint, having no threshold to flip at.
-  A worker's per-row scope — the pathspec and, for the combined range row, its
-  endpoints — travels as one `RowScope` (built by `GitkApp::row_scope`, the single
-  accessor all three job types use) rather than as two parallel fields on each job, so a
-  new worker cannot pick up the pathspec and quietly forget the endpoints. That failure
-  is silent, not loud: `get_diff_data` would compute an EMPTY diff and
-  `finalize_diff_key` would cache it under a content hash.
+  A worker's per-row scope — WHAT to diff and the pathspec to diff it under — travels as
+  one `diff::RowScope` (built by `GitkApp::row_scope`, the single accessor all three job
+  types use) rather than as parallel fields on each job, so a new worker cannot pick up
+  one and quietly forget the other. That failure is silent, not loud: a diff scoped to
+  nothing still computes and `finalize_diff_key` still caches it. Its `source` is a
+  `DiffSource`, which carries the range row's endpoints INSIDE the variant — see the
+  virtual-rows note under **Common Pitfalls** for why that shape, not a kind beside an
+  `Option`.
   `diff_load_started_at: Option<Instant>` is the *only* in-flight flag —
   preserved across rapid re-dispatch (`get_or_insert`), cleared on apply/fail/cancel. A
   monotonic `diff_load_epoch` (bumped per selection and by every synchronous install)
@@ -416,11 +420,15 @@ the deltas came from. Every guard downstream reads the pair, not the row, which 
 change at all** to cover ranges.
 
 The range row's sentinel oid names no commit, so unlike every other row its `oid` alone
-cannot say which trees to diff: `ApplyRequest::range` carries them (taken from the row
-whose diff is on screen, like the oid itself), and `of_request` refuses with
-`Unsupported` rather than falling back to the sentinel. A range's `before` tree is never
-legitimately `None` — unlike a root commit's parent — so any failure to read it is an
-error, not an empty tree that would read as "delete everything the range added".
+cannot say which trees to diff. `ApplyRequest` therefore carries a `DiffSource`, not an
+oid — taken from the row whose diff is on screen — so `of_request` matches
+`DiffSource::Range(ends)` and has the endpoints in hand. There is no "range without
+endpoints" refusal because there is no such value. (`Unsupported` still covers the
+`Uncommitted`/`Staged` arms: those are index routes that never build a tree pair, and
+reaching them here is a routing bug.) A range's `before` tree is never legitimately
+`None` — unlike a root commit's parent — so any failure to read it is an error, not an
+empty tree that would read as "delete everything the range added"; `diff::range_trees`
+states that once, for the pane and the write layer both.
 
 Two consequences worth knowing. A range diff can show a file as `Added` that was added
 and *then modified* inside the range, and a whole-file revert deletes the worktree copy —
@@ -735,5 +743,6 @@ ones that actually fail when the write is removed.
 - File-list sidebar is not row-virtualized — every row draws each frame, so per-row file text goes through `SidebarCache`: elided labels (laid out in `Color32::PLACEHOLDER` so normal/hover color applies at paint time) and `+n`/`-n` stat galleys are built once per (diff, width, font) — `rebuild_file_rows` and a font reload reset the cache, `ensure` re-keys it on width change. `build_file_rows` (pure) turns `(new_path, Option<old_path>)` pairs into header/file rows per `[diff] file_list` (`grouped` = one header per directory, files sorted by label; renames/copies group under their `rename_brace` common directory); `left_elide` left-truncates labels, measuring the full string once and binary-searching only when it overflows (directory headers still elide per frame — they're the minority of rows). `grouped` directory headers are drawn breadcrumb-style (`draw_dir_header` + `common_dir_prefix_len`): the ancestor path a header shares with the header drawn just above it is dimmed (`SUBTEXT_DIM`) and the distinguishing tail is `SUBTEXT`, so deep trees don't repeat the same long prefix on every header
 - Any new diff-*data*-affecting setting goes in `DiffSettings` only. `GitkApp` holds one `DiffSettings` field (the diff-shaping state — `context`/`ignore_ws` are toolbar-owned + persisted, `show_stats`/`detect_renames`/`detect_copies` come from `[diff]` config), and `DiffCacheKey` *embeds* a `DiffSettings`. So a field added to `DiffSettings` is automatically (a) part of the cache key — cached diffs invalidate when it changes, no second edit site — and (b) covered by the config-reload's whole-struct comparison (`new_settings != self.diff_settings`), which triggers the re-diff. The prefetch mapping reads it back as `key.settings`. Settings that only change *spans* (theme, syntax on/off, `diff_bg`) or *render* (`word_diff`, `file_list`) are handled by their own branches in the config-reload block, not `DiffSettings`.
 - The uncommitted/staged/combined-range rows are "virtual": each has a fixed sentinel oid (`oid_uncommitted`/`oid_staged`/`oid_range`) — which the graph layout needs as a node id — but is classified by `CommitKind::of(oid)`, the single place that maps oid → `Real`/`Uncommitted`/`Staged`/`Range`. `get_diff_data` classifies from the oid it was already given and dispatches on the `CommitKind` (exhaustive — a new kind can't fall through to the commit path), and the "virtual ⇒ content-keyed cache entry" rule lives only in `finalize_diff_key`. Don't re-derive virtual-ness by comparing sentinel oids at call sites; ask `CommitKind::of` (or `is_real_commit`, which delegates to it).
-  The **range** row is virtual for the same reason the other two are: its sentinel is fixed while its endpoints move with `HEAD`, so content keying and every existing eviction path cover it without a second rule. Its endpoints ride on its own `CommitInfo::range` (read back by `diff_range_for`, resolved by `range_ends`), the way `--follow`'s per-commit path rides on `follow_path` — per-row scope data recomputed on every rebuild, never held beside the list it describes.
+  The **range** row is virtual for the same reason the other two are: its sentinel is fixed while its endpoints move with `HEAD`, so content keying and every existing eviction path cover it without a second rule. Its endpoints ride on its own `CommitInfo::source` (a `DiffSource::Range`, resolved by `range_ends`), the way `--follow`'s per-commit path rides on `follow_path` — per-row scope data recomputed on every rebuild, never held beside the list it describes.
+  **The endpoints live inside the variant, not beside the kind.** `DiffSource` is `Commit(oid) | Uncommitted | Staged | Range(RangeEnds)`, and it is what `get_diff_data`, `commit_stats` and `ApplyRequest` all receive. They used to receive an oid plus a loose `Option<RangeEnds>`, which made `Range` with no endpoints representable at three layer boundaries — and each invented its own answer for a state none of them could produce: an empty diff, a synthetic `git2::Error`, and an `Unsupported` refusal, none compiler-checked. `CommitInfo` stores a source and derives its `oid` field from it (`DiffSource::oid`, cached because the row render, the graph layout and the per-keystroke search all read it), so the two cannot disagree and nothing downstream has anything left to check. `CommitKind` remains the *payload-free* question — classify from an oid alone, no row lookup — which is what the row tint, `ApplyAction::of` and the cache-key rules want; `DiffSource::kind` bridges the two.
   **Which** value gets keyed in is a separate question from virtual-ness, and `CommitKind::content_hashed_after_diff` is where it lives. `DiffCacheKey::content` exists to pin what a row shows; a real commit's oid pins it (so `content` stays 0), the range row's ENDPOINTS pin it (two fixed oids naming two immutable trees — `hash_range_ends`, mixed in by `GitkApp::diff_cache_key` *before* the diff exists), and only the uncommitted/staged rows have nothing but their diff text to pin them, so `finalize_diff_key` hashes theirs afterwards. That split is what lets the range row take the synchronous cache hit: revisiting it would otherwise regenerate a patch for every file the range touched, every time. Virtual-ness is still the eviction question and still answers "yes" for all three — `sync_virtual_stats` and `stash_current_diff`'s `retain_keys` read `content` moving, which under endpoint keying happens exactly when the endpoints do. (Adoption of an in-flight worker and caching a superseded result stay gated on `is_real_commit`; the range row could join both now, but they are optimisations for the common navigation case, not correctness.) It carries **no parents**: it contains the head commit rather than descending from it, so a lane down to it would draw the opposite. It cannot co-occur with the uncommitted/staged rows, because `show_local` needs `scope.all || scope.revs.is_empty()` and a range scope has revs — which is what makes its index-0 position unambiguous

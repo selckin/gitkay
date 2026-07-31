@@ -1,6 +1,6 @@
 //! The write layer: stage, unstage, and revert a hunk or a file.
 
-use crate::diff::{CommitKind, HunkRange};
+use crate::diff::{CommitKind, DiffSource, HunkRange};
 
 /// What a right-click acts on, derived from the row the diff belongs to. Delegates
 /// to `CommitKind::of` — the single oid→kind rule the whole app shares — so a new
@@ -40,12 +40,11 @@ impl ApplyAction {
 /// One requested write. `hunk: None` means the whole file.
 #[derive(Clone, Debug)]
 pub struct ApplyRequest {
-    /// The row the diff belongs to — classified by `ApplyAction::of`.
-    pub oid: git2::Oid,
-    /// The combined range row's endpoints. `Some` only for `CommitKind::Range`, whose
-    /// sentinel oid names no commit — so unlike every other row, `oid` alone cannot say
-    /// which trees to diff. Resolved into a pair by `RevertTrees::of_request`.
-    pub range: Option<RangeEnds>,
+    /// The row the diff belongs to, and — for the combined range row, whose sentinel
+    /// oid names no commit — the endpoints that say which trees to diff. Carrying the
+    /// pair as one value is why `RevertTrees::of_request` has no "range without
+    /// endpoints" case to refuse. `ApplyAction::of` classifies from `source.oid()`.
+    pub source: DiffSource,
     /// Target file, new-side path, as RAW BYTES — the identity key
     /// `FileEntry::path_bytes` uses. Not the `String`: `FileEntry::path` is built
     /// with `from_utf8_lossy` for display, so a non-UTF-8 name arrives with
@@ -75,27 +74,17 @@ impl ApplyRequest {
     /// menu's rows become a write, so the tests exercise the same mapping the
     /// context menu does instead of a parallel copy that can drift.
     pub fn for_entry(
-        oid: git2::Oid,
+        source: DiffSource,
         file: &crate::diff::FileEntry,
         hunk: Option<HunkRange>,
     ) -> Self {
         Self {
-            oid,
-            range: None,
+            source,
             path: file.path_bytes.clone(),
             old_path: file.old_path_bytes.clone(),
             status: file.status,
             hunk,
         }
-    }
-
-    /// Attach the combined range row's endpoints. Separate from `for_entry` because
-    /// only that one row has any: every other row's `oid` already says which trees to
-    /// diff, and a positional `None` there reads as nothing but noise next to `hunk`'s.
-    #[must_use]
-    pub const fn with_range(mut self, range: Option<RangeEnds>) -> Self {
-        self.range = range;
-        self
     }
 
     /// The old path of a genuine RENAME — never a copy's source.
@@ -315,7 +304,7 @@ pub const fn hunk_fit(clicked: &HunkRange, generated: &HunkRange, reversed: bool
 }
 
 use crate::diff::{
-    DiffSettings, RangeEnds, detect_similar, diff_opts, staged_diff_against, worktree_git_diff,
+    DiffSettings, detect_similar, diff_opts, staged_diff_against, worktree_git_diff,
 };
 use git2::{ApplyLocation, ApplyOptions, DiffOptions, Repository};
 use std::cell::Cell;
@@ -392,7 +381,7 @@ fn action_diff<'r>(
     settings: DiffSettings,
     ignore_ws: bool,
 ) -> Result<(git2::Diff<'r>, ApplyLocation, bool), ApplyError> {
-    let action = ApplyAction::of(req.oid);
+    let action = ApplyAction::of(req.source.oid());
     let reversed = !matches!(action, ApplyAction::Stage);
     let mut opts = action_diff_opts(req, settings, reversed, ignore_ws);
     let (mut diff, location) = match action {
@@ -673,11 +662,8 @@ impl<'r> RevertTrees<'r> {
     /// Dispatches on `CommitKind` exhaustively, like `get_diff_data`, so a new row kind
     /// cannot silently fall through to the commit path.
     fn of_request(repo: &'r Repository, req: &ApplyRequest) -> Result<Self, ApplyError> {
-        match CommitKind::of(req.oid) {
-            CommitKind::Range => {
-                // A range row without endpoints is a wiring bug. Refuse rather than fall
-                // back to `req.oid`, which is the sentinel and names no commit at all.
-                let ends = req.range.ok_or(ApplyError::Unsupported)?;
+        match req.source {
+            DiffSource::Range(ends) => {
                 // The same resolution the pane's `range_git_diff` runs, so the guards
                 // below decide on the trees the deltas were actually generated from.
                 let (before, after) = crate::diff::range_trees(repo, ends)?;
@@ -686,15 +672,15 @@ impl<'r> RevertTrees<'r> {
                     before: Some(before),
                 })
             }
-            CommitKind::Real => {
-                let commit = repo.find_commit(req.oid)?;
+            DiffSource::Commit(oid) => {
+                let commit = repo.find_commit(oid)?;
                 Ok(Self {
                     after: commit.tree()?,
                     before: parent_tree_for_write(&commit)?,
                 })
             }
             // The index routes never build a tree pair; reaching here is a routing bug.
-            CommitKind::Uncommitted | CommitKind::Staged => Err(ApplyError::Unsupported),
+            DiffSource::Uncommitted | DiffSource::Staged => Err(ApplyError::Unsupported),
         }
     }
 
@@ -1216,7 +1202,7 @@ pub fn apply_request(
     req: &ApplyRequest,
     settings: DiffSettings,
 ) -> Result<(), ApplyError> {
-    let action = ApplyAction::of(req.oid);
+    let action = ApplyAction::of(req.source.oid());
     let Some(clicked) = req.hunk else {
         // A whole file needs no patch when the target is the index. Both sides of a
         // rename are handled, so the old path leaves the index with the new one.
@@ -1387,7 +1373,9 @@ pub fn apply_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::{DiffSettings, hunk_at_line, oid_staged, oid_uncommitted};
+    use crate::diff::{
+        DiffSettings, RangeEnds, RowScope, hunk_at_line, oid_staged, oid_uncommitted,
+    };
     use crate::test_repo::{
         commit_bytes, commit_file, commit_index, commit_rename, corrupt_head, index_blob,
         read_file, remove_loose_object, stage, temp_repo, write_file,
@@ -1559,13 +1547,13 @@ mod tests {
         }
     }
 
-    fn renamed_req(oid: git2::Oid, old: &str, path: &str) -> ApplyRequest {
-        ApplyRequest::for_entry(oid, &entry(path, Some(old), git2::Delta::Renamed), None)
+    fn renamed_req(source: DiffSource, old: &str, path: &str) -> ApplyRequest {
+        ApplyRequest::for_entry(source, &entry(path, Some(old), git2::Delta::Renamed), None)
     }
 
     /// A request for a file the pane displayed as DELETED from the worktree.
-    fn deleted_req(oid: git2::Oid, path: &str) -> ApplyRequest {
-        ApplyRequest::for_entry(oid, &entry(path, None, git2::Delta::Deleted), None)
+    fn deleted_req(source: DiffSource, path: &str) -> ApplyRequest {
+        ApplyRequest::for_entry(source, &entry(path, None, git2::Delta::Deleted), None)
     }
 
     /// Every request in this suite is built the way the context menu builds one —
@@ -1573,18 +1561,13 @@ mod tests {
     /// struct literal. That is what makes the suite actually exercise the
     /// mapping: a change to `for_entry` that the menu would suffer shows up here
     /// instead of compiling quietly past ~60 hand-written literals.
-    fn req(oid: git2::Oid, path: &str, hunk: Option<HunkRange>) -> ApplyRequest {
-        ApplyRequest::for_entry(oid, &entry(path, None, git2::Delta::Modified), hunk)
+    fn req(source: DiffSource, path: &str, hunk: Option<HunkRange>) -> ApplyRequest {
+        ApplyRequest::for_entry(source, &entry(path, None, git2::Delta::Modified), hunk)
     }
 
     /// A combined-range-row request, built the way the context menu builds one.
     fn range_req(ends: RangeEnds, path: &str, hunk: Option<HunkRange>) -> ApplyRequest {
-        ApplyRequest::for_entry(
-            crate::diff::oid_range(),
-            &entry(path, None, git2::Delta::Modified),
-            hunk,
-        )
-        .with_range(Some(ends))
+        req(DiffSource::Range(ends), path, hunk)
     }
 
     #[test]
@@ -1747,11 +1730,10 @@ mod tests {
         let head = commit_rename(&repo, "old.txt", "new.txt", "rename");
 
         let request = ApplyRequest::for_entry(
-            crate::diff::oid_range(),
+            DiffSource::Range(RangeEnds { base, head }),
             &entry("new.txt", Some("old.txt"), git2::Delta::Renamed),
             Some(hr(1, 3, 1, 3)),
-        )
-        .with_range(Some(RangeEnds { base, head }));
+        );
         let err = apply_request(&repo, &request, settings()).unwrap_err();
 
         assert!(
@@ -1795,7 +1777,7 @@ mod tests {
         let hunk = hr(14, 7, 14, 7);
         apply_request(
             &repo,
-            &req(oid_uncommitted(), "f.txt", Some(hunk)),
+            &req(DiffSource::Uncommitted, "f.txt", Some(hunk)),
             settings(),
         )
         .unwrap();
@@ -1819,7 +1801,12 @@ mod tests {
         stage(&repo, "f.txt");
 
         let hunk = hr(14, 7, 14, 7);
-        apply_request(&repo, &req(oid_staged(), "f.txt", Some(hunk)), settings()).unwrap();
+        apply_request(
+            &repo,
+            &req(DiffSource::Staged, "f.txt", Some(hunk)),
+            settings(),
+        )
+        .unwrap();
 
         let staged = index_blob(&repo, "f.txt");
         assert!(staged.contains("EDITED 3"), "untouched hunk stays staged");
@@ -1838,7 +1825,12 @@ mod tests {
         stage(&repo, "f.txt");
 
         let hunk = hr(14, 7, 14, 7);
-        apply_request(&repo, &req(oid_staged(), "f.txt", Some(hunk)), settings()).unwrap();
+        apply_request(
+            &repo,
+            &req(DiffSource::Staged, "f.txt", Some(hunk)),
+            settings(),
+        )
+        .unwrap();
 
         let reopened = git2::Repository::open(dir.path()).unwrap();
         assert!(!index_blob(&reopened, "f.txt").contains("EDITED 17"));
@@ -1851,7 +1843,12 @@ mod tests {
         let oid = commit_file(&repo, "f.txt", &body(&[5, 17]), "two edits");
 
         let hunk = hr(2, 7, 2, 7);
-        apply_request(&repo, &req(oid, "f.txt", Some(hunk)), settings()).unwrap();
+        apply_request(
+            &repo,
+            &req(DiffSource::Commit(oid), "f.txt", Some(hunk)),
+            settings(),
+        )
+        .unwrap();
 
         let wd = read_file(&repo, "f.txt");
         assert!(
@@ -1878,7 +1875,7 @@ mod tests {
         let stale = hr(500, 5, 500, 5);
         let err = apply_request(
             &repo,
-            &req(oid_uncommitted(), "f.txt", Some(stale)),
+            &req(DiffSource::Uncommitted, "f.txt", Some(stale)),
             settings(),
         )
         .unwrap_err();
@@ -1899,7 +1896,12 @@ mod tests {
         write_file(&repo, "f.txt", &body(&[5, 6]));
 
         let hunk = hr(2, 7, 2, 7);
-        let err = apply_request(&repo, &req(oid, "f.txt", Some(hunk)), settings()).unwrap_err();
+        let err = apply_request(
+            &repo,
+            &req(DiffSource::Commit(oid), "f.txt", Some(hunk)),
+            settings(),
+        )
+        .unwrap_err();
         assert!(matches!(err, ApplyError::Stale), "{err:?}");
         assert!(
             read_file(&repo, "f.txt").contains("EDITED 6"),
@@ -1913,7 +1915,12 @@ mod tests {
         commit_file(&repo, "f.txt", &body(&[]), "base");
         write_file(&repo, "f.txt", &body(&[3, 17]));
 
-        apply_request(&repo, &req(oid_uncommitted(), "f.txt", None), settings()).unwrap();
+        apply_request(
+            &repo,
+            &req(DiffSource::Uncommitted, "f.txt", None),
+            settings(),
+        )
+        .unwrap();
 
         let staged = index_blob(&repo, "f.txt");
         assert!(staged.contains("EDITED 3") && staged.contains("EDITED 17"));
@@ -1928,7 +1935,7 @@ mod tests {
         // `shown_deleted` because the pane showed the deletion — the menu derives
         // it from the delta status, and staging is refused without it (see
         // `stage_file_refuses_a_deletion_the_displayed_diff_did_not_show`).
-        let request = deleted_req(oid_uncommitted(), "f.txt");
+        let request = deleted_req(DiffSource::Uncommitted, "f.txt");
         apply_request(&repo, &request, settings()).unwrap();
 
         let index = repo.index().unwrap();
@@ -1942,7 +1949,7 @@ mod tests {
         write_file(&repo, "f.txt", &body(&[3, 17]));
         stage(&repo, "f.txt");
 
-        apply_request(&repo, &req(oid_staged(), "f.txt", None), settings()).unwrap();
+        apply_request(&repo, &req(DiffSource::Staged, "f.txt", None), settings()).unwrap();
 
         // Index back to HEAD; the worktree keeps the edits.
         assert!(!index_blob(&repo, "f.txt").contains("EDITED 3"));
@@ -1956,7 +1963,7 @@ mod tests {
         write_file(&repo, "new.txt", "brand new\n");
         stage(&repo, "new.txt");
 
-        apply_request(&repo, &req(oid_staged(), "new.txt", None), settings()).unwrap();
+        apply_request(&repo, &req(DiffSource::Staged, "new.txt", None), settings()).unwrap();
 
         let index = repo.index().unwrap();
         assert!(index.get_path(std::path::Path::new("new.txt"), 0).is_none());
@@ -1977,7 +1984,7 @@ mod tests {
 
         apply_request(
             &repo,
-            &renamed_req(oid_uncommitted(), "old.txt", "new.txt"),
+            &renamed_req(DiffSource::Uncommitted, "old.txt", "new.txt"),
             settings(),
         )
         .unwrap();
@@ -2012,7 +2019,7 @@ mod tests {
 
         apply_request(
             &repo,
-            &renamed_req(oid_staged(), "old.txt", "new.txt"),
+            &renamed_req(DiffSource::Staged, "old.txt", "new.txt"),
             settings(),
         )
         .unwrap();
@@ -2045,7 +2052,7 @@ mod tests {
 
         apply_request(
             &repo,
-            &req(oid_uncommitted(), "broken.link", None),
+            &req(DiffSource::Uncommitted, "broken.link", None),
             settings(),
         )
         .unwrap();
@@ -2064,13 +2071,18 @@ mod tests {
         commit_bytes(&repo, "b.bin", &[0u8, 1, 2, 3, 0, 5], "base");
         std::fs::write(&bin, [0u8, 9, 9, 9, 0, 5]).unwrap();
 
-        apply_request(&repo, &req(oid_uncommitted(), "b.bin", None), settings()).unwrap();
+        apply_request(
+            &repo,
+            &req(DiffSource::Uncommitted, "b.bin", None),
+            settings(),
+        )
+        .unwrap();
         let index = repo.index().unwrap();
         let entry = index.get_path(std::path::Path::new("b.bin"), 0).unwrap();
         let blob = repo.find_blob(entry.id).unwrap();
         assert_eq!(blob.content(), [0u8, 9, 9, 9, 0, 5]);
 
-        apply_request(&repo, &req(oid_staged(), "b.bin", None), settings()).unwrap();
+        apply_request(&repo, &req(DiffSource::Staged, "b.bin", None), settings()).unwrap();
         let index = repo.index().unwrap();
         let entry = index.get_path(std::path::Path::new("b.bin"), 0).unwrap();
         let blob = repo.find_blob(entry.id).unwrap();
@@ -2085,7 +2097,12 @@ mod tests {
         let path = repo.workdir().unwrap().join("s.sh");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        apply_request(&repo, &req(oid_uncommitted(), "s.sh", None), settings()).unwrap();
+        apply_request(
+            &repo,
+            &req(DiffSource::Uncommitted, "s.sh", None),
+            settings(),
+        )
+        .unwrap();
 
         let index = repo.index().unwrap();
         let entry = index.get_path(std::path::Path::new("s.sh"), 0).unwrap();
@@ -2110,7 +2127,7 @@ mod tests {
         write_file(&repo, "s.sh", "#!/bin/sh\necho changed\n");
         stage(&repo, "s.sh");
 
-        apply_request(&repo, &req(oid_staged(), "s.sh", None), settings()).unwrap();
+        apply_request(&repo, &req(DiffSource::Staged, "s.sh", None), settings()).unwrap();
 
         let index = repo.index().unwrap();
         let entry = index.get_path(std::path::Path::new("s.sh"), 0).unwrap();
@@ -2139,7 +2156,7 @@ mod tests {
 
         apply_request(
             &repo,
-            &req(oid_uncommitted(), "f.txt", Some(hunk)),
+            &req(DiffSource::Uncommitted, "f.txt", Some(hunk)),
             settings(),
         )
         .unwrap();
@@ -2155,7 +2172,12 @@ mod tests {
         let target = commit_file(&repo, "f.txt", &body(&[5]), "edit f");
         commit_file(&repo, "g.txt", "g changed later\n", "edit g");
 
-        apply_request(&repo, &req(target, "f.txt", None), settings()).unwrap();
+        apply_request(
+            &repo,
+            &req(DiffSource::Commit(target), "f.txt", None),
+            settings(),
+        )
+        .unwrap();
 
         assert!(
             !read_file(&repo, "f.txt").contains("EDITED 5"),
@@ -2175,7 +2197,12 @@ mod tests {
         commit_bytes(&repo, "b.bin", &[0u8, 1, 2, 3], "base");
         let target = commit_bytes(&repo, "b.bin", &[0u8, 9, 9, 9], "change binary");
 
-        apply_request(&repo, &req(target, "b.bin", None), settings()).unwrap();
+        apply_request(
+            &repo,
+            &req(DiffSource::Commit(target), "b.bin", None),
+            settings(),
+        )
+        .unwrap();
 
         assert_eq!(std::fs::read(&bin).unwrap(), [0u8, 1, 2, 3]);
     }
@@ -2201,8 +2228,12 @@ mod tests {
         std::fs::remove_file(&bin).unwrap();
         std::os::unix::fs::symlink(&store, &bin).unwrap();
 
-        let err = apply_request(&repo, &req(target, "b.bin", None), settings())
-            .expect_err("a symlink at the target path must not be written through");
+        let err = apply_request(
+            &repo,
+            &req(DiffSource::Commit(target), "b.bin", None),
+            settings(),
+        )
+        .expect_err("a symlink at the target path must not be written through");
 
         assert!(matches!(err, ApplyError::ChangedSinceCommit), "{err:?}");
         assert_eq!(
@@ -2227,7 +2258,12 @@ mod tests {
         // Someone changed it again since.
         std::fs::write(&bin, [7u8, 7, 7, 7]).unwrap();
 
-        let err = apply_request(&repo, &req(target, "b.bin", None), settings()).unwrap_err();
+        let err = apply_request(
+            &repo,
+            &req(DiffSource::Commit(target), "b.bin", None),
+            settings(),
+        )
+        .unwrap_err();
         assert!(matches!(err, ApplyError::ChangedSinceCommit), "{err:?}");
         assert_eq!(std::fs::read(&bin).unwrap(), [7u8, 7, 7, 7], "left alone");
     }
@@ -2250,7 +2286,11 @@ mod tests {
         write_file(&repo, "b.txt", &body(&[3]));
         let target = commit_rename(&repo, "a.txt", "b.txt", "rename a->b and edit");
 
-        let data = crate::diff::get_diff_data(&repo, target, settings(), &[], None);
+        let data = crate::diff::get_diff_data(
+            &repo,
+            &RowScope::new(DiffSource::Commit(target)),
+            settings(),
+        );
         let row = data
             .lines
             .iter()
@@ -2260,7 +2300,7 @@ mod tests {
 
         let request = ApplyRequest {
             hunk: Some(hunk),
-            ..renamed_req(target, "a.txt", "b.txt")
+            ..renamed_req(DiffSource::Commit(target), "a.txt", "b.txt")
         };
         let err = apply_request(&repo, &request, settings())
             .expect_err("a hunk click must not carry out the rename");
@@ -2287,7 +2327,7 @@ mod tests {
         .unwrap();
         let target = commit_rename(&repo, "a.txt", "b.txt", "rename a->b");
 
-        let request = renamed_req(target, "a.txt", "b.txt");
+        let request = renamed_req(DiffSource::Commit(target), "a.txt", "b.txt");
         apply_request(&repo, &request, settings()).unwrap();
 
         assert!(
@@ -2316,7 +2356,7 @@ mod tests {
         .unwrap();
         let target = commit_rename(&repo, "a.bin", "b.bin", "rename binary a->b");
 
-        let request = renamed_req(target, "a.bin", "b.bin");
+        let request = renamed_req(DiffSource::Commit(target), "a.bin", "b.bin");
         apply_request(&repo, &request, settings()).unwrap();
 
         assert_eq!(
@@ -2419,8 +2459,12 @@ mod tests {
 
         // The stale rename display: b.bin clicked, a.txt named as its old side,
         // so both reach the action pathspec — one binary delta, one text delta.
-        let err = apply_request(&repo, &renamed_req(target, "a.txt", "b.bin"), settings())
-            .expect_err("a mixed binary/text delta set has no route that can carry it");
+        let err = apply_request(
+            &repo,
+            &renamed_req(DiffSource::Commit(target), "a.txt", "b.bin"),
+            settings(),
+        )
+        .expect_err("a mixed binary/text delta set has no route that can carry it");
 
         assert!(matches!(err, ApplyError::Unsupported), "{err:?}");
         assert_eq!(
@@ -2476,7 +2520,7 @@ mod tests {
 
         let err = apply_request(
             &repo,
-            &renamed_req(target, "a/x.bin", "b/y.bin"),
+            &renamed_req(DiffSource::Commit(target), "a/x.bin", "b/y.bin"),
             settings(),
         )
         .expect_err("the removal cannot succeed, so the revert must fail");
@@ -2516,7 +2560,7 @@ mod tests {
         // Someone/something put different content at the pre-rename path since.
         std::fs::write(repo.workdir().unwrap().join("a.bin"), [9u8, 9, 9, 9]).unwrap();
 
-        let request = renamed_req(target, "a.bin", "b.bin");
+        let request = renamed_req(DiffSource::Commit(target), "a.bin", "b.bin");
         let err = apply_request(&repo, &request, settings()).unwrap_err();
         assert!(matches!(err, ApplyError::ChangedSinceCommit), "{err:?}");
 
@@ -2560,7 +2604,12 @@ mod tests {
             commit_index(&repo, &mut index, "edit both files")
         };
 
-        apply_request(&repo, &req(target, "a[1].bin", None), settings()).unwrap();
+        apply_request(
+            &repo,
+            &req(DiffSource::Commit(target), "a[1].bin", None),
+            settings(),
+        )
+        .unwrap();
 
         assert_eq!(
             read_file(&repo, "a[1].bin"),
@@ -2583,7 +2632,12 @@ mod tests {
         let bin = repo.workdir().unwrap().join("b.bin");
         let target = commit_bytes(&repo, "b.bin", &[0u8, 1, 2, 3], "add binary");
 
-        apply_request(&repo, &req(target, "b.bin", None), settings()).unwrap();
+        apply_request(
+            &repo,
+            &req(DiffSource::Commit(target), "b.bin", None),
+            settings(),
+        )
+        .unwrap();
 
         assert!(
             bin.symlink_metadata().is_err(),
@@ -2603,7 +2657,12 @@ mod tests {
         let target = commit_file(&repo, "f.txt", &body(&[5]), "edit line 5");
         commit_file(&repo, "f.txt", &body(&[5, 17]), "later edit, same file");
 
-        apply_request(&repo, &req(target, "f.txt", None), settings()).unwrap();
+        apply_request(
+            &repo,
+            &req(DiffSource::Commit(target), "f.txt", None),
+            settings(),
+        )
+        .unwrap();
 
         let wd = read_file(&repo, "f.txt");
         assert!(
@@ -2628,7 +2687,11 @@ mod tests {
         commit_file(&repo, "unrelated.txt", "x\n", "base");
         let target = commit_file(&repo, "changed.txt", &body(&[]), "add changed.txt");
 
-        let outcome = apply_request(&repo, &req(target, "unrelated.txt", None), settings());
+        let outcome = apply_request(
+            &repo,
+            &req(DiffSource::Commit(target), "unrelated.txt", None),
+            settings(),
+        );
 
         assert!(matches!(outcome, Err(ApplyError::Stale)), "{outcome:?}");
         assert_eq!(
@@ -2663,7 +2726,11 @@ mod tests {
         let (_d, repo) = temp_repo();
         let target = added_file_with_local_edits(&repo);
 
-        let outcome = apply_request(&repo, &req(target, "new.txt", None), settings());
+        let outcome = apply_request(
+            &repo,
+            &req(DiffSource::Commit(target), "new.txt", None),
+            settings(),
+        );
 
         // State first: the whole point is that nothing was destroyed. `read_to_string`
         // is fallible on purpose — a deleted file must read as `None`, not a panic.
@@ -2688,7 +2755,11 @@ mod tests {
         let (_d, repo) = temp_repo();
         let target = added_file_with_local_edits(&repo);
 
-        let data = crate::diff::get_diff_data(&repo, target, settings(), &[], None);
+        let data = crate::diff::get_diff_data(
+            &repo,
+            &RowScope::new(DiffSource::Commit(target)),
+            settings(),
+        );
         let row = data
             .lines
             .iter()
@@ -2696,7 +2767,11 @@ mod tests {
             .expect("the added file's body is in the diff");
         let hunk = hunk_at_line(&data.lines, row).expect("that row is inside a hunk");
 
-        let outcome = apply_request(&repo, &req(target, "new.txt", Some(hunk)), settings());
+        let outcome = apply_request(
+            &repo,
+            &req(DiffSource::Commit(target), "new.txt", Some(hunk)),
+            settings(),
+        );
 
         assert_eq!(
             still_on_disk(&repo, "new.txt").as_deref(),
@@ -2724,7 +2799,7 @@ mod tests {
         let stale = hr(500, 5, 500, 5);
         let err = apply_request(
             &repo,
-            &req(oid_uncommitted(), "f.txt", Some(stale)),
+            &req(DiffSource::Uncommitted, "f.txt", Some(stale)),
             settings(),
         )
         .unwrap_err();
@@ -2764,7 +2839,11 @@ mod tests {
 
         // Nowhere near the real hunk, which restores lines 1..=20.
         let stale = hr(500, 5, 500, 5);
-        let outcome = apply_request(&repo, &req(target, "f.txt", Some(stale)), settings());
+        let outcome = apply_request(
+            &repo,
+            &req(DiffSource::Commit(target), "f.txt", Some(stale)),
+            settings(),
+        );
 
         assert!(matches!(outcome, Err(ApplyError::Stale)), "{outcome:?}");
         assert!(
@@ -2802,7 +2881,7 @@ mod tests {
 
         apply_request(
             &repo,
-            &ApplyRequest::for_entry(oid_uncommitted(), f, Some(hunk)),
+            &ApplyRequest::for_entry(DiffSource::Uncommitted, f, Some(hunk)),
             settings(),
         )
         .unwrap();
@@ -2846,7 +2925,7 @@ mod tests {
             .position(|l| l.kind == crate::diff::LineKind::Add)
             .expect("the edit shows as an added line");
         let hunk = hunk_at_line(&data.lines, row).expect("that row is inside a hunk");
-        let request = ApplyRequest::for_entry(oid_uncommitted(), f, Some(hunk));
+        let request = ApplyRequest::for_entry(DiffSource::Uncommitted, f, Some(hunk));
 
         // The race: a build script / `git clean` / editor removes the file in the
         // gap between the display and the click.
@@ -2881,7 +2960,12 @@ mod tests {
             .expect("the whole new file shows as added lines");
         let hunk = hunk_at_line(&data.lines, row).expect("that row is inside a hunk");
 
-        apply_request(&repo, &req(oid_staged(), "new.txt", Some(hunk)), settings()).unwrap();
+        apply_request(
+            &repo,
+            &req(DiffSource::Staged, "new.txt", Some(hunk)),
+            settings(),
+        )
+        .unwrap();
 
         let index = repo.index().unwrap();
         assert!(
@@ -2908,7 +2992,11 @@ mod tests {
         commit_file(&repo, "unrelated.txt", "x\n", "base");
         let target = commit_file(&repo, "new.txt", &body(&[]), "add new.txt");
 
-        let data = crate::diff::get_diff_data(&repo, target, settings(), &[], None);
+        let data = crate::diff::get_diff_data(
+            &repo,
+            &RowScope::new(DiffSource::Commit(target)),
+            settings(),
+        );
         let row = data
             .lines
             .iter()
@@ -2916,7 +3004,12 @@ mod tests {
             .expect("the added file's body is in the diff");
         let hunk = hunk_at_line(&data.lines, row).expect("that row is inside a hunk");
 
-        apply_request(&repo, &req(target, "new.txt", Some(hunk)), settings()).unwrap();
+        apply_request(
+            &repo,
+            &req(DiffSource::Commit(target), "new.txt", Some(hunk)),
+            settings(),
+        )
+        .unwrap();
 
         assert!(
             still_on_disk(&repo, "new.txt").is_none(),
@@ -2956,7 +3049,8 @@ mod tests {
             index.write().unwrap();
         }
 
-        let err = apply_request(&repo, &req(oid_staged(), "sub", None), settings()).unwrap_err();
+        let err =
+            apply_request(&repo, &req(DiffSource::Staged, "sub", None), settings()).unwrap_err();
 
         assert!(matches!(err, ApplyError::Unsupported), "{err:?}");
         let index = repo.index().unwrap();
@@ -3029,7 +3123,7 @@ mod tests {
 
         apply_request(
             &repo,
-            &ApplyRequest::for_entry(oid_uncommitted(), f, None),
+            &ApplyRequest::for_entry(DiffSource::Uncommitted, f, None),
             settings(),
         )
         .unwrap();
@@ -3059,7 +3153,12 @@ mod tests {
         commit_file(&repo, "f.txt", &body(&[]), "base");
         write_file(&repo, "f.txt", &body(&[3]));
 
-        apply_request(&repo, &req(oid_uncommitted(), "f.txt", None), settings()).unwrap();
+        apply_request(
+            &repo,
+            &req(DiffSource::Uncommitted, "f.txt", None),
+            settings(),
+        )
+        .unwrap();
 
         let reopened = git2::Repository::open(dir.path()).unwrap();
         assert!(
@@ -3076,7 +3175,7 @@ mod tests {
         write_file(&repo, "f.txt", &body(&[3]));
         stage(&repo, "f.txt");
 
-        apply_request(&repo, &req(oid_staged(), "f.txt", None), settings()).unwrap();
+        apply_request(&repo, &req(DiffSource::Staged, "f.txt", None), settings()).unwrap();
 
         let reopened = git2::Repository::open(dir.path()).unwrap();
         assert!(
@@ -3102,7 +3201,7 @@ mod tests {
         let data = crate::diff::get_working_tree_diff(&repo, settings(), &[]);
         let f = &data.files[0];
         assert_eq!(f.status, git2::Delta::Modified);
-        let request = ApplyRequest::for_entry(oid_uncommitted(), f, None);
+        let request = ApplyRequest::for_entry(DiffSource::Uncommitted, f, None);
 
         // The race: the file goes away before the worker runs.
         std::fs::remove_file(repo.workdir().unwrap().join("f.txt")).unwrap();
@@ -3133,7 +3232,7 @@ mod tests {
 
         apply_request(
             &repo,
-            &ApplyRequest::for_entry(oid_uncommitted(), f, None),
+            &ApplyRequest::for_entry(DiffSource::Uncommitted, f, None),
             settings(),
         )
         .unwrap();
@@ -3175,8 +3274,12 @@ mod tests {
             "fixture must fail for a reason OTHER than absence (got {kind:?})"
         );
 
-        let err = apply_request(&repo, &req(oid_uncommitted(), "d/f.txt", None), settings())
-            .expect_err("an unreadable path must not be staged as a deletion");
+        let err = apply_request(
+            &repo,
+            &req(DiffSource::Uncommitted, "d/f.txt", None),
+            settings(),
+        )
+        .expect_err("an unreadable path must not be staged as a deletion");
 
         assert!(matches!(err, ApplyError::Git(_)), "{err:?}");
         let index = repo.index().unwrap();
@@ -3217,8 +3320,12 @@ mod tests {
             &numbered(40, &[(10, "EDITED"), (12, "EDITED")]),
         );
 
-        let err = apply_request(&repo, &req(oid_uncommitted(), "f.txt", Some(clicked)), ws)
-            .expect_err("an oversized hunk must be refused");
+        let err = apply_request(
+            &repo,
+            &req(DiffSource::Uncommitted, "f.txt", Some(clicked)),
+            ws,
+        )
+        .expect_err("an oversized hunk must be refused");
 
         assert!(
             matches!(err, ApplyError::Stale),
@@ -3253,8 +3360,12 @@ mod tests {
         let target = commit_index(&repo, &mut index, "retarget link -> bbb");
         drop(index);
 
-        let err = apply_request(&repo, &req(target, "l", None), settings())
-            .expect_err("a symlink revert must be refused, not reported as stale");
+        let err = apply_request(
+            &repo,
+            &req(DiffSource::Commit(target), "l", None),
+            settings(),
+        )
+        .expect_err("a symlink revert must be refused, not reported as stale");
 
         assert!(matches!(err, ApplyError::Unsupported), "{err:?}");
         assert_eq!(
@@ -3297,8 +3408,12 @@ mod tests {
         // Checked out, as a real submodule would be.
         std::fs::create_dir_all(repo.workdir().unwrap().join("vendor/lib")).unwrap();
 
-        let err = apply_request(&repo, &req(target, "vendor/lib", None), settings())
-            .expect_err("a submodule revert must be refused");
+        let err = apply_request(
+            &repo,
+            &req(DiffSource::Commit(target), "vendor/lib", None),
+            settings(),
+        )
+        .expect_err("a submodule revert must be refused");
 
         assert!(matches!(err, ApplyError::Unsupported), "{err:?}");
     }
@@ -3317,7 +3432,7 @@ mod tests {
         let data = crate::diff::get_working_tree_diff(&repo, settings(), &[]);
         let f = &data.files[0];
         assert_eq!(f.status, git2::Delta::Deleted);
-        let request = ApplyRequest::for_entry(oid_uncommitted(), f, None);
+        let request = ApplyRequest::for_entry(DiffSource::Uncommitted, f, None);
 
         // The race: a build script puts the file back before the worker runs.
         write_file(&repo, "generated.rs", "REGENERATED\n");
@@ -3352,7 +3467,7 @@ mod tests {
         corrupt_head(dir.path());
         let repo = git2::Repository::open(dir.path()).unwrap();
 
-        let err = apply_request(&repo, &req(oid_staged(), "f.txt", None), settings())
+        let err = apply_request(&repo, &req(DiffSource::Staged, "f.txt", None), settings())
             .expect_err("an unreadable HEAD must not read as 'HEAD has no such file'");
 
         assert!(matches!(err, ApplyError::Git(_)), "{err:?}");
@@ -3394,8 +3509,12 @@ mod tests {
         corrupt_head(dir.path());
         let repo = git2::Repository::open(dir.path()).unwrap();
 
-        let err = apply_request(&repo, &req(oid_staged(), "f.txt", Some(hunk)), settings())
-            .expect_err("an unreadable HEAD must not read as 'HEAD has nothing staged'");
+        let err = apply_request(
+            &repo,
+            &req(DiffSource::Staged, "f.txt", Some(hunk)),
+            settings(),
+        )
+        .expect_err("an unreadable HEAD must not read as 'HEAD has nothing staged'");
 
         assert!(matches!(err, ApplyError::Git(_)), "{err:?}");
         assert_eq!(
@@ -3437,8 +3556,12 @@ mod tests {
         remove_loose_object(dir.path(), sub);
         let repo = git2::Repository::open(dir.path()).unwrap();
 
-        let err = apply_request(&repo, &req(oid_staged(), "sub/f.txt", None), settings())
-            .expect_err("an unreadable sub-tree must not read as 'HEAD has no such file'");
+        let err = apply_request(
+            &repo,
+            &req(DiffSource::Staged, "sub/f.txt", None),
+            settings(),
+        )
+        .expect_err("an unreadable sub-tree must not read as 'HEAD has no such file'");
 
         assert!(matches!(err, ApplyError::Git(_)), "{err:?}");
         let index = repo.index().unwrap();
@@ -3468,8 +3591,12 @@ mod tests {
         remove_loose_object(dir.path(), first);
         let repo = git2::Repository::open(dir.path()).unwrap();
 
-        let err = apply_request(&repo, &req(target, "f.txt", None), settings())
-            .expect_err("an unreadable parent must not read as 'this commit added everything'");
+        let err = apply_request(
+            &repo,
+            &req(DiffSource::Commit(target), "f.txt", None),
+            settings(),
+        )
+        .expect_err("an unreadable parent must not read as 'this commit added everything'");
 
         assert!(matches!(err, ApplyError::Git(_)), "{err:?}");
         assert_eq!(
@@ -3533,7 +3660,12 @@ mod tests {
         commit_tree_with_mode(&repo, "100775", "f.bin", &[0u8, 1, 2, 3], "base, oddly");
         let target = commit_bytes(&repo, "f.bin", &[0u8, 9, 9, 9], "change it");
 
-        apply_request(&repo, &req(target, "f.bin", None), settings()).unwrap();
+        apply_request(
+            &repo,
+            &req(DiffSource::Commit(target), "f.bin", None),
+            settings(),
+        )
+        .unwrap();
 
         let path = repo.workdir().unwrap().join("f.bin");
         assert_eq!(
@@ -3560,8 +3692,12 @@ mod tests {
         let target = commit_tree_with_mode(&repo, "100775", "f.txt", b"changed one\n", "oddly");
         write_file(&repo, "f.txt", "changed one\n");
 
-        let err = apply_request(&repo, &req(target, "f.txt", None), settings())
-            .expect_err("libgit2 refuses the mode when it builds the preimage index");
+        let err = apply_request(
+            &repo,
+            &req(DiffSource::Commit(target), "f.txt", None),
+            settings(),
+        )
+        .expect_err("libgit2 refuses the mode when it builds the preimage index");
 
         assert!(matches!(err, ApplyError::Git(_)), "{err:?}");
         assert_eq!(
@@ -3600,7 +3736,7 @@ mod tests {
         write_file(&repo, "f.txt", "edited\n");
         stage(&repo, "f.txt");
 
-        apply_request(&repo, &req(oid_staged(), "f.txt", None), settings())
+        apply_request(&repo, &req(DiffSource::Staged, "f.txt", None), settings())
             .expect("unstaging must restore HEAD's entry, not reject its mode");
 
         assert_eq!(index_blob(&repo, "f.txt"), "base\n");
@@ -3649,7 +3785,7 @@ mod tests {
             assert!(index.has_conflicts(), "fixture must actually be conflicted");
         }
 
-        apply_request(&repo, &req(oid_staged(), "f.txt", None), settings()).unwrap();
+        apply_request(&repo, &req(DiffSource::Staged, "f.txt", None), settings()).unwrap();
 
         let index = repo.index().unwrap();
         assert!(
@@ -3696,7 +3832,7 @@ mod tests {
             "fixture must produce the split display this test is about"
         );
 
-        let req = req(oid_uncommitted(), "f.txt", Some(first));
+        let req = req(DiffSource::Uncommitted, "f.txt", Some(first));
         let err = apply_request(&repo, &req, ws)
             .expect_err("an indivisible hunk that exceeds the click must be refused");
 
@@ -3728,7 +3864,7 @@ mod tests {
         let hunk = hr(7, 7, 7, 7);
         let req = ApplyRequest {
             hunk: Some(hunk),
-            ..renamed_req(oid_uncommitted(), "old.txt", "new.txt")
+            ..renamed_req(DiffSource::Uncommitted, "old.txt", "new.txt")
         };
         let _ = apply_request(&repo, &req, settings());
 
@@ -3755,7 +3891,7 @@ mod tests {
 
         apply_request(
             &repo,
-            &ApplyRequest::for_entry(oid_staged(), b, None),
+            &ApplyRequest::for_entry(DiffSource::Staged, b, None),
             copy_settings(),
         )
         .unwrap();
@@ -3793,7 +3929,7 @@ mod tests {
 
         let err = apply_request(
             &repo,
-            &ApplyRequest::for_entry(oid_staged(), b, Some(hunk)),
+            &ApplyRequest::for_entry(DiffSource::Staged, b, Some(hunk)),
             copy_settings(),
         )
         .expect_err("a hunk on a copy cannot be applied");
@@ -3829,7 +3965,7 @@ mod tests {
 
         apply_request(
             &repo,
-            &ApplyRequest::for_entry(oid_uncommitted(), &b, None),
+            &ApplyRequest::for_entry(DiffSource::Uncommitted, &b, None),
             copy_settings(),
         )
         .unwrap();
@@ -3852,7 +3988,11 @@ mod tests {
         let oid = commit_index(&repo, &mut index, "copy a to b, edit a");
         drop(index);
 
-        let data = crate::diff::get_diff_data(&repo, oid, copy_settings(), &[], None);
+        let data = crate::diff::get_diff_data(
+            &repo,
+            &RowScope::new(DiffSource::Commit(oid)),
+            copy_settings(),
+        );
         let b = data
             .files
             .iter()
@@ -3862,7 +4002,7 @@ mod tests {
 
         apply_request(
             &repo,
-            &ApplyRequest::for_entry(oid, b, None),
+            &ApplyRequest::for_entry(DiffSource::Commit(oid), b, None),
             copy_settings(),
         )
         .unwrap();

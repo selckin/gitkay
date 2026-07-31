@@ -27,12 +27,11 @@ mod test_repo;
 mod word_diff;
 use config::{FileListLayout, Fonts, Role};
 use diff::{
-    CommitKind, CommitStats, DiffAnchor, DiffData, DiffLine, DiffSettings, FileEntry, LineKind,
-    StatsWant, anchor_hint, capture_anchor, commit_parent_diff, commit_stats, emphasize_rows,
-    file_index_at_line, file_index_at_line_opt, file_line_ranges, file_line_starts,
+    CommitKind, CommitStats, DiffAnchor, DiffData, DiffLine, DiffSettings, DiffSource, FileEntry,
+    LineKind, RowScope, StatsWant, anchor_hint, capture_anchor, commit_parent_diff, commit_stats,
+    emphasize_rows, file_index_at_line, file_index_at_line_opt, file_line_ranges, file_line_starts,
     format_commit_time, get_diff_data, hash_diff_content, is_real_commit, local_tz_offset_min,
-    next_file_line, oid_range, oid_staged, oid_uncommitted, pathspec_opts, resolve_anchor,
-    staged_git_diff, worktree_git_diff,
+    next_file_line, oid_staged, pathspec_opts, resolve_anchor, staged_git_diff, worktree_git_diff,
 };
 use diff_cache::DiffCache;
 use highlight::{DiffBg, HighlightLines, Highlighter};
@@ -125,16 +124,21 @@ impl VisibleRange {
 
 #[derive(Clone)]
 struct CommitInfo {
+    /// What this row's diff is taken over. The range row's endpoints ride in here, the
+    /// same arrangement as `follow_path` — per-row scope data recomputed on every
+    /// rebuild, so it cannot drift from the list that describes it. Everything below
+    /// this struct receives the source, never a kind plus a loose `Option`, so a range
+    /// without endpoints is unrepresentable rather than defended against.
+    source: diff::DiffSource,
+    /// `source.oid()`, cached: the row render, the graph layout and the per-keystroke
+    /// search all read it, and `DiffSource::oid` is a match plus (for the virtual rows)
+    /// a sentinel parse. Derived at construction, so the two cannot disagree.
     oid: git2::Oid,
     summary: String,
     author: String,
     parents: Vec<git2::Oid>,
     refs: Vec<(String, RefKind)>,
     follow_path: Option<String>, // in --follow mode, the file's name at this commit
-    /// On the combined range row only: the two commits whose trees it diffs. Per-row
-    /// scope data, recomputed on every rebuild — the same arrangement as `follow_path`,
-    /// so the endpoints cannot drift from the list that describes them.
-    range: Option<diff::RangeEnds>,
     // Derived once here, immutable per commit, so the hot paths don't recompute them:
     // the row render runs every frame, and search scans every commit each keystroke.
     // `time`/`tz_offset_min` aren't stored — they're only needed to format `date_str`.
@@ -151,7 +155,7 @@ impl CommitInfo {
     /// recomputing `to_lowercase`, the date format, and the short SHA every time.
     #[allow(clippy::too_many_arguments)]
     fn new(
-        oid: git2::Oid,
+        source: diff::DiffSource,
         summary: String,
         author: String,
         time: i64,
@@ -159,8 +163,8 @@ impl CommitInfo {
         parents: Vec<git2::Oid>,
         refs: Vec<(String, RefKind)>,
         follow_path: Option<String>,
-        range: Option<diff::RangeEnds>,
     ) -> Self {
+        let oid = source.oid();
         Self {
             summary_lc: summary.to_lowercase(),
             author_lc: author.to_lowercase(),
@@ -171,13 +175,13 @@ impl CommitInfo {
             } else {
                 String::new()
             },
+            source,
             oid,
             summary,
             author,
             parents,
             refs,
             follow_path,
-            range,
         }
     }
 }
@@ -1121,7 +1125,7 @@ fn build_commit_info(
     let author = commit.author();
     let when = author.when();
     CommitInfo::new(
-        oid,
+        diff::DiffSource::Commit(oid),
         commit
             .summary_bytes()
             .map(|b| String::from_utf8_lossy(b).into_owned())
@@ -1131,7 +1135,6 @@ fn build_commit_info(
         when.offset_minutes(),
         parents,
         ref_map.get(&oid).cloned().unwrap_or_default(),
-        None,
         None,
     )
 }
@@ -1231,26 +1234,6 @@ fn startup_selection(commits: &[CommitInfo], combined: bool) -> Option<usize> {
         .or_else(|| (!commits.is_empty()).then_some(0))
 }
 
-/// The range endpoints a row's diff needs — `Some` only for the combined range row.
-/// The mirror of `diff_paths_for`: per-row scope data read off the row itself, so a
-/// rebuild cannot leave the endpoints describing a list that has moved on.
-fn diff_range_for(commit: Option<&CommitInfo>) -> Option<diff::RangeEnds> {
-    commit.and_then(|c| c.range)
-}
-
-/// The per-row scope a diff needs beyond its cache key: the pathspec, and — for the
-/// combined range row — its endpoints.
-///
-/// One struct rather than two parallel fields on each of the three job types, so a new
-/// worker cannot pick up the pathspec and quietly forget the endpoints. That failure is
-/// silent rather than loud: `get_diff_data` would compute an EMPTY diff and
-/// `finalize_diff_key` would then cache it under a content hash.
-#[derive(Clone, Default)]
-struct RowScope {
-    paths: Vec<String>,
-    range: Option<diff::RangeEnds>,
-}
-
 fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitInfo> {
     let t = std::time::Instant::now();
     let ref_map = build_ref_map(repo);
@@ -1298,16 +1281,15 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
     let has_uncommitted = probe("uncommitted (diff_index_to_workdir)", worktree_git_diff);
 
     let virtual_row =
-        |oid: git2::Oid, title: &str, parents: Vec<git2::Oid>, chip: (&str, RefKind)| {
+        |source: diff::DiffSource, title: &str, parents: Vec<git2::Oid>, chip: (&str, RefKind)| {
             CommitInfo::new(
-                oid,
+                source,
                 title.to_string(),
                 String::new(),
                 chrono::Utc::now().timestamp(),
                 local_tz_offset_min(),
                 parents,
                 vec![(chip.0.to_string(), chip.1)],
-                None,
                 None,
             )
         };
@@ -1320,7 +1302,7 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
         // working-tree rows have none to offer.
         let when = repo.find_commit(ends.head).map(|c| c.author().when()).ok();
         commits.push(CommitInfo::new(
-            oid_range(),
+            diff::DiffSource::Range(ends),
             token,
             String::new(),
             when.map_or(0, |t| t.seconds()),
@@ -1330,14 +1312,13 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
             Vec::new(),
             vec![("range".to_string(), RefKind::Range)],
             None,
-            Some(ends),
         ));
     }
 
     // Add virtual entries at the top
     if has_uncommitted {
         commits.push(virtual_row(
-            oid_uncommitted(),
+            diff::DiffSource::Uncommitted,
             "Uncommitted changes",
             if has_staged {
                 vec![oid_staged()]
@@ -1349,7 +1330,7 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
     }
     if has_staged {
         commits.push(virtual_row(
-            oid_staged(),
+            diff::DiffSource::Staged,
             "Staged changes",
             head_oid.into_iter().collect(),
             ("index", RefKind::Index),
@@ -1553,14 +1534,13 @@ fn load_reflog(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitI
     for (i, entry) in reflog.iter().take(max).enumerate() {
         let committer = entry.committer();
         out.push(CommitInfo::new(
-            entry.id_new(),
+            diff::DiffSource::Commit(entry.id_new()),
             entry.message().ok().flatten().unwrap_or("").to_string(),
             committer.name().unwrap_or("").to_string(),
             committer.when().seconds(),
             committer.when().offset_minutes(),
             Vec::new(),
             vec![(format!("{refname}@{{{i}}}"), RefKind::Reflog)],
-            None,
             None,
         ));
     }
@@ -2528,7 +2508,7 @@ fn prefetch_worker(job: PrefetchJob) {
         };
         let t = std::time::Instant::now();
         log::debug!("prefetch: start {}", key.oid);
-        let mut data = get_diff_data(&repo, key.oid, key.settings, &scope.paths, scope.range);
+        let mut data = get_diff_data(&repo, &scope, key.settings);
         highlight_diff(&mut data.lines, &data.files, &hl);
         let (oid, lines) = (key.oid, data.lines.len());
         if tx.send((key, data)).is_err() {
@@ -2649,11 +2629,10 @@ fn diff_load_worker(job: DiffLoadJob) {
         return;
     }
     let t = std::time::Instant::now();
-    let kind = CommitKind::of(key.oid);
-    let mut data = get_diff_data(&repo, key.oid, key.settings, &scope.paths, scope.range);
+    let mut data = get_diff_data(&repo, &scope, key.settings);
     // Content-key a working-tree row off-thread here so an unchanged working tree hits
     // the cache and reuses its highlighting.
-    let key = finalize_diff_key(key, kind, &data);
+    let key = finalize_diff_key(key, scope.source.kind(), &data);
     log::debug!(
         "diff-load: {} ({} lines) in {:?}",
         key.oid,
@@ -2868,7 +2847,7 @@ struct StatsJob {
     /// Per-oid scope: under `--follow` each commit is asked about the name the file
     /// had AT that commit, matching the diff the pane would show; the range row is
     /// asked about its endpoints.
-    targets: Vec<(git2::Oid, RowScope)>,
+    targets: Vec<RowScope>,
     settings: DiffSettings,
     want: StatsWant,
     epoch: u64,
@@ -2938,16 +2917,17 @@ fn stats_worker(job: StatsJob) {
             // `report_batch_failed`. Reachable in practice: the repo can be
             // moved, unmounted or `git worktree remove`d with gitkay open.
             log::debug!("stats: repo discover failed: {e}");
-            let oids: Vec<git2::Oid> = targets.iter().map(|&(oid, _)| oid).collect();
+            let oids: Vec<git2::Oid> = targets.iter().map(|s| s.source.oid()).collect();
             report_batch_failed(&tx, epoch, &oids, &ctx);
             return;
         }
     };
-    for (oid, scope) in targets {
+    for scope in targets {
         if !current_epoch.is_current(epoch) {
             return; // invalidated; the UI cleared the in-flight set with the map
         }
-        let stats = commit_stats(&repo, oid, settings, &scope.paths, scope.range, want)
+        let oid = scope.source.oid();
+        let stats = commit_stats(&repo, &scope, settings, want)
             .inspect_err(|e| log::debug!("stats: {oid} failed: {e}"))
             .ok();
         if tx.send(StatsResult { epoch, oid, stats }).is_err() {
@@ -4410,11 +4390,23 @@ impl GitkApp {
     /// worker, the stats worker — calls this, so none can drift from the --follow path
     /// resolution or the range row's endpoints.
     fn row_scope(&self, oid: git2::Oid) -> RowScope {
-        let commit = self.commit_for(oid);
         RowScope {
-            paths: diff_paths_for(&self.scope, commit),
-            range: diff_range_for(commit),
+            source: self.row_source(oid),
+            paths: diff_paths_for(&self.scope, self.commit_for(oid)),
         }
+    }
+
+    /// What the row `oid` names diffs over — the ONE place an oid becomes a
+    /// `DiffSource`, so the range row's endpoints have a single way into the layers
+    /// below.
+    ///
+    /// The row is the authority, because that is where the endpoints live. A lookup
+    /// that misses can only be a real commit — a sentinel exists exactly while
+    /// `load_commits` has put its row in the list — and there the oid IS the whole
+    /// source, so this is the answer rather than a fallback.
+    fn row_source(&self, oid: git2::Oid) -> DiffSource {
+        self.commit_for(oid)
+            .map_or(DiffSource::Commit(oid), |c| c.source)
     }
 
     /// The row `oid` names, through the oid index — the single lookup every per-row
@@ -4440,8 +4432,8 @@ impl GitkApp {
             theme: self.theme,
             enabled: self.syntax_enabled,
             content: self
-                .commit_for(oid)
-                .and_then(|c| c.range)
+                .row_source(oid)
+                .range()
                 .map_or(0, diff::hash_range_ends),
         }
     }
@@ -4896,11 +4888,10 @@ impl GitkApp {
             // it here rather than on every navigation.
             match Repository::discover(&self.repo_path) {
                 Ok(repo) => {
-                    let kind = CommitKind::of(oid);
                     let scope = self.row_scope(oid);
-                    let data =
-                        get_diff_data(&repo, oid, self.diff_settings, &scope.paths, scope.range);
-                    let key = finalize_diff_key(self.diff_cache_key(oid), kind, &data);
+                    let data = get_diff_data(&repo, &scope, self.diff_settings);
+                    let key =
+                        finalize_diff_key(self.diff_cache_key(oid), scope.source.kind(), &data);
                     self.install_preferring_cache(key, data);
                 }
                 // No repo and no worker — clear the just-armed loading state so the pane
@@ -4972,7 +4963,7 @@ impl GitkApp {
     fn drain_apply_results(&mut self) {
         while let Ok(ApplyResult { req, outcome }) = self.apply_rx.try_recv() {
             self.apply_in_flight = false;
-            let action = apply::ApplyAction::of(req.oid);
+            let action = apply::ApplyAction::of(req.source.oid());
             let scope = if req.hunk.is_some() { "hunk" } else { "file" };
             match outcome {
                 Ok(()) => {
@@ -5240,10 +5231,9 @@ impl GitkApp {
         if targets.is_empty() {
             return;
         }
-        let jobs: Vec<(git2::Oid, RowScope)> = targets
-            .iter()
-            .map(|&oid| (oid, self.row_scope(oid)))
-            .collect();
+        // The oid rides inside each scope's source, so the batch is one value per row
+        // rather than a pair the worker has to keep aligned.
+        let jobs: Vec<RowScope> = targets.iter().map(|&oid| self.row_scope(oid)).collect();
         self.stats_inflight.extend(targets.iter().copied());
         let epoch = self.stats_epoch.current();
         let job = StatsJob {
@@ -5709,10 +5699,10 @@ impl GitkApp {
     ) -> Option<apply::ApplyRequest> {
         let oid = self.current_diff_key.as_ref().map(|k| k.oid)?;
         let file = self.diff_files.get(file_idx)?;
-        // From the row the displayed diff belongs to, like `oid` above — the range
-        // row's sentinel oid names no commit, so the endpoints are the only thing
-        // that says which trees a revert works between.
-        let range = self.row_scope(oid).range;
+        // The SOURCE, not the oid: the range row's sentinel names no commit, so its
+        // endpoints are the only thing that says which trees a revert works between.
+        // Read off the row the displayed diff belongs to, like `oid` above.
+        let source = self.row_source(oid);
         let verb = apply::ApplyAction::of(oid).verb();
         let busy = self.apply_in_flight;
         let mut chosen = None;
@@ -5725,7 +5715,7 @@ impl GitkApp {
             if hunk.is_none() {
                 let _ = hunk_item.on_disabled_hover_text("this row is not inside a hunk");
             } else if hunk_item.clicked() {
-                chosen = Some(apply::ApplyRequest::for_entry(oid, file, hunk).with_range(range));
+                chosen = Some(apply::ApplyRequest::for_entry(source, file, hunk));
                 ui.close();
             }
         }
@@ -5734,7 +5724,7 @@ impl GitkApp {
             .add_enabled(!busy, egui::Button::new(format!("{verb} file")))
             .clicked()
         {
-            chosen = Some(apply::ApplyRequest::for_entry(oid, file, None).with_range(range));
+            chosen = Some(apply::ApplyRequest::for_entry(source, file, None));
             ui.close();
         }
         chosen
@@ -7696,6 +7686,7 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff::oid_uncommitted;
     use crate::test_repo::{
         commit_file, commit_index, commit_rename, stage, temp_repo, write_file,
     };
@@ -7711,14 +7702,13 @@ mod tests {
     /// order (newest first), just like `load_commits` returns.
     fn commit(id: u32, parents: &[u32]) -> CommitInfo {
         CommitInfo::new(
-            oid(id),
+            DiffSource::Commit(oid(id)),
             format!("Commit {id}"),
             "test".into(),
             0,
             0,
             parents.iter().map(|p| oid(*p)).collect(),
             vec![],
-            None,
             None,
         )
     }
@@ -9092,24 +9082,32 @@ mod tests {
         );
     }
 
-    /// A bare `CommitInfo` carrying only an oid, for prefetch-target tests.
-    fn ci(oid: git2::Oid) -> CommitInfo {
+    /// The combined range row's source, over placeholder endpoints — for the tests that
+    /// only care THAT a row is the range row, not which range it spans.
+    fn range_row() -> DiffSource {
+        DiffSource::Range(diff::RangeEnds {
+            base: oid(1),
+            head: oid(2),
+        })
+    }
+
+    /// A bare `CommitInfo` carrying only a source, for prefetch-target tests.
+    fn ci(source: DiffSource) -> CommitInfo {
         CommitInfo::new(
-            oid,
+            source,
             String::new(),
             String::new(),
             0,
             0,
             Vec::new(),
             Vec::new(),
-            None,
             None,
         )
     }
 
     #[test]
     fn prefetch_targets_closest_first_below_wins_ties() {
-        let commits: Vec<CommitInfo> = (0..9).map(|n| ci(oid(n))).collect();
+        let commits: Vec<CommitInfo> = (0..9).map(|n| ci(DiffSource::Commit(oid(n)))).collect();
         // selected = 4, whole list visible. Ordered by |i-4|; on a tie the row below
         // (larger index) first: 5,3, 6,2, 7,1, 8,0. Capped at 4.
         assert_eq!(
@@ -9125,8 +9123,8 @@ mod tests {
 
     #[test]
     fn prefetch_targets_excludes_virtual_and_caps() {
-        let mut commits = vec![ci(oid_uncommitted()), ci(oid_staged())];
-        commits.extend((2..7).map(|n| ci(oid(n)))); // indices 2..=6
+        let mut commits = vec![ci(DiffSource::Uncommitted), ci(DiffSource::Staged)];
+        commits.extend((2..7).map(|n| ci(DiffSource::Commit(oid(n))))); // indices 2..=6
         // selected = 2 (first real), whole list visible. Virtual rows 0,1 excluded;
         // candidates 3,4,5,6 by distance; capped at 2.
         assert_eq!(prefetch_targets(&commits, 2, 0..7, 2), vec![oid(3), oid(4)]);
@@ -9182,7 +9180,12 @@ mod tests {
     /// object.
     #[test]
     fn stats_targets_skips_known_and_failed_rows() {
-        let commits = vec![ci(oid(1)), ci(oid(2)), ci(oid(3)), ci(oid(4))];
+        let commits = vec![
+            ci(DiffSource::Commit(oid(1))),
+            ci(DiffSource::Commit(oid(2))),
+            ci(DiffSource::Commit(oid(3))),
+            ci(DiffSource::Commit(oid(4))),
+        ];
         let mut known: HashMap<git2::Oid, Option<CommitStats>> = HashMap::new();
         known.insert(
             oid(2),
@@ -9209,7 +9212,10 @@ mod tests {
     /// patched over by blanking the whole map from the config reload.
     #[test]
     fn stats_targets_requeues_a_files_only_row_when_lines_are_wanted() {
-        let commits = vec![ci(oid(1)), ci(oid(2))];
+        let commits = vec![
+            ci(DiffSource::Commit(oid(1))),
+            ci(DiffSource::Commit(oid(2))),
+        ];
         let mut known: HashMap<git2::Oid, Option<CommitStats>> = HashMap::new();
         known.insert(
             oid(1),
@@ -9240,7 +9246,12 @@ mod tests {
     /// Only the visible window is computed — no margin.
     #[test]
     fn stats_targets_is_limited_to_the_visible_rows() {
-        let commits = vec![ci(oid(1)), ci(oid(2)), ci(oid(3)), ci(oid(4))];
+        let commits = vec![
+            ci(DiffSource::Commit(oid(1))),
+            ci(DiffSource::Commit(oid(2))),
+            ci(DiffSource::Commit(oid(3))),
+            ci(DiffSource::Commit(oid(4))),
+        ];
         let known = HashMap::new();
         assert_eq!(
             stats_targets(&commits, 1..3, &known, StatsWant::FilesAndLines),
@@ -9264,7 +9275,13 @@ mod tests {
     #[test]
     fn stats_targets_dedupes_reflog_repeated_oids() {
         // reset-and-back: oid(1) shows up again a couple of entries later.
-        let commits = vec![ci(oid(1)), ci(oid(2)), ci(oid(1)), ci(oid(3)), ci(oid(1))];
+        let commits = vec![
+            ci(DiffSource::Commit(oid(1))),
+            ci(DiffSource::Commit(oid(2))),
+            ci(DiffSource::Commit(oid(1))),
+            ci(DiffSource::Commit(oid(3))),
+            ci(DiffSource::Commit(oid(1))),
+        ];
         let known = HashMap::new();
         assert_eq!(
             stats_targets(&commits, 0..5, &known, StatsWant::FilesAndLines),
@@ -9567,9 +9584,9 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let targets = vec![
-            (c1, RowScope::default()),
-            (c2, RowScope::default()),
-            (oid_uncommitted(), RowScope::default()),
+            RowScope::new(DiffSource::Commit(c1)),
+            RowScope::new(DiffSource::Commit(c2)),
+            RowScope::new(DiffSource::Uncommitted),
         ];
         let epoch = Epoch::default();
         stats_worker(StatsJob {
@@ -9629,7 +9646,7 @@ mod tests {
         epoch.bump(); // an invalidation lands before the worker runs
         stats_worker(StatsJob {
             repo_path: dir.path().to_string_lossy().into_owned(),
-            targets: vec![(c1, RowScope::default())],
+            targets: vec![RowScope::new(DiffSource::Commit(c1))],
             settings: ds(),
             want: StatsWant::FilesAndLines,
             epoch: dispatched,
@@ -9666,7 +9683,10 @@ mod tests {
         let batch = [oid(1), oid(2), oid(3)];
         stats_worker(StatsJob {
             repo_path: missing.to_string_lossy().into_owned(),
-            targets: batch.iter().map(|&o| (o, RowScope::default())).collect(),
+            targets: batch
+                .iter()
+                .map(|&o| RowScope::new(DiffSource::Commit(o)))
+                .collect(),
             settings: ds(),
             want: StatsWant::FilesAndLines,
             epoch: dispatched,
@@ -10032,13 +10052,14 @@ mod tests {
         // Diff of c3 is scoped to a.txt: its file list is exactly [a.txt].
         let data = get_diff_data(
             &repo,
-            c3,
+            &RowScope {
+                source: DiffSource::Commit(c3),
+                paths: s.paths.clone(),
+            },
             DiffSettings {
                 show_stats: true,
                 ..ds()
             },
-            &s.paths,
-            None,
         );
         let files: Vec<&str> = data.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(files, vec!["a.txt"]);
@@ -10056,20 +10077,18 @@ mod tests {
 
         let on = get_diff_data(
             &repo,
-            c2,
+            &RowScope::new(DiffSource::Commit(c2)),
             DiffSettings {
                 show_stats: true,
                 ..ds()
             },
-            &[],
-            None,
         );
         assert!(
             on.lines.iter().any(|l| l.kind == LineKind::Stat),
             "show_stats=true must include the diffstat block"
         );
 
-        let off = get_diff_data(&repo, c2, ds(), &[], None);
+        let off = get_diff_data(&repo, &RowScope::new(DiffSource::Commit(c2)), ds());
         assert!(
             !off.lines.iter().any(|l| l.kind == LineKind::Stat),
             "show_stats=false must omit the diffstat block"
@@ -10097,7 +10116,7 @@ mod tests {
             detect_renames: true,
             ..ds()
         };
-        let files: Vec<String> = get_diff_data(&repo, oid, on, &[], None)
+        let files: Vec<String> = get_diff_data(&repo, &RowScope::new(DiffSource::Commit(oid)), on)
             .files
             .iter()
             .map(|f| f.path.clone())
@@ -10108,11 +10127,12 @@ mod tests {
             "rename detected ⇒ one entry"
         );
 
-        let mut files: Vec<String> = get_diff_data(&repo, oid, ds(), &[], None)
-            .files
-            .iter()
-            .map(|f| f.path.clone())
-            .collect();
+        let mut files: Vec<String> =
+            get_diff_data(&repo, &RowScope::new(DiffSource::Commit(oid)), ds())
+                .files
+                .iter()
+                .map(|f| f.path.clone())
+                .collect();
         files.sort();
         assert_eq!(
             files,
@@ -10136,7 +10156,7 @@ mod tests {
             detect_renames: true,
             ..ds()
         };
-        let data = get_diff_data(&repo, oid, s, &[], None);
+        let data = get_diff_data(&repo, &RowScope::new(DiffSource::Commit(oid)), s);
         assert_eq!(data.files.len(), 1);
         assert_eq!(data.files[0].path, "new.txt");
         assert_eq!(data.files[0].old_path.as_deref(), Some("old.txt"));
@@ -10176,7 +10196,7 @@ mod tests {
             detect_copies: true,
             ..ds()
         };
-        let data = get_diff_data(&repo, oid, s, &[], None);
+        let data = get_diff_data(&repo, &RowScope::new(DiffSource::Commit(oid)), s);
         let b = data
             .files
             .iter()
@@ -10443,7 +10463,7 @@ mod tests {
     fn diff_paths_for_follows_per_commit_name() {
         let mk = |o: git2::Oid, fp: Option<&str>| {
             CommitInfo::new(
-                o,
+                DiffSource::Commit(o),
                 String::new(),
                 String::new(),
                 0,
@@ -10451,7 +10471,6 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 fp.map(String::from),
-                None,
             )
         };
         let newer = mk(oid(2), Some("new.txt"));
@@ -10600,7 +10619,10 @@ mod tests {
             got[0].summary, token,
             "the row is labelled with the token as typed"
         );
-        assert_eq!(got[0].range, Some(diff::RangeEnds { base, head }));
+        assert_eq!(
+            got[0].source,
+            DiffSource::Range(diff::RangeEnds { base, head })
+        );
         assert!(
             got[0].parents.is_empty(),
             "the row contains B, it is not B's child"
@@ -10612,7 +10634,7 @@ mod tests {
         // The walked commits are still there, and carry no endpoints.
         let real: Vec<&CommitInfo> = got.iter().filter(|c| is_real_commit(c.oid)).collect();
         assert_eq!(real.len(), 2, "A..B excludes A");
-        assert!(real.iter().all(|c| c.range.is_none()));
+        assert!(real.iter().all(|c| c.source.range().is_none()));
     }
 
     #[test]
@@ -10629,12 +10651,19 @@ mod tests {
     /// `--combined` selects the row; without it the launch selection is unchanged.
     #[test]
     fn combined_flag_selects_the_range_row_at_startup() {
-        let commits = vec![ci(diff::oid_range()), ci(oid(1)), ci(oid(2))];
+        let commits = vec![
+            ci(range_row()),
+            ci(DiffSource::Commit(oid(1))),
+            ci(DiffSource::Commit(oid(2))),
+        ];
         assert_eq!(startup_selection(&commits, true), Some(0));
         assert_eq!(startup_selection(&commits, false), Some(1));
 
         // No range row: the flag has nothing to select and must not shift anything.
-        let plain = vec![ci(oid(1)), ci(oid(2))];
+        let plain = vec![
+            ci(DiffSource::Commit(oid(1))),
+            ci(DiffSource::Commit(oid(2))),
+        ];
         assert_eq!(startup_selection(&plain, true), Some(0));
         assert_eq!(startup_selection(&plain, false), Some(0));
 
@@ -10647,22 +10676,27 @@ mod tests {
     /// pane until it is clicked.
     #[test]
     fn a_lone_range_row_is_selected_even_without_the_flag() {
-        let only = vec![ci(diff::oid_range())];
+        let only = vec![ci(range_row())];
         assert_eq!(startup_selection(&only, false), Some(0));
         assert_eq!(startup_selection(&only, true), Some(0));
     }
 
+    /// A row's source is what the diff, the stats column and the write layer are all
+    /// handed, so the endpoints reaching them is the row's own doing — and a row that is
+    /// not the range row has none to hand over.
     #[test]
-    fn diff_range_for_reads_the_row() {
+    fn the_range_rows_source_carries_its_endpoints() {
         let ends = diff::RangeEnds {
             base: oid(1),
             head: oid(2),
         };
-        let mut row = ci(diff::oid_range());
-        row.range = Some(ends);
-        assert_eq!(diff_range_for(Some(&row)), Some(ends));
-        assert_eq!(diff_range_for(Some(&ci(oid(3)))), None);
-        assert_eq!(diff_range_for(None), None);
+        let row = ci(DiffSource::Range(ends));
+        assert_eq!(row.source.range(), Some(ends));
+        assert_eq!(row.oid, diff::oid_range(), "keyed under the sentinel");
+
+        let plain = ci(DiffSource::Commit(oid(3)));
+        assert_eq!(plain.source.range(), None);
+        assert_eq!(plain.oid, oid(3));
     }
 
     #[test]
