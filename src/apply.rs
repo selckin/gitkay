@@ -2250,8 +2250,7 @@ mod tests {
         write_file(&repo, "b.txt", &body(&[3]));
         let target = commit_rename(&repo, "a.txt", "b.txt", "rename a->b and edit");
 
-        let data =
-            crate::diff::get_diff_data(&repo, target, CommitKind::Real, settings(), &[], None);
+        let data = crate::diff::get_diff_data(&repo, target, settings(), &[], None);
         let row = data
             .lines
             .iter()
@@ -2689,14 +2688,7 @@ mod tests {
         let (_d, repo) = temp_repo();
         let target = added_file_with_local_edits(&repo);
 
-        let data = crate::diff::get_diff_data(
-            &repo,
-            target,
-            crate::diff::CommitKind::Real,
-            settings(),
-            &[],
-            None,
-        );
+        let data = crate::diff::get_diff_data(&repo, target, settings(), &[], None);
         let row = data
             .lines
             .iter()
@@ -2916,14 +2908,7 @@ mod tests {
         commit_file(&repo, "unrelated.txt", "x\n", "base");
         let target = commit_file(&repo, "new.txt", &body(&[]), "add new.txt");
 
-        let data = crate::diff::get_diff_data(
-            &repo,
-            target,
-            crate::diff::CommitKind::Real,
-            settings(),
-            &[],
-            None,
-        );
+        let data = crate::diff::get_diff_data(&repo, target, settings(), &[], None);
         let row = data
             .lines
             .iter()
@@ -3867,8 +3852,7 @@ mod tests {
         let oid = commit_index(&repo, &mut index, "copy a to b, edit a");
         drop(index);
 
-        let data =
-            crate::diff::get_diff_data(&repo, oid, CommitKind::Real, copy_settings(), &[], None);
+        let data = crate::diff::get_diff_data(&repo, oid, copy_settings(), &[], None);
         let b = data
             .files
             .iter()

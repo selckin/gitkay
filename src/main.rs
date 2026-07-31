@@ -294,10 +294,13 @@ const _: () = {
 };
 
 /// Everything a cached diff's content + spans depend on. `diff_bg` is excluded
-/// (it's a render-time tint, not baked into spans). `content` is 0 for real commits
-/// (the immutable oid already pins the content) and a hash of the generated diff text
-/// for the virtual uncommitted/staged entries — whose content tracks the working tree,
-/// so the same sentinel oid must not serve a stale highlighted diff.
+/// (it's a render-time tint, not baked into spans). `content` is what pins the row's
+/// contents when its oid does not: 0 for real commits (the immutable oid already
+/// pins it), a hash of the ENDPOINTS for the combined range row (two fixed oids naming
+/// two immutable trees), and a hash of the generated diff text for the uncommitted and
+/// staged entries — whose content tracks the working tree, so the same sentinel oid
+/// must not serve a stale highlighted diff. Only that last pair can be hashed after
+/// the fact; see `CommitKind::content_hashed_after_diff`.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct DiffCacheKey {
     oid: git2::Oid,
@@ -1201,18 +1204,21 @@ fn range_ends(repo: &Repository, scope: &cli::Scope) -> Option<(String, diff::Ra
     Some((token, diff::RangeEnds { base, head }))
 }
 
-/// Which row the window opens on: the combined range row when `--combined` asked for
-/// it, otherwise the first row that is NOT it.
+/// Which row the window opens on, as a preference order: the combined range row when
+/// `--combined` asked for it, else the first row that is NOT it, else whatever is there.
 ///
-/// Skipping the range row in the `false` case is the whole point of the flag existing.
-/// The row is always present for a range scope, but landing on it by default would
-/// change what `gitkay a..b` opens on for everyone already using it; the flag is how
-/// you ask for it.
+/// Preferring the other rows in the `false` case is the whole point of the flag
+/// existing. The row is present for any lone-range scope, but landing on it by default
+/// would change what `gitkay a..b` opens on for everyone already using it; the flag is
+/// how you ask for it.
+///
+/// The last rung is not the same as the second: a range whose walk is empty (`a..b`
+/// with `b` an ancestor of `a`) has the range row as its ONLY row, and "the first row
+/// that isn't it" answers nothing there — the window would open with a visible row, no
+/// selection, and a pane that stays empty until the user clicks. Preferring is the
+/// honest shape; refusing to select is only right when there are no rows at all.
 ///
 /// Pure and index-based so the rule is unit-testable without a repo or an egui context.
-/// `combined` is only ever true for a scope `cli::validate` accepted, but the row can
-/// still be absent (endpoints that no longer resolve), so the fallback is not dead code
-/// — it is the honest answer when there is nothing to select.
 fn startup_selection(commits: &[CommitInfo], combined: bool) -> Option<usize> {
     let range_at = commits
         .iter()
@@ -1220,7 +1226,9 @@ fn startup_selection(commits: &[CommitInfo], combined: bool) -> Option<usize> {
     if combined && let Some(i) = range_at {
         return Some(i);
     }
-    (0..commits.len()).find(|&i| Some(i) != range_at)
+    (0..commits.len())
+        .find(|&i| Some(i) != range_at)
+        .or_else(|| (!commits.is_empty()).then_some(0))
 }
 
 /// The range endpoints a row's diff needs — `Some` only for the combined range row.
@@ -1909,12 +1917,14 @@ fn show_virtualized_diff(
     });
 }
 
-/// Finalize a freshly computed diff's cache key: a virtual (uncommitted/staged) row is
-/// content-keyed, so mix a hash of the diff text into the key — a working-tree edit then
-/// re-keys and can't be served a stale cached diff. A real commit's oid already pins it.
-/// The single place the "virtual ⇒ content-keyed" rule lives.
+/// Finalize a freshly computed diff's cache key. The working-tree rows are the only
+/// ones whose `content` could not be filled in when the key was built, so mix a hash of
+/// the diff text in here — a working-tree edit then re-keys and can't be served a stale
+/// cached diff. A real commit's oid pins its content and the range row's endpoints pin
+/// its own (`GitkApp::diff_cache_key` hashed them already), so both are left alone. The
+/// single place the "content only knowable from the diff" rule lives.
 fn finalize_diff_key(mut key: DiffCacheKey, kind: CommitKind, data: &DiffData) -> DiffCacheKey {
-    if kind.is_virtual() {
+    if kind.content_hashed_after_diff() {
         key.content = hash_diff_content(data);
     }
     key
@@ -2518,14 +2528,7 @@ fn prefetch_worker(job: PrefetchJob) {
         };
         let t = std::time::Instant::now();
         log::debug!("prefetch: start {}", key.oid);
-        let mut data = get_diff_data(
-            &repo,
-            key.oid,
-            CommitKind::of(key.oid),
-            key.settings,
-            &scope.paths,
-            scope.range,
-        );
+        let mut data = get_diff_data(&repo, key.oid, key.settings, &scope.paths, scope.range);
         highlight_diff(&mut data.lines, &data.files, &hl);
         let (oid, lines) = (key.oid, data.lines.len());
         if tx.send((key, data)).is_err() {
@@ -2647,16 +2650,9 @@ fn diff_load_worker(job: DiffLoadJob) {
     }
     let t = std::time::Instant::now();
     let kind = CommitKind::of(key.oid);
-    let mut data = get_diff_data(
-        &repo,
-        key.oid,
-        kind,
-        key.settings,
-        &scope.paths,
-        scope.range,
-    );
-    // Content-key a virtual row off-thread here so an unchanged working tree hits the
-    // cache and reuses its highlighting.
+    let mut data = get_diff_data(&repo, key.oid, key.settings, &scope.paths, scope.range);
+    // Content-key a working-tree row off-thread here so an unchanged working tree hits
+    // the cache and reuses its highlighting.
     let key = finalize_diff_key(key, kind, &data);
     log::debug!(
         "diff-load: {} ({} lines) in {:?}",
@@ -4414,26 +4410,39 @@ impl GitkApp {
     /// worker, the stats worker — calls this, so none can drift from the --follow path
     /// resolution or the range row's endpoints.
     fn row_scope(&self, oid: git2::Oid) -> RowScope {
-        let commit = self
-            .commit_index_by_oid
-            .get(&oid)
-            .and_then(|&i| self.commits.get(i));
+        let commit = self.commit_for(oid);
         RowScope {
             paths: diff_paths_for(&self.scope, commit),
             range: diff_range_for(commit),
         }
     }
 
-    /// The cache key for a real commit (its immutable oid pins the content). The
-    /// virtual entries set `content` to a per-diff hash on top of this (see
-    /// `load_selected_diff`).
-    const fn diff_cache_key(&self, oid: git2::Oid) -> DiffCacheKey {
+    /// The row `oid` names, through the oid index — the single lookup every per-row
+    /// accessor shares. Cheap enough (one hash lookup, no clone) for the callers that
+    /// want one field, which `row_scope` is not: it clones the pathspec.
+    fn commit_for(&self, oid: git2::Oid) -> Option<&CommitInfo> {
+        self.commit_index_by_oid
+            .get(&oid)
+            .and_then(|&i| self.commits.get(i))
+    }
+
+    /// The cache key for a row, as complete as it can be before the diff exists.
+    ///
+    /// `content` is what pins the row's contents when its oid does not. A real
+    /// commit's oid already does, so it stays 0; the range row's endpoints do, and are
+    /// known right here; only the working-tree rows have to wait for their diff, and
+    /// `finalize_diff_key` fills theirs in afterwards. See
+    /// `CommitKind::content_hashed_after_diff`.
+    fn diff_cache_key(&self, oid: git2::Oid) -> DiffCacheKey {
         DiffCacheKey {
             oid,
             settings: self.diff_settings,
             theme: self.theme,
             enabled: self.syntax_enabled,
-            content: 0,
+            content: self
+                .commit_for(oid)
+                .and_then(|c| c.range)
+                .map_or(0, diff::hash_range_ends),
         }
     }
 
@@ -4455,11 +4464,13 @@ impl GitkApp {
         // commit (e.g. a fetch/rebase debounce), and navigating back to the on-screen
         // commit after overshooting to one that's still loading. In the latter, cancel
         // that abandoned load (bump the epoch, drop the loading state) so its result
-        // can't replace what's on screen. A real commit's diff is immutable so skipping
-        // the reload is safe; a virtual entry's stored key carries a content hash while
-        // diff_cache_key leaves it 0 here, so its key never matches and it always
-        // refreshes. Return without queueing any scroll restore so the user keeps
-        // their live position.
+        // can't replace what's on screen. Skipping the reload is safe exactly when the
+        // key pins the content: a real commit's oid does, and the range row's endpoints
+        // do — a rebuild that moved them (HEAD moving under `main..`) rebuilds the row
+        // with new ones, so the key differs and this doesn't fire. A working-tree row's
+        // stored key carries a content hash while diff_cache_key leaves it 0 here, so
+        // its key never matches and it always refreshes. Return without queueing any
+        // scroll restore so the user keeps their live position.
         let sel = self.selected.filter(|&s| s < self.commits.len());
         if let Some(oid) = self.selected_oid()
             && self.current_diff_key.as_ref() == Some(&self.diff_cache_key(oid))
@@ -4542,9 +4553,12 @@ impl GitkApp {
         // build the cache key once here.
         let key = self.diff_cache_key(oid);
 
-        // Real commit: an oid-keyed cache hit installs synchronously — no worker, no
+        // Key already complete: a cache hit installs synchronously — no worker, no
         // placeholder (neighbours are usually prefetched, so this is the common path).
-        if is_real_commit(oid)
+        // The range row qualifies alongside real commits, and it is the row that gains
+        // most: without it, every revisit regenerates a patch for every file the range
+        // touched.
+        if !CommitKind::of(oid).content_hashed_after_diff()
             && let Some(data) = self.diff_cache.remove(&key)
         {
             log::debug!(
@@ -4557,7 +4571,7 @@ impl GitkApp {
             return;
         }
 
-        // Cache miss (or a virtual entry): compute off the UI thread, keeping the
+        // Cache miss (or a working-tree row): compute off the UI thread, keeping the
         // previous diff on screen until the result lands (see dispatch_diff_load).
         // Resolve the row scope only here — a hit above must do no work, and under
         // --follow diff_paths_for is an O(commits) scan.
@@ -4592,9 +4606,10 @@ impl GitkApp {
                 std::mem::take(&mut self.diff_files),
                 self.diff_max_chars,
             );
-            // A virtual entry is content-keyed, so each working-tree edit produces a
-            // fresh hash and the previous content would linger under the same sentinel
-            // oid as unreachable dead weight. Drop superseded same-oid entries before
+            // A virtual entry is content-keyed, so each working-tree edit — or, for the
+            // range row, each move of its endpoints — produces a fresh hash and the
+            // previous content would linger under the same sentinel oid as unreachable
+            // dead weight. Drop superseded same-oid entries before
             // re-inserting — but only those sharing this key's settings/theme: an
             // entry stashed under OTHER settings (e.g. a different context width) is
             // still reachable by flipping the toolbar back, and a stale-content one
@@ -4736,14 +4751,15 @@ impl GitkApp {
     /// is reused instead of re-tokenized.
     fn install_preferring_cache(&mut self, key: DiffCacheKey, data: DiffData) {
         // The single point where a freshly computed diff becomes the displayed
-        // one (a virtual row never installs from the cache — load_selected_diff
-        // gates that on is_real_commit), so it is also where a working-tree edit
-        // becomes visible to the stats column. Before the early return: an
+        // one (a working-tree row never installs from the cache — load_selected_diff
+        // gates that on the key being complete), so it is also where a working-tree
+        // edit becomes visible to the stats column. Before the early return: an
         // unchanged key is exactly the "content did not move" case, and it must
         // still be recorded as seen.
         sync_virtual_stats(&mut self.virtual_diff_content, &mut self.commit_stats, &key);
-        // Same key ⇒ same content (real commits are oid+settings-keyed; virtual
-        // entries carry a content hash), so keep the on-screen copy — spans and
+        // Same key ⇒ same content (real commits are oid+settings-keyed; the range row
+        // carries an endpoint hash, the working-tree rows a diff hash), so keep the
+        // on-screen copy — spans and
         // scroll position included — and just clear the loading state. Nothing
         // moved, so a pending anchor has nothing to correct; dropping it here
         // keeps consumption exhaustive rather than leaving one to fire later.
@@ -4882,14 +4898,8 @@ impl GitkApp {
                 Ok(repo) => {
                     let kind = CommitKind::of(oid);
                     let scope = self.row_scope(oid);
-                    let data = get_diff_data(
-                        &repo,
-                        oid,
-                        kind,
-                        self.diff_settings,
-                        &scope.paths,
-                        scope.range,
-                    );
+                    let data =
+                        get_diff_data(&repo, oid, self.diff_settings, &scope.paths, scope.range);
                     let key = finalize_diff_key(self.diff_cache_key(oid), kind, &data);
                     self.install_preferring_cache(key, data);
                 }
@@ -8919,6 +8929,64 @@ mod tests {
         );
     }
 
+    /// The invariant the range row's synchronous cache hit rests on: the key its worker
+    /// caches a result under is the key the UI already built before dispatching. Taking
+    /// its `content` from the computed diff would break that — the UI cannot know that
+    /// value — which is exactly why the working-tree rows miss on every visit.
+    #[test]
+    fn finalize_only_re_keys_the_rows_that_had_nothing_else_to_pin_them() {
+        use highlight::EmbeddedThemeName as T;
+        let data = DiffData::new(
+            vec![diff::DiffLine::new("+x", diff::LineKind::Add)],
+            Vec::new(),
+        );
+        let key = |o: git2::Oid, content: u64| DiffCacheKey {
+            oid: o,
+            settings: ds(),
+            theme: T::CatppuccinMocha,
+            enabled: true,
+            content,
+        };
+
+        let ends = diff::RangeEnds {
+            base: oid(1),
+            head: oid(2),
+        };
+        let pinned = diff::hash_range_ends(ends);
+        assert_eq!(
+            finalize_diff_key(key(diff::oid_range(), pinned), CommitKind::Range, &data).content,
+            pinned,
+            "the endpoints already pinned it — finalize must leave the key alone"
+        );
+        assert_eq!(
+            finalize_diff_key(key(oid(3), 0), CommitKind::Real, &data).content,
+            0,
+            "a real commit's oid pins it"
+        );
+        assert_ne!(
+            finalize_diff_key(
+                key(diff::oid_uncommitted(), 0),
+                CommitKind::Uncommitted,
+                &data
+            )
+            .content,
+            0,
+            "nothing but the diff pins a working-tree row"
+        );
+    }
+
+    /// Endpoint keying is only sound if the hash moves whenever the endpoints do —
+    /// `HEAD` advancing under `main..` resolves a new head oid, and the diff cached for
+    /// the old pair must not be served for the new one.
+    #[test]
+    fn the_range_key_moves_with_its_endpoints() {
+        let h = |base, head| diff::hash_range_ends(diff::RangeEnds { base, head });
+        assert_eq!(h(oid(1), oid(2)), h(oid(1), oid(2)));
+        assert_ne!(h(oid(1), oid(2)), h(oid(1), oid(3)), "head moved");
+        assert_ne!(h(oid(1), oid(2)), h(oid(3), oid(2)), "base moved");
+        assert_ne!(h(oid(1), oid(2)), h(oid(2), oid(1)), "the pair is ordered");
+    }
+
     #[test]
     fn diff_cache_key_includes_detect_toggles() {
         let key = |detect_renames: bool, detect_copies: bool| DiffCacheKey {
@@ -9965,7 +10033,6 @@ mod tests {
         let data = get_diff_data(
             &repo,
             c3,
-            CommitKind::Real,
             DiffSettings {
                 show_stats: true,
                 ..ds()
@@ -9990,7 +10057,6 @@ mod tests {
         let on = get_diff_data(
             &repo,
             c2,
-            CommitKind::Real,
             DiffSettings {
                 show_stats: true,
                 ..ds()
@@ -10003,7 +10069,7 @@ mod tests {
             "show_stats=true must include the diffstat block"
         );
 
-        let off = get_diff_data(&repo, c2, CommitKind::Real, ds(), &[], None);
+        let off = get_diff_data(&repo, c2, ds(), &[], None);
         assert!(
             !off.lines.iter().any(|l| l.kind == LineKind::Stat),
             "show_stats=false must omit the diffstat block"
@@ -10031,7 +10097,7 @@ mod tests {
             detect_renames: true,
             ..ds()
         };
-        let files: Vec<String> = get_diff_data(&repo, oid, CommitKind::Real, on, &[], None)
+        let files: Vec<String> = get_diff_data(&repo, oid, on, &[], None)
             .files
             .iter()
             .map(|f| f.path.clone())
@@ -10042,7 +10108,7 @@ mod tests {
             "rename detected ⇒ one entry"
         );
 
-        let mut files: Vec<String> = get_diff_data(&repo, oid, CommitKind::Real, ds(), &[], None)
+        let mut files: Vec<String> = get_diff_data(&repo, oid, ds(), &[], None)
             .files
             .iter()
             .map(|f| f.path.clone())
@@ -10070,7 +10136,7 @@ mod tests {
             detect_renames: true,
             ..ds()
         };
-        let data = get_diff_data(&repo, oid, CommitKind::Real, s, &[], None);
+        let data = get_diff_data(&repo, oid, s, &[], None);
         assert_eq!(data.files.len(), 1);
         assert_eq!(data.files[0].path, "new.txt");
         assert_eq!(data.files[0].old_path.as_deref(), Some("old.txt"));
@@ -10110,7 +10176,7 @@ mod tests {
             detect_copies: true,
             ..ds()
         };
-        let data = get_diff_data(&repo, oid, CommitKind::Real, s, &[], None);
+        let data = get_diff_data(&repo, oid, s, &[], None);
         let b = data
             .files
             .iter()
@@ -10573,6 +10639,17 @@ mod tests {
         assert_eq!(startup_selection(&plain, false), Some(0));
 
         assert_eq!(startup_selection(&[], true), None);
+    }
+
+    /// An empty walk (`a..b` with `b` an ancestor of `a`) leaves the range row alone in
+    /// the list. Without the flag it is not PREFERRED, but it is still the only thing
+    /// there — selecting nothing would open a window whose one visible row has an empty
+    /// pane until it is clicked.
+    #[test]
+    fn a_lone_range_row_is_selected_even_without_the_flag() {
+        let only = vec![ci(diff::oid_range())];
+        assert_eq!(startup_selection(&only, false), Some(0));
+        assert_eq!(startup_selection(&only, true), Some(0));
     }
 
     #[test]
