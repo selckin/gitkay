@@ -39,9 +39,21 @@ cp target/release/gitkay ~/.local/bin/   # install
   (openSUSE: `gtk4-devel libgraphene-devel openssl-devel`).
 - Rust deps of note: `fontdb` (system-font name → file lookup), `dirs` (XDG paths),
   `serde` + `toml` (config).
-- CLI: `gitkay [-C <dir>] [--all] [<rev>…] [-- <path>…]`, `gitkay --reflog [<ref>]`,
-  `gitkay --follow [<rev>…] <path>` (`--follow` needs exactly one path). The
-  rev-vs-path classification of positional tokens lives in `cli.rs`.
+- CLI: `gitkay [-C <dir>] [--all] [--combined] [<rev>…] [-- <path>…]`,
+  `gitkay --reflog [<ref>]`, `gitkay --follow [<rev>…] <path>` (`--follow` needs exactly
+  one path). The rev-vs-path classification of positional tokens lives in `cli.rs`, as do
+  `range_tokens`/`combined_range` — the single answer to "is this scope a lone `A..B`?",
+  asked both by `validate` (for the usage error) and by `load_commits` (for whether to
+  build the combined row), so the flag can never be accepted for a scope that then
+  produces no row. Which flags *deny* the row is likewise one datum, `combined_conflict`:
+  `combined_range` filters on it and `validate` names its answer in the usage error, so a
+  fourth mutually-exclusive flag cannot be added to one and forgotten in the other.
+  `RangeTokens::token` carries the token as typed — the label the row gets — so "which
+  token is the range" is decided where it is matched, not re-derived from `revs`.
+  `validate` takes the whole `Scope` because it needs
+  `all`/`reflog`/`follow`/`combined` plus the revs, and four bool params would trip
+  `clippy::fn_params_excessive_bools`; `main()` therefore builds the `Scope` *before*
+  validating it.
 
 ## CI & Release
 
@@ -160,6 +172,12 @@ parts run off the window-creation critical path:
   holding it longer is the worse lie. Both the pane and the sidebar read one snapshot
   (`showing_placeholder`) so they cannot disagree mid-frame, and a rebuild also skips the
   wake-at-threshold repaint, having no threshold to flip at.
+  A worker's per-row scope — the pathspec and, for the combined range row, its
+  endpoints — travels as one `RowScope` (built by `GitkApp::row_scope`, the single
+  accessor all three job types use) rather than as two parallel fields on each job, so a
+  new worker cannot pick up the pathspec and quietly forget the endpoints. That failure
+  is silent, not loud: `get_diff_data` would compute an EMPTY diff and
+  `finalize_diff_key` would cache it under a content hash.
   `diff_load_started_at: Option<Instant>` is the *only* in-flight flag —
   preserved across rapid re-dispatch (`get_or_insert`), cleared on apply/fail/cancel. A
   monotonic `diff_load_epoch` (bumped per selection and by every synchronous install)
@@ -382,7 +400,34 @@ parts run off the window-creation critical path:
 ### Write actions (`src/apply.rs`)
 Right-click in the diff pane or the file sidebar to act on a hunk or a file. The verb
 comes from the row kind via `ApplyAction::of` → `CommitKind::of` (uncommitted ⇒ Stage,
-staged ⇒ Unstage, real commit ⇒ Revert). Every action is reversible, so none prompts.
+staged ⇒ Unstage, real commit **or combined range** ⇒ Revert). Every action is
+reversible, so none prompts.
+
+A commit revert and a range revert are the **same operation over a different pair of
+trees** — `(commit.tree(), parent.tree())` vs `(tree(head), tree(base))` — so there is
+one mechanism, not two. `RevertTrees` is that pair, named for its two sides rather than
+for a commit and its parent, and `RevertTrees::of_request` is the single place a request
+becomes one (dispatching on `CommitKind`, exhaustively). `action_diff` and `revert_file`
+both call it, so the modes a guard decides on can never be read off a different pair than
+the deltas came from. Every guard downstream reads the pair, not the row, which is why
+`refuse_unwritable_modes`, `restore_binary` and `guard_workdir_deletions` needed **no
+change at all** to cover ranges.
+
+The range row's sentinel oid names no commit, so unlike every other row its `oid` alone
+cannot say which trees to diff: `ApplyRequest::range` carries them (taken from the row
+whose diff is on screen, like the oid itself), and `of_request` refuses with
+`Unsupported` rather than falling back to the sentinel. A range's `before` tree is never
+legitimately `None` — unlike a root commit's parent — so any failure to read it is an
+error, not an empty tree that would read as "delete everything the range added".
+
+Two consequences worth knowing. A range diff can show a file as `Added` that was added
+and *then modified* inside the range, and a whole-file revert deletes the worktree copy —
+`guard_workdir_deletions` permits that only while the worktree still matches
+`tree(head)`. And renames are far more common in a range than in a commit (any rename
+anywhere inside it surfaces), so `RenameNeedsWholeFile` fires more often; it still names
+the action that works. Text still goes through the patch pipeline, so a later edit
+*elsewhere* in a file is preserved rather than refused — same promise as the commit
+route.
 
 Patch application is the mechanism for **hunks**, not for everything:
 - **whole-file stage/unstage** are direct index operations (`index.add_path` / restore the
@@ -527,9 +572,10 @@ libgit2 will not take them for us:
   importer's `100775` crashed the write worker instead of reverting. `TreeEntry::filemode`
   is libgit2's own normalization of that same value and returns a plain `i32` — git's rule
   rather than a reimplementation of it, and no `unsafe` to reach the raw field. The diff is
-  reversed, so a delta's old side is an entry of the commit's tree and its new side an entry
-  of the parent's; `RevertTrees::of` resolves both from the request's oid through the same
-  `parent_tree_for_write` that built the diff, so the modes cannot come off a different pair
+  reversed, so a delta's old side is an entry of the `after` tree and its new side an entry
+  of `before`; `RevertTrees::of_request` resolves the pair once — a commit's through
+  `parent_tree_for_write`, a range's through `diff::range_trees`, the same resolution the
+  pane's own `range_git_diff` runs — so the modes cannot come off a different pair
   of trees than the deltas did. (The binary route then reverts such a file correctly; on the
   patch route libgit2 itself declines the non-canonical mode when it builds the preimage
   index — its call, and an honest error instead of a crashed worker.)
@@ -686,4 +732,5 @@ ones that actually fail when the write is removed.
 - Branch highlighting walks first-parent children upward, but all parents downward, so merge commits keep merged history highlighted
 - File-list sidebar is not row-virtualized — every row draws each frame, so per-row file text goes through `SidebarCache`: elided labels (laid out in `Color32::PLACEHOLDER` so normal/hover color applies at paint time) and `+n`/`-n` stat galleys are built once per (diff, width, font) — `rebuild_file_rows` and a font reload reset the cache, `ensure` re-keys it on width change. `build_file_rows` (pure) turns `(new_path, Option<old_path>)` pairs into header/file rows per `[diff] file_list` (`grouped` = one header per directory, files sorted by label; renames/copies group under their `rename_brace` common directory); `left_elide` left-truncates labels, measuring the full string once and binary-searching only when it overflows (directory headers still elide per frame — they're the minority of rows). `grouped` directory headers are drawn breadcrumb-style (`draw_dir_header` + `common_dir_prefix_len`): the ancestor path a header shares with the header drawn just above it is dimmed (`SUBTEXT_DIM`) and the distinguishing tail is `SUBTEXT`, so deep trees don't repeat the same long prefix on every header
 - Any new diff-*data*-affecting setting goes in `DiffSettings` only. `GitkApp` holds one `DiffSettings` field (the diff-shaping state — `context`/`ignore_ws` are toolbar-owned + persisted, `show_stats`/`detect_renames`/`detect_copies` come from `[diff]` config), and `DiffCacheKey` *embeds* a `DiffSettings`. So a field added to `DiffSettings` is automatically (a) part of the cache key — cached diffs invalidate when it changes, no second edit site — and (b) covered by the config-reload's whole-struct comparison (`new_settings != self.diff_settings`), which triggers the re-diff. The prefetch mapping reads it back as `key.settings`. Settings that only change *spans* (theme, syntax on/off, `diff_bg`) or *render* (`word_diff`, `file_list`) are handled by their own branches in the config-reload block, not `DiffSettings`.
-- The uncommitted/staged rows are "virtual": each has a fixed sentinel oid (`oid_uncommitted`/`oid_staged`) — which the graph layout needs as a node id — but is classified by `CommitKind::of(oid)`, the single place that maps oid → `Real`/`Uncommitted`/`Staged`. `get_diff_data` dispatches on the `CommitKind` (exhaustive — a new kind can't fall through to the commit path), and the "virtual ⇒ content-keyed cache entry" rule lives only in `finalize_diff_key`. Don't re-derive virtual-ness by comparing sentinel oids at call sites; ask `CommitKind::of` (or `is_real_commit`, which delegates to it)
+- The uncommitted/staged/combined-range rows are "virtual": each has a fixed sentinel oid (`oid_uncommitted`/`oid_staged`/`oid_range`) — which the graph layout needs as a node id — but is classified by `CommitKind::of(oid)`, the single place that maps oid → `Real`/`Uncommitted`/`Staged`/`Range`. `get_diff_data` dispatches on the `CommitKind` (exhaustive — a new kind can't fall through to the commit path), and the "virtual ⇒ content-keyed cache entry" rule lives only in `finalize_diff_key`. Don't re-derive virtual-ness by comparing sentinel oids at call sites; ask `CommitKind::of` (or `is_real_commit`, which delegates to it).
+  The **range** row is virtual for the same reason the other two are: its sentinel is fixed while its endpoints move with `HEAD`, so content keying and every existing eviction path cover it without a second rule. Its endpoints ride on its own `CommitInfo::range` (read back by `diff_range_for`, resolved by `range_ends`), the way `--follow`'s per-commit path rides on `follow_path` — per-row scope data recomputed on every rebuild, never held beside the list it describes. It carries **no parents**: it contains the head commit rather than descending from it, so a lane down to it would draw the opposite. It cannot co-occur with the uncommitted/staged rows, because `show_local` needs `scope.all || scope.revs.is_empty()` and a range scope has revs — which is what makes its index-0 position unambiguous

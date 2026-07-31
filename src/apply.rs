@@ -20,7 +20,10 @@ impl ApplyAction {
         match CommitKind::of(oid) {
             CommitKind::Uncommitted => Self::Stage,
             CommitKind::Staged => Self::Unstage,
-            CommitKind::Real => Self::Revert,
+            // A range is reverted like a commit — the same reversed tree pair applied
+            // to the worktree, just resolved from two endpoints instead of from a
+            // commit and its parent. `RevertTrees::of_request` is where that happens.
+            CommitKind::Real | CommitKind::Range => Self::Revert,
         }
     }
 
@@ -39,6 +42,10 @@ impl ApplyAction {
 pub struct ApplyRequest {
     /// The row the diff belongs to — classified by `ApplyAction::of`.
     pub oid: git2::Oid,
+    /// The combined range row's endpoints. `Some` only for `CommitKind::Range`, whose
+    /// sentinel oid names no commit — so unlike every other row, `oid` alone cannot say
+    /// which trees to diff. Resolved into a pair by `RevertTrees::of_request`.
+    pub range: Option<RangeEnds>,
     /// Target file, new-side path, as RAW BYTES — the identity key
     /// `FileEntry::path_bytes` uses. Not the `String`: `FileEntry::path` is built
     /// with `from_utf8_lossy` for display, so a non-UTF-8 name arrives with
@@ -74,11 +81,21 @@ impl ApplyRequest {
     ) -> Self {
         Self {
             oid,
+            range: None,
             path: file.path_bytes.clone(),
             old_path: file.old_path_bytes.clone(),
             status: file.status,
             hunk,
         }
+    }
+
+    /// Attach the combined range row's endpoints. Separate from `for_entry` because
+    /// only that one row has any: every other row's `oid` already says which trees to
+    /// diff, and a positional `None` there reads as nothing but noise next to `hunk`'s.
+    #[must_use]
+    pub const fn with_range(mut self, range: Option<RangeEnds>) -> Self {
+        self.range = range;
+        self
     }
 
     /// The old path of a genuine RENAME — never a copy's source.
@@ -298,8 +315,7 @@ pub const fn hunk_fit(clicked: &HunkRange, generated: &HunkRange, reversed: bool
 }
 
 use crate::diff::{
-    DiffSettings, commit_diff_against, detect_similar, diff_opts, staged_diff_against,
-    worktree_git_diff,
+    DiffSettings, RangeEnds, detect_similar, diff_opts, staged_diff_against, worktree_git_diff,
 };
 use git2::{ApplyLocation, ApplyOptions, DiffOptions, Repository};
 use std::cell::Cell;
@@ -362,12 +378,14 @@ fn action_diff_opts(
 /// |---------|----------------------|---------|----------|-------------------------|
 /// | Stage   | `worktree_git_diff`  | no      | `Index`   | `git apply --cached`    |
 /// | Unstage | `staged_diff_against`| yes     | `Index`   | `git apply -R --cached` |
-/// | Revert  | `commit_diff_against`| yes     | `WorkDir` | `git apply -R`          |
+/// | Revert  | `RevertTrees::diff`  | yes     | `WorkDir` | `git apply -R`          |
 ///
-/// The two reversed routes take the `_against` variants, resolving HEAD and the
-/// first parent through this module's own `*_for_write` helpers: the display
-/// builders fold an unreadable tree into "there is no tree", which for a write is
-/// a silent whole-file deletion reported as a success (see each helper).
+/// The two reversed routes resolve their trees through this module's own
+/// `*_for_write` helpers — `staged_diff_against` takes HEAD, `RevertTrees::of_request`
+/// takes the pair — because the display builders fold an unreadable tree into "there is
+/// no tree", which for a write is a silent whole-file deletion reported as a success
+/// (see each helper). Revert is the one route whose pair depends on the row KIND: a
+/// commit and its first parent, or a range's two endpoints.
 fn action_diff<'r>(
     repo: &'r Repository,
     req: &ApplyRequest,
@@ -384,12 +402,11 @@ fn action_diff<'r>(
             ApplyLocation::Index,
         ),
         ApplyAction::Revert => {
-            let commit = repo.find_commit(req.oid)?;
-            let parent = parent_tree_for_write(&commit)?;
-            (
-                commit_diff_against(repo, &commit, parent.as_ref(), Some(&mut opts))?,
-                ApplyLocation::WorkDir,
-            )
+            // Same resolution path `revert_file` uses, so a range and a commit reach
+            // the diff builder identically. The trees are dropped at the end of this
+            // arm: the returned `Diff` borrows the repo, not them.
+            let trees = RevertTrees::of_request(repo, req)?;
+            (trees.diff(repo, &mut opts)?, ApplyLocation::WorkDir)
         }
     };
     // Rename/copy coalescing is a post-pass, not a DiffOptions flag — run the same
@@ -635,32 +652,69 @@ const MODE_GITLINK: i32 = 0o160_000;
 /// exactly that value and returns a plain `i32`, so the trees can answer what the
 /// diff cannot — with git's own rule rather than a reimplementation of it.
 ///
-/// The diff is REVERSED (see `action_diff`), so a delta's old side is an entry of
-/// the commit's tree and its new side an entry of the parent's.
+/// The diff is REVERSED (see `action_diff`), so a delta's old side is an entry of the
+/// `after` tree and its new side an entry of `before`.
+///
+/// Named for the two SIDES rather than for a commit and its parent, because a commit
+/// revert and a range revert are the same operation over a different pair: a commit is
+/// `(commit.tree(), parent.tree())`, a range is `(tree(head), tree(base))`. Every guard
+/// downstream — modes, binary restore, workdir deletions — reads the pair, not the row,
+/// which is why supporting ranges needed no second mechanism.
 struct RevertTrees<'r> {
-    commit: git2::Tree<'r>,
-    parent: Option<git2::Tree<'r>>,
+    after: git2::Tree<'r>,
+    before: Option<git2::Tree<'r>>,
 }
 
 impl<'r> RevertTrees<'r> {
-    /// Resolved from the same oid, and through the same `parent_tree_for_write`,
-    /// that built the diff — so the modes can never be read off a different pair
-    /// of trees than the deltas came from.
-    fn of(repo: &'r Repository, oid: git2::Oid) -> Result<Self, ApplyError> {
-        let commit = repo.find_commit(oid)?;
-        let parent = parent_tree_for_write(&commit)?;
-        Ok(Self {
-            commit: commit.tree()?,
-            parent,
-        })
+    /// The ONE place a request becomes a tree pair. `action_diff` and `revert_file`
+    /// both call it, so the modes a guard decides on can never be read off a different
+    /// pair of trees than the deltas came from.
+    ///
+    /// Dispatches on `CommitKind` exhaustively, like `get_diff_data`, so a new row kind
+    /// cannot silently fall through to the commit path.
+    fn of_request(repo: &'r Repository, req: &ApplyRequest) -> Result<Self, ApplyError> {
+        match CommitKind::of(req.oid) {
+            CommitKind::Range => {
+                // A range row without endpoints is a wiring bug. Refuse rather than fall
+                // back to `req.oid`, which is the sentinel and names no commit at all.
+                let ends = req.range.ok_or(ApplyError::Unsupported)?;
+                // The same resolution the pane's `range_git_diff` runs, so the guards
+                // below decide on the trees the deltas were actually generated from.
+                let (before, after) = crate::diff::range_trees(repo, ends)?;
+                Ok(Self {
+                    after,
+                    before: Some(before),
+                })
+            }
+            CommitKind::Real => {
+                let commit = repo.find_commit(req.oid)?;
+                Ok(Self {
+                    after: commit.tree()?,
+                    before: parent_tree_for_write(&commit)?,
+                })
+            }
+            // The index routes never build a tree pair; reaching here is a routing bug.
+            CommitKind::Uncommitted | CommitKind::Staged => Err(ApplyError::Unsupported),
+        }
     }
 
-    fn commit_mode(&self, delta: &git2::DiffDelta<'_>) -> Result<Option<i32>, ApplyError> {
-        tree_mode(Some(&self.commit), delta.old_file().path())
+    /// The diff to apply for a revert: the pair, reversed by the caller's `opts`.
+    /// Identical to what `commit_diff_against` builds for a commit — same trees, same
+    /// call — so the two row kinds reach libgit2 through one code path.
+    fn diff(
+        &self,
+        repo: &'r Repository,
+        opts: &mut DiffOptions,
+    ) -> Result<git2::Diff<'r>, git2::Error> {
+        repo.diff_tree_to_tree(self.before.as_ref(), Some(&self.after), Some(opts))
     }
 
-    fn parent_mode(&self, delta: &git2::DiffDelta<'_>) -> Result<Option<i32>, ApplyError> {
-        tree_mode(self.parent.as_ref(), delta.new_file().path())
+    fn after_mode(&self, delta: &git2::DiffDelta<'_>) -> Result<Option<i32>, ApplyError> {
+        tree_mode(Some(&self.after), delta.old_file().path())
+    }
+
+    fn before_mode(&self, delta: &git2::DiffDelta<'_>) -> Result<Option<i32>, ApplyError> {
+        tree_mode(self.before.as_ref(), delta.new_file().path())
     }
 }
 
@@ -817,7 +871,7 @@ fn restore_binary(
                     .map_err(|e| io_error(&e))?
                     .permissions()
                     .mode();
-                let mode = if trees.parent_mode(delta)? == Some(MODE_EXEC) {
+                let mode = if trees.before_mode(delta)? == Some(MODE_EXEC) {
                     current_mode | 0o111
                 } else {
                     current_mode & !0o111
@@ -980,7 +1034,7 @@ fn refuse_unwritable_modes(
         // itself — `DiffFile::mode()` panics on a mode outside git2's canonical
         // seven, which would be a crash where this function's whole job is to
         // answer honestly. See `RevertTrees`.
-        for mode in [trees.commit_mode(&delta)?, trees.parent_mode(&delta)?] {
+        for mode in [trees.after_mode(&delta)?, trees.before_mode(&delta)?] {
             if matches!(mode, Some(MODE_LINK | MODE_GITLINK)) {
                 return Err(ApplyError::Unsupported);
             }
@@ -1044,9 +1098,9 @@ fn revert_file(
         // `Ok(())` for a write that touched nothing.
         return Err(ApplyError::Stale);
     }
-    // The same commit and parent `action_diff` built the diff from, resolved the
-    // same way — the modes the routes below decide on live there, not in the diff.
-    let trees = RevertTrees::of(repo, req.oid)?;
+    // The same trees `action_diff` built the diff from, resolved through the same
+    // function — the modes the routes below decide on live there, not in the diff.
+    let trees = RevertTrees::of_request(repo, req)?;
     let binary: Vec<_> = diff.deltas().filter(|d| delta_is_binary(repo, d)).collect();
     if binary.is_empty() {
         return apply_revert_to_workdir(repo, &trees, &diff, None);
@@ -1314,7 +1368,7 @@ pub fn apply_request(
     // A revert lands in the worktree, where a `Deleted` delta destroys whatever is
     // on disk without checking it — the same guard the whole-file route needs.
     let outcome = if matches!(location, ApplyLocation::WorkDir) {
-        let trees = RevertTrees::of(repo, req.oid)?;
+        let trees = RevertTrees::of_request(repo, req)?;
         apply_revert_to_workdir(repo, &trees, &diff, Some(&mut opts))
     } else {
         apply_diff(repo, &diff, location, Some(&mut opts))
@@ -1521,6 +1575,213 @@ mod tests {
     /// instead of compiling quietly past ~60 hand-written literals.
     fn req(oid: git2::Oid, path: &str, hunk: Option<HunkRange>) -> ApplyRequest {
         ApplyRequest::for_entry(oid, &entry(path, None, git2::Delta::Modified), hunk)
+    }
+
+    /// A combined-range-row request, built the way the context menu builds one.
+    fn range_req(ends: RangeEnds, path: &str, hunk: Option<HunkRange>) -> ApplyRequest {
+        ApplyRequest::for_entry(
+            crate::diff::oid_range(),
+            &entry(path, None, git2::Delta::Modified),
+            hunk,
+        )
+        .with_range(Some(ends))
+    }
+
+    #[test]
+    fn range_row_reverts_like_a_commit() {
+        assert_eq!(
+            ApplyAction::of(crate::diff::oid_range()),
+            ApplyAction::Revert
+        );
+    }
+
+    #[test]
+    fn revert_file_over_a_range_restores_the_base_content() {
+        let (_d, repo) = temp_repo();
+        let base = commit_file(&repo, "f.txt", "a\nb\nc\n", "base");
+        commit_file(&repo, "f.txt", "a\nB\nc\n", "mid");
+        let head = commit_file(&repo, "f.txt", "a\nB\nC\n", "head");
+
+        apply_request(
+            &repo,
+            &range_req(RangeEnds { base, head }, "f.txt", None),
+            settings(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_file(&repo, "f.txt"),
+            "a\nb\nc\n",
+            "both range edits undone"
+        );
+    }
+
+    /// Reverting a range takes back the RANGE's lines and leaves everything else,
+    /// exactly as reverting a commit does — that is why text goes through the patch
+    /// pipeline instead of restoring a blob. A local edit made after the head commit
+    /// survives; only the `+b` the range introduced goes away.
+    ///
+    /// (`git apply -R` itself refuses this patch — its last hunk carries no trailing
+    /// context, so git requires the file to end there. libgit2 is more permissive and
+    /// applies it. The outcome is still the right one, and it is the same outcome the
+    /// commit route already produces for a later edit elsewhere in the file.)
+    #[test]
+    fn revert_over_a_range_keeps_a_later_edit_to_the_same_file() {
+        let (_d, repo) = temp_repo();
+        let base = commit_file(&repo, "f.txt", "a\n", "base");
+        let head = commit_file(&repo, "f.txt", "a\nb\n", "head");
+        // Someone edits the file after the range's head commit.
+        write_file(&repo, "f.txt", "a\nb\nlocal\n");
+
+        apply_request(
+            &repo,
+            &range_req(RangeEnds { base, head }, "f.txt", None),
+            settings(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_file(&repo, "f.txt"),
+            "a\nlocal\n",
+            "the range's line is gone, the local edit is not"
+        );
+    }
+
+    /// The binary route cannot merge, so it guards instead: `restore_binary` refuses
+    /// unless the worktree still holds exactly what the range produced. Without
+    /// `content_matches` this overwrites an edit that exists nowhere else.
+    #[test]
+    fn revert_over_a_range_refuses_a_binary_changed_since_the_head_commit() {
+        let (_d, repo) = temp_repo();
+        let base = commit_bytes(&repo, "b.bin", b"\0old", "base");
+        let head = commit_bytes(&repo, "b.bin", b"\0new", "head");
+        std::fs::write(repo.workdir().unwrap().join("b.bin"), b"\0local").unwrap();
+
+        let err = apply_request(
+            &repo,
+            &range_req(RangeEnds { base, head }, "b.bin", None),
+            settings(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ApplyError::ChangedSinceCommit), "got {err:?}");
+        assert_eq!(
+            std::fs::read(repo.workdir().unwrap().join("b.bin")).unwrap(),
+            b"\0local",
+            "nothing was written"
+        );
+    }
+
+    /// A file the range ADDED is deleted by a whole-file revert.
+    #[test]
+    fn revert_over_a_range_deletes_a_file_the_range_added() {
+        let (_d, repo) = temp_repo();
+        let base = commit_file(&repo, "keep.txt", "k\n", "base");
+        let head = commit_file(&repo, "new.txt", "n\n", "add");
+
+        apply_request(
+            &repo,
+            &range_req(RangeEnds { base, head }, "new.txt", None),
+            settings(),
+        )
+        .unwrap();
+
+        assert!(!repo.workdir().unwrap().join("new.txt").exists());
+    }
+
+    /// …but only while the worktree still matches what the range produced.
+    /// `guard_workdir_deletions` is what stops libgit2 deleting it regardless.
+    #[test]
+    fn revert_over_a_range_refuses_to_delete_an_added_file_modified_since() {
+        let (_d, repo) = temp_repo();
+        let base = commit_file(&repo, "keep.txt", "k\n", "base");
+        let head = commit_file(&repo, "new.txt", "n\n", "add");
+        write_file(&repo, "new.txt", "n\nlocal\n");
+
+        let err = apply_request(
+            &repo,
+            &range_req(RangeEnds { base, head }, "new.txt", None),
+            settings(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ApplyError::ChangedSinceCommit), "got {err:?}");
+        assert_eq!(
+            read_file(&repo, "new.txt"),
+            "n\nlocal\n",
+            "the local edit survives"
+        );
+    }
+
+    #[test]
+    fn revert_over_a_range_restores_a_binary_to_the_base_bytes() {
+        let (_d, repo) = temp_repo();
+        let base = commit_bytes(&repo, "b.bin", b"\0old", "base");
+        let head = commit_bytes(&repo, "b.bin", b"\0new", "head");
+
+        apply_request(
+            &repo,
+            &range_req(RangeEnds { base, head }, "b.bin", None),
+            settings(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(repo.workdir().unwrap().join("b.bin")).unwrap(),
+            b"\0old"
+        );
+    }
+
+    /// A rename anywhere inside the range surfaces as a rename in the combined diff,
+    /// and libgit2 performs the move outside the patch machinery — so a HUNK click
+    /// must be refused, naming the whole-file action that works.
+    #[test]
+    fn revert_hunk_over_a_range_refuses_a_rename() {
+        let (_d, repo) = temp_repo();
+        let base = commit_file(&repo, "old.txt", "a\nb\nc\n", "base");
+        std::fs::rename(
+            repo.workdir().unwrap().join("old.txt"),
+            repo.workdir().unwrap().join("new.txt"),
+        )
+        .unwrap();
+        let head = commit_rename(&repo, "old.txt", "new.txt", "rename");
+
+        let request = ApplyRequest::for_entry(
+            crate::diff::oid_range(),
+            &entry("new.txt", Some("old.txt"), git2::Delta::Renamed),
+            Some(hr(1, 3, 1, 3)),
+        )
+        .with_range(Some(RangeEnds { base, head }));
+        let err = apply_request(&repo, &request, settings()).unwrap_err();
+
+        assert!(
+            matches!(err, ApplyError::RenameNeedsWholeFile),
+            "got {err:?}"
+        );
+    }
+
+    /// A failure to READ is never a benign default: an unreadable endpoint must error,
+    /// not diff against nothing — which would delete every file the range added.
+    #[test]
+    fn range_revert_errors_on_an_unreadable_endpoint() {
+        let (d, repo) = temp_repo();
+        let base = commit_file(&repo, "f.txt", "a\n", "base");
+        let head = commit_file(&repo, "f.txt", "a\nb\n", "head");
+        let base_tree = repo.find_commit(base).unwrap().tree_id();
+        let path = d.path().to_path_buf();
+        drop(repo);
+        remove_loose_object(&path, base_tree);
+
+        let repo = git2::Repository::open(&path).unwrap();
+        let err = apply_request(
+            &repo,
+            &range_req(RangeEnds { base, head }, "f.txt", None),
+            settings(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ApplyError::Git(_)), "got {err:?}");
+        assert_eq!(read_file(&repo, "f.txt"), "a\nb\n", "nothing was written");
     }
 
     #[test]
@@ -1989,7 +2250,8 @@ mod tests {
         write_file(&repo, "b.txt", &body(&[3]));
         let target = commit_rename(&repo, "a.txt", "b.txt", "rename a->b and edit");
 
-        let data = crate::diff::get_diff_data(&repo, target, CommitKind::Real, settings(), &[]);
+        let data =
+            crate::diff::get_diff_data(&repo, target, CommitKind::Real, settings(), &[], None);
         let row = data
             .lines
             .iter()
@@ -2106,13 +2368,13 @@ mod tests {
 
         let repo = git2::Repository::open(dir.path()).unwrap();
         let commit = repo.head().unwrap().peel_to_commit().unwrap();
-        // The revert diff's shape, built by the same `commit_diff_against` the
-        // production revert route uses (a root commit, so `None` for the parent
-        // tree): the commit added the file, reversed to a `Deleted` delta whose
-        // OLD side is the commit's (now unreadable) blob.
+        // The revert diff's shape: the same two trees `RevertTrees::of_request`
+        // resolves for this commit (a root commit, so `None` for the parent tree),
+        // reversed. The commit added the file, so it comes back as a `Deleted` delta
+        // whose OLD side is the commit's (now unreadable) blob.
         let mut opts = DiffOptions::new();
         opts.reverse(true);
-        let diff = commit_diff_against(&repo, &commit, None, Some(&mut opts)).unwrap();
+        let diff = crate::diff::commit_diff_against(&repo, &commit, None, Some(&mut opts)).unwrap();
         assert_eq!(
             diff.deltas().next().map(|d| d.status()),
             Some(git2::Delta::Deleted)
@@ -2433,6 +2695,7 @@ mod tests {
             crate::diff::CommitKind::Real,
             settings(),
             &[],
+            None,
         );
         let row = data
             .lines
@@ -2659,6 +2922,7 @@ mod tests {
             crate::diff::CommitKind::Real,
             settings(),
             &[],
+            None,
         );
         let row = data
             .lines
@@ -3603,7 +3867,8 @@ mod tests {
         let oid = commit_index(&repo, &mut index, "copy a to b, edit a");
         drop(index);
 
-        let data = crate::diff::get_diff_data(&repo, oid, CommitKind::Real, copy_settings(), &[]);
+        let data =
+            crate::diff::get_diff_data(&repo, oid, CommitKind::Real, copy_settings(), &[], None);
         let b = data
             .files
             .iter()
