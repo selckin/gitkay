@@ -942,14 +942,11 @@ parts run off the window-creation critical path:
   stability *within* a row — the slot exists before the number does, so a landing
   result never reflows the row and a growing `+` never shifts the `-`. Alignment
   *down the list* is a separate property, and comes from `MetaCols` (below).
-  A blank cell is what "not computed yet" looks like, so a zero side is drawn as
-  `+0`/`-0` in its own colour (as in the file-list sidebar): omitting it collides with
-  that blank — "this commit only adds" and "the worker has not answered yet" would look
-  identical, on a column being read while scrolling. It does NOT make blank
-  unambiguous, though: a row whose stats **failed** is stored as `None` and renders
-  blank too, and unlike the pending case it stays that way until a `.git` write runs
-  `retry_failed_stats`. Separating those needs a third rendering; the zero case is
-  separated because it is the common one. `compact_count` caps a number
+  A blank cell is what "not computed yet" looks like, and that is the ONLY thing it
+  means: a zero side is drawn as `+0`/`-0` in its own colour (as in the file-list
+  sidebar). Omitting it collides with the blank — "this commit only adds" and "the
+  worker has not answered yet" would look identical, on a column being read while
+  scrolling. `compact_count` caps a number
   at five characters (`123k`, `12M`, and on up to `E` so no `usize` can overflow
   the cell).
   `[commit_list] file_count` / `line_count` choose the cells
@@ -970,9 +967,8 @@ parts run off the window-creation critical path:
   to the left of the widest field inherited its raggedness, and the SHAs and stat cells
   stepped in and out down the list as the author changed. Each width is now a property
   of the font and the config alone: `SHA_SAMPLE` (short SHAs are always 7 chars),
-  `STATS_CELL_CHARS`, the date measured by *running the formatter*
-  (`format_commit_time(0, 0, false)`, so the sample cannot drift from the format the
-  rows use), and the author at `[commit_list] author_chars` (default 20) `'0'` glyphs —
+  `STATS_CELL_CHARS`, the date from `DateCol::sample`, and the author at
+  `[commit_list] author_chars` (default 20) `'0'` glyphs —
   a digit rather than `M` or `i` because it sits near the average advance in a
   proportional font and is exact in the default monospace one. `author_chars` is
   clamped **as it parses** (`clamped_author_chars`), so no read site sees a raw value
@@ -984,20 +980,64 @@ parts run off the window-creation critical path:
   (colour still hashes the **full** name, so two authors sharing an elided prefix keep
   their own colours), and a row missing a field — the virtual rows have no SHA, an
   unrepresentable timezone offset yields no date — leaves a gap instead of pulling the
-  group sideways. **All three fields draw from their column's left edge**, none
-  right-aligned against the row: a field placed INTO a column is the point, and one
-  aligned the other way is a rule the next variable-width field will not inherit.
+  group sideways. **All three fields draw from their column's left edge**, the date
+  included: right-aligning it was harmless while every date was `YYYY-MM-DD HH:MM`, but
+  relative dates vary in width and right-aligning those moves the raggedness one field
+  over instead of removing it.
   `MetaCols::origins` turns the widths into the per-row x positions
   (`MetaOrigins`, whose `sha` is also where the stats cells stop), so the three gaps are
-  summed in one place rather than as a bare total in the row plus two repeated inline
-  literals. Pure, and pinned by `meta_origins_lay_the_columns_out_right_to_left`, since
-  a swapped gap reads on screen as a few points of drift. The author is laid out
-  **first and re-elided only on overflow**, not passed through `right_elide`
-  unconditionally: that helper measures by laying out, so every name that fits would be
-  laid out twice a frame. The group is **clipped** to what the ref chips leave, as the
-  summary always has been — fixed columns claim the same ~250pt on every row where the
-  old per-row widths shrank with a short author name, so on a narrow window `sha` can
-  land left of the chips, and an unclipped draw put the SHA over the graph.
+  summed in one place — the row used to derive its own from a bare `40.0` and then
+  repeat two of the three as inline literals. Pure, and pinned by
+  `meta_origins_lay_the_columns_out_right_to_left`, since a swapped gap reads on screen
+  as a few points of drift. The author is laid out **first and
+  re-elided only on overflow**, not passed through `right_elide` unconditionally:
+  that helper measures by laying out, so every name that fits was laid out twice a frame.
+  The group is **clipped** to what the ref chips leave, as the summary always has been —
+  fixed columns claim the same ~250–290pt on every row where the old per-row widths
+  shrank with a short author name, so on a narrow window `sha` can now land left of the
+  chips, and an unclipped draw put the SHA over the graph.
+- **The date column** (`DateCol`, carried on `MetaCols`) reads either the commit's own
+  timestamp or its age, per `[commit_list] date = "absolute" | "relative"`. It rides on
+  `MetaCols` rather than being resolved per row because the date column's *width* is
+  measured from `DateCol::sample`, so the style and the width have to answer for the
+  same frame. **Both styles format in `DateCol::text`**, from the raw `time` +
+  `tz_offset_min` that `CommitInfo` keeps — unlike every other render-derived field
+  there, the date is NOT pre-formatted at construction. It cannot be for the relative
+  style (an age moves), and pre-formatting only the absolute one would split one
+  decision across two types while allocating a string per commit that the relative
+  setting never reads. The cost is a `format_commit_time` per visible row per frame
+  (~30 rows) in place of a `String` clone — well under the `layout_no_wrap` on the same
+  row. `now` is sampled **once per frame** into the `Relative` variant, so two
+  rows can never be measured against different instants. The relative form is a **port
+  of git's own `show_date_relative` (`date.c`)**, deliberately rather than an
+  equivalent-looking ladder: the interesting part is the rounding, and it is not what
+  anyone writes from scratch — each rung rounds into the next unit before testing it
+  (`(diff + 30) / 60`) and every threshold overshoots (90s, 90min, 36h, 14d, 10w), so
+  `90s` reads `2 minutes ago` and `36h` reads `2 days ago`, and 1–5 years takes git's
+  two-part `4 years, 11 months ago`. Its test expectations come from **real git output**
+  (2.55.0 — a scratch repo, one empty commit per boundary age, read back with `%ar`),
+  not from reading `date.c`; re-derive them that way. Width is bounded by
+  `diff::RELATIVE_DATE_SAMPLE`, which lives beside the formatter that must honour it
+  rather than beside the column measuring from it, and holds for **every** `i64` — the
+  two-part form is the widest ordinary output and ties, coincidentally, with `i64::MIN`'s
+  `292471208678 years ago`. A future timestamp reads `in the future` as git has it, and
+  the arithmetic saturates so a corrupt
+  timestamp near `i64`'s edge cannot overflow a row draw. Relative has no blank case
+  where absolute has one: a timezone offset chrono cannot represent makes
+  `format_commit_time` return `""`. An age never involves the offset, so that
+  commit reads correctly rather than being blanked to match.
+  **The two working-tree rows show no date at all**, in either style. `load_commits`
+  stamps them with `now()` because `CommitInfo` needs a time, but that is the walk's
+  clock rather than a property of the row — the range row beside them takes its
+  endpoint's author date for exactly this reason ("the working-tree rows have none to
+  offer"). Absolute concealed it, since a stamp renders as a plausible timestamp;
+  relative cannot, because the number grows — an hour after launch "Uncommitted changes"
+  claimed to be an hour old beside an edit made a moment ago. `DateCol::text` classifies
+  through `CommitKind`, with `Range` grouped alongside `Real`: what matters there is
+  having a real timestamp, not being a real commit.
+  Relative mode also asks for a repaint every `RELATIVE_DATE_TICK` (30s), since it is
+  the one thing on screen that goes stale with no input to prompt one; without it an
+  idle window showed ages frozen at its last paint.
 - **Bottom panel**: diff view (left, syntax-highlighted) + file list sidebar
   (right, dynamic width). Both remember their scroll position per commit for
   the session (`scroll_memory`, oid-keyed: saved by `stash_current_diff` when

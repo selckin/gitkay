@@ -177,6 +177,18 @@ impl Default for DiffSection {
     }
 }
 
+/// What the commit list's date column reads (`[commit_list] date`).
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DateStyle {
+    /// The commit's own timestamp in its recorded UTC offset, `YYYY-MM-DD HH:MM`.
+    #[default]
+    Absolute,
+    /// Its age at the moment the frame was drawn, worded exactly as
+    /// `git log --date=relative` does ("3 days ago", "1 year, 2 months ago").
+    Relative,
+}
+
 /// `[commit_list]`: which per-commit change counts the commit-list column shows.
 ///
 /// Two independent booleans rather than an on/off key plus a shape key: the
@@ -196,6 +208,8 @@ pub struct CommitListSection {
     /// reach for and no accessor to remember to call.
     #[serde(deserialize_with = "clamped_author_chars")]
     pub(crate) author_chars: usize,
+    /// Absolute timestamp or age. Same column either way, different content.
+    pub(crate) date: DateStyle,
 }
 
 impl Default for CommitListSection {
@@ -204,6 +218,7 @@ impl Default for CommitListSection {
             file_count: true,
             line_count: true,
             author_chars: DEFAULT_AUTHOR_CHARS,
+            date: DateStyle::Absolute,
         }
     }
 }
@@ -463,6 +478,9 @@ fn default_template() -> String {
          # per-row, so the sha and the counts line up down the list; longer\n\
          # names are elided.\n\
          # author_chars = 20\n\
+         # Date column: \"absolute\" (2026-07-06 09:49) or \"relative\"\n\
+         # (\"3 days ago\", worded as git log --date=relative does).\n\
+         # date = \"absolute\"\n\
          \n\
          [cache]\n\
          # Diffs are cached on disk at ~/.cache/gitkay/diffs so a commit whose\n\
@@ -1265,6 +1283,15 @@ mod tests {
     }
 
     #[test]
+    fn commit_list_date_style_parses_and_defaults_absolute() {
+        assert_eq!(Config::default().commit_list.date, DateStyle::Absolute);
+        let cfg: Config = toml::from_str("[commit_list]\ndate = \"relative\"\n").unwrap();
+        assert_eq!(cfg.commit_list.date, DateStyle::Relative);
+        // A misspelled variant is an error, not a silent fall back to absolute.
+        assert!(toml::from_str::<Config>("[commit_list]\ndate = \"ago\"\n").is_err());
+    }
+
+    #[test]
     fn commit_list_rejects_unknown_keys() {
         // deny_unknown_fields: a typo is an error, not a silently ignored line.
         assert!(toml::from_str::<Config>("[commit_list]\nline_counts = false\n").is_err());
@@ -1277,6 +1304,7 @@ mod tests {
         assert!(t.contains("file_count ="));
         assert!(t.contains("line_count ="));
         assert!(t.contains("author_chars ="));
+        assert!(t.contains("date ="));
     }
 
     /// `[cache] min_build_ms` parses and defaults to one second.
