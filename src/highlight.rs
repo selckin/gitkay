@@ -892,7 +892,7 @@ mod tests {
     }
 
     #[test]
-    fn with_theme_swaps_palette() {
+    fn reconfigured_swaps_palette() {
         // Build on a dark theme, derive a light one — the palette background
         // must follow (dark → light).
         let hl = test_highlighter();
