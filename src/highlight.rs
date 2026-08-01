@@ -12,7 +12,7 @@ pub use two_face::theme::EmbeddedThemeName;
 
 pub use syntect::easy::HighlightLines;
 use syntect::highlighting::{Color as SynColor, Highlighter as SynHighlighter, Theme};
-use syntect::parsing::{Scope, SyntaxSet};
+use syntect::parsing::{Scope, SyntaxReference, SyntaxSet};
 
 /// Default syntax theme when none is configured or the configured slug is unknown.
 pub const DEFAULT_THEME_SLUG: &str = "catppuccin-mocha";
@@ -97,7 +97,17 @@ pub const FIXED_DEFAULT_BANDS: DiffBg = DiffBg::Fixed {
 };
 #[cfg(test)]
 pub fn test_highlighter() -> Highlighter {
-    Highlighter::new(DEFAULT_THEME, FIXED_DEFAULT_BANDS)
+    Highlighter::new(DEFAULT_THEME, FIXED_DEFAULT_BANDS, &LanguageMap::new())
+}
+
+/// A highlighter with a `[diff.languages]` mapping, for the tests that exercise it.
+#[cfg(test)]
+pub fn test_highlighter_with(languages: &[(&str, &str)]) -> Highlighter {
+    let map: LanguageMap = languages
+        .iter()
+        .map(|(e, s)| ((*e).to_string(), (*s).to_string()))
+        .collect();
+    Highlighter::new(DEFAULT_THEME, FIXED_DEFAULT_BANDS, &map)
 }
 
 /// A run of text sharing one foreground color: the color plus the byte range
@@ -296,6 +306,19 @@ impl DiffPalette {
     }
 }
 
+/// `[diff.languages]`: file extension (no dot, lower-cased) → the syntect syntax to
+/// highlight it as, by name (`"XML"`) or by one of its own extensions (`"xml"`).
+///
+/// Exists because syntect resolves a grammar from the extension alone, and a repo's
+/// own suffix is simply absent from that set: an `.oml` ontology (XML underneath) or a
+/// `.tfvars` (HCL) falls back to plain text. That fallback is invisible — it still
+/// sets a span on every line, so the diff reads as "highlighted" everywhere that
+/// question is asked, and renders in one flat colour for good.
+///
+/// First-line sniffing is not an alternative here even though the content would give
+/// it away: a diff holds hunks, and the `<?xml` line of a large file is not in them.
+pub type LanguageMap = std::collections::BTreeMap<String, String>;
+
 /// Owns the highlighting assets + active theme. Built lazily on the first diff.
 /// `Send + Sync` so it can be shared with a background highlighting worker via
 /// `Arc`; the multi-MB syntax set lives behind its own `Arc` so a theme swap
@@ -304,6 +327,24 @@ pub struct Highlighter {
     syntaxes: Arc<SyntaxSet>,
     theme: Theme,
     palette: DiffPalette,
+    /// `[diff.languages]`, keys normalized once here (lower-cased, any leading dot
+    /// stripped) so every lookup is a plain `get` and the config may be written
+    /// `oml`, `.oml` or `OML`.
+    languages: LanguageMap,
+}
+
+/// Normalize `[diff.languages]` keys so the lookup is a plain `get`: an extension is
+/// matched lower-cased and without a leading dot, whichever way it was written.
+fn normalize_languages(languages: &LanguageMap) -> LanguageMap {
+    languages
+        .iter()
+        .map(|(ext, syntax)| {
+            (
+                ext.trim_start_matches('.').to_ascii_lowercase(),
+                syntax.clone(),
+            )
+        })
+        .collect()
 }
 
 /// Resolve a configured theme slug to a theme, defaulting (with the one warning)
@@ -346,25 +387,37 @@ pub fn palette_for(name: EmbeddedThemeName, diff_bg: DiffBg) -> DiffPalette {
 impl Highlighter {
     /// Build the highlighter for a theme. Deserializes the bundled syntax set
     /// (multi-MB) once — call this lazily, not at startup.
-    pub fn new(name: EmbeddedThemeName, diff_bg: DiffBg) -> Self {
+    pub fn new(name: EmbeddedThemeName, diff_bg: DiffBg, languages: &LanguageMap) -> Self {
         let syntaxes = Arc::new(two_face::syntax::extra_newlines());
         let (theme, palette) = theme_and_palette(name, diff_bg);
         Self {
             syntaxes,
             theme,
             palette,
+            languages: normalize_languages(languages),
         }
     }
 
-    /// A new highlighter with a different theme and/or diff-background mode,
-    /// reusing this one's syntax set (a cheap `Arc` clone — no reload). The old
+    /// A new highlighter with a different theme, diff-background mode and/or language
+    /// map, reusing this one's syntax set (a cheap `Arc` clone — no reload). The old
     /// instance stays valid for any in-flight worker still holding it.
-    pub fn with_theme(&self, name: EmbeddedThemeName, diff_bg: DiffBg) -> Self {
+    ///
+    /// Takes all three rather than only the theme because they arrive together: the
+    /// config-reload branch that rebuilds for a new theme is the same one that would
+    /// rebuild for a new map, and the prewarm install re-asserts the UI's own config
+    /// over whatever the prewarm thread read for itself.
+    pub fn reconfigured(
+        &self,
+        name: EmbeddedThemeName,
+        diff_bg: DiffBg,
+        languages: &LanguageMap,
+    ) -> Self {
         let (theme, palette) = theme_and_palette(name, diff_bg);
         Self {
             syntaxes: Arc::clone(&self.syntaxes),
             theme,
             palette,
+            languages: normalize_languages(languages),
         }
     }
 
@@ -372,23 +425,54 @@ impl Highlighter {
         &self.palette
     }
 
-    /// Fresh per-file highlight state, language chosen by the path's extension
-    /// (falling back to plain text).
-    pub fn new_file_state(&self, path: &str) -> HighlightLines<'_> {
-        let syntax = std::path::Path::new(path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .and_then(|ext| self.syntaxes.find_syntax_by_extension(ext))
-            .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text());
-        HighlightLines::new(syntax, &self.theme)
+    /// The grammar for extension `ext` (no leading dot), or `None` when nothing
+    /// matches and the file would render plain.
+    ///
+    /// `[diff.languages]` is consulted FIRST, so a mapping also overrides a built-in
+    /// one — which is the point for a suffix syntect claims but gets wrong for this
+    /// repo. The built-in lookup then gets the extension exactly as written, not the
+    /// lower-cased form, because syntect distinguishes `.C` from `.c`.
+    fn syntax_for_ext(&self, ext: &str) -> Option<&SyntaxReference> {
+        self.languages
+            .get(&ext.to_ascii_lowercase())
+            .and_then(|token| self.syntaxes.find_syntax_by_token(token))
+            .or_else(|| self.syntaxes.find_syntax_by_extension(ext))
     }
 
-    /// Whether syntect has a real grammar for files with extension `ext` (no
-    /// leading dot, e.g. `"rs"`). False for extensions with no syntax (`png`,
-    /// `pdf`, …) — the prewarm uses this to skip warming languages that don't
-    /// exist instead of wasting a warm-set slot on the plain-text fallback.
+    /// The grammar for `path`, or `None` when it will render as plain text.
+    fn syntax_for(&self, path: &str) -> Option<&SyntaxReference> {
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(|ext| self.syntax_for_ext(ext))
+    }
+
+    /// Whether a real grammar backs `path`, i.e. whether tokenizing it will produce
+    /// anything but one flat colour.
+    ///
+    /// Callers use it to report honestly: the plain-text fallback still sets spans on
+    /// every line, so nothing downstream — not `diff_fully_highlighted`, not the
+    /// prefetch's `Highlighted` log line — can tell the two apart on its own.
+    pub fn has_grammar(&self, path: &str) -> bool {
+        self.syntax_for(path).is_some()
+    }
+
+    /// Whether a real grammar backs files with extension `ext` (no leading dot, e.g.
+    /// `"rs"`). False for extensions with no syntax (`png`, `pdf`, …) — the prewarm
+    /// uses this to skip warming languages that don't exist instead of wasting a
+    /// warm-set slot on the plain-text fallback. A `[diff.languages]` mapping counts:
+    /// such an extension IS warmable, through the grammar it maps to.
     pub fn has_syntax(&self, ext: &str) -> bool {
-        self.syntaxes.find_syntax_by_extension(ext).is_some()
+        self.syntax_for_ext(ext).is_some()
+    }
+
+    /// Fresh per-file highlight state, its grammar chosen by `[diff.languages]` and
+    /// then the path's extension, falling back to plain text.
+    pub fn new_file_state(&self, path: &str) -> HighlightLines<'_> {
+        let syntax = self
+            .syntax_for(path)
+            .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text());
+        HighlightLines::new(syntax, &self.theme)
     }
 
     /// Force-compile the main-context regexes for the syntax matching `ext` by
@@ -495,7 +579,11 @@ mod tests {
 
     #[test]
     fn tokenizes_rust_into_multiple_spans() {
-        let hl = Highlighter::new(EmbeddedThemeName::CatppuccinMocha, FIXED_DEFAULT_BANDS);
+        let hl = Highlighter::new(
+            EmbeddedThemeName::CatppuccinMocha,
+            FIXED_DEFAULT_BANDS,
+            &LanguageMap::new(),
+        );
         let mut state = hl.new_file_state("x.rs");
         let code = "fn main() {}";
         let spans = hl.tokenize_line(&mut state, code, &mut String::new());
@@ -513,6 +601,58 @@ mod tests {
         let spans = hl.tokenize_line(&mut state, code, &mut String::new());
         let joined: String = spans.iter().map(|(_, r)| &code[r.start..r.end]).collect();
         assert_eq!(joined, code);
+    }
+
+    /// The fallback is invisible from the outside: it still spans every line, so
+    /// nothing downstream can tell "coloured" from "rendered flat". `has_grammar` is
+    /// what makes the difference reportable.
+    #[test]
+    fn a_missing_grammar_is_reported_even_though_it_still_tokenizes() {
+        let hl = test_highlighter();
+        assert!(hl.has_grammar("x.rs"));
+        assert!(!hl.has_grammar("data/master/ontology-master.oml"));
+        assert!(!hl.has_grammar("Makefile"), "no extension, no grammar");
+
+        // …and it produces spans regardless, which is exactly why it went unnoticed.
+        let mut state = hl.new_file_state("x.oml");
+        assert!(
+            !hl.tokenize_line(&mut state, "<terms>", &mut String::new())
+                .is_empty()
+        );
+    }
+
+    /// `[diff.languages]` gives a repo's own suffix a real grammar. Accepted by syntax
+    /// name or by another extension, and matched however the key was written.
+    #[test]
+    fn a_mapped_extension_gets_the_grammar_it_names() {
+        for spelling in [("oml", "xml"), (".OML", "XML")] {
+            let hl = test_highlighter_with(&[spelling]);
+            assert!(
+                hl.has_grammar("data/master/ontology-master.oml"),
+                "mapped as {spelling:?}"
+            );
+            assert!(hl.has_syntax("oml"), "and so is warmable, as {spelling:?}");
+
+            // Really the XML grammar, not plain text: a tag is more than one token.
+            let mut state = hl.new_file_state("x.oml");
+            let code = "<ontology name=\"master\">";
+            let spans = hl.tokenize_line(&mut state, code, &mut String::new());
+            assert!(spans.len() >= 2, "expected XML tokens, got {spans:?}");
+            let joined: String = spans.iter().map(|(_, r)| &code[r.start..r.end]).collect();
+            assert_eq!(joined, code, "and covers the line exactly");
+        }
+    }
+
+    /// An unmapped extension keeps the built-in lookup, and a mapping the syntax set
+    /// has no grammar for falls through to it rather than breaking the file.
+    #[test]
+    fn the_map_never_takes_a_grammar_away() {
+        let hl = test_highlighter_with(&[("oml", "no-such-syntax")]);
+        assert!(hl.has_grammar("x.rs"), "unmapped extensions are untouched");
+        assert!(
+            !hl.has_grammar("x.oml"),
+            "an unresolvable mapping is a miss, not a panic"
+        );
     }
 
     #[test]
@@ -570,7 +710,7 @@ mod tests {
         // The config boundary defaults + warns; a palette is still derived.
         let (theme, warn) = resolve_theme(Some("no-such-theme"));
         assert!(warn.is_some());
-        let hl = Highlighter::new(theme, FIXED_DEFAULT_BANDS);
+        let hl = Highlighter::new(theme, FIXED_DEFAULT_BANDS, &LanguageMap::new());
         assert!(luminance(hl.palette().background) < 0.5);
     }
 
@@ -623,7 +763,11 @@ mod tests {
         // must follow (dark → light).
         let hl = test_highlighter();
         assert!(luminance(hl.palette().background) < 0.5);
-        let hl2 = hl.with_theme(EmbeddedThemeName::CatppuccinLatte, FIXED_DEFAULT_BANDS);
+        let hl2 = hl.reconfigured(
+            EmbeddedThemeName::CatppuccinLatte,
+            FIXED_DEFAULT_BANDS,
+            &LanguageMap::new(),
+        );
         assert!(luminance(hl2.palette().background) > 0.5);
     }
 
