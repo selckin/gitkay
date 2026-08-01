@@ -485,10 +485,17 @@ impl Highlighter {
     /// The fallback is announced once per extension (see `note_missing_grammar`) —
     /// this is the one place it actually happens, and where the file being tokenized
     /// is known.
+    ///
+    /// At `warn`, which is `env_logger`'s default filter here, so it shows on a plain
+    /// run rather than only under `RUST_LOG`. That is the point: this is a config gap
+    /// the reader can close and would otherwise never learn about, since the fallback
+    /// renders perfectly happily — the same reason `resolve_font_path` warns for a font
+    /// name fontdb cannot resolve. The once-per-extension dedup is what makes a level
+    /// this loud affordable.
     pub fn new_file_state(&self, path: &str) -> HighlightLines<'_> {
         let Some(syntax) = self.syntax_for(path) else {
             if let Some(ext) = self.note_missing_grammar(path) {
-                log::info!(
+                log::warn!(
                     "no syntax highlighting for .{ext} files — they render as plain text; \
                      add `{ext} = \"<language>\"` under [diff.languages] in the config \
                      to highlight them as something else (e.g. \"xml\")"
