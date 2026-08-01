@@ -3530,7 +3530,7 @@ fn spawn_font_build(
 /// prefetches) so the build overlaps window/GL init and the deferred first diff
 /// usually installs already coloured instead of flashing plain → highlighted.
 /// The thread resolves theme/bands silently — warning is `GitkApp::new`'s job, and
-/// the install re-themes via `with_theme` anyway. Returns `None` on spawn failure
+/// the install re-themes via `reconfigured` anyway. Returns `None` on spawn failure
 /// (the first diff then builds the highlighter synchronously).
 fn spawn_prewarm(repo_path: String) -> Option<mpsc::Receiver<Arc<Highlighter>>> {
     let (tx, rx) = mpsc::channel();
@@ -3952,14 +3952,24 @@ fn warm_row(
     // `.oml` rows logged `Highlighted` at ~3µs/line against ~60µs/line for the rows that
     // really tokenized — the ratio was the only clue.)
     let applied = match hl {
+        // A COUNT, not `any`: one .rs beside 500 .oml files would otherwise read
+        // as "Highlighted", which is the exact "looks like a success" reading the
+        // PlainText label exists to remove. `any` also called an empty diff
+        // PlainText, though nothing had been left uncoloured.
         Some(hl) if colour => {
-            if data.files.iter().any(|f| hl.has_grammar(&f.path)) {
-                "Highlighted"
-            } else {
-                "PlainText"
+            let with = data
+                .files
+                .iter()
+                .filter(|f| hl.has_grammar(&f.path))
+                .count();
+            match (with, data.files.len()) {
+                (_, 0) => "Highlighted (no files)".to_owned(),
+                (w, n) if w == n => "Highlighted".to_owned(),
+                (0, _) => "PlainText".to_owned(),
+                (w, n) => format!("Highlighted {w}/{n}, rest PlainText"),
             }
         }
-        _ => "DiffOnly",
+        _ => "DiffOnly".to_owned(),
     };
     // A send failure means the UI is gone, i.e. the process is on its way out; there is
     // nothing useful left to do, but nothing to clean up either.
