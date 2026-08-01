@@ -209,6 +209,30 @@ impl CommitListSection {
     }
 }
 
+/// `[cache]` — the persistent on-disk diff store.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CacheSection {
+    /// Store a diff on disk once building it took at least this long.
+    ///
+    /// Compared as a `Duration`, so `0` really does mean "store everything" —
+    /// `as_millis() > n` would make `0` store nothing built in under a
+    /// millisecond, the opposite of what the setting says. Unclamped: `0` and a
+    /// very large value ("effectively off") are both coherent requests.
+    ///
+    /// 1s is the conservative end of a wide gap. On a repo of 265MB blobs,
+    /// builds are bimodal by four orders of magnitude — ordinary rows at
+    /// 1.8–3.1ms, blob-heavy rows at 11.7–14.3s — so any threshold between them
+    /// separates them identically.
+    pub(crate) min_build_ms: u64,
+}
+
+impl Default for CacheSection {
+    fn default() -> Self {
+        Self { min_build_ms: 1000 }
+    }
+}
+
 #[derive(Deserialize, Clone, Debug, PartialEq, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -216,6 +240,7 @@ pub struct Config {
     pub(crate) text: TextSection,
     pub(crate) diff: DiffSection,
     pub(crate) commit_list: CommitListSection,
+    pub(crate) cache: CacheSection,
 }
 
 /// Read + parse the config. A missing file is not an error (returns defaults);
@@ -405,7 +430,14 @@ fn default_template() -> String {
          # Lines added and removed (\"+42  -7\"). Turning this off is markedly\n\
          # cheaper: file counts come from the tree walk, line counts require\n\
          # diffing every changed blob.\n\
-         # line_count = true\n",
+         # line_count = true\n\
+         \n\
+         [cache]\n\
+         # Diffs are cached on disk at ~/.cache/gitkay/diffs so a commit whose\n\
+         # blobs are huge but whose diff is small is not rebuilt every launch.\n\
+         # Store a diff once building it took at least this long, in\n\
+         # milliseconds. 0 stores everything; a very large value stores nothing.\n\
+         # min_build_ms = 1000\n",
         default_theme = crate::highlight::DEFAULT_THEME_SLUG,
         added_band = hex(crate::highlight::DEFAULT_ADDED_BAND_DARK),
         deleted_band = hex(crate::highlight::DEFAULT_DELETED_BAND_DARK),
@@ -1189,5 +1221,30 @@ mod tests {
         assert!(t.contains("[commit_list]"));
         assert!(t.contains("file_count ="));
         assert!(t.contains("line_count ="));
+    }
+
+    /// `[cache] min_build_ms` parses and defaults to one second.
+    #[test]
+    fn cache_min_build_parses_and_defaults_to_one_second() {
+        assert_eq!(Config::default().cache.min_build_ms, 1000);
+        let cfg: Config = toml::from_str("[cache]\nmin_build_ms = 250\n").expect("parses");
+        assert_eq!(cfg.cache.min_build_ms, 250);
+    }
+
+    /// `0` means "store everything" and a huge value means "store nothing". Both
+    /// are coherent requests, unlike a nonsensical font size, so neither is clamped.
+    #[test]
+    fn cache_min_build_is_not_clamped() {
+        let zero: Config = toml::from_str("[cache]\nmin_build_ms = 0\n").expect("parses");
+        assert_eq!(zero.cache.min_build_ms, 0);
+        let huge: Config = toml::from_str("[cache]\nmin_build_ms = 86400000\n").expect("parses");
+        assert_eq!(huge.cache.min_build_ms, 86_400_000);
+    }
+
+    #[test]
+    fn template_mentions_the_cache_section() {
+        let t = default_template();
+        assert!(t.contains("[cache]"));
+        assert!(t.contains("min_build_ms"));
     }
 }
