@@ -2692,10 +2692,11 @@ fn prewarm_highlighter(
     repo_path: &str,
     theme: highlight::EmbeddedThemeName,
     diff_bg: DiffBg,
+    languages: &highlight::LanguageMap,
     tx: &mpsc::Sender<Arc<Highlighter>>,
 ) {
     let t = std::time::Instant::now();
-    let hl = Arc::new(Highlighter::new(theme, diff_bg));
+    let hl = Arc::new(Highlighter::new(theme, diff_bg, languages));
     log::debug!("prewarm: highlighter built off-thread in {:?}", t.elapsed());
     // Hand the highlighter to the UI immediately so the first diff can install
     // and highlight; warming continues below through the same shared SyntaxSet.
@@ -3517,7 +3518,10 @@ fn spawn_prewarm(repo_path: String) -> Option<mpsc::Receiver<Arc<Highlighter>>> 
             }
             let (theme, _) = highlight::resolve_theme(cfg.diff.theme.as_deref());
             let (diff_bg, _) = config::resolve_diff_bg(&cfg.diff.bands);
-            prewarm_highlighter(&repo_path, theme, diff_bg, &tx);
+            // The language map matters here too, not just at the install: it decides
+            // which extensions `top_extensions` counts as warmable and which grammar
+            // each warms. The UI re-asserts its own copy through `reconfigured`.
+            prewarm_highlighter(&repo_path, theme, diff_bg, &cfg.diff.languages, &tx);
         },
     )
     .map_err(|e| {
@@ -3772,13 +3776,30 @@ fn warm_row(
         highlight_diff(&mut data.lines, &data.files, hl);
     }
     let coloured = colour_start.elapsed();
-    // The depth actually applied, not the one asked for — a downgrade the log hid would
-    // read as syntect being mysteriously fast on an enormous row.
-    let depth = if colour && hl.is_some() {
-        WarmDepth::Highlighted
-    } else {
-        WarmDepth::DiffOnly
+    // What was actually applied, not what was asked for — and THREE outcomes, not two.
+    // A depth downgrade the log hid would read as syntect being mysteriously fast on an
+    // enormous row; the plain-text fallback reads the same way and is worse, because it
+    // looks like a success. Nothing else can tell them apart: the fallback still sets a
+    // span on every line, so `diff_fully_highlighted` is true, the diff is never
+    // re-tokenized, and it renders in one flat colour for the rest of the session.
+    // `PlainText` here is the only place that shows up. (Measured: a whole band of
+    // `.oml` rows logged `Highlighted` at ~3µs/line against ~60µs/line for the rows that
+    // really tokenized — the ratio was the only clue.)
+    let applied = match hl {
+        Some(hl) if colour => {
+            if data.files.iter().any(|f| hl.has_grammar(&f.path)) {
+                "Highlighted"
+            } else {
+                "PlainText"
+            }
+        }
+        _ => "DiffOnly",
     };
+    // Named before the send takes `data`: the fix for a plain row is a `[diff.languages]`
+    // entry, and it needs the extension that has no grammar.
+    let ungrammared = hl
+        .filter(|_| applied == "PlainText")
+        .and_then(|hl| first_ungrammared_ext(&data.files, hl));
     // A send failure means the UI is gone, i.e. the process is on its way out; there is
     // nothing useful left to do, but nothing to clean up either.
     if ctx.tx.send((target.key, data)).is_err() {
@@ -3788,10 +3809,33 @@ fn warm_row(
     // are reported separately so a slow row says WHICH half was slow — git2 walking a
     // big tree and syntect tokenizing are different problems with different fixes.
     log::debug!(
-        "prefetch: done {oid} ({lines} lines, {depth:?}) build {built:?} + colour {coloured:?}"
+        "prefetch: done {oid} ({lines} lines, {applied}) build {built:?} + colour {coloured:?}"
     );
+    if let Some(ext) = ungrammared {
+        log::debug!(
+            "prefetch: {oid} has no syntax for .{ext} — rendering plain; \
+             map it with [diff.languages] (e.g. {ext} = \"xml\")"
+        );
+    }
     ctx.ctx.request_repaint();
     Outcome::Warmed { lines }
+}
+
+/// The extension of the first file no grammar matches, if any.
+///
+/// What a `PlainText` prefetch line names, so the symptom ("this diff is not
+/// coloured") and the fix (a `[diff.languages]` entry for that extension) are the same
+/// log line rather than a bisect.
+fn first_ungrammared_ext(files: &[FileEntry], hl: &Highlighter) -> Option<String> {
+    files
+        .iter()
+        .find(|f| !hl.has_grammar(&f.path))
+        .and_then(|f| {
+            std::path::Path::new(&f.path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_owned)
+        })
 }
 
 /// One finished apply. Every worker exit reports one of these — success, failure,
@@ -4891,7 +4935,11 @@ struct GitkApp {
     theme: highlight::EmbeddedThemeName, // configured syntax theme (validated at the config boundary)
     diff_bg: DiffBg,                     // add/del row background mode + colors
     diff_palette: highlight::DiffPalette, // theme-derived diff colours (both modes)
-    diff_needs_highlight: bool,          // diff_lines changed; re-run highlight_diff
+    /// `[diff.languages]`: extensions syntect has no grammar for, and what to
+    /// highlight them as. Held so the highlighter can be rebuilt with it — on the
+    /// prewarm install, the synchronous fallback, and a config reload.
+    diff_languages: highlight::LanguageMap,
+    diff_needs_highlight: bool, // diff_lines changed; re-run highlight_diff
     diff_generation: Epoch, // bumped each highlight pass; lets stale workers bail + results drop
     highlight_tx: mpsc::Sender<HighlightBatch>, // worker → UI: per-file span updates
     highlight_rx: mpsc::Receiver<HighlightBatch>,
@@ -5480,6 +5528,7 @@ impl GitkApp {
             syntax_enabled,
             theme,
             diff_bg,
+            diff_languages: cfg.diff.languages.clone(),
             diff_palette,
             diff_needs_highlight: false, // no diff yet — the deferred startup load arms highlighting
             diff_generation: Epoch::default(),
@@ -6365,8 +6414,11 @@ impl GitkApp {
                 // for the current theme (it may have changed since startup) — this
                 // reuses the warm SyntaxSet.
                 Some(Ok(prewarmed)) => {
-                    self.highlighter =
-                        Some(Arc::new(prewarmed.with_theme(self.theme, self.diff_bg)));
+                    self.highlighter = Some(Arc::new(prewarmed.reconfigured(
+                        self.theme,
+                        self.diff_bg,
+                        &self.diff_languages,
+                    )));
                     self.prewarm_rx = None;
                 }
                 // Still building off-thread: render plain this frame and retry —
@@ -6383,7 +6435,7 @@ impl GitkApp {
                 Some(Err(mpsc::TryRecvError::Disconnected)) | None => {
                     self.prewarm_rx = None;
                     let t = std::time::Instant::now();
-                    let hl = Highlighter::new(self.theme, self.diff_bg);
+                    let hl = Highlighter::new(self.theme, self.diff_bg, &self.diff_languages);
                     log::debug!("perf: built highlighter (sync fallback) {:?}", t.elapsed());
                     self.highlighter = Some(Arc::new(hl));
                 }
@@ -8045,10 +8097,21 @@ impl GitkApp {
                 if new_enabled != self.syntax_enabled
                     || new_theme != self.theme
                     || new_diff_bg != self.diff_bg
+                    || cfg.diff.languages != self.diff_languages
                 {
                     self.syntax_enabled = new_enabled;
                     self.theme = new_theme;
                     self.diff_bg = new_diff_bg;
+                    self.diff_languages = cfg.diff.languages.clone();
+                    // Every cached diff's spans were tokenized under the OLD settings,
+                    // and only two of the four are in `DiffCacheKey` — `theme` and
+                    // `enabled` make a stale entry miss on their own, `diff_bg` and
+                    // `languages` do not. So drop the lot rather than key on all four:
+                    // the pool refills the band within a dispatch, and the alternative
+                    // is a neighbour that keeps yesterday's colours (or no colours, for
+                    // the extension just mapped) until something unrelated evicts it.
+                    // This also closes the same pre-existing gap for `diff_bg`.
+                    self.diff_cache.retain_keys(|_| false);
                     // If syntax was just turned off, drop any in-flight prewarm
                     // receiver: it would otherwise linger as a dead channel, and
                     // on re-enable a still-warming thread could leave the diff
@@ -8065,7 +8128,8 @@ impl GitkApp {
                     // blob is loaded once, not twice; a new Arc leaves any
                     // in-flight worker holding the old one valid.
                     if let Some(old_hl) = self.highlighter.take() {
-                        let new_hl = old_hl.with_theme(self.theme, self.diff_bg);
+                        let new_hl =
+                            old_hl.reconfigured(self.theme, self.diff_bg, &self.diff_languages);
                         self.diff_palette = new_hl.palette().clone();
                         self.highlighter = Some(Arc::new(new_hl));
                     } else {

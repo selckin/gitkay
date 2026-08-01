@@ -156,6 +156,10 @@ pub struct DiffSection {
     /// Detect copied files (git -C): a new file copied from another modified file
     /// renders as `source → copy`. Off by default — more expensive than renames.
     pub(crate) detect_copies: bool,
+    /// `[diff.languages]` — extension → syntax, for suffixes syntect has no grammar
+    /// for. See `highlight::LanguageMap`; empty by default, which is exactly the
+    /// pre-existing extension-only behaviour.
+    pub(crate) languages: crate::highlight::LanguageMap,
 }
 
 impl Default for DiffSection {
@@ -168,6 +172,7 @@ impl Default for DiffSection {
             bands: BandsSection::default(),
             detect_renames: true,
             detect_copies: false,
+            languages: crate::highlight::LanguageMap::new(),
         }
     }
 }
@@ -375,6 +380,14 @@ fn default_template() -> String {
          # Diff syntax-highlighting theme. Any of:\n\
          {theme_list}\n\
          # theme = \"{default_theme}\"\n\
+         \n\
+         [diff.languages]\n\
+         # Highlight an extension syntect has no grammar for as some other language.\n\
+         # Key = file extension (no dot); value = a syntax by name (\"XML\") or by one\n\
+         # of its own extensions (\"xml\"). Without a mapping such a file falls back to\n\
+         # plain text — which still renders, just in one flat colour.\n\
+         # oml = \"xml\"\n\
+         # tfvars = \"hcl\"\n\
          \n\
          [diff.bands]\n\
          # Add/remove row band colours (syntax-on diffs). source \"fixed\" (default)\n\
@@ -894,6 +907,25 @@ mod tests {
         assert!(t.contains("theme ="));
         assert!(t.contains("[diff.bands]"));
         assert!(t.contains("syntax ="));
+        assert!(t.contains("[diff.languages]"));
+    }
+
+    /// `[diff.languages]` parses as extension → syntax, and is empty by default —
+    /// which is exactly the extension-only behaviour that predates it.
+    #[test]
+    fn diff_languages_parses_and_defaults_empty() {
+        assert!(Config::default().diff.languages.is_empty());
+
+        let cfg: Config =
+            toml::from_str("[diff.languages]\noml = \"xml\"\ntfvars = \"hcl\"\n").expect("parses");
+        assert_eq!(
+            cfg.diff.languages.get("oml").map(String::as_str),
+            Some("xml")
+        );
+        assert_eq!(
+            cfg.diff.languages.get("tfvars").map(String::as_str),
+            Some("hcl")
+        );
     }
 
     #[test]
