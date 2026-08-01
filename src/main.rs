@@ -11,7 +11,7 @@ use arboard::SetExtLinux;
 use eframe::egui;
 use git2::{Repository, Sort};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -22,6 +22,7 @@ mod config;
 mod diff;
 mod diff_cache;
 mod highlight;
+mod mem;
 #[cfg(test)]
 mod test_repo;
 mod word_diff;
@@ -198,9 +199,146 @@ enum RefKind {
     Range,       // the virtual "combined range" row's chip
 }
 
-/// Total cached diff lines before the LRU starts evicting. ~50–100 MB at this
-/// size (each token holds its own `String`); tunable.
-const DIFF_CACHE_LINE_BUDGET: usize = 100_000;
+/// Total cached diff lines before the LRU starts evicting.
+///
+/// Sized so that **no diff a real repo produces gets refused a cache entry**, and so
+/// that several `warm_band`s fit beside it. Two numbers set it:
+///
+/// - A ~54-row band averaged ~1,930 lines a row on a real repo, so a band is ~104k
+///   lines. At `100_000` — where this sat — the cache held barely one band and evicted
+///   during ordinary navigation, which defeats warming a window out of view at all.
+/// - The largest single diff observed on that repo was **133,460 lines**.
+///   `PREFETCH_MAX_ENTRY_LINES` is a *fraction* of this budget, so admitting that row
+///   speculatively is what fixes the size: 8 × 133,460 ≈ 1.07M, rounded up here for
+///   headroom.
+///
+/// **Cost, measured from the structs rather than guessed:** a `DiffLine` is ~72 B, its
+/// `Arc<String>` text ~96 B, and its spans ~24 B each (`highlight::Span` is
+/// `(Color32, Range<usize>)` — byte offsets INTO the shared text, not an owned string
+/// per token, which an earlier version of this comment had wrong and priced ~3× too
+/// high). So ~370 B/line highlighted, ~170 B/line for a `DiffOnly` warm: this budget is
+/// roughly **350 MB** at a realistic mix, and ~440 MB if every entry were highlighted.
+/// That is a deliberate trade of memory for never re-diffing, not an oversight — it is
+/// the one dial, and turning it down scales both prefetch bounds with it.
+const DIFF_CACHE_LINE_CEILING: usize = 1_200_000;
+/// Floor on the derived cache, so a machine already short of memory still caches
+/// something. `DiffCache::insert` keeps at least one entry regardless, so this is about
+/// the app staying useful rather than about it working at all.
+/// The value gitkay shipped with before the ceiling was raised (~29MB), so the floor is
+/// a budget known to work rather than a guess — and it keeps `PREFETCH_MAX_ENTRY_LINES`
+/// above `PREFETCH_MAX_HIGHLIGHT_LINES` at every budget the derivation can produce,
+/// which the `const` block asserts.
+const DIFF_CACHE_LINE_FLOOR: usize = 100_000;
+/// Share of the memory budget the diff cache may hold. The rest is for everything else
+/// gitkay allocates — the live diff, the pool's transient blobs, egui's own buffers.
+const CACHE_SHARE_PERCENT: u64 = 25;
+/// Bytes one cached line costs, averaged over the highlighted (~370 B) and `DiffOnly`
+/// (~170 B) mixes measured from the structs. Only used to turn a byte budget into the
+/// cache's line-shaped one, so a rough figure is the right kind of answer.
+const BYTES_PER_CACHED_LINE: u64 = 290;
+
+/// The diff cache's line budget, from the system's memory where it will say.
+///
+/// Derived rather than fixed because `DIFF_CACHE_LINE_CEILING` was sized against a
+/// 24-core workstation: it is ~350MB, which is reasonable there and absurd on an 8GB
+/// laptop. The derivation can only ever **lower** it — the ceiling is a deliberate
+/// choice (it is what admits the largest diff a real repo produced), and more cache
+/// than that buys nothing, so a big machine keeps today's behaviour exactly.
+///
+/// `mem::usable_bytes` has already held back 10% of total, so what is divided here is
+/// memory the machine can genuinely spare. Logged at startup, because a value that
+/// varies by machine and by moment is otherwise impossible to reason about from a bug
+/// report.
+fn diff_cache_line_budget() -> usize {
+    let derived = mem::usable_bytes().map_or(DIFF_CACHE_LINE_CEILING, |usable| {
+        usize::try_from(usable / 100 * CACHE_SHARE_PERCENT / BYTES_PER_CACHED_LINE)
+            .unwrap_or(usize::MAX)
+    });
+    let budget = derived.clamp(DIFF_CACHE_LINE_FLOOR, DIFF_CACHE_LINE_CEILING);
+    log::debug!(
+        "memory: diff cache budget {budget} lines (~{}MB){}",
+        budget as u64 * BYTES_PER_CACHED_LINE / 1024 / 1024,
+        if budget < DIFF_CACHE_LINE_CEILING {
+            " — lowered from the ceiling by available memory"
+        } else {
+            ""
+        }
+    );
+    budget
+}
+/// Lines one prefetch dispatch may build before it stops and drops the rest of its
+/// band.
+///
+/// Half the cache, so a dispatch cannot evict its own warms — the band it just filled
+/// is the band the user is about to scroll into — while the other half stays for the
+/// live diff and the previous band. The `diff cache: insert … evicted …` debug line is
+/// where you would see it bind.
+///
+/// It bounds a **dispatch**, not the band, so it is no defence against one enormous
+/// row: `PREFETCH_MAX_ENTRY_LINES` is that. Lines built but dropped for being oversized
+/// still count here — a worker that spent six seconds on a diff it then discarded has
+/// done a dispatch's worth of harm whether or not anything was cached.
+const PREFETCH_LINE_BUDGET_DIVISOR: usize = 2;
+/// Largest diff a prefetch will cache.
+///
+/// A speculative warm that alone fills a large share of the cache is **negative
+/// value**: every row in the band is about equally likely to be opened, so holding one
+/// giant row costs a dozen ordinary ones. Worse at the extreme — `DiffCache::insert`
+/// keeps at least one entry, so a diff bigger than the whole budget evicts everything
+/// and then sits alone until the next insert evicts it too. Measured: a 133,460-line
+/// diff evicted all 51 warmed entries (98,507 lines), leaving the cache empty of
+/// anything useful.
+///
+/// An eighth of the budget, so the cache can always hold at least eight prefetched rows
+/// and at a realistic ~1,930 lines a row some hundreds of them. Deliberately a
+/// *fraction*: what makes a row too big is how much of the band it displaces, so the
+/// cap tracks the cache rather than being tuned against it.
+///
+/// At the current budget that is 150,000 lines, chosen so the largest diff seen on a
+/// real repo (133,460 lines — the one that emptied the cache when nothing capped it)
+/// is now **admitted** rather than dropped: the cache is big enough to hold it beside
+/// a full band. Refusing an entry is the fallback for a repo that outgrows even this,
+/// not the normal path.
+///
+/// The **display** path is deliberately unaffected: a diff the user actually opened is
+/// theirs to cache however large, because they are looking at it.
+const PREFETCH_MAX_ENTRY_DIVISOR: usize = 8;
+/// Largest diff a prefetch will pre-**highlight**. A bigger one is still cached, just
+/// as `WarmDepth::DiffOnly` however near the view it is.
+///
+/// An absolute line count, not a fraction of the cache, because this bounds syntect
+/// TIME rather than memory — the two scale with completely different things, and tying
+/// it to the cache would mean raising the budget silently signs the pool up for longer
+/// stalls. Measured: `ef5d12e6` (133,460 lines) took **10.65s** highlighted where the
+/// same diff took 761ms as `DiffOnly` — ~9.9s of one worker, a quarter of the pool, on
+/// a row the user had not asked for.
+///
+/// The trade is barely a trade. Pre-highlighting exists so a diff arrives coloured
+/// instead of flashing plain, and `ensure_diff_highlighted` colours the landing
+/// screenful on demand in milliseconds; on a diff this size the full pass is spending
+/// seconds to pre-colour tens of thousands of rows nobody will scroll to. 10,000 lines
+/// keeps the overwhelming majority of real diffs fully warm — in a measured session
+/// only a handful of rows exceeded it — while capping the worst case at ~1.3s at the
+/// ~0.13ms/line this repo sees under pool contention.
+const PREFETCH_MAX_HIGHLIGHT_LINES: usize = 10_000;
+/// Blob bytes a prefetch will read before postponing the row.
+///
+/// libgit2 loads both sides of every changed file and runs xdiff over them, so a diff's
+/// cost tracks BYTES READ and not the number of changed lines. Line-based caps cannot
+/// see it coming — on a repo holding 265MB files, a few-line change in one cost ~11s of
+/// a core while producing a three-line patch.
+///
+/// Thresholds the **total**, not the largest blob, which is the correction the second
+/// measurement forced: a row whose largest blob was comfortably under this still took
+/// **5.6s** to build, where a row of comparable line count took 40ms. Many medium files
+/// have a small maximum and a large total, and a max-only guard waved them straight
+/// through. `RowCostProbe` still reports the maximum and the delta count, because the
+/// three read very differently in a log and the next surprise may be one of the others.
+///
+/// 8 MiB is ~0.4s at the ~55ms/MB those figures imply, in line with what the rest of
+/// the band costs. Being conservative is cheap here precisely because the row is
+/// **deferred rather than dropped**: it still gets warmed, just last.
+const PREFETCH_MAX_DIFF_BYTES: u64 = 8 * 1024 * 1024;
 /// Prewarm: most files scanned in the HEAD tree to rank languages by frequency.
 /// Frequencies converge long before this, so the top languages are the same on a
 /// 5k- or 500k-file tree.
@@ -211,12 +349,21 @@ const MAX_WARM_LANGS: usize = 12;
 /// pathologically deep trees (real repos nest far shallower). Deeper subtrees are
 /// skipped — the entry cap already bounds total work.
 const MAX_TREE_DEPTH: usize = 64;
-/// Prefetch: hard cap on commits warmed into the cache per dispatch, so a very tall
-/// commit list doesn't queue a huge number of diff builds. Closest-to-selected win.
-const PREFETCH_MAX: usize = 24;
-/// Prefetch: rows warmed beyond each visible edge, so arrow-key navigation off a
-/// view edge (the next Up/Down target is just off-screen) still hits a warm cache.
+/// Prefetch: how far past a visible edge a row is still worth **fully colouring**.
+///
+/// Not the width of the warmed band — `warm_band` is that, and it reaches a full
+/// window each way. This is the boundary between the two `WarmDepth`s: roughly an
+/// arrow-key step's worth of rows, which is what it was always really sized for.
+/// Beyond it a row is cached un-highlighted, which is what makes the wide band
+/// affordable.
 const PREFETCH_MARGIN: usize = 8;
+/// Prefetch: ceiling on the worker pool, however many cores the machine has.
+///
+/// The work does not scale indefinitely: a band is ~54 rows and an ordinary row costs
+/// ~3ms to build, so eight workers already drain a whole band in well under a frame.
+/// The expensive rows are not in this pool at all — the heavy lane builds those, on
+/// threads of its own, admitted against memory rather than counted against this.
+const PREFETCH_MAX_WORKERS: usize = 8;
 
 /// Real commits loaded by the startup walk. The `all_loaded` derivation compares
 /// the loaded count against this same constant (and the watcher-reload floor
@@ -294,6 +441,22 @@ const _: () = {
     assert!(
         PREHIGHLIGHT_CEILING.as_millis() > 0,
         "a zero ceiling silently disables pre-highlighting entirely"
+    );
+    assert!(
+        PREFETCH_LINE_BUDGET_DIVISOR > 1,
+        "a dispatch that may fill the whole cache evicts its own warms, and the \
+         band the user is about to scroll into is gone before they reach it"
+    );
+    assert!(
+        PREFETCH_MAX_ENTRY_DIVISOR > PREFETCH_LINE_BUDGET_DIVISOR,
+        "one speculative row must not be able to spend a whole dispatch's budget, \
+         or the band is one giant diff and nothing else"
+    );
+    assert!(
+        PREFETCH_MAX_HIGHLIGHT_LINES < DIFF_CACHE_LINE_FLOOR / PREFETCH_MAX_ENTRY_DIVISOR,
+        "a row too big to pre-highlight must still be cacheable at EVERY budget the \
+         derivation can produce, or on a small machine the size rule collapses into \
+         the entry rule and the DiffOnly downgrade never happens"
     );
 };
 
@@ -667,24 +830,189 @@ fn build_file_rows(files: &[(&str, Option<&str>)], layout: FileListLayout) -> Ve
     }
 }
 
-/// The real-commit oids to prefetch: every row in `view` (a row range, clamped to the
-/// list via `get`) except the selected one and the virtual uncommitted/staged entries,
-/// ordered by distance from `selected` so the most likely next navigation targets warm
-/// first (on a tie the row *below* — larger index, i.e. scrolling down — wins), capped
-/// at `max`. Pure — fed the loaded commit list.
+/// How much of a prefetched row's diff gets built.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WarmDepth {
+    /// Diff built and fully syntax-highlighted, as every prefetch was before the
+    /// band widened. For rows close enough to the view to be an arrow-key away.
+    Highlighted,
+    /// Diff built and cached, no spans. An un-highlighted entry is a state the
+    /// cache already supports — a superseded highlight worker's diff is stashed
+    /// exactly this way, `spans` is an `Option` per line, and
+    /// `ensure_diff_highlighted` colours it on install. Roughly an order of
+    /// magnitude cheaper per row in both CPU and memory (spans hold a `String` per
+    /// token), which is what makes a full-window band reachable at all.
+    DiffOnly,
+}
+
+/// The commit rows worth warming, given the visible row range: the visible rows
+/// plus **one full window** past each edge, so a page-scroll in either direction
+/// lands on rows a dispatch has already reached.
+///
+/// The one place "a full window out of view" is defined — the diff prefetch and the
+/// commit-stats dispatch both call it, so the two cannot drift.
+///
+/// Symmetric on purpose, and the upward half is close to free: those rows were on
+/// screen a moment ago, so `dispatch_prefetch`'s `diff_cache.contains` filter drops
+/// them before a worker ever sees them — and scrolling *up* then gets the same
+/// coverage as scrolling down, for nothing.
+///
+/// Clamping to the loaded list is the caller's job (`prefetch_targets` indexes
+/// through `get`, `stats_targets` clamps with `min`), so this may return a range
+/// past the end of the list.
+fn warm_band(view: &std::ops::Range<usize>) -> std::ops::Range<usize> {
+    let window = view.len();
+    view.start.saturating_sub(window)..view.end.saturating_add(window)
+}
+
+/// Whether the visible rows have moved far enough from the range the last prefetch
+/// dispatch was aimed at to warrant re-aiming.
+///
+/// Half a window. Re-dispatching on every scrolled frame would rebuild a ~54-row
+/// target list on the UI thread each time — a `diff_cache_key` and a pathspec-cloning
+/// `row_scope` per row — and replace the pool's queue under it continuously. Half a
+/// window is also strictly inside the band's one-window margin, so the user cannot
+/// scroll out of warmed rows before the next dispatch fires.
+///
+/// Both ends are compared, so a resize re-aims as well as a scroll: the band is
+/// derived from the length, and growing the pane extends the band past what the last
+/// dispatch covered without moving the top row at all.
+///
+/// Measured against the SMALLER of the two windows, so a shrink re-aims as readily as
+/// a grow. Comparing lengths for *inequality* instead — the first version of this —
+/// re-aims on a one-row change, which `show_rows` produces routinely while a window
+/// lays out or a fractional scroll offset rounds. That produced a dispatch storm at
+/// startup (127 rows, then 21, 17, 2, 1, 4, 1 …) which, under the since-replaced
+/// pool-per-dispatch design, stacked a fresh set of threads on the previous one's
+/// still-running diffs and pushed a single 8.6k-line row from ~100ms to 1.16s. The
+/// persistent pool makes that failure mode structurally impossible, so what remains
+/// here is the UI-thread cost — smaller, and still not worth paying every frame.
+fn view_moved_enough(prev: &std::ops::Range<usize>, now: &std::ops::Range<usize>) -> bool {
+    // `max(1)` so a zero-length view (no render yet) needs an actual move rather than
+    // answering true on every frame against a zero threshold.
+    let threshold = (now.len().min(prev.len()) / 2).max(1);
+    now.start.abs_diff(prev.start) >= threshold || now.end.abs_diff(prev.end) >= threshold
+}
+
+/// Threads in the prefetch pool, derived from the machine's core count.
+///
+/// **Half the cores**, so the foreground — the UI thread, the diff the user is waiting
+/// on, its highlight worker, the stats worker — keeps the other half. `cores - 1`, what
+/// this used to be, is the wrong shape twice over: it hands nearly the whole machine to
+/// speculative work, and on anything past five cores the ceiling was doing all the
+/// deciding anyway (24 cores → 23 → clamped to 4), so the core count was not really an
+/// input at all.
+///
+/// `available_parallelism` already accounts for cgroup quotas and CPU affinity, so a
+/// two-core container sees two. Floored at 1 so a single-core machine still prefetches,
+/// and ceilinged at `PREFETCH_MAX_WORKERS` because a band is finite.
+fn prefetch_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, |n| n.get() / 2)
+        .clamp(1, PREFETCH_MAX_WORKERS)
+}
+
+/// What one heavy row is assumed to cost, for sizing the lane before any row has been
+/// measured.
+///
+/// A guess, deliberately a large one: the measured 265MB-a-side commits need ~1.06GB
+/// each (both sides inflated, then doubled for xdiff's records), and sizing threads by
+/// the biggest thing we have seen is the conservative direction. It only bounds the
+/// THREAD count — real admission uses each row's actual measurement — so being
+/// pessimistic here costs a little parallelism on a small machine whose rows turn out to
+/// be small, and prevents spawning eight threads that cannot all run on one that is
+/// genuinely short of memory.
+const HEAVY_ROW_NOMINAL_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Threads on the heavy lane: **as many as the pool, less whatever memory says**.
+///
+/// Both bounds matter. The two lanes are complementary, which is what makes matching
+/// them affordable: on an
+/// ordinary repo heavy rows are rare and this lane sleeps, while on a repo of 265MB
+/// blobs almost nothing is cheap and the POOL sleeps — measured, eight pool workers
+/// idle for 36 seconds while four heavy ones did all the work. Sizing them the same
+/// means whichever lane the repo actually needs gets the whole speculative budget.
+///
+/// The memory term is a floor on safety rather than the whole of it: `heavy_fits` still
+/// admits per row against each row's ACTUAL measurement, which is the bound that has to
+/// hold, since rows vary from a few MB to over a gigabyte. This one exists so a machine
+/// with 2GB to spare does not start eight threads it can never keep busy.
+///
+/// One thread was tried and was wrong for the case that matters. The argument for it —
+/// nobody is waiting on a speculative row, so serialising costs nothing — holds only
+/// where heavy rows are the exception. On a repo where nearly every commit touches a
+/// 265MB blob the heavy lane IS the prefetch, and 200 commits at ~11s each is 37
+/// minutes of warming that never catches up with the user.
+///
+/// **It scales at about 90% efficiency.** Measured on the 265MB repo across three
+/// batches each way: four threads sustained 4 rows per ~11.7s (0.34 rows/s), eight
+/// sustained 8 per ~13.0s (0.62 rows/s) — a 1.8× speedup out of a possible 2×, with
+/// per-row builds ~11% slower under the wider lane. Each row is ~12s of single-core
+/// zlib inflation over one blob pair, so it is CPU work with no shared bottleneck, and
+/// it spreads across cores well but not perfectly.
+///
+/// **Measure across several batches.** Both earlier versions of this comment were wrong
+/// from one-batch samples, in opposite directions: first that contention would hold the
+/// gain to 1.3–1.8× (from one slow batch of four, which turned out to be per-row
+/// variance — those same commits are equally slow at eight concurrent), then that it
+/// scaled 2.2× (from one fast batch of eight, faster than every batch since, and above
+/// the 2× ceiling that doubling can even reach).
+fn prefetch_heavy_workers(budget: Option<u64>) -> usize {
+    let by_memory = budget.map_or(usize::MAX, |b| {
+        usize::try_from(b / HEAVY_ROW_NOMINAL_BYTES).unwrap_or(usize::MAX)
+    });
+    by_memory.clamp(1, prefetch_worker_count())
+}
+
+/// The real commits to warm and how deeply, for a visible row range.
+///
+/// The band is `warm_band(view)`; rows within `near` of a visible edge get
+/// `Highlighted`, the rest `DiffOnly`. The selected row and the virtual
+/// uncommitted/staged/range entries are skipped — a virtual row's cache key is
+/// content-hashed only after its diff exists, so a prefetch cannot key one.
+///
+/// Ordered by distance from an anchor that is **the selection clamped into the
+/// view**. While the selection is on screen that anchor *is* the selection, exactly
+/// as before, so the next arrow-key target warms first. Once the user has scrolled
+/// away from it the anchor becomes the visible edge they scrolled toward, so the
+/// pool warms what is on screen instead of racing off to rows nobody is looking at.
+/// On a tie the row *below* (larger index, i.e. scrolling down) wins.
+///
+/// Deliberately **uncapped**: the work is bounded by `PREFETCH_LINE_BUDGET` in the
+/// worker, which is the bound that matches the actual cost. A count cap here would
+/// silently truncate the band and make the widened window a no-op.
+///
+/// Pure — fed the loaded commit list.
 fn prefetch_targets(
     commits: &[CommitInfo],
     selected: usize,
-    view: std::ops::Range<usize>,
-    max: usize,
-) -> Vec<git2::Oid> {
-    let mut idxs: Vec<usize> = view
+    view: &std::ops::Range<usize>,
+    near: usize,
+) -> Vec<(git2::Oid, WarmDepth)> {
+    // An empty view has no edge to clamp to, and `warm_band` has already made the
+    // band empty, so this value is never read.
+    let anchor = if view.is_empty() {
+        selected
+    } else {
+        selected.clamp(view.start, view.end - 1)
+    };
+    let near_band = view.start.saturating_sub(near)..view.end.saturating_add(near);
+    let mut idxs: Vec<usize> = warm_band(view)
         .filter(|&i| i != selected)
         .filter(|&i| commits.get(i).is_some_and(|c| is_real_commit(c.oid)))
         .collect();
-    // Closest to the selection first; tie → the row below (larger index) first.
-    idxs.sort_by_key(|&i| (i.abs_diff(selected), i < selected));
-    idxs.into_iter().take(max).map(|i| commits[i].oid).collect()
+    // Closest to the anchor first; tie → the row below (larger index) first.
+    idxs.sort_by_key(|&i| (i.abs_diff(anchor), i < anchor));
+    idxs.into_iter()
+        .map(|i| {
+            let depth = if near_band.contains(&i) {
+                WarmDepth::Highlighted
+            } else {
+                WarmDepth::DiffOnly
+            };
+            (commits[i].oid, depth)
+        })
+        .collect()
 }
 
 /// The settings that can change a diffstat COUNT — deliberately not the whole
@@ -703,8 +1031,10 @@ const fn stats_relevant(s: DiffSettings) -> (bool, bool, bool) {
 /// Which visible rows still need their stats computed, for the `want` the
 /// column is currently asking for.
 ///
-/// Exactly the visible window, no margin: each target costs a diff, and rows
-/// the user has scrolled past are not worth computing.
+/// Answers for whatever range it is handed, clamped to the list. The caller decides
+/// which range: `dispatch_commit_stats` asks for the visible rows first and for
+/// `warm_band` only once those are all known, so the column fills where the user is
+/// looking before it warms where they might scroll.
 ///
 /// A row is skipped only when what is already cached **satisfies `want`** —
 /// "known" is not a property of the map alone. A `FilesOnly` entry carries
@@ -719,19 +1049,17 @@ const fn stats_relevant(s: DiffSettings) -> (bool, bool, bool) {
 /// switched on is what lets the file counts stay on screen while the line
 /// counts fill in.
 ///
-/// No in-flight parameter: `dispatch_commit_stats` is already a no-op while a
-/// batch is running, so a skip-in-flight branch here could never execute.
+/// No in-flight parameter: a row being computed is not yet in `known`, so it reads as
+/// unknown and is re-offered. `WorkPool::claim_stats` is what makes that harmless —
+/// the second worker to reach an oid drops the job.
 ///
-/// Deduped by oid (first appearance wins, order otherwise preserved) — a
-/// `--reflog` view routinely shows the same oid at several visible indices
-/// (reset-and-back, amends; see `finish_resync`). That dedupe is load-bearing,
-/// not a micro-optimisation: `stats_inflight` is a `HashSet`, so it takes one
-/// claim per oid no matter how many targets carry it. A duplicated target
-/// would make the worker compute that commit's diff N times, and the FIRST
-/// of those N results releases the claim — letting `dispatch_commit_stats`
-/// spawn a second batch while the first one is still running, exactly the
-/// thread-per-frame fling-scroll behaviour the one-batch-at-a-time gate
-/// exists to prevent.
+/// Deduped by oid (first appearance wins, order otherwise preserved) — a `--reflog`
+/// view routinely shows the same oid at several visible indices (reset-and-back,
+/// amends; see `finish_resync`). Duplicates would otherwise put N jobs for one commit
+/// in the queue, where the claim makes all but one a wasted dequeue, and the returned
+/// list is also what `dispatch_commit_stats` compares against `stats_submitted` to
+/// decide whether anything changed — a list that varies with row *positions* rather
+/// than with content would resubmit on every scroll.
 fn stats_targets(
     commits: &[CommitInfo],
     view: std::ops::Range<usize>,
@@ -765,24 +1093,25 @@ fn stats_targets(
 /// three steps would stay green with it deleted.
 fn invalidate_stats_state(
     known: &mut HashMap<git2::Oid, Option<CommitStats>>,
-    inflight: &mut HashSet<git2::Oid>,
+    submitted: &mut Vec<git2::Oid>,
     epoch: &Epoch,
 ) {
     known.clear();
-    inflight.clear();
+    submitted.clear();
     epoch.bump();
 }
 
-/// Install one landed stats result. A `None` (failed) result must never
-/// clobber an existing `Some(_)`: on the normal path each oid is reported
-/// exactly once, so the only way a `None` can arrive for an oid that already
-/// holds a success is `report_batch_failed`'s panic path, which re-reports
-/// every target in the batch — including ones the worker had already sent
-/// good results for before it panicked. A `Some(_)` result always overwrites,
-/// which is the normal one-report-per-oid path; the only way an oid gets a
-/// second `Some` is a fresh dispatch after `handle_git_reload` retries a
-/// failed entry. Free rather than inline in `drain_commit_stats` so the
-/// regression test drives the real decision, not a model of it.
+/// Install one landed stats result. A `None` (failed) result must never clobber an
+/// existing `Some(_)`.
+///
+/// With per-row jobs and a claim per oid, one result per oid is the normal path and a
+/// `Some` always overwrites — `handle_git_reload` retrying a failed entry is the only
+/// way an oid legitimately gets a second one. The `None` guard is deliberately kept as
+/// defence rather than deleted as unreachable: the ordering that makes it matter (a
+/// failure landing after a success for the same row) is a property of how jobs are
+/// queued and claimed, and the cost of being wrong is a number silently replaced by a
+/// blank. Free rather than inline in `drain_commit_stats` so the regression test drives
+/// the real decision, not a model of it.
 fn install_stats_result(
     known: &mut HashMap<git2::Oid, Option<CommitStats>>,
     oid: git2::Oid,
@@ -2357,19 +2686,620 @@ impl Drop for InflightClaim {
     }
 }
 
-/// Everything the background prefetch worker owns for one dispatch.
-struct PrefetchJob {
-    repo_path: String,
-    /// Each neighbour to warm: its cache key plus the per-row scope to diff it under.
-    targets: Vec<(DiffCacheKey, RowScope)>,
-    hl: Arc<Highlighter>,
-    /// This dispatch's epoch; the worker bails once `current_epoch` moves past it.
-    epoch: u64,
-    current_epoch: Epoch,
-    /// The shared claim set — targets another worker is already computing are skipped.
+/// One row for the prefetch pool to warm.
+struct PrefetchTarget {
+    /// `Some(total_blob_bytes)` once the probe has measured this row.
+    ///
+    /// Carries the number rather than a bare "was deferred" flag so the row is measured
+    /// exactly once: `Some` is both "this belongs on the heavy lane" and "do not probe
+    /// it again". Re-probing is a tree diff plus an odb lookup per file — cheap once,
+    /// and paid on every dispatch without this (measured: 18 rows re-probed on the
+    /// second dispatch alone, and a dispatch fires every half-window while scrolling).
+    probed: Option<u64>,
+    key: DiffCacheKey,
+    /// The per-row scope to diff it under — WHAT to diff plus the pathspec, as one
+    /// value, so a worker cannot pick up one and quietly forget the other.
+    scope: RowScope,
+    depth: WarmDepth,
+}
+
+impl PrefetchTarget {
+    /// The same target, carrying the probe's measurement, so the heavy lane builds it
+    /// rather than measuring it again.
+    const fn measured(mut self, est_bytes: u64) -> Self {
+        self.probed = Some(est_bytes);
+        self
+    }
+}
+
+/// Limits a worker applies to the row it was handed, fixed at spawn.
+///
+/// Passed by value rather than shared, so a worker reads them without a lock and the
+/// coordinator cannot be asked to arbitrate a number nobody changes.
+#[derive(Clone, Copy)]
+struct Limits {
+    /// Blob bytes (both sides, every changed file) above which a row is reported back
+    /// unbuilt. A change of a few lines inside a 200MB file still costs libgit2 a full
+    /// xdiff over both blobs, and no line-based cap can see that coming.
+    max_blob_bytes: u64,
+    /// Built lines above which the diff is dropped rather than sent. Caching one giant
+    /// row costs a dozen ordinary ones, and past the whole budget it is catastrophic:
+    /// `DiffCache::insert` keeps at least one entry, so the row evicts everything and
+    /// then sits alone until the next insert evicts it too. Measured: a 133,460-line
+    /// diff evicted all 51 warmed entries (98,507 lines).
+    max_entry_lines: usize,
+}
+
+/// One unit of background work, as handed to a worker.
+///
+/// Stats and diffs share the pool because they are the same shape — per-row git work,
+/// speculative, priority-ordered — and because they compete for the same cores. Two
+/// pools could not express that the numbers on screen outrank a diff nobody has
+/// clicked; one coordinator does.
+enum Job {
+    /// The commit-list `+`/`-` column for one row. On screen NOW, so it outranks every
+    /// speculative diff.
+    Stats(StatsJob),
+    /// A diff warmed into the cache for a click that may never come.
+    Warm {
+        target: PrefetchTarget,
+        /// The `stats_epoch` in force when this job was handed out, so a row whose
+        /// diff is dropped uncached can still report the column's numbers — the one
+        /// route by which those numbers would otherwise never arrive.
+        stats_epoch: u64,
+        /// `None` when syntax is off — the row then warms `DiffOnly`, which is why
+        /// prefetching still runs at all in that mode. Carried ON the job rather than
+        /// read from shared state, so a config reload swapping the highlighter cannot
+        /// race a worker mid-row: the job holds the one it was dispatched under.
+        hl: Option<Arc<Highlighter>>,
+    },
+}
+
+/// What a worker did with the job it was handed.
+///
+/// Every job produces exactly one of these — including a panicked one — which is what
+/// lets the coordinator own all the bookkeeping: it handed the work out, so it knows
+/// what came back, and nothing has to be reconstructed from shared state.
+enum Outcome {
+    /// The row's blobs are too large to build inline. Carries the target back so the
+    /// coordinator can queue it on the heavy lane without rebuilding it, and the
+    /// measurement so it is never probed again.
+    TooBig {
+        target: Box<PrefetchTarget>,
+        bytes: u64,
+    },
+    /// Built and handed to the UI. `lines` feeds the dispatch budget.
+    Warmed { lines: usize },
+    /// Built, over `Limits::max_entry_lines`, dropped uncached.
+    Oversized { key: DiffCacheKey, lines: usize },
+    /// A stats row finished — result already sent. `costly` carries the probe's
+    /// measurement when the row was too expensive for its line counts, in which case
+    /// only the file count was sent.
+    Stats { oid: git2::Oid, costly: Option<u64> },
+    /// Nothing happened: the row was claimed elsewhere, the send failed, or the job
+    /// panicked. The worker is free; no state changed.
+    Nothing,
+}
+
+/// Everything the coordinator is told about, from either side.
+///
+/// One channel with many senders — the UI's dispatches and every worker's completions
+/// arrive in the same queue, which is what makes the coordinator's state single-owner
+/// and therefore lock-free.
+enum CoordMsg {
+    /// A new band, replacing whatever the pool was working through.
+    Submit {
+        targets: VecDeque<PrefetchTarget>,
+        hl: Option<Arc<Highlighter>>,
+    },
+    /// The commit-list rows still needing numbers, replacing that tier.
+    SubmitStats(VecDeque<StatsJob>),
+    /// Drop every queued stats row: they answer a question that has changed.
+    ClearStats,
+    /// A worker is free again, having produced `Outcome`.
+    Done(usize, Outcome),
+}
+
+/// The UI's handle on the pool: three sends, no shared state, no locks.
+///
+/// A dispatch **replaces** what the pool was working through rather than creating a job
+/// and a set of threads, which is what makes concurrency bounded by construction. The
+/// shape before the pool existed spawned threads per dispatch and let the old ones
+/// drain, so overlapping dispatches stacked: measured, five dispatches inside one
+/// second put ~20 threads on the CPU alongside three multi-second rows still running
+/// from earlier ones, and the contention showed up as a 1,990-line diff taking 2.9s
+/// where an 8,627-line one had managed 1.13s.
+///
+/// That replacement is also the whole supersession mechanism, which is why there is no
+/// epoch: rows outside the new band are simply gone from the coordinator's queue. A
+/// worker already building a row still finishes it, and the result is still a valid
+/// cache entry, so nothing has to be detected or discarded.
+struct PoolHandle {
+    tx: mpsc::Sender<CoordMsg>,
+}
+
+impl PoolHandle {
+    /// Hand the pool a new band. The line budget restarts with it.
+    ///
+    /// A send failure means the coordinator thread is gone, which only happens if it
+    /// could not start — prefetching is off for the session, and nothing else breaks.
+    fn submit(&self, targets: VecDeque<PrefetchTarget>, hl: Option<Arc<Highlighter>>) {
+        let _dropped = self.tx.send(CoordMsg::Submit { targets, hl });
+    }
+
+    /// Hand the pool the commit-list rows still needing numbers.
+    ///
+    /// Separate from `submit` because the two are dispatched by different triggers at
+    /// different rates — the stats tier refills as the user scrolls, the diff tier when
+    /// the band is re-aimed — and neither should clear the other's work.
+    fn submit_stats(&self, jobs: VecDeque<StatsJob>) {
+        let _dropped = self.tx.send(CoordMsg::SubmitStats(jobs));
+    }
+
+    /// Drop every queued stats row. Used by an invalidation.
+    fn clear_stats(&self) {
+        let _dropped = self.tx.send(CoordMsg::ClearStats);
+    }
+}
+
+/// The single owner of every scheduling decision.
+///
+/// It runs on its own thread and **nothing else touches its fields**, so the queues,
+/// the memos and the in-flight sets need no mutexes, no RAII guards and no ordering
+/// discipline. Workers are pure: they receive a job, do it, and report what happened.
+///
+/// This replaced a design where each of eight workers made these decisions itself
+/// against six shared mutexes. Everything that had to be locked, claimed or released
+/// is now a plain field — and the class of bug that shape produced went with it: a
+/// dedup that read "measured" as "queued" silently dropped every heavy row the stats
+/// path had already probed, i.e. every heavy row on screen.
+struct Coordinator {
+    /// On-screen work: the commit-list numbers the user is looking at right now.
+    /// Always handed out first — a blank cell is visible, a cold cache entry is not.
+    stats: VecDeque<StatsJob>,
+    /// The band in priority order, popped from the front so every worker takes the
+    /// globally highest-priority row left. Striping the list across workers up front
+    /// would leave one grinding the far band while another idled on an exhausted stripe.
+    ready: VecDeque<PrefetchTarget>,
+    /// Rows the probe found expensive. Only `heavy` is ever given one of these, so a
+    /// row that costs seconds can never occupy a worker the next band needs.
+    ///
+    /// Order matters more here than in `ready`, because one thread drains it in
+    /// sequence — the order IS the schedule — so `Submit` replaces it wholesale,
+    /// re-sorted by the new band's priority.
+    deferred: VecDeque<PrefetchTarget>,
+    /// Blob bytes per row, from the probe. Keyed by **oid**, not `DiffCacheKey`,
+    /// because blob size is a property of the commit and its pathspec — not of the
+    /// theme, the context width, or whether syntax is on. That is also what lets stats
+    /// and diff jobs share one measurement: they read the same blobs, so the pool
+    /// should learn it once. (Under `--follow` a rebuild can narrow a row's pathspec,
+    /// which could leave a measurement pessimistic; the cost of being wrong is a row
+    /// warmed last that needn't have been.)
+    ///
+    /// Without it a re-dispatch re-probed every deferred row — measured, 18 of them on
+    /// the second dispatch alone, and a dispatch fires every half-window while scrolling.
+    measured: HashMap<git2::Oid, u64>,
+    /// Diffs whose BUILT line count exceeded the cap and were dropped.
+    ///
+    /// A separate store from `measured`, and `DiffCacheKey`-keyed rather than by oid,
+    /// because it answers a different question with a different validity domain: a line
+    /// count depends on the context width and `ignore_ws`, which the key carries and an
+    /// oid does not. It also cannot be probed — the count is unknown until the diff is
+    /// built, which is exactly why the verdict has to be kept afterwards. Without it an
+    /// over-cap row was rebuilt in full on every dispatch purely to be discarded again
+    /// (measured: a 292,503-line row built twice in two seconds, 629ms each).
+    oversized: HashSet<DiffCacheKey>,
+    /// Pool workers with no job right now.
+    idle: Vec<usize>,
+    /// Heavy-lane workers with no row right now.
+    heavy_idle: Vec<usize>,
+    /// Bytes each outstanding heavy row is expected to hold, by worker id. Summed by
+    /// `heavy_fits` into what the lane has committed, and keyed by worker so a finishing
+    /// row releases exactly what it reserved.
+    heavy_outstanding: HashMap<usize, u64>,
+    /// Bytes the heavy lane may have committed at once, resolved ONCE at startup from
+    /// `mem::usable_bytes`. `None` where the platform will not say, leaving the thread
+    /// count as the only bound.
+    heavy_budget: Option<u64>,
+    /// Oids being computed for the commit-list column right now. The stats tier can
+    /// legitimately be re-submitted while a row is in flight, since a row not yet in
+    /// `commit_stats` still reads as unknown, so without this the same row would be
+    /// handed to a second worker.
+    busy_stats: HashSet<git2::Oid>,
+    /// Claims on the keys being warmed, released when the worker reports back.
+    ///
+    /// Held here rather than by the worker because the coordinator is what knows the
+    /// job ended. The set itself is shared with the foreground diff-load path, which is
+    /// the point: a prefetch skips a key that load is already computing, and that load
+    /// skips one the pool has.
+    warming: HashMap<usize, InflightClaim>,
+    /// Lines built since the last `Submit`, across every worker.
+    warmed: usize,
+    /// Lines one dispatch may build before it stops — a fraction of the resolved cache
+    /// budget, which is derived from system memory and so is not known until startup.
+    line_budget: usize,
+    /// The highlighter as of the last `Submit`, copied onto each warm job.
+    hl: Option<Arc<Highlighter>>,
+    /// The epoch of the last `SubmitStats`, copied onto each warm job. Uniform across
+    /// a batch — the UI stamps every job in a dispatch from one `stats_epoch.current()`
+    /// — so the front job speaks for all of them. A stale one is simply dropped by the
+    /// UI's own epoch check, leaving the cell exactly as blank as it was.
+    stats_epoch: u64,
+    /// One mailbox per pool worker, then one per heavy worker. Heavy ids continue
+    /// straight on from the pool's, so `id >= mailboxes.len()` names the lane.
+    mailboxes: Vec<mpsc::Sender<Job>>,
+    heavy: Vec<mpsc::Sender<Job>>,
     inflight: InflightKeys,
-    tx: mpsc::Sender<(DiffCacheKey, DiffData)>,
-    ctx: egui::Context,
+}
+
+impl Coordinator {
+    /// Receive, record, dispatch — forever, or until the UI is gone.
+    ///
+    /// The loop is the whole scheduler: every state change enters through one channel,
+    /// so there is no interleaving to reason about and every decision sees a consistent
+    /// picture by construction.
+    fn run(mut self, rx: &mpsc::Receiver<CoordMsg>) {
+        while let Ok(msg) = rx.recv() {
+            self.run_msg(msg);
+        }
+    }
+
+    /// Apply one message and hand out whatever work that frees up. Split from `run`
+    /// so the scheduler's behaviour is reachable from a test without a channel or a
+    /// thread behind it.
+    fn run_msg(&mut self, msg: CoordMsg) {
+        match msg {
+            CoordMsg::Submit { targets, hl } => {
+                self.hl = hl;
+                self.warmed = 0;
+                self.take_band(targets);
+            }
+            CoordMsg::SubmitStats(jobs) => {
+                if let Some(job) = jobs.front() {
+                    self.stats_epoch = job.epoch;
+                }
+                // Replaced, not extended: a costly row reads as "unknown" to
+                // `stats_targets` until its line counts land, so every scroll
+                // re-offers it and an extend would stack a duplicate each time.
+                //
+                // A row already measured costly gets NO stats job. Its line counts
+                // cost exactly the blob reads its diff already owes, and
+                // `cache_diff` hands them over for free when that diff lands.
+                // Queueing one anyway is how the doubling came back once: the diff
+                // probe recorded the oid, the next dispatch re-offered the row (its
+                // line counts still unknown), and the stats job was ten seconds into
+                // recomputing them when the diff arrived with the answer.
+                self.stats = jobs
+                    .into_iter()
+                    .filter(|j| !self.measured.contains_key(&j.scope.source.oid()))
+                    .collect();
+            }
+            CoordMsg::ClearStats => self.stats.clear(),
+            CoordMsg::Done(id, outcome) => self.finish(id, outcome),
+        }
+        self.dispatch();
+    }
+
+    /// Split a new band into the cheap and expensive lanes, dropping what is already
+    /// known too large to cache.
+    fn take_band(&mut self, targets: VecDeque<PrefetchTarget>) {
+        let (mut ready, mut deferred) = (VecDeque::new(), VecDeque::new());
+        for mut target in targets {
+            if self.oversized.contains(&target.key) {
+                continue; // built once, dropped once; rebuilding it proves nothing
+            }
+            // A row whose cost is known skips re-learning it: it goes straight to the
+            // lane the probe would have sent it to, carrying the measurement so no
+            // worker probes it again.
+            target.probed = self.measured.get(&target.key.oid).copied();
+            if target.probed.is_some() {
+                deferred.push_back(target);
+            } else {
+                ready.push_back(target);
+            }
+        }
+        self.ready = ready;
+        self.deferred = deferred;
+    }
+
+    /// Record what a worker did and free it.
+    fn finish(&mut self, id: usize, outcome: Outcome) {
+        // Releases the shared claim for a warm job (nothing for a stats job).
+        drop(self.warming.remove(&id));
+        match outcome {
+            Outcome::TooBig { target, bytes } => {
+                // Postponed, not dropped: the cache is sized to hold it and revisiting
+                // it should be instant. It simply must not stand in front of fifty
+                // cheap rows. No dedup needed — the coordinator handed this row out
+                // exactly once, so it can come back exactly once.
+                self.measured.insert(target.key.oid, bytes);
+                self.deferred.push_back(target.measured(bytes));
+            }
+            Outcome::Warmed { lines } => self.warmed += lines,
+            Outcome::Oversized { key, lines } => {
+                // Counted before being remembered: a row built and discarded still cost
+                // this dispatch a worker's time, which is what the budget rations.
+                self.warmed += lines;
+                self.oversized.insert(key);
+            }
+            Outcome::Stats { oid, costly } => {
+                self.busy_stats.remove(&oid);
+                if let Some(bytes) = costly {
+                    self.measured.insert(oid, bytes);
+                }
+            }
+            Outcome::Nothing => {}
+        }
+        // Keyed on the id alone, not on the lane still being alive: a heavy id must
+        // never end up in the pool's idle list, or the pool would be handed a worker
+        // whose mailbox it cannot reach.
+        if self.is_heavy(id) {
+            self.heavy_outstanding.remove(&id);
+            self.heavy_idle.push(id);
+        } else {
+            self.idle.push(id);
+        }
+    }
+
+    /// Hand out as much work as there are free workers, highest priority first.
+    fn dispatch(&mut self) {
+        // The budget is the dispatch's, not each worker's. Crossing it empties both
+        // diff lanes: warming past it would evict the band just filled, so the rows the
+        // user is about to scroll into would be gone before they reached them.
+        if self.warmed >= self.line_budget && !(self.ready.is_empty() && self.deferred.is_empty()) {
+            let dropped = self.ready.len() + self.deferred.len();
+            self.ready.clear();
+            self.deferred.clear();
+            log::debug!("prefetch: line budget spent; dropped {dropped} rows of the band");
+        }
+        while let Some(&id) = self.heavy_idle.last() {
+            let Some((job, need)) = self.next_heavy() else {
+                break;
+            };
+            self.heavy_idle.pop();
+            self.heavy_outstanding.insert(id, need);
+            if !self.send(id, job) {
+                // Its thread is gone; it is already off `heavy_idle`, so it is simply
+                // never used again.
+                self.heavy_outstanding.remove(&id);
+            }
+        }
+        while let Some(&id) = self.idle.last() {
+            let Some(job) = self.next_pool_job() else {
+                return;
+            };
+            self.idle.pop();
+            self.send(id, job);
+        }
+    }
+
+    /// Is `id` a heavy-lane worker? Heavy ids continue on from the pool's.
+    const fn is_heavy(&self, id: usize) -> bool {
+        id >= self.mailboxes.len()
+    }
+
+    /// The heavy lane's next row and the bytes it is expected to hold, or `None` when
+    /// nothing is left or the next row will not fit in memory right now.
+    ///
+    /// The front row is **inspected before it is popped**, so a row that does not fit
+    /// stays exactly where it is and is reconsidered on the next dispatch — which runs
+    /// whenever a worker reports, i.e. precisely when memory frees. That replaced a
+    /// requeue-and-park loop with a retry interval; there is nothing to park on when
+    /// the queue is the coordinator's own field.
+    fn next_heavy(&mut self) -> Option<(Job, u64)> {
+        loop {
+            let need = self.deferred.front().map(Self::heavy_need)?;
+            if !self.heavy_fits(need) {
+                return None;
+            }
+            let target = self.deferred.pop_front()?;
+            let id = *self.heavy_idle.last()?;
+            if let Some(job) = self.claim_warm(id, target) {
+                return Some((job, need));
+            }
+        }
+    }
+
+    /// Transient memory a heavy row is expected to hold: both sides of every changed
+    /// file, doubled for xdiff's own line records and the `DiffData` that follows, both
+    /// of which scale with the same content. `probed` is set for every row on this
+    /// lane; a row without it has not been measured and is treated as free.
+    fn heavy_need(target: &PrefetchTarget) -> u64 {
+        target.probed.unwrap_or(0).saturating_mul(2)
+    }
+
+    /// May another heavy row start right now?
+    ///
+    /// **An idle lane always admits.** Progress has to be guaranteed — nothing would
+    /// re-trigger a dispatch for a lane holding nothing — and a single row is exactly
+    /// what the foreground allocates when the user clicks that commit, which has never
+    /// been guarded either. So this only ever declines to *add* to a loaded lane.
+    ///
+    /// Then TWO bounds, because they fail differently and neither covers the other.
+    ///
+    /// **Self-accounting** (`held + need <= heavy_budget`) is what stops a stampede, and
+    /// the stampede is the real crash risk: `dispatch` hands out every free worker in a
+    /// tight loop, so without this all eight rows are admitted against the same
+    /// `MemAvailable` reading — none of them has allocated anything yet — and then
+    /// collectively ask for 8.5GB on a machine that had 4. A budget fixed at startup can
+    /// be compared against our own committed total with no double counting, because it
+    /// is not itself moving as the blobs land.
+    ///
+    /// **A live reading** (`need <= usable`) is what notices the machine getting busy
+    /// after startup, which a fixed budget never would. Compared against `need` ALONE,
+    /// deliberately, and never against `held + need`: `MemAvailable` already reflects
+    /// the blobs of rows that have been running a while, so adding them here subtracts
+    /// the same memory twice. Measured on a 31GB machine reporting 13.2GB available,
+    /// that made ~5.9GB look spendable and refused rows that fit several times over.
+    ///
+    /// Each bound is therefore compared against the quantity it can measure without
+    /// double counting — our own commitments against a fixed budget, one row's need
+    /// against a live figure. Swapping either pairing reintroduces a bug that has
+    /// already been fixed once.
+    ///
+    /// `None` from `mem` means the platform will not say, and the thread count is the
+    /// only bound, exactly as it is on a machine with room to spare.
+    fn heavy_fits(&self, need: u64) -> bool {
+        if self.heavy_outstanding.is_empty() {
+            return true;
+        }
+        let held: u64 = self.heavy_outstanding.values().copied().sum();
+        self.heavy_budget
+            .is_none_or(|budget| held.saturating_add(need) <= budget)
+            && mem::usable_bytes().is_none_or(|usable| need <= usable)
+    }
+
+    /// The pool's next job: stats before any speculative diff. The pool never reads
+    /// `deferred`, which is what makes "an expensive row never occupies a worker the
+    /// next band needs" a fact about who reads what rather than an arithmetic
+    /// invariant between a counter and a limit.
+    fn next_pool_job(&mut self) -> Option<Job> {
+        while let Some(job) = self.stats.pop_front() {
+            if self.busy_stats.insert(job.scope.source.oid()) {
+                return Some(Job::Stats(job));
+            }
+        }
+        let id = *self.idle.last()?;
+        while let Some(target) = self.ready.pop_front() {
+            if let Some(job) = self.claim_warm(id, target) {
+                return Some(job);
+            }
+        }
+        None
+    }
+
+    /// Claim a row's key for `id`, or `None` when the foreground diff-load already
+    /// holds it — that result will be cached when it lands, so recomputing it here
+    /// would be pure duplicate work.
+    fn claim_warm(&mut self, id: usize, target: PrefetchTarget) -> Option<Job> {
+        let claim = InflightClaim::try_claim(&self.inflight, target.key.clone())?;
+        self.warming.insert(id, claim);
+        Some(Job::Warm {
+            target,
+            stats_epoch: self.stats_epoch,
+            hl: self.hl.clone(),
+        })
+    }
+
+    /// Post a job to one worker. `false` when that worker's thread is gone, in which
+    /// case its claim is released and it is simply never used again.
+    fn send(&mut self, id: usize, job: Job) -> bool {
+        let mailbox = if self.is_heavy(id) {
+            self.heavy.get(id - self.mailboxes.len())
+        } else {
+            self.mailboxes.get(id)
+        };
+        let sent = mailbox.is_some_and(|tx| tx.send(job).is_ok());
+        if !sent {
+            drop(self.warming.remove(&id));
+        }
+        sent
+    }
+}
+
+/// Start the pool: `prefetch_worker_count()` threads, `prefetch_heavy_workers()` more
+/// for the heavy lane, and the coordinator — all living for the app's lifetime.
+///
+/// Each worker owns its own `Repository` — git2's is `Send` but not `Sync`, so
+/// per-thread is required, and opening it once per thread rather than once per dispatch
+/// is free after the first. A thread that cannot open the repo exits; the coordinator
+/// notices when its mailbox send fails and stops using it.
+fn spawn_prefetch_pool(
+    repo_path: &str,
+    cache_lines: usize,
+    inflight: InflightKeys,
+    tx: &mpsc::Sender<(DiffCacheKey, DiffData)>,
+    stats_tx: &mpsc::Sender<StatsResult>,
+    ctx: &egui::Context,
+) -> PoolHandle {
+    let (coord_tx, coord_rx) = mpsc::channel();
+    let limits = Limits {
+        max_blob_bytes: PREFETCH_MAX_DIFF_BYTES,
+        max_entry_lines: cache_lines / PREFETCH_MAX_ENTRY_DIVISOR,
+    };
+    let count = prefetch_worker_count();
+    // Heavy ids continue straight on from the pool's, so `id >= mailboxes.len()` names
+    // the lane — one comparison rather than a second collection to keep in step.
+    let spawn_one = |id: usize, name: String| -> Option<mpsc::Sender<Job>> {
+        let (job_tx, job_rx) = mpsc::channel();
+        let ctx = WorkerCtx {
+            id,
+            limits,
+            coord: coord_tx.clone(),
+            tx: tx.clone(),
+            stats_tx: stats_tx.clone(),
+            ctx: ctx.clone(),
+        };
+        let repo_path = repo_path.to_owned();
+        spawn_guarded(
+            &name,
+            "prefetch thread panicked; the pool continues with one fewer worker",
+            move || match Repository::discover(&repo_path) {
+                Ok(repo) => worker(&ctx, &repo, &job_rx),
+                Err(e) => log::debug!("prefetch: repo discover failed: {e}"),
+            },
+        )
+        .map_err(|_| log::warn!("prefetch worker {id} spawn failed"))
+        .ok()
+        .map(|_| job_tx)
+    };
+    let mailboxes: Vec<_> = (0..count)
+        .filter_map(|i| spawn_one(i, format!("gitkay-prefetch-{i}")))
+        .collect();
+    // A lane of its own, so an expensive row can never occupy a worker the next band
+    // needs — and several threads on it, because on a repo where nearly every commit
+    // is expensive this lane IS the prefetch. How many run at once is not this number:
+    // `Coordinator::heavy_fits` decides that per row against what the system can spare,
+    // which is what a count chosen up front cannot do.
+    // Resolved once, and once only: a budget that moved as the lane's own blobs landed
+    // could not be compared against the lane's own commitments without double counting.
+    // `usable_bytes` already holds back 10% of total for the machine.
+    let heavy_budget = mem::usable_bytes();
+    let heavy: Vec<_> = (0..prefetch_heavy_workers(heavy_budget))
+        .filter_map(|k| {
+            let id = mailboxes.len() + k;
+            spawn_one(id, format!("gitkay-prefetch-heavy-{k}"))
+        })
+        .collect();
+    let coordinator = Coordinator {
+        stats: VecDeque::new(),
+        ready: VecDeque::new(),
+        deferred: VecDeque::new(),
+        measured: HashMap::new(),
+        oversized: HashSet::new(),
+        idle: (0..mailboxes.len()).collect(),
+        heavy_idle: (mailboxes.len()..mailboxes.len() + heavy.len()).collect(),
+        heavy_outstanding: HashMap::new(),
+        heavy_budget,
+        busy_stats: HashSet::new(),
+        warming: HashMap::new(),
+        warmed: 0,
+        line_budget: cache_lines / PREFETCH_LINE_BUDGET_DIVISOR,
+        hl: None,
+        stats_epoch: 0,
+        mailboxes,
+        heavy,
+        inflight,
+    };
+    let (started, heavy_started) = (coordinator.mailboxes.len(), coordinator.heavy.len());
+    if spawn_guarded(
+        "gitkay-prefetch-coord",
+        "prefetch coordinator panicked; background warming is off for this session",
+        move || coordinator.run(&coord_rx),
+    )
+    .is_err()
+    {
+        log::warn!("prefetch coordinator spawn failed; background warming is off");
+    }
+    log::debug!(
+        "prefetch: pool started with {started} workers + {heavy_started} on the heavy lane \
+         (budget {})",
+        heavy_budget.map_or_else(
+            || "unknown".to_owned(),
+            |b| format!("{}MB", b / 1024 / 1024)
+        )
+    );
+    PoolHandle { tx: coord_tx }
 }
 
 /// Spawn a named detached thread running `f`, catching (and logging, with `panic_msg`) a
@@ -2469,55 +3399,244 @@ fn spawn_prewarm(repo_path: String) -> Option<mpsc::Receiver<Arc<Highlighter>>> 
     .map(|_| rx)
 }
 
-/// Background prefetch: for each neighbour `DiffCacheKey`, compute its diff and
-/// fully highlight it, sending the finished `(key, DiffData)` back for the UI to
-/// cache. Bails as soon as a newer dispatch supersedes it (`epoch`). Pure
-/// optimization — any failure just warms fewer neighbours.
-fn prefetch_worker(job: PrefetchJob) {
-    let PrefetchJob {
-        repo_path,
-        targets,
-        hl,
-        epoch,
-        current_epoch,
-        inflight,
-        tx,
-        ctx,
-    } = job;
-    // Superseded before we even ran — don't open the repo.
-    if !current_epoch.is_current(epoch) {
-        return;
-    }
-    let repo = match Repository::discover(&repo_path) {
-        Ok(r) => r,
-        Err(e) => {
-            log::debug!("prefetch: repo discover failed: {e}");
-            return;
-        }
-    };
-    for (key, scope) in targets {
-        if !current_epoch.is_current(epoch) {
-            return; // user moved on
-        }
-        // Claim the key for the duration of the compute (released on drop, after
-        // the send). Already claimed ⇒ another worker is on it and its result will
-        // be cached when it lands — recomputing here would be pure duplicate work.
-        let Some(_claim) = InflightClaim::try_claim(&inflight, key.clone()) else {
-            log::debug!("prefetch: skip {} — already being computed", key.oid);
-            continue;
+/// Run `f`, turning a panic into `None` instead of unwinding the worker.
+///
+/// Per job, not per thread: a bad row costs one job rather than a worker for the rest
+/// of the session — and, more importantly, the report still goes out. "Every job
+/// produces exactly one `Outcome`" is what lets the coordinator own the bookkeeping;
+/// a silent exit would strand a claim and an idle slot with nothing to release them.
+fn run_caught(f: impl FnOnce() -> Outcome) -> Option<Outcome> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok()
+}
+
+/// Everything a worker holds for its whole life. All of it is either `Copy` or a
+/// channel endpoint — there is no shared mutable state left for a worker to reach.
+struct WorkerCtx {
+    id: usize,
+    limits: Limits,
+    coord: mpsc::Sender<CoordMsg>,
+    tx: mpsc::Sender<(DiffCacheKey, DiffData)>,
+    stats_tx: mpsc::Sender<StatsResult>,
+    ctx: egui::Context,
+}
+
+/// One worker: take a job, do it, report what happened. Forever.
+///
+/// The panic is caught **per job** rather than being allowed to kill the thread, so a
+/// bad row costs one job instead of a worker for the rest of the session — and, more
+/// importantly, the report still goes out. "Every job produces exactly one `Outcome`"
+/// is what lets the coordinator own the bookkeeping; a silent exit would strand a
+/// claim and an idle slot with nothing to release them.
+fn worker(ctx: &WorkerCtx, repo: &Repository, jobs: &mpsc::Receiver<Job>) {
+    while let Ok(job) = jobs.recv() {
+        let caught = |what: &str| log::warn!("prefetch: worker {} panicked on {what}", ctx.id);
+        let outcome = match job {
+            // The job is matched BEFORE the catch, so a panicking stats row can still
+            // be reported as itself. `Outcome::Nothing` would leave its oid marked
+            // busy forever — the coordinator would never hand it out again — and the
+            // UI would never record it as computed, so the dispatcher would re-offer
+            // it on every frame. Sending `None` is what records "computed and failed".
+            Job::Stats(job) => run_caught(|| run_stats_job(ctx, repo, &job)).unwrap_or_else(|| {
+                caught("a stats row");
+                send_stats(ctx, &job, None);
+                Outcome::Stats {
+                    oid: job.scope.source.oid(),
+                    costly: None,
+                }
+            }),
+            // Nothing to report for a warm: the coordinator releases the key claim
+            // when the worker reports back, and the row is simply re-offered by the
+            // next dispatch.
+            Job::Warm {
+                target,
+                hl,
+                stats_epoch,
+            } => run_caught(|| warm_row(ctx, repo, target, hl.as_deref(), stats_epoch))
+                .unwrap_or_else(|| {
+                    caught("a diff");
+                    Outcome::Nothing
+                }),
         };
-        let t = std::time::Instant::now();
-        log::debug!("prefetch: start {}", key.oid);
-        let mut data = get_diff_data(&repo, &scope, key.settings);
-        highlight_diff(&mut data.lines, &data.files, &hl);
-        let (oid, lines) = (key.oid, data.lines.len());
-        if tx.send((key, data)).is_err() {
-            return; // UI gone
+        if ctx.coord.send(CoordMsg::Done(ctx.id, outcome)).is_err() {
+            return; // the coordinator is gone; so is the reason to keep working
         }
-        // Log only after the result actually reached the UI for caching.
-        log::debug!("prefetch: done {oid} ({lines} lines) in {:?}", t.elapsed());
-        ctx.request_repaint();
     }
+}
+
+/// Compute one row's commit-list stats and report it, exactly once.
+///
+/// Exactly-once matters: a row left unknown is re-queued by the dispatcher forever, and
+/// a `None` here is what records "computed and failed" so it stops being asked.
+///
+/// A row too expensive to compute inline gets its file count and nothing else; see the
+/// comment at that return for why it does not ask to be finished later.
+fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome {
+    let oid = job.scope.source.oid();
+    // `FilesAndLines` calls `diff.stats()`, which loads blob content — the same bytes
+    // the diff reads. Unguarded, that had eight workers spend 24 seconds computing this
+    // column on a repo of 265MB blobs, and (because stats outrank diffs) blocking every
+    // prefetch behind it. `FilesOnly` needs no content, so it is never worth probing.
+    if job.want == StatsWant::FilesAndLines
+        && let Ok(cost) = diff::probe_row_cost(repo, &job.scope, job.settings)
+        && cost.total_blob_bytes > ctx.limits.max_blob_bytes
+    {
+        log::debug!(
+            "stats: defer {oid} — {} blob bytes over {} (largest {}, {} files)",
+            cost.total_blob_bytes,
+            ctx.limits.max_blob_bytes,
+            cost.max_blob_bytes,
+            cost.deltas
+        );
+        // Send the file count NOW, so the row shows something rather than staying blank.
+        // Deliberately the real `commit_stats` and not `cost.deltas`: the probe skips
+        // `detect_similar`, so it counts a rename as two files where the pane shows one,
+        // and a column that disagrees with the pane is the exact drift the shared
+        // pipeline exists to prevent.
+        send_stats(
+            ctx,
+            job,
+            commit_stats(repo, &job.scope, job.settings, StatsWant::FilesOnly).ok(),
+        );
+        // And then STOP. The line counts cost the same blob reads the diff does, and
+        // this row's diff goes to the heavy lane — `cache_diff` takes the column off it
+        // for free when it lands. Computing them here as well would pay ~11s twice for
+        // one set of bytes, which is the doubling this path exists to remove.
+        //
+        // A row whose diff is ALSO over `Limits::max_entry_lines` never reaches
+        // `cache_diff` either — `warm_row` sends the numbers off the built data at the
+        // drop site, which is the exact moment that becomes knowable.
+        return Outcome::Stats {
+            oid,
+            costly: Some(cost.total_blob_bytes),
+        };
+    }
+    let t = std::time::Instant::now();
+    let stats = commit_stats(repo, &job.scope, job.settings, job.want)
+        .inspect_err(|e| log::debug!("stats: {oid} failed: {e}"))
+        .ok();
+    log::debug!("stats: done {oid} ({:?}) in {:?}", job.want, t.elapsed());
+    send_stats(ctx, job, stats);
+    Outcome::Stats { oid, costly: None }
+}
+
+/// Hand one stats row's result to the UI and wake it.
+fn send_stats(ctx: &WorkerCtx, job: &StatsJob, stats: Option<CommitStats>) {
+    send_stats_result(ctx, job.epoch, job.scope.source.oid(), stats);
+}
+
+/// As `send_stats`, for a result that did not come from a stats job — the column's
+/// numbers harvested off a diff that is about to be dropped uncached.
+fn send_stats_result(ctx: &WorkerCtx, epoch: u64, oid: git2::Oid, stats: Option<CommitStats>) {
+    if ctx.stats_tx.send(StatsResult { epoch, oid, stats }).is_ok() {
+        ctx.ctx.request_repaint();
+    }
+}
+
+/// Warm one row into the cache: probe, build, cap, colour, send.
+///
+/// Pure in the sense that matters: everything it learns comes back as the return value,
+/// so the coordinator — not this thread — decides what any of it means.
+fn warm_row(
+    ctx: &WorkerCtx,
+    repo: &Repository,
+    target: PrefetchTarget,
+    hl: Option<&Highlighter>,
+    stats_epoch: u64,
+) -> Outcome {
+    // Probe first: a row whose blobs are huge costs seconds whatever its patch looks
+    // like, and must not hold up the rest of the band. An already-measured row skips it
+    // — re-probing would postpone it forever. A probe that errors falls through to the
+    // build, which surfaces the same error properly.
+    if target.probed.is_none()
+        && let Ok(cost) = diff::probe_row_cost(repo, &target.scope, target.key.settings)
+        && cost.total_blob_bytes > ctx.limits.max_blob_bytes
+    {
+        // All three dimensions, not just the one that tripped: which of them is large
+        // is what tells a 265MB single file apart from a wide shallow commit, and this
+        // guard has already had to move from one to another once.
+        log::debug!(
+            "prefetch: defer {} — {} blob bytes over {} (largest {}, {} files)",
+            target.key.oid,
+            cost.total_blob_bytes,
+            ctx.limits.max_blob_bytes,
+            cost.max_blob_bytes,
+            cost.deltas
+        );
+        return Outcome::TooBig {
+            bytes: cost.total_blob_bytes,
+            target: Box::new(target),
+        };
+    }
+    // At `trace`, not `debug`: several workers logging twice a row is a lot of output,
+    // and every field here reappears on the `done` line.
+    log::trace!("prefetch: start {} ({:?})", target.key.oid, target.depth);
+    // Started AFTER the log call, deliberately. `env_logger` takes the stderr lock, so
+    // with a slow sink (a pipe into a pager or grep) that call blocks — and with the
+    // timer above it that wait was reported as compute: measured, 33- and 56-line rows
+    // "taking" 11-13s in tight clusters while their neighbours finished in 1.4ms. A
+    // timer must bracket the work and nothing else.
+    let t = std::time::Instant::now();
+    let mut data = get_diff_data(repo, &target.scope, target.key.settings);
+    let built = t.elapsed();
+    let (oid, lines) = (target.key.oid, data.lines.len());
+    // Too big to hold alongside the rest of the band — caching it would evict many rows
+    // the user is equally likely to open, to keep one. Dropped here rather than at the
+    // drain, so the highlight below is skipped too.
+    if lines > ctx.limits.max_entry_lines {
+        log::debug!(
+            "prefetch: drop {oid} ({lines} lines) — over the {}-line speculative cap, \
+             built in {built:?}",
+            ctx.limits.max_entry_lines
+        );
+        // The column's numbers would otherwise never arrive for this row: it is
+        // blob-heavy, so its stats job sent a file count and stopped, trusting the
+        // diff to supply the rest — and that diff is about to be dropped uncached, so
+        // `cache_diff` never harvests it. They are free here, being a sum over the
+        // `FileEntry` list already in hand, and this is the exact moment the gap
+        // becomes knowable. Real commits only: `stats_from_data` is what `cache_diff`
+        // derives the column from, and it guards the same way.
+        if is_real_commit(oid) {
+            send_stats_result(ctx, stats_epoch, oid, Some(diff::stats_from_data(&data)));
+        }
+        return Outcome::Oversized {
+            key: target.key,
+            lines,
+        };
+    }
+    // A row is coloured only if it is BOTH near enough to be worth colouring and small
+    // enough to be worth colouring. `WarmDepth` answers the first — "would an arrow key
+    // land here" says nothing about what the pass costs — so an oversized row is
+    // downgraded here however near the view it is. With syntax off there is no
+    // highlighter at all and every row takes the same path;
+    // `ensure_diff_highlighted` colours the landing screenful on demand regardless.
+    let colour = target.depth == WarmDepth::Highlighted && lines <= PREFETCH_MAX_HIGHLIGHT_LINES;
+    let colour_start = std::time::Instant::now();
+    if let Some(hl) = hl
+        && colour
+    {
+        highlight_diff(&mut data.lines, &data.files, hl);
+    }
+    let coloured = colour_start.elapsed();
+    // The depth actually applied, not the one asked for — a downgrade the log hid would
+    // read as syntect being mysteriously fast on an enormous row.
+    let depth = if colour && hl.is_some() {
+        WarmDepth::Highlighted
+    } else {
+        WarmDepth::DiffOnly
+    };
+    // A send failure means the UI is gone, i.e. the process is on its way out; there is
+    // nothing useful left to do, but nothing to clean up either.
+    if ctx.tx.send((target.key, data)).is_err() {
+        return Outcome::Nothing;
+    }
+    // Logged only after the result actually reached the UI for caching. Build and colour
+    // are reported separately so a slow row says WHICH half was slow — git2 walking a
+    // big tree and syntect tokenizing are different problems with different fixes.
+    log::debug!(
+        "prefetch: done {oid} ({lines} lines, {depth:?}) build {built:?} + colour {coloured:?}"
+    );
+    ctx.ctx.request_repaint();
+    Outcome::Warmed { lines }
 }
 
 /// One finished apply. Every worker exit reports one of these — success, failure,
@@ -2842,99 +3961,23 @@ struct StatsResult {
     stats: Option<CommitStats>,
 }
 
+/// One row's commit-list stats to compute.
+///
+/// Per row, not per batch. The batch was an artefact of the single dedicated worker
+/// this used to have: it made one slow commit block every row behind it, and gated
+/// re-dispatch until the whole batch landed, so scrolling past a large commit left the
+/// following small ones blank. As a queue item among others, a slow row occupies one
+/// worker and nothing else.
 struct StatsJob {
-    repo_path: String,
     /// Per-oid scope: under `--follow` each commit is asked about the name the file
     /// had AT that commit, matching the diff the pane would show; the range row is
     /// asked about its endpoints.
-    targets: Vec<RowScope>,
+    scope: RowScope,
     settings: DiffSettings,
     want: StatsWant,
+    /// The `stats_epoch` this was queued under; a result from before an invalidation
+    /// is dropped on arrival.
     epoch: u64,
-    current_epoch: Epoch,
-    tx: mpsc::Sender<StatsResult>,
-    ctx: egui::Context,
-}
-
-/// Report every target in a batch as failed, then wake the UI once.
-///
-/// `stats_inflight` is UI-owned: a claim is taken at dispatch and released only
-/// by `drain_commit_stats` installing that oid's result. So a target the worker
-/// never reports is a claim nothing can free — and dispatch is gated on that
-/// set being empty, which makes one silent exit enough to kill the column for
-/// the rest of the session, with only a `debug!` line to show for it. Every
-/// worker exit that skips the per-target loop comes through here, so "every
-/// dispatched target reports back" is true by construction rather than by
-/// inspection of each `return`.
-///
-/// On the panic path this re-reports every target in the batch, including
-/// ones the worker had already sent good results for before it panicked.
-/// That double-report is harmless: `drain_commit_stats` installs through
-/// `install_stats_result`, which never lets a `None` here overwrite an
-/// already-landed `Some(_)` — so a row that succeeded keeps its number, and
-/// only the targets that genuinely never reported end up `Some(None)`.
-fn report_batch_failed(
-    tx: &mpsc::Sender<StatsResult>,
-    epoch: u64,
-    targets: &[git2::Oid],
-    ctx: &egui::Context,
-) {
-    for &oid in targets {
-        let _ = tx.send(StatsResult {
-            epoch,
-            oid,
-            stats: None,
-        });
-    }
-    ctx.request_repaint();
-}
-
-/// Compute the commit-list stats for a batch of rows, off the frame loop.
-///
-/// Sends ONE result per target as it finishes, so rows fill in progressively
-/// rather than a screenful arriving at once. Every target it processes reports
-/// back — success or failure — because an oid left "unknown" is re-queued by
-/// the dispatcher on the next frame.
-fn stats_worker(job: StatsJob) {
-    let StatsJob {
-        repo_path,
-        targets,
-        settings,
-        want,
-        epoch,
-        current_epoch,
-        tx,
-        ctx,
-    } = job;
-    if !current_epoch.is_current(epoch) {
-        return; // superseded before we ran — the UI already cleared its in-flight set
-    }
-    let repo = match Repository::discover(&repo_path) {
-        Ok(r) => r,
-        Err(e) => {
-            // The claims are already taken and not one target has reported, so
-            // returning silently here would strand the whole batch — see
-            // `report_batch_failed`. Reachable in practice: the repo can be
-            // moved, unmounted or `git worktree remove`d with gitkay open.
-            log::debug!("stats: repo discover failed: {e}");
-            let oids: Vec<git2::Oid> = targets.iter().map(|s| s.source.oid()).collect();
-            report_batch_failed(&tx, epoch, &oids, &ctx);
-            return;
-        }
-    };
-    for scope in targets {
-        if !current_epoch.is_current(epoch) {
-            return; // invalidated; the UI cleared the in-flight set with the map
-        }
-        let oid = scope.source.oid();
-        let stats = commit_stats(&repo, &scope, settings, want)
-            .inspect_err(|e| log::debug!("stats: {oid} failed: {e}"))
-            .ok();
-        if tx.send(StatsResult { epoch, oid, stats }).is_err() {
-            return; // UI gone
-        }
-        ctx.request_repaint();
-    }
 }
 
 /// Resolve the visual config — the diff theme slug and the `[diff.bands]`
@@ -3715,8 +4758,17 @@ struct GitkApp {
     prewarm_rx: Option<mpsc::Receiver<Arc<Highlighter>>>, // startup-prewarmed highlighter, until installed
     prefetch_tx: mpsc::Sender<(DiffCacheKey, DiffData)>,
     prefetch_rx: mpsc::Receiver<(DiffCacheKey, DiffData)>,
-    prefetch_epoch: Epoch, // bumped per dispatch; supersedes older prefetch workers
-    prefetched_gen: u64,   // diff_generation we last dispatched prefetch for
+    /// The persistent worker pool, started on first dispatch. A dispatch replaces its
+    /// queue rather than spawning threads, so concurrency is bounded by construction.
+    prefetch_pool: Option<PoolHandle>,
+    /// The diff cache's resolved line budget (see `diff_cache_line_budget`). Kept
+    /// because the pool derives its own two bounds from it and is built later.
+    cache_line_budget: usize,
+    prefetched_gen: u64, // diff_generation we last dispatched prefetch for
+    /// The visible row range the last prefetch dispatch was aimed at. Re-aiming when
+    /// the view scrolls half a window past it is what makes the band follow a scroll
+    /// rather than only a selection change; see `view_moved_enough`.
+    prefetched_view: std::ops::Range<usize>,
     /// Diff keys some worker (prefetch or diff-load) is computing right now — the
     /// shared claim set that stops overlapping dispatches from recomputing the
     /// same diff concurrently. See `InflightKeys`.
@@ -3743,7 +4795,10 @@ struct GitkApp {
     /// Oids the stats worker is computing right now. Doubles as the "a batch is
     /// running" flag, so the two can never disagree — which makes emptying it
     /// load-bearing: see `invalidate_commit_stats`.
-    stats_inflight: HashSet<git2::Oid>,
+    /// The target list the pool was last handed, so a per-frame dispatch can compare
+    /// before it rebuilds. Cleared by an invalidation, or the comparison would find an
+    /// unchanged list and never re-queue.
+    stats_submitted: Vec<git2::Oid>,
     /// Bumped by `invalidate_commit_stats`. Its ONLY job is stopping a batch
     /// that outlived an invalidation from writing stale numbers into the
     /// freshly cleared map — with one batch at a time there is nothing to
@@ -4185,6 +5240,9 @@ impl GitkApp {
         let file_list_width: f32 = stored(cc.storage, "file_list_width", 200.0);
 
         let (highlight_tx, highlight_rx) = mpsc::channel();
+        // Resolved once, here: it is read from the system, so it must not be re-derived
+        // per use or the cache and the pool could disagree about their own budget.
+        let cache_line_budget = diff_cache_line_budget();
         let (prefetch_tx, prefetch_rx) = mpsc::channel();
         let (diff_load_tx, diff_load_rx) = mpsc::channel();
         let (history_load_tx, history_load_rx) = mpsc::channel();
@@ -4263,23 +5321,29 @@ impl GitkApp {
             highlight_tx,
             highlight_rx,
             highlight_priority: None,
-            diff_cache: DiffCache::new(DIFF_CACHE_LINE_BUDGET),
+            diff_cache: DiffCache::new(cache_line_budget),
+            cache_line_budget,
             current_diff_key,
             prewarm_rx,
             prefetch_tx,
             prefetch_rx,
-            prefetch_epoch: Epoch::default(),
+            prefetch_pool: None,
             prefetched_gen: 0,
+            // Empty, so the first frame always dispatches.
+            prefetched_view: 0..0,
             inflight_diffs: Arc::default(),
             inflight_loads: HashSet::new(),
             last_highlight_check_gen: 0,
-            // A generous first-frame estimate so a diff that settles before the
-            // commit panel has rendered once still warms the top commits; the panel
-            // overwrites this with the exact visible range every frame.
-            commit_view_range: 0..64,
+            // Empty until the panel has rendered once, NOT a generous estimate: the
+            // band is derived from this length, so an over-guess is tripled. The old
+            // 0..64 placeholder made the first dispatch warm 127 rows before the
+            // real viewport (~18 rows) was known — harmless under the deleted
+            // `PREFETCH_MAX` cap, 100+ wasted diffs without it. Costing one frame of
+            // prefetch beats guessing; the panel fills this in on the very next.
+            commit_view_range: 0..0,
             commit_stats: HashMap::new(),
             virtual_diff_content: HashMap::new(),
-            stats_inflight: HashSet::new(),
+            stats_submitted: Vec::new(),
             stats_epoch: Epoch::default(),
             stats_tx,
             stats_rx,
@@ -4640,9 +5704,36 @@ impl GitkApp {
         }
     }
 
-    /// Insert a finished diff into the cache under `key` — the single place the
-    /// cache's weight unit (line count) is decided.
+    /// Insert a finished diff into the cache under `key` — the single place the cache's
+    /// weight unit (line count) is decided — and take the commit-list numbers off it
+    /// while it is in hand.
+    ///
+    /// Harvesting the column here is what stops the same expensive work being done
+    /// twice. `commit_stats` and `build_diff_data` both run `scoped_diff` and both force
+    /// libgit2 to load blob content, so on a repo of 265MB blobs the column and the pane
+    /// each paid ~11s for the same bytes — and the user saw it as "11s for the numbers,
+    /// then another 11s for the diff". Off a built `DiffData` the numbers are a sum over
+    /// `files`, and `stats_from_data` is exactly what `commit_stats` would have returned
+    /// (pinned by `commit_stats_agrees_with_the_panes_own_per_file_counts`).
+    ///
+    /// It also **cancels the redundant job**: a row whose numbers land here stops being
+    /// a `stats_targets` target, so the next `dispatch_commit_stats` submits a shorter
+    /// list and `submit_stats` — which replaces the stats tiers rather than adding to
+    /// them — drops any still-queued stats job for it. Whichever of the two finishes
+    /// first wins and the other is dequeued. A diff too large to cache never reaches
+    /// here, so its row keeps its own stats job, which is the correct outcome and needs
+    /// no special case.
+    ///
+    /// Real commits only: the virtual rows are content-keyed and their stats are evicted
+    /// by `sync_virtual_stats` on a content change, which this would race.
     fn cache_diff(&mut self, key: DiffCacheKey, data: DiffData) {
+        if is_real_commit(key.oid) {
+            install_stats_result(
+                &mut self.commit_stats,
+                key.oid,
+                Some(diff::stats_from_data(&data)),
+            );
+        }
         let weight = data.lines.len();
         self.diff_cache.insert(key, data, weight);
     }
@@ -5206,15 +6297,21 @@ impl GitkApp {
         }
     }
 
-    /// Compute the visible rows' stats on the `gitkay-stats` worker.
+    /// Queue the commit-list rows still needing numbers onto the shared pool.
     ///
-    /// One batch at a time: while `stats_inflight` is non-empty nothing new is
-    /// dispatched, so a fling-scroll spawns one worker rather than one per
-    /// frame each computing rows the user has already passed. Waiting is also
-    /// more useful — the next dispatch takes whatever is on screen when the
-    /// batch lands, which is where the user actually stopped.
+    /// No longer a batch on a dedicated thread. That shape put every row of a screenful
+    /// through one worker in series and gated re-dispatch until the whole batch landed,
+    /// so a single large commit blanked the numbers of every smaller commit behind it
+    /// and kept them blank while you scrolled past. As jobs in the shared queue they
+    /// run `prefetch_worker_count()`-wide, ahead of every speculative diff, and a slow
+    /// row costs one worker.
+    ///
+    /// Called every frame, so it compares before it builds: `stats_targets` is a
+    /// handful of hash lookups, while `row_scope` clones a pathspec per row. Submitting
+    /// only when the target list actually changes keeps that off the frame loop without
+    /// reintroducing a gate that can strand.
     fn dispatch_commit_stats(&mut self, ctx: &egui::Context) {
-        if !self.commit_list_cfg.any() || !self.stats_inflight.is_empty() {
+        if !self.commit_list_cfg.any() {
             return;
         }
         let want = if self.commit_list_cfg.line_count {
@@ -5222,89 +6319,77 @@ impl GitkApp {
         } else {
             StatsWant::FilesOnly
         };
-        let targets = stats_targets(
-            &self.commits,
-            self.commit_view_range.clone(),
-            &self.commit_stats,
-            want,
-        );
-        if targets.is_empty() {
-            return;
-        }
-        // The oid rides inside each scope's source, so the batch is one value per row
-        // rather than a pair the worker has to keep aligned.
-        let jobs: Vec<RowScope> = targets.iter().map(|&oid| self.row_scope(oid)).collect();
-        self.stats_inflight.extend(targets.iter().copied());
-        let epoch = self.stats_epoch.current();
-        let job = StatsJob {
-            repo_path: self.repo_path.clone(),
-            targets: jobs,
-            settings: self.diff_settings,
-            want,
-            epoch,
-            current_epoch: self.stats_epoch.clone(),
-            tx: self.stats_tx.clone(),
-            ctx: ctx.clone(),
-        };
-        // Every target must report back or its claim on `stats_inflight` is
-        // never released, so a panic reports the whole batch as failed rather
-        // than dying quietly — the same exit the worker's own bail-outs take.
-        let on_panic = {
-            let (tx, ctx, oids) = (self.stats_tx.clone(), ctx.clone(), targets.clone());
-            move || report_batch_failed(&tx, epoch, &oids, &ctx)
-        };
-        if spawn_reporting(
-            "gitkay-stats",
-            "stats worker panicked; reporting the batch as failed",
-            move || stats_worker(job),
-            on_panic,
-        )
-        .is_err()
-        {
-            // Never inline: that would stall the frame loop, which is the whole
-            // reason this is a worker. Drop the claims so a later frame retries.
-            log::warn!("stats thread spawn failed");
-            for oid in &targets {
-                self.stats_inflight.remove(oid);
+        // Visible rows first, the band only once those are all known — the column fills
+        // where the user is looking before it warms where they might scroll.
+        let targets = {
+            let visible = stats_targets(
+                &self.commits,
+                self.commit_view_range.clone(),
+                &self.commit_stats,
+                want,
+            );
+            if visible.is_empty() {
+                stats_targets(
+                    &self.commits,
+                    warm_band(&self.commit_view_range),
+                    &self.commit_stats,
+                    want,
+                )
+            } else {
+                visible
             }
+        };
+        if targets == self.stats_submitted {
+            return; // nothing has changed since the pool was last handed this list
         }
+        let epoch = self.stats_epoch.current();
+        let jobs: VecDeque<StatsJob> = targets
+            .iter()
+            .map(|&oid| StatsJob {
+                scope: self.row_scope(oid),
+                settings: self.diff_settings,
+                want,
+                epoch,
+            })
+            .collect();
+        self.stats_submitted = targets;
+        self.ensure_prefetch_pool(ctx).submit_stats(jobs);
     }
 
-    /// Install finished stats. A result from before an invalidation is dropped —
-    /// its in-flight entry went with the map. The claim is released
-    /// unconditionally (`stats_inflight.remove`), but the map write goes
-    /// through `install_stats_result` so a re-reported failure (see
-    /// `report_batch_failed`'s panic path) can't overwrite a row that already
-    /// succeeded.
+    /// Install finished stats. A result queued before an invalidation is dropped: the
+    /// question it answers has changed.
+    ///
+    /// The map write goes through `install_stats_result` rather than a bare insert so a
+    /// failure can never clobber a success — with per-row jobs each oid reports once,
+    /// but a re-dispatch after `handle_git_reload` retries a failed row can put two
+    /// results in flight for it.
     fn drain_commit_stats(&mut self) {
         while let Ok(StatsResult { epoch, oid, stats }) = self.stats_rx.try_recv() {
-            // The same question `stats_worker` asks before and after each diff:
-            // is this batch still the current one? A stale result's in-flight
-            // entry went with the map that was cleared, so there is nothing to
-            // release and nothing to install.
             if !self.stats_epoch.is_current(epoch) {
                 continue;
             }
-            self.stats_inflight.remove(&oid);
             install_stats_result(&mut self.commit_stats, oid, stats);
         }
     }
 
     /// Drop every cached stat, because the question they answer changed.
     ///
-    /// Clears the in-flight set TOO, and that is not optional. A batch that is
-    /// running when this fires has its results discarded by the epoch check, so
-    /// nothing would ever remove those oids from `stats_inflight` — and dispatch
-    /// is gated on that set being empty. Miss this and the column silently stops
-    /// updating for the rest of the session, with nothing logged. The three
-    /// steps live in `invalidate_stats_state` so the test that pins that pins
-    /// this code, not a copy of it.
+    /// Also clears what the pool still has queued, and the record of what was last
+    /// submitted — otherwise the next dispatch would compare against a stale list, find
+    /// it unchanged, and never re-queue. A row already being computed needs no handling:
+    /// its claim releases on its own and the epoch check discards its result.
+    ///
+    /// The steps live in `invalidate_stats_state` so the regression test drives the real
+    /// thing rather than a copy.
     fn invalidate_commit_stats(&mut self) {
         invalidate_stats_state(
             &mut self.commit_stats,
-            &mut self.stats_inflight,
+            &mut self.stats_submitted,
             &self.stats_epoch,
         );
+        if let Some(pool) = &self.prefetch_pool {
+            pool.clear_stats();
+        }
     }
 
     /// Drop the cached stats iff the settings change that just landed is one the
@@ -5322,67 +6407,78 @@ impl GitkApp {
         }
     }
 
-    /// Spawn a background prefetch of the cacheable commits in (and just past) the
-    /// visible window — closest-to-selected first, capped at `PREFETCH_MAX` — skipping
-    /// any already cached or currently live. Best-effort: only when a highlighter
-    /// exists and a real commit is selected.
-    fn dispatch_prefetch(&self, ctx: &egui::Context) {
+    /// Spawn the background prefetch pool over the rows in (and a full window past)
+    /// the visible range — nearest-first, tiered by `WarmDepth`, bounded by
+    /// `PREFETCH_LINE_BUDGET` — skipping anything already cached or being computed by
+    /// another worker.
+    ///
+    /// Best-effort throughout: a spawn failure just means a smaller pool, and no
+    /// highlighter just means every row warms `DiffOnly`.
+    fn dispatch_prefetch(&mut self, ctx: &egui::Context) {
         let Some(sel) = self.selected else {
             log::debug!("prefetch: skip — no commit selected");
             return;
         };
-        let Some(hl) = self.highlighter.clone() else {
-            log::debug!("prefetch: skip — highlighter not ready");
-            return;
-        };
-        // The visible rows plus a margin past each edge, so an arrow-key step off the
-        // edge still lands on a warm diff. Each target carries its own pathspec, so
-        // --follow prefetches a pre-rename commit under its old name (not the global
-        // path) — matching the single diff path load_selected_diff would use, so the
-        // oid-keyed cache can't be poisoned by a wrong-path prefetch.
-        let view = self.commit_view_range.start.saturating_sub(PREFETCH_MARGIN)
-            ..self.commit_view_range.end + PREFETCH_MARGIN;
-        let jobs: Vec<(DiffCacheKey, RowScope)> = {
+        // Each target carries its own pathspec, so --follow prefetches a pre-rename
+        // commit under its old name (not the global path) — matching the single diff
+        // path load_selected_diff would use, so the oid-keyed cache can't be poisoned
+        // by a wrong-path prefetch.
+        let view = self.commit_view_range.clone();
+        let targets: VecDeque<PrefetchTarget> = {
             // Also drop targets some worker is already computing — their results
-            // arrive regardless, so queueing them would only burn PREFETCH_MAX slots
-            // (the worker re-checks at start time; this filter is just the early cut).
+            // arrive regardless (the workers re-check at claim time; this filter is
+            // just the early cut).
             let inflight = lock_inflight(&self.inflight_diffs);
-            prefetch_targets(&self.commits, sel, view, PREFETCH_MAX)
+            prefetch_targets(&self.commits, sel, &view, PREFETCH_MARGIN)
                 .into_iter()
-                .map(|oid| (self.diff_cache_key(oid), self.row_scope(oid)))
-                .filter(|(k, _)| {
-                    !self.diff_cache.contains(k)
-                        && self.current_diff_key.as_ref() != Some(k)
-                        && !inflight.contains(k)
+                .map(|(oid, depth)| PrefetchTarget {
+                    probed: None,
+                    key: self.diff_cache_key(oid),
+                    scope: self.row_scope(oid),
+                    depth,
+                })
+                .filter(|t| {
+                    !self.diff_cache.contains(&t.key)
+                        && self.current_diff_key.as_ref() != Some(&t.key)
+                        && !inflight.contains(&t.key)
                 })
                 .collect()
         };
-        if jobs.is_empty() {
-            log::debug!("prefetch: skip — visible commits already cached (or none)");
+        // Recorded even when nothing needs warming: the band IS covered, so re-aiming
+        // should wait until the view has moved off it, like any other dispatch.
+        self.prefetched_view = view;
+        if targets.is_empty() {
+            log::debug!("prefetch: skip — band already cached (or empty)");
             return;
         }
-        let epoch = self.prefetch_epoch.bump();
         log::debug!(
-            "prefetch: dispatched {} visible around commit #{sel}",
-            jobs.len()
+            "prefetch: dispatched {} rows around commit #{sel}",
+            targets.len()
         );
-        let job = PrefetchJob {
-            repo_path: self.repo_path.clone(),
-            targets: jobs,
-            hl,
-            epoch,
-            current_epoch: self.prefetch_epoch.clone(),
-            inflight: Arc::clone(&self.inflight_diffs),
-            tx: self.prefetch_tx.clone(),
-            ctx: ctx.clone(),
-        };
-        if spawn_guarded("gitkay-prefetch", "prefetch thread panicked", move || {
-            prefetch_worker(job);
+        let hl = self.highlighter.clone();
+        // Hands the band to the pool that already exists, replacing whatever it was
+        // working through. No threads are created here — that is the whole point: the
+        // previous shape spawned a pool per dispatch, and overlapping dispatches
+        // stacked pools until they were fighting each other for the CPU.
+        self.ensure_prefetch_pool(ctx).submit(targets, hl);
+    }
+
+    /// The prefetch pool, started on first use.
+    ///
+    /// Lazy rather than built in `new()` because startup is latency-critical and a
+    /// pool with nothing to do is pure cost on that path; by the time the first diff
+    /// has settled the window is long since up.
+    fn ensure_prefetch_pool(&mut self, ctx: &egui::Context) -> &PoolHandle {
+        self.prefetch_pool.get_or_insert_with(|| {
+            spawn_prefetch_pool(
+                &self.repo_path,
+                self.cache_line_budget,
+                Arc::clone(&self.inflight_diffs),
+                &self.prefetch_tx,
+                &self.stats_tx,
+                ctx,
+            )
         })
-        .is_err()
-        {
-            log::warn!("prefetch thread spawn failed");
-        }
     }
 
     /// Spawn a background history load (lazy-load extension or watcher rebuild) —
@@ -7012,21 +8108,33 @@ impl GitkApp {
                 self.cache_diff(key, data);
             }
         }
-        // Once the current diff is fully coloured, warm the visible commit window
-        // (closest-to-selected first), once per settled diff. Syntax-enabled only.
-        if self.syntax_enabled {
-            let current_gen = self.diff_generation.current();
-            // diff_fully_highlighted is O(lines); it can only flip to true when new
-            // spans arrive (a batch was applied) or a fresh diff loaded. Skipping
-            // the scan on the other repaints during the highlight window (scroll,
-            // hover) avoids re-scanning the whole diff for nothing.
-            let maybe_settled = applied_highlight || self.last_highlight_check_gen != current_gen;
-            if self.prefetched_gen != current_gen && maybe_settled {
-                self.last_highlight_check_gen = current_gen;
-                if diff_fully_highlighted(&self.diff_lines, &self.diff_files) {
-                    self.prefetched_gen = current_gen;
-                    self.dispatch_prefetch(ctx);
-                }
+        // Once the current diff is fully coloured, warm the band around the visible
+        // rows (nearest-first): once per settled diff, and again whenever the view has
+        // scrolled half a window off the range the last dispatch was aimed at. Without
+        // the scroll trigger the band would only ever follow the *selection*, and a
+        // wheel-scroll two pages down would land entirely cold.
+        //
+        // No longer gated on syntax being enabled: a `DiffOnly` row needs no
+        // highlighter, so with `[diff] syntax = false` — where nothing was prefetched
+        // at all before — every row now warms diff-only.
+        let current_gen = self.diff_generation.current();
+        // diff_fully_highlighted is O(lines); it can only flip to true when new spans
+        // arrive (a batch was applied) or a fresh diff loaded. Skipping the scan on
+        // the other repaints during the highlight window (scroll, hover) avoids
+        // re-scanning the whole diff for nothing. A scrolled-away view scans until the
+        // foreground diff settles, which is bounded by the highlight window — and
+        // during it `applied_highlight` is generally true anyway, so it adds no scan
+        // that wasn't already happening.
+        let settled_diff_unwarmed = self.prefetched_gen != current_gen
+            && (applied_highlight || self.last_highlight_check_gen != current_gen);
+        let scrolled_off_band = view_moved_enough(&self.prefetched_view, &self.commit_view_range);
+        if settled_diff_unwarmed || scrolled_off_band {
+            self.last_highlight_check_gen = current_gen;
+            // Still never compete with the foreground diff's own colouring: the reader
+            // is looking at that, not at a row they might scroll to.
+            if diff_fully_highlighted(&self.diff_lines, &self.diff_files) {
+                self.prefetched_gen = current_gen;
+                self.dispatch_prefetch(ctx);
             }
         }
     }
@@ -9105,29 +10213,510 @@ mod tests {
         )
     }
 
+    /// A `Coordinator` with `workers` pool mailboxes and one heavy worker, and no
+    /// threads at all behind them — every scheduling decision is a plain method call on
+    /// a struct nothing else can touch, which is the point of the design.
+    fn test_coord(workers: usize) -> (Coordinator, Vec<mpsc::Receiver<Job>>) {
+        test_coord_n(workers, 1)
+    }
+
+    /// As `test_coord`, with an explicit heavy-lane width.
+    fn test_coord_n(workers: usize, heavy_count: usize) -> (Coordinator, Vec<mpsc::Receiver<Job>>) {
+        let (mut mailboxes, rxs): (Vec<_>, Vec<_>) = (0..workers + heavy_count)
+            .map(|_| mpsc::channel())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .unzip();
+        let heavy = mailboxes.split_off(workers);
+        (
+            Coordinator {
+                stats: VecDeque::new(),
+                ready: VecDeque::new(),
+                deferred: VecDeque::new(),
+                measured: HashMap::new(),
+                oversized: HashSet::new(),
+                idle: (0..workers).collect(),
+                heavy_idle: (workers..workers + heavy.len()).collect(),
+                heavy_outstanding: HashMap::new(),
+                heavy_budget: None,
+                busy_stats: HashSet::new(),
+                warming: HashMap::new(),
+                warmed: 0,
+                line_budget: 1_000,
+                hl: None,
+                stats_epoch: 0,
+                mailboxes,
+                heavy,
+                inflight: Arc::default(),
+            },
+            rxs,
+        )
+    }
+
+    /// A bare warm target for one oid.
+    fn heavy_target(n: u32) -> PrefetchTarget {
+        PrefetchTarget {
+            probed: None,
+            key: DiffCacheKey {
+                oid: oid(n),
+                settings: DiffSettings {
+                    context: 3,
+                    ignore_ws: false,
+                    show_stats: true,
+                    detect_renames: true,
+                    detect_copies: false,
+                },
+                theme: highlight::DEFAULT_THEME,
+                enabled: true,
+                content: 0,
+            },
+            scope: RowScope::new(DiffSource::Commit(oid(n))),
+            depth: WarmDepth::DiffOnly,
+        }
+    }
+
+    /// A heavy target that has been measured at `bytes`, as one off the lane always is.
+    fn measured_target(n: u32, bytes: u64) -> PrefetchTarget {
+        heavy_target(n).measured(bytes)
+    }
+
+    fn stats_job(n: u32) -> StatsJob {
+        StatsJob {
+            scope: RowScope::new(DiffSource::Commit(oid(n))),
+            settings: DiffSettings {
+                context: 3,
+                ignore_ws: false,
+                show_stats: true,
+                detect_renames: true,
+                detect_copies: false,
+            },
+            want: StatsWant::FilesAndLines,
+            epoch: 0,
+        }
+    }
+
+    /// A row reported too expensive comes back onto the heavy lane carrying its
+    /// measurement, so no worker probes it a second time.
+    ///
+    /// The coordinator handed it out exactly once, so it can return exactly once —
+    /// which is what removed the three-way dedup this used to need. That dedup read
+    /// "measured" as "already queued", and because the stats path measures visible
+    /// rows FIRST, every heavy row on screen was silently dropped instead of deferred:
+    /// the rows built first were the ones out of view, and the on-screen ones came
+    /// back a dispatch later having lost 13 seconds of priority.
     #[test]
-    fn prefetch_targets_closest_first_below_wins_ties() {
-        let commits: Vec<CommitInfo> = (0..9).map(|n| ci(DiffSource::Commit(oid(n)))).collect();
-        // selected = 4, whole list visible. Ordered by |i-4|; on a tie the row below
-        // (larger index) first: 5,3, 6,2, 7,1, 8,0. Capped at 4.
-        assert_eq!(
-            prefetch_targets(&commits, 4, 0..9, 4),
-            vec![oid(5), oid(3), oid(6), oid(2)]
+    fn a_row_reported_too_big_lands_on_the_heavy_lane_measured() {
+        let (mut coord, _rxs) = test_coord(2);
+        coord.finish(
+            0,
+            Outcome::TooBig {
+                target: Box::new(heavy_target(1)),
+                bytes: 999,
+            },
         );
-        // Only the rows in `view` are eligible — a narrow window excludes the rest.
+        assert_eq!(coord.deferred.len(), 1, "postponed, not dropped");
+        assert_eq!(coord.deferred[0].probed, Some(999), "measured exactly once");
+        assert_eq!(coord.measured.get(&oid(1)), Some(&999));
+    }
+
+    /// The pool never takes a row off the heavy lane. That is a fact about which
+    /// collection `next_pool_job` reads, not an arithmetic invariant between a counter
+    /// and a limit that the next edit could quietly break.
+    #[test]
+    fn the_pool_never_takes_an_expensive_row() {
+        let (mut coord, _rxs) = test_coord(2);
+        coord.deferred.push_back(heavy_target(1));
+        assert!(
+            coord.next_pool_job().is_none(),
+            "a heavy row must wait for its own lane, not occupy a worker the next \
+             band needs"
+        );
+        assert!(
+            coord.next_heavy().is_some(),
+            "and the heavy lane does take it"
+        );
+    }
+
+    /// A measured row is re-offered to the heavy lane rather than re-probed, and one
+    /// already built-and-dropped is not offered at all.
+    #[test]
+    fn a_new_band_routes_rows_by_what_is_already_known() {
+        let (mut coord, _rxs) = test_coord(2);
+        coord.measured.insert(oid(1), 999);
+        coord.oversized.insert(heavy_target(3).key);
+        coord.take_band(
+            [heavy_target(1), heavy_target(2), heavy_target(3)]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(coord.deferred.len(), 1, "the measured row");
         assert_eq!(
-            prefetch_targets(&commits, 4, 3..6, 10),
-            vec![oid(5), oid(3)]
+            coord.deferred[0].probed,
+            Some(999),
+            "carrying its measurement"
+        );
+        assert_eq!(coord.ready.len(), 1, "the unknown row");
+        assert!(coord.ready[0].probed.is_none(), "still to be probed");
+    }
+
+    /// Stats for a row already known expensive are never queued: its line counts cost
+    /// exactly the blob reads its diff already owes, and `cache_diff` hands them over
+    /// for free when that diff lands. Queueing one anyway is how the doubling came
+    /// back once — 10.7s spent on an answer that had already arrived.
+    #[test]
+    fn stats_are_not_queued_for_a_row_the_diff_already_owes() {
+        let (mut coord, _rxs) = test_coord(2);
+        coord.measured.insert(oid(1), 999);
+        coord.stats = [stats_job(1), stats_job(2)]
+            .into_iter()
+            .filter(|j| !coord.measured.contains_key(&j.scope.source.oid()))
+            .collect();
+        assert_eq!(coord.stats.len(), 1);
+        assert_eq!(coord.stats[0].scope.source.oid(), oid(2));
+    }
+
+    /// One row is handed to one worker, however often the tier is re-submitted — a
+    /// row not yet in `commit_stats` still reads as unknown, so the dispatcher keeps
+    /// offering it while it is being computed.
+    #[test]
+    fn one_stats_row_goes_to_one_worker() {
+        let (mut coord, _rxs) = test_coord(2);
+        coord.stats = [stats_job(1), stats_job(1)].into_iter().collect();
+        assert!(coord.next_pool_job().is_some());
+        assert!(
+            coord.next_pool_job().is_none(),
+            "the second copy must not be handed out while the first is in flight"
+        );
+    }
+
+    /// A warm job carries the stats epoch, so a row whose diff is dropped uncached can
+    /// still report the column's numbers. Without it that cell keeps its file count and
+    /// a permanently blank `+`/`-`: the row is blob-heavy, so its stats job sent a file
+    /// count and stopped, trusting a diff that then never reaches `cache_diff`.
+    #[test]
+    fn a_warm_job_carries_the_epoch_a_dropped_row_needs_to_report_stats() {
+        // Two workers: `run_msg` dispatches, so the stats row takes one and the warm
+        // row needs the other.
+        let (mut coord, _rxs) = test_coord(2);
+        let mut job = stats_job(1);
+        job.epoch = 7;
+        coord.run_msg(CoordMsg::SubmitStats(std::iter::once(job).collect()));
+        coord.ready.push_back(heavy_target(2));
+        match coord.next_pool_job() {
+            Some(Job::Warm { stats_epoch, .. }) => assert_eq!(stats_epoch, 7),
+            _ => panic!("expected a warm job"),
+        }
+    }
+
+    /// The lane runs several rows at once. One thread was tried and was wrong for the
+    /// case that matters: where nearly every commit is expensive, this lane IS the
+    /// prefetch, and 200 commits at ~11s each is 37 minutes that never catches up.
+    #[test]
+    fn the_heavy_lane_runs_several_rows_at_once() {
+        let (mut coord, _rxs) = test_coord_n(1, 3);
+        for n in 1..=3 {
+            coord.deferred.push_back(measured_target(n, 1_000));
+        }
+        coord.dispatch();
+        assert!(coord.deferred.is_empty(), "all three handed out");
+        assert_eq!(coord.heavy_outstanding.len(), 3);
+        assert!(coord.heavy_idle.is_empty());
+    }
+
+    /// An idle lane admits any row, however large. Progress has to be guaranteed —
+    /// nothing would re-trigger a dispatch for a lane holding nothing — and one row is
+    /// exactly what the foreground allocates when the user clicks that commit.
+    #[test]
+    fn an_idle_heavy_lane_admits_a_row_of_any_size() {
+        let (mut coord, _rxs) = test_coord(1);
+        coord.deferred.push_back(measured_target(1, u64::MAX / 2));
+        assert!(coord.next_heavy().is_some());
+    }
+
+    /// A row that will not fit stays exactly where it is rather than being popped and
+    /// requeued: dispatch runs whenever a worker reports, which is precisely when
+    /// memory frees, so it is reconsidered then. That is what replaced a park-and-retry
+    /// loop measured at ~120 refusals a second.
+    #[test]
+    fn a_row_that_does_not_fit_waits_at_the_front_of_the_lane() {
+        let (mut coord, _rxs) = test_coord_n(1, 2);
+        coord.heavy_outstanding.insert(1, 1_000); // the lane is loaded
+        coord.deferred.push_back(measured_target(1, u64::MAX / 2));
+        assert!(coord.next_heavy().is_none(), "declined");
+        assert_eq!(coord.deferred.len(), 1, "and kept, not dropped");
+    }
+
+    /// The lane never outgrows the pool. The two are complementary — whichever the
+    /// repo needs, the other is idle — so matching them is affordable; exceeding them
+    /// would hand speculation more of the machine than the foreground keeps.
+    #[test]
+    fn the_heavy_lane_never_outgrows_the_pool() {
+        let pool = prefetch_worker_count();
+        for budget in [None, Some(0), Some(64 << 30)] {
+            let heavy = prefetch_heavy_workers(budget);
+            assert!(heavy >= 1, "the lane must be able to drain, at {budget:?}");
+            assert!(heavy <= pool, "{heavy} heavy of {pool} pool, at {budget:?}");
+        }
+    }
+
+    /// A machine short of memory gets fewer threads, not eight it can never keep busy.
+    #[test]
+    fn the_lane_narrows_on_a_machine_with_little_memory() {
+        assert_eq!(prefetch_heavy_workers(Some(0)), 1, "never zero");
+        assert_eq!(
+            prefetch_heavy_workers(Some(2 * HEAVY_ROW_NOMINAL_BYTES)),
+            2.min(prefetch_worker_count())
+        );
+        assert_eq!(
+            prefetch_heavy_workers(Some(64 << 30)),
+            prefetch_worker_count(),
+            "and a machine with room gets the whole lane"
+        );
+    }
+
+    /// The stampede is the real crash risk, and the live reading cannot catch it:
+    /// `dispatch` hands out every free worker in one tight loop, so without
+    /// self-accounting all of them are admitted against the same `MemAvailable` figure
+    /// — none has allocated yet — and then collectively ask for more than the machine
+    /// has.
+    #[test]
+    fn the_lane_stops_committing_past_its_budget() {
+        let (mut coord, _rxs) = test_coord_n(1, 4);
+        coord.heavy_budget = Some(1_000);
+        coord.heavy_outstanding.insert(1, 900);
+        assert!(!coord.heavy_fits(200), "900 + 200 is over a 1000 budget");
+        assert!(coord.heavy_fits(100), "900 + 100 is not");
+    }
+
+    /// Eight rows admitted in one dispatch must not exceed the budget between them.
+    #[test]
+    fn a_whole_dispatch_cannot_overcommit_the_lane() {
+        let (mut coord, _rxs) = test_coord_n(1, 8);
+        coord.heavy_budget = Some(3_000); // room for three 1_000-byte rows
+        for n in 1..=8 {
+            coord.deferred.push_back(measured_target(n, 500)); // need = 1_000 each
+        }
+        coord.dispatch();
+        let held: u64 = coord.heavy_outstanding.values().sum();
+        assert!(
+            held <= 3_000,
+            "committed {held} against a 3000 budget across one dispatch"
+        );
+        assert!(
+            !coord.deferred.is_empty(),
+            "the rest wait, they are not dropped"
+        );
+    }
+
+    /// Crossing the dispatch's line budget empties BOTH diff lanes: warming past it
+    /// would evict the band just filled, so the rows the user is about to scroll into
+    /// would be gone before they got there.
+    #[test]
+    fn spending_the_budget_drops_the_rest_of_the_band() {
+        let (mut coord, _rxs) = test_coord(1);
+        coord.ready.push_back(heavy_target(1));
+        coord.deferred.push_back(heavy_target(2));
+        coord.finish(0, Outcome::Warmed { lines: 1_000 });
+        coord.dispatch();
+        assert!(coord.ready.is_empty() && coord.deferred.is_empty());
+    }
+
+    #[test]
+    fn warm_band_extends_one_full_window_each_way() {
+        // 18 visible rows ⇒ 18 above and 18 below, so a page-scroll either way
+        // lands on rows this dispatch already reached.
+        assert_eq!(warm_band(&(100..118)), 82..136);
+    }
+
+    #[test]
+    fn warm_band_saturates_at_the_top_of_the_list() {
+        // A view at (or near) the top has no rows above it; the band must not
+        // underflow, and the downward half is unaffected.
+        assert_eq!(warm_band(&(0..18)), 0..36);
+        assert_eq!(warm_band(&(5..18)), 0..31);
+    }
+
+    #[test]
+    fn warm_band_of_an_empty_view_is_empty() {
+        // Before the first render stores a row range, and on a list with no rows.
+        // No window ⇒ nothing to warm, rather than an unbounded band.
+        assert_eq!(warm_band(&(0..0)), 0..0);
+        assert_eq!(warm_band(&(7..7)), 7..7);
+    }
+
+    #[test]
+    fn view_moved_enough_needs_half_a_window() {
+        let prev = 100..118; // 18 rows
+        assert!(!view_moved_enough(&prev, &(100..118)), "unmoved");
+        assert!(
+            !view_moved_enough(&prev, &(103..121)),
+            "3 rows — under half"
+        );
+        assert!(
+            !view_moved_enough(&prev, &(92..110)),
+            "8 rows up — under half"
+        );
+        assert!(
+            view_moved_enough(&prev, &(109..127)),
+            "9 rows — half a window"
+        );
+        assert!(
+            view_moved_enough(&prev, &(91..109)),
+            "9 rows up — half a window"
+        );
+    }
+
+    /// The band is derived from the window length, so growing the pane extends the
+    /// band past what the last dispatch covered without the top row moving at all.
+    #[test]
+    fn view_moved_enough_on_a_resized_window() {
+        assert!(view_moved_enough(&(100..118), &(100..130)), "grown by 12");
+        assert!(view_moved_enough(&(100..118), &(100..112)), "shrunk by 6");
+    }
+
+    /// `show_rows` hands back a range whose length wobbles by a row while a window
+    /// lays out or a fractional scroll offset rounds. Re-aiming on that — which
+    /// comparing lengths for inequality did — is a dispatch storm: measured at
+    /// startup as 127 rows, then 21, 17, 2, 1, 4, 1 …, each bumping the epoch and
+    /// stacking a fresh pool on the previous one's still-running diffs.
+    #[test]
+    fn view_moved_enough_ignores_a_one_row_wobble() {
+        assert!(!view_moved_enough(&(100..118), &(100..119)), "grown by one");
+        assert!(
+            !view_moved_enough(&(100..118), &(100..117)),
+            "shrunk by one"
+        );
+        assert!(!view_moved_enough(&(100..118), &(101..119)), "slid by one");
+    }
+
+    /// A zero-length view (before the first render stores a range) would give a zero
+    /// threshold, and `>=` would then call every frame a move.
+    #[test]
+    fn view_moved_enough_on_an_empty_view_needs_an_actual_move() {
+        assert!(!view_moved_enough(&(0..0), &(0..0)));
+        assert!(view_moved_enough(&(0..0), &(1..1)));
+    }
+
+    /// One worker would be no pool, and an unbounded one would starve the very
+    /// diffs the user is waiting on — this repo has measured syntect degrading from
+    /// ~0.3ms/line to 0.7–2.7ms/line under exactly that saturation.
+    #[test]
+    fn prefetch_worker_count_is_bounded_and_leaves_the_foreground_room() {
+        let n = prefetch_worker_count();
+        assert!((1..=PREFETCH_MAX_WORKERS).contains(&n), "got {n}");
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        assert!(
+            n < cores || cores == 1,
+            "speculative work must never take the whole machine: {n} of {cores}"
         );
     }
 
     #[test]
-    fn prefetch_targets_excludes_virtual_and_caps() {
+    fn prefetch_targets_closest_first_below_wins_ties() {
+        let commits: Vec<CommitInfo> = (0..9).map(|n| ci(DiffSource::Commit(oid(n)))).collect();
+        // selected = 4, all 9 rows visible. Ordered by |i-4|; on a tie the row below
+        // (larger index) first: 5,3, 6,2, 7,1, 8,0. Uncapped — the band is the bound.
+        let got: Vec<git2::Oid> = prefetch_targets(&commits, 4, &(0..9), 8)
+            .into_iter()
+            .map(|(oid, _)| oid)
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                oid(5),
+                oid(3),
+                oid(6),
+                oid(2),
+                oid(7),
+                oid(1),
+                oid(8),
+                oid(0)
+            ]
+        );
+    }
+
+    #[test]
+    fn prefetch_targets_reaches_a_full_window_past_each_edge() {
+        let commits: Vec<CommitInfo> = (0..60).map(|n| ci(DiffSource::Commit(oid(n)))).collect();
+        // A 10-row view at 20..30 ⇒ band 10..40. Rows outside it are never targets,
+        // however close to the selection they would be under the old 8-row margin.
+        let got: Vec<git2::Oid> = prefetch_targets(&commits, 25, &(20..30), 8)
+            .into_iter()
+            .map(|(oid, _)| oid)
+            .collect();
+        assert_eq!(got.len(), 29, "band is 30 rows minus the selected one");
+        assert!(
+            got.contains(&oid(10)),
+            "one full window above is in the band"
+        );
+        assert!(
+            got.contains(&oid(39)),
+            "one full window below is in the band"
+        );
+        assert!(!got.contains(&oid(9)), "past the band");
+        assert!(!got.contains(&oid(40)), "past the band");
+    }
+
+    #[test]
+    fn prefetch_targets_highlights_only_within_the_near_margin() {
+        let commits: Vec<CommitInfo> = (0..60).map(|n| ci(DiffSource::Commit(oid(n)))).collect();
+        let depth = |target: u32| {
+            prefetch_targets(&commits, 25, &(20..30), 8)
+                .into_iter()
+                .find(|(o, _)| *o == oid(target))
+                .map(|(_, d)| d)
+        };
+        // near margin 8 ⇒ rows 12..38 are worth fully colouring; the rest of the
+        // band is cached un-highlighted.
+        assert_eq!(depth(29), Some(WarmDepth::Highlighted), "visible");
+        assert_eq!(depth(12), Some(WarmDepth::Highlighted), "near edge, inside");
+        assert_eq!(depth(37), Some(WarmDepth::Highlighted), "near edge, inside");
+        assert_eq!(
+            depth(11),
+            Some(WarmDepth::DiffOnly),
+            "one past the near edge"
+        );
+        assert_eq!(
+            depth(38),
+            Some(WarmDepth::DiffOnly),
+            "one past the near edge"
+        );
+    }
+
+    /// Once the user scrolls away from the selection, ranking by distance from it
+    /// would send the pool off warming rows nobody is looking at. The anchor is the
+    /// selection clamped into the view, so it becomes the edge scrolled toward.
+    #[test]
+    fn prefetch_targets_anchor_clamps_an_offscreen_selection_into_the_view() {
+        let commits: Vec<CommitInfo> = (0..60).map(|n| ci(DiffSource::Commit(oid(n)))).collect();
+        let first = |sel: usize| {
+            prefetch_targets(&commits, sel, &(20..30), 8)
+                .into_iter()
+                .map(|(oid, _)| oid)
+                .next()
+        };
+        // Selection on screen: unchanged behaviour. The selected row is skipped, so
+        // the nearest target is the tie below it.
+        assert_eq!(first(25), Some(oid(26)));
+        // Scrolled down past the selection ⇒ anchor is the top visible row, and that
+        // row is itself a target (it is not the selection), so it warms first.
+        assert_eq!(first(3), Some(oid(20)));
+        // Scrolled up past it ⇒ anchor is the bottom visible row.
+        assert_eq!(first(55), Some(oid(29)));
+    }
+
+    #[test]
+    fn prefetch_targets_excludes_virtual_rows() {
         let mut commits = vec![ci(DiffSource::Uncommitted), ci(DiffSource::Staged)];
         commits.extend((2..7).map(|n| ci(DiffSource::Commit(oid(n))))); // indices 2..=6
-        // selected = 2 (first real), whole list visible. Virtual rows 0,1 excluded;
-        // candidates 3,4,5,6 by distance; capped at 2.
-        assert_eq!(prefetch_targets(&commits, 2, 0..7, 2), vec![oid(3), oid(4)]);
+        // selected = 2 (first real). The virtual rows at 0 and 1 are never warmed:
+        // their cache key is content-hashed after the diff exists, so a prefetch
+        // could not key them correctly.
+        let got: Vec<git2::Oid> = prefetch_targets(&commits, 2, &(0..7), 8)
+            .into_iter()
+            .map(|(oid, _)| oid)
+            .collect();
+        assert_eq!(got, vec![oid(3), oid(4), oid(5), oid(6)]);
     }
 
     /// Only what can change a COUNT invalidates cached stats. `context` cannot
@@ -9243,9 +10832,12 @@ mod tests {
         );
     }
 
-    /// Only the visible window is computed — no margin.
+    /// `stats_targets` answers for whatever range it is handed and clamps to the
+    /// list; the two-phase dispatch (visible rows, then `warm_band`) is what turns
+    /// that into "visible first". Pinning the clamp here keeps a band that runs past
+    /// the end of a short list from panicking.
     #[test]
-    fn stats_targets_is_limited_to_the_visible_rows() {
+    fn stats_targets_is_limited_to_the_range_it_is_given() {
         let commits = vec![
             ci(DiffSource::Commit(oid(1))),
             ci(DiffSource::Commit(oid(2))),
@@ -9262,6 +10854,42 @@ mod tests {
             stats_targets(&commits, 3..99, &known, StatsWant::FilesAndLines),
             vec![oid(4)]
         );
+    }
+
+    /// The two-phase rule the dispatcher implements: while any visible row is
+    /// unknown the batch is visible-only, and the band is asked for only once they
+    /// are all known. A single batch spanning both would leave the on-screen numbers
+    /// blank while the one-batch-at-a-time worker ground through rows nobody can see.
+    #[test]
+    fn stats_two_phase_prefers_visible_rows_over_the_band() {
+        let commits: Vec<CommitInfo> = (0..40).map(|n| ci(DiffSource::Commit(oid(n)))).collect();
+        let view = 20..25;
+        let want = StatsWant::FilesAndLines;
+        let mut known: HashMap<git2::Oid, Option<CommitStats>> = HashMap::new();
+
+        // Phase 1: nothing known ⇒ exactly the visible rows.
+        assert_eq!(
+            stats_targets(&commits, view.clone(), &known, want),
+            (20..25).map(oid).collect::<Vec<_>>(),
+            "visible rows only while any is unknown"
+        );
+
+        // Once every visible row is known, phase 1 comes back empty and the band is
+        // what remains to warm.
+        for n in 20..25 {
+            known.insert(
+                oid(n),
+                Some(CommitStats {
+                    files: 1,
+                    lines: Some((1, 1)),
+                }),
+            );
+        }
+        assert!(stats_targets(&commits, view.clone(), &known, want).is_empty());
+        let band = stats_targets(&commits, warm_band(&view), &known, want);
+        assert_eq!(band.len(), 10, "band is 15 rows less the 5 already known");
+        assert!(band.contains(&oid(15)), "one window above");
+        assert!(band.contains(&oid(29)), "one window below");
     }
 
     /// A `--reflog` view shows the same oid at several visible indices
@@ -9348,372 +10976,73 @@ mod tests {
         );
     }
 
-    /// Invalidating WHILE a batch is running must clear the in-flight set too.
+    /// Invalidating while rows are in flight must clear the submitted list too.
     ///
-    /// The batch's results are discarded by the epoch check, so nothing else
-    /// ever removes those oids — and dispatch is gated on the set being empty.
-    /// Without the clear, the column stops updating for the rest of the
-    /// session, silently. Simulated here as the real sequence: claim a batch,
-    /// invalidate through the SAME function the app calls, deliver the
-    /// now-stale results, and assert we can dispatch again.
+    /// The old hazard was an unreleased CLAIM: the in-flight set doubled as the "a batch
+    /// is running" gate, so results discarded by the epoch check left claims nothing
+    /// could free, and the column died silently for the session. Pool-side RAII claims
+    /// made that unrepresentable. What replaces it is subtler and just as fatal:
+    /// `dispatch_commit_stats` submits only when the target list differs from
+    /// `stats_submitted`, so leaving that list behind makes the next dispatch compare an
+    /// unchanged list against a freshly cleared map and never re-queue — the same
+    /// silently-stuck column, reached a different way.
+    ///
+    /// Driven through the production function, so deleting its `submitted.clear()` turns
+    /// this red.
     #[test]
-    fn invalidating_during_a_batch_leaves_the_dispatcher_free() {
-        let mut inflight: HashSet<git2::Oid> = HashSet::new();
+    fn invalidating_mid_flight_lets_the_dispatcher_requeue() {
+        let mut submitted: Vec<git2::Oid> = Vec::new();
         let mut known: HashMap<git2::Oid, Option<CommitStats>> = HashMap::new();
         let epoch = Epoch::default();
-        let batch = [oid(1), oid(2), oid(3)];
+        let batch = vec![oid(1), oid(2), oid(3)];
 
-        // Dispatch: claim the batch under the current epoch.
+        // Dispatch: the pool is handed this list under the current epoch.
         let dispatched_epoch = epoch.current();
-        inflight.extend(batch);
+        submitted.clone_from(&batch);
 
-        // Invalidate mid-flight — the production function, not a copy of it, so
-        // dropping `inflight.clear()` from it turns this test red.
-        invalidate_stats_state(&mut known, &mut inflight, &epoch);
+        invalidate_stats_state(&mut known, &mut submitted, &epoch);
 
-        // The worker's already-sent results land, and are stale — the same
-        // `is_current` gate `drain_commit_stats` runs, over the same `Epoch`.
-        for oid in batch {
+        // The in-flight results land and are stale — the same `is_current` gate
+        // `drain_commit_stats` applies, over the same `Epoch`.
+        for o in &batch {
             if !epoch.is_current(dispatched_epoch) {
                 continue;
             }
-            inflight.remove(&oid);
-            known.insert(oid, None);
+            known.insert(*o, None);
         }
 
         assert!(
-            inflight.is_empty(),
-            "a stale batch must not leave claims behind — dispatch is gated on this"
+            known.is_empty(),
+            "stale results must not land in the freshly cleared map"
         );
-        assert!(known.is_empty(), "and no stale numbers may be installed");
+        assert_ne!(
+            submitted, batch,
+            "the submitted list must not survive an invalidation, or the next dispatch \
+             finds it unchanged and never re-queues"
+        );
     }
 
-    /// A panicking worker's `report_batch_failed` re-reports EVERY target,
-    /// including ones it had already sent good results for — so a `None`
-    /// landing for an oid that already holds `Some(_)` must not clobber it.
-    /// The claim must still be released either way, or the panic path would
-    /// wedge the dispatcher on top of losing the number.
+    /// A `None` landing for an oid that already holds `Some(_)` must not clobber it.
+    ///
+    /// Pins `install_stats_result`'s guard, which is defence rather than a path the
+    /// current queueing reaches: with per-row jobs and a claim per oid, each row reports
+    /// once. The cost of being wrong is a number silently replaced by a blank, so the
+    /// guard stays and this holds it in place.
     #[test]
     fn a_none_result_does_not_clobber_an_already_succeeded_row() {
         let stats = CommitStats {
             files: 2,
             lines: Some((3, 1)),
         };
-        let mut inflight: HashSet<git2::Oid> = HashSet::new();
         let mut known: HashMap<git2::Oid, Option<CommitStats>> = HashMap::new();
-        inflight.insert(oid(1));
         known.insert(oid(1), Some(stats));
 
-        // Simulate the drain installing the re-reported failure — same two
-        // lines `drain_commit_stats` runs once the epoch check passes.
-        inflight.remove(&oid(1));
         install_stats_result(&mut known, oid(1), None);
 
         assert_eq!(
             known.get(&oid(1)),
             Some(&Some(stats)),
-            "a re-reported failure must not overwrite an already-succeeded row"
-        );
-        assert!(
-            !inflight.contains(&oid(1)),
-            "the claim must still be released even though the result was dropped"
-        );
-    }
-
-    /// A worktree-only edit never touches `.git`, so the watcher's debounced
-    /// reload — the only other thing that evicts the virtual rows' stats — never
-    /// fires. The diff PANE stays correct regardless (a virtual key carries a
-    /// content hash, so it re-keys and recomputes), and without this the column
-    /// would sit beside it showing the pre-edit numbers: exactly the
-    /// column-vs-pane disagreement the feature exists to make impossible.
-    #[test]
-    fn a_worktree_edit_drops_the_edited_virtual_rows_stats() {
-        let k = |o: git2::Oid, content: u64| DiffCacheKey {
-            oid: o,
-            settings: ds(),
-            theme: highlight::EmbeddedThemeName::CatppuccinMocha,
-            enabled: true,
-            content,
-        };
-        let st = |files| {
-            Some(CommitStats {
-                files,
-                lines: Some((1, 0)),
-            })
-        };
-        let mut seen: HashMap<git2::Oid, u64> = HashMap::new();
-        let mut known: HashMap<git2::Oid, Option<CommitStats>> = HashMap::new();
-        known.insert(oid_uncommitted(), st(1));
-        known.insert(oid_staged(), st(2));
-        known.insert(oid(9), st(3));
-
-        // First sighting of each virtual diff: recorded, nothing evicted.
-        sync_virtual_stats(&mut seen, &mut known, &k(oid_uncommitted(), 10));
-        sync_virtual_stats(&mut seen, &mut known, &k(oid_staged(), 20));
-        assert_eq!(known.len(), 3, "a first sighting is not a change");
-
-        // The same content again — re-selecting the row, a debounced refresh,
-        // an apply that changed nothing. Must not evict, or the column would
-        // blank and recompute on every visit to a virtual row.
-        sync_virtual_stats(&mut seen, &mut known, &k(oid_uncommitted(), 10));
-        assert_eq!(
-            known.len(),
-            3,
-            "recomputing identical content is not a change"
-        );
-
-        // A real commit's diff is immutable; it can never invalidate anything.
-        sync_virtual_stats(&mut seen, &mut known, &k(oid(9), 99));
-        assert!(
-            known.contains_key(&oid(9)),
-            "a real commit is never evicted"
-        );
-
-        // The edit: same diff, new content hash.
-        sync_virtual_stats(&mut seen, &mut known, &k(oid_uncommitted(), 11));
-        assert!(
-            !known.contains_key(&oid_uncommitted()),
-            "the edited row must be recomputed, not left showing pre-edit numbers"
-        );
-        assert!(
-            known.contains_key(&oid_staged()),
-            "the other virtual row did not change"
-        );
-        assert!(
-            known.contains_key(&oid(9)),
-            "and neither did any real commit"
-        );
-
-        // Widening the toolbar's context re-hashes the SAME working tree (more
-        // context lines in the diff text), so this eviction is pure waste — and
-        // it is still the right answer, because the case below is the same
-        // install seen from here and absorbing it is permanent.
-        let wider = DiffCacheKey {
-            settings: DiffSettings { context: 9, ..ds() },
-            ..k(oid_staged(), 21)
-        };
-        sync_virtual_stats(&mut seen, &mut known, &wider);
-        assert!(
-            !known.contains_key(&oid_staged()),
-            "a moved hash always recomputes — settings changed or not"
-        );
-
-        // The interleaving that makes a settings guard unsafe: the user edits
-        // the file, THEN clicks the toolbar's context `+`. That click is the
-        // re-diff trigger, so one install carries both a new hash and new
-        // settings, and it is indistinguishable from the pure re-layout above.
-        // Absorbing it would leave the row permanently wrong: the post-edit
-        // hash is recorded either way, so no later install could detect it.
-        known.insert(oid_uncommitted(), st(1));
-        let edited_and_widened = DiffCacheKey {
-            settings: DiffSettings { context: 9, ..ds() },
-            ..k(oid_uncommitted(), 12)
-        };
-        sync_virtual_stats(&mut seen, &mut known, &edited_and_widened);
-        assert!(
-            !known.contains_key(&oid_uncommitted()),
-            "an edit arriving with a settings change must not be absorbed"
-        );
-
-        // Same for a re-theme, which doesn't even reshape the diff.
-        known.insert(oid_staged(), st(2));
-        let retimed = DiffCacheKey {
-            theme: highlight::EmbeddedThemeName::CatppuccinLatte,
-            settings: DiffSettings { context: 9, ..ds() },
-            ..k(oid_staged(), 22)
-        };
-        sync_virtual_stats(&mut seen, &mut known, &retimed);
-        assert!(
-            !known.contains_key(&oid_staged()),
-            "a re-theme must not mask a working-tree change"
-        );
-
-        // The only thing that holds an eviction back is an unmoved hash — so
-        // the last install of each row, repeated, still changes nothing.
-        known.insert(oid_uncommitted(), st(1));
-        known.insert(oid_staged(), st(2));
-        sync_virtual_stats(&mut seen, &mut known, &edited_and_widened);
-        sync_virtual_stats(&mut seen, &mut known, &retimed);
-        assert_eq!(
-            known.len(),
-            3,
-            "a repeat of the same content is not a change"
-        );
-    }
-
-    /// `handle_git_reload` retries failed stats rows through this, because a
-    /// `.git` write (an NFS blip clearing, a `git worktree` shuffle finishing,
-    /// a moved repo path coming back) is precisely when a previously
-    /// unreadable object may have become readable again. A succeeded row must
-    /// survive untouched — this is a retry, not a second `invalidate_commit_stats`.
-    #[test]
-    fn retry_failed_stats_drops_only_the_failures() {
-        let mut known: HashMap<git2::Oid, Option<CommitStats>> = HashMap::new();
-        known.insert(
-            oid(1),
-            Some(CommitStats {
-                files: 1,
-                lines: Some((2, 0)),
-            }),
-        );
-        known.insert(oid(2), None); // previously failed
-
-        retry_failed_stats(&mut known);
-
-        assert!(
-            known.contains_key(&oid(1)),
-            "a succeeded row must survive a reload"
-        );
-        assert!(
-            !known.contains_key(&oid(2)),
-            "a failed row must be retried after a reload"
-        );
-    }
-
-    /// The worker end-to-end over a real repo: every dispatched target reports
-    /// back with real numbers, none as a failure. Pins what the by-hand run
-    /// ("no `stats: … failed` lines during normal scrolling") checks — and
-    /// unlike that run it works without a display server.
-    #[test]
-    fn stats_worker_reports_every_target_it_is_given() {
-        let (dir, repo) = temp_repo();
-        let c1 = commit_file(&repo, "a.txt", "1\n", "c1");
-        let c2 = commit_file(&repo, "a.txt", "1\n2\n", "c2");
-        // An uncommitted change, so a virtual row is in the batch too.
-        write_file(&repo, "a.txt", "1\n2\n3\n");
-
-        let (tx, rx) = mpsc::channel();
-        let targets = vec![
-            RowScope::new(DiffSource::Commit(c1)),
-            RowScope::new(DiffSource::Commit(c2)),
-            RowScope::new(DiffSource::Uncommitted),
-        ];
-        let epoch = Epoch::default();
-        stats_worker(StatsJob {
-            repo_path: dir.path().to_string_lossy().into_owned(),
-            targets,
-            settings: ds(),
-            want: StatsWant::FilesAndLines,
-            epoch: epoch.current(),
-            current_epoch: epoch,
-            tx,
-            ctx: egui::Context::default(),
-        });
-
-        let got: HashMap<git2::Oid, Option<CommitStats>> = rx
-            .into_iter()
-            .map(|StatsResult { oid, stats, .. }| (oid, stats))
-            .collect();
-        assert_eq!(got.len(), 3, "every target must report back");
-        assert!(
-            got.values().all(Option::is_some),
-            "no target may come back as a failure: {got:?}"
-        );
-        // Root commit: the whole file is an addition.
-        assert_eq!(
-            got[&c1],
-            Some(CommitStats {
-                files: 1,
-                lines: Some((1, 0))
-            })
-        );
-        assert_eq!(
-            got[&c2],
-            Some(CommitStats {
-                files: 1,
-                lines: Some((1, 0))
-            })
-        );
-        assert_eq!(
-            got[&oid_uncommitted()],
-            Some(CommitStats {
-                files: 1,
-                lines: Some((1, 0))
-            })
-        );
-    }
-
-    /// A batch superseded mid-flight stops sending: the epoch check is what
-    /// keeps a stale worker from filling the channel behind an invalidation.
-    #[test]
-    fn stats_worker_bails_once_its_epoch_is_superseded() {
-        let (dir, repo) = temp_repo();
-        let c1 = commit_file(&repo, "a.txt", "1\n", "c1");
-
-        let (tx, rx) = mpsc::channel();
-        let epoch = Epoch::default();
-        let dispatched = epoch.current();
-        epoch.bump(); // an invalidation lands before the worker runs
-        stats_worker(StatsJob {
-            repo_path: dir.path().to_string_lossy().into_owned(),
-            targets: vec![RowScope::new(DiffSource::Commit(c1))],
-            settings: ds(),
-            want: StatsWant::FilesAndLines,
-            epoch: dispatched,
-            current_epoch: epoch,
-            tx,
-            ctx: egui::Context::default(),
-        });
-        assert_eq!(rx.into_iter().count(), 0);
-    }
-
-    /// A worker that cannot even OPEN the repo must still report every target.
-    ///
-    /// The claims were taken at dispatch and only the drain releases them, so a
-    /// silent return here strands the whole batch in `stats_inflight` — and
-    /// dispatch is gated on that set being empty, so the column would go dead
-    /// for the rest of the session on one `debug!` line. Real enough to test:
-    /// the repo can be moved, unmounted or `git worktree remove`d while gitkay
-    /// is open.
-    #[test]
-    fn stats_worker_reports_every_target_when_the_repo_cannot_be_opened() {
-        let dir = tempfile::tempdir().unwrap();
-        // A path that does not EXIST, so `discover` cannot walk upwards and
-        // succeed against some enclosing repo by accident (it walks up from the
-        // start path, and /tmp being repo-free is not something to rely on).
-        let missing = dir.path().join("gone");
-        assert!(
-            Repository::discover(&missing).is_err(),
-            "precondition: the worker must actually fail to open this"
-        );
-
-        let (tx, rx) = mpsc::channel();
-        let epoch = Epoch::default();
-        let dispatched = epoch.current();
-        let batch = [oid(1), oid(2), oid(3)];
-        stats_worker(StatsJob {
-            repo_path: missing.to_string_lossy().into_owned(),
-            targets: batch
-                .iter()
-                .map(|&o| RowScope::new(DiffSource::Commit(o)))
-                .collect(),
-            settings: ds(),
-            want: StatsWant::FilesAndLines,
-            epoch: dispatched,
-            current_epoch: epoch,
-            tx,
-            ctx: egui::Context::default(),
-        });
-
-        let got: Vec<StatsResult> = rx.into_iter().collect();
-        assert_eq!(
-            got.len(),
-            batch.len(),
-            "every target must report back, or its claim is never released"
-        );
-        assert!(
-            got.iter().all(|r| r.stats.is_none()),
-            "an unopenable repo yields no numbers"
-        );
-        assert!(
-            got.iter().all(|r| r.epoch == dispatched),
-            "results must carry the dispatched epoch, or the drain discards them \
-             and the claims stay put anyway"
-        );
-        assert_eq!(
-            got.iter().map(|r| r.oid).collect::<HashSet<_>>(),
-            batch.into_iter().collect::<HashSet<_>>(),
-            "and they must be the oids we dispatched"
+            "a failure must not overwrite an already-succeeded row"
         );
     }
 
