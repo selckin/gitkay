@@ -2412,6 +2412,42 @@ fn file_fully_highlighted(lines: &[DiffLine], start: usize, end: usize) -> bool 
 /// lines outside them (e.g. a no-patch/binary file's placeholder, which is
 /// `Context` but excluded from `file_line_ranges`) are never tokenized, so
 /// checking the whole `[0, len)` range would never be satisfied.
+/// May the band be warmed this frame?
+///
+/// With syntax off there is nothing to wait for and nothing to compete with, so every
+/// row warms `DiffOnly` immediately.
+///
+/// With syntax ON, two things must hold, and the FIRST one is the one that is easy to
+/// miss. A warm needs a `Highlighter` to hand the worker: without one every row lands
+/// `DiffOnly` however near the selection it is, and the entry is **sticky** — later
+/// dispatches skip it via `diff_cache.contains`, so it stays uncoloured for the session
+/// and each visit pays on-demand tokenizing. That is precisely what the startup band
+/// used to get. `GitkApp` has no highlighter until `ensure_diff_highlighted` collects
+/// the prewarmed one, which needs a diff to have arrived; the first dispatch fires
+/// before that, off the scroll trigger, because `prefetched_view` starts empty. And it
+/// gets past the settled check because `diff_fully_highlighted` is **vacuously true
+/// over an empty pane** — `.all()` on no files — so the predicate reads "nothing left to
+/// colour" at the one moment it means "there is no diff yet". Measured: 25 rows warmed
+/// uncoloured at startup, the eight heavy ones after 11.5s of building each.
+///
+/// Waiting costs a few tens of milliseconds of cold band once; dispatching early costs
+/// those rows their colour for the session. `ensure_diff_highlighted` runs earlier in
+/// the same frame as the drains, so the wait ends on the frame the first diff installs.
+///
+/// Then the usual rule: never compete with the foreground diff's own colouring — the
+/// reader is looking at that, not at a row they might scroll to. `settled` is a closure
+/// so the O(lines) question is not asked when the highlighter answer already decided it.
+fn band_warmable(
+    syntax_enabled: bool,
+    have_highlighter: bool,
+    settled: impl FnOnce() -> bool,
+) -> bool {
+    if !syntax_enabled {
+        return true;
+    }
+    have_highlighter && settled()
+}
+
 /// Must a memoized `diff_fully_highlighted` answer be recomputed?
 ///
 /// Two ways, and only two. The generation moved, so the memo describes a different diff
@@ -8281,7 +8317,11 @@ impl GitkApp {
             // the O(lines) scan off the frame loop: the scroll trigger stays true for
             // every frame until a dispatch actually succeeds, so an un-memoized question
             // would be re-asked on all of them.
-            if !self.syntax_enabled || self.diff_highlight_settled(applied_highlight) {
+            let syntax = self.syntax_enabled;
+            let have_highlighter = self.highlighter.is_some();
+            if band_warmable(syntax, have_highlighter, || {
+                self.diff_highlight_settled(applied_highlight)
+            }) {
                 self.prefetched_gen = current_gen;
                 self.dispatch_prefetch(ctx);
             }
@@ -9949,6 +9989,40 @@ mod tests {
         // One code line still None ⇒ not done.
         let partial = vec![highlighted, not_yet];
         assert!(!file_fully_highlighted(&partial, 0, 2));
+    }
+
+    /// A band is never warmed before there is a highlighter to warm it with.
+    ///
+    /// The entries are sticky: a row cached `DiffOnly` is skipped by every later
+    /// dispatch (`diff_cache.contains`), so dispatching one frame early costs those rows
+    /// their colour for the whole session. At startup this fired for the entire band,
+    /// because the scroll trigger goes off before the first diff has arrived and
+    /// `diff_fully_highlighted` is vacuously true over the empty pane it leaves behind.
+    #[test]
+    fn a_band_is_not_warmed_before_it_can_be_coloured() {
+        assert!(
+            !band_warmable(true, false, || true),
+            "no highlighter yet ⇒ wait, even though nothing is left to colour"
+        );
+        assert!(
+            band_warmable(true, true, || true),
+            "highlighter present and the foreground is settled ⇒ warm"
+        );
+        assert!(
+            !band_warmable(true, true, || false),
+            "and never while the foreground diff is still colouring"
+        );
+    }
+
+    /// With syntax off there is no highlighter to wait for and no colouring to compete
+    /// with, so every row warms `DiffOnly` at once — the mode where nothing was
+    /// prefetched at all before. The settled question must not even be asked: with no
+    /// spans ever set it answers false for every non-empty diff, forever.
+    #[test]
+    fn syntax_off_warms_without_asking_about_colour() {
+        assert!(band_warmable(false, false, || {
+            panic!("must not consult the highlight state with syntax off")
+        }));
     }
 
     /// The memo keeps the O(lines) scan off the frame loop. The case that matters is a
