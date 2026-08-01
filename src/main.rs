@@ -3795,11 +3795,6 @@ fn warm_row(
         }
         _ => "DiffOnly",
     };
-    // Named before the send takes `data`: the fix for a plain row is a `[diff.languages]`
-    // entry, and it needs the extension that has no grammar.
-    let ungrammared = hl
-        .filter(|_| applied == "PlainText")
-        .and_then(|hl| first_ungrammared_ext(&data.files, hl));
     // A send failure means the UI is gone, i.e. the process is on its way out; there is
     // nothing useful left to do, but nothing to clean up either.
     if ctx.tx.send((target.key, data)).is_err() {
@@ -3811,31 +3806,8 @@ fn warm_row(
     log::debug!(
         "prefetch: done {oid} ({lines} lines, {applied}) build {built:?} + colour {coloured:?}"
     );
-    if let Some(ext) = ungrammared {
-        log::debug!(
-            "prefetch: {oid} has no syntax for .{ext} — rendering plain; \
-             map it with [diff.languages] (e.g. {ext} = \"xml\")"
-        );
-    }
     ctx.ctx.request_repaint();
     Outcome::Warmed { lines }
-}
-
-/// The extension of the first file no grammar matches, if any.
-///
-/// What a `PlainText` prefetch line names, so the symptom ("this diff is not
-/// coloured") and the fix (a `[diff.languages]` entry for that extension) are the same
-/// log line rather than a bisect.
-fn first_ungrammared_ext(files: &[FileEntry], hl: &Highlighter) -> Option<String> {
-    files
-        .iter()
-        .find(|f| !hl.has_grammar(&f.path))
-        .and_then(|f| {
-            std::path::Path::new(&f.path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(str::to_owned)
-        })
 }
 
 /// One finished apply. Every worker exit reports one of these — success, failure,

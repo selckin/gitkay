@@ -1,7 +1,8 @@
 //! Syntax highlighting for the diff view: owns the syntect `SyntaxSet`, the active
 //! theme, and a theme-derived diff palette. Built lazily on the first diff.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 use two_face::re_exports::syntect;
@@ -331,6 +332,16 @@ pub struct Highlighter {
     /// stripped) so every lookup is a plain `get` and the config may be written
     /// `oml`, `.oml` or `OML`.
     languages: LanguageMap,
+    /// Extensions already reported as having no grammar, so the `info` line is one
+    /// per extension per session rather than one per file per highlight pass — the
+    /// same `.oml` would otherwise be announced for every file of every diff, and
+    /// again for every prefetched row.
+    ///
+    /// Shared (`Arc`) rather than owned, and shared *through* `reconfigured`, for two
+    /// reasons: the prefetch pool holds `Arc` clones of one instance and all of its
+    /// workers must dedupe against each other, and a theme change or the prewarm
+    /// install would otherwise re-announce everything already said.
+    reported: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Normalize `[diff.languages]` keys so the lookup is a plain `get`: an extension is
@@ -395,6 +406,7 @@ impl Highlighter {
             theme,
             palette,
             languages: normalize_languages(languages),
+            reported: Arc::default(),
         }
     }
 
@@ -418,6 +430,7 @@ impl Highlighter {
             theme,
             palette,
             languages: normalize_languages(languages),
+            reported: Arc::clone(&self.reported),
         }
     }
 
@@ -468,11 +481,45 @@ impl Highlighter {
 
     /// Fresh per-file highlight state, its grammar chosen by `[diff.languages]` and
     /// then the path's extension, falling back to plain text.
+    ///
+    /// The fallback is announced once per extension (see `note_missing_grammar`) —
+    /// this is the one place it actually happens, and where the file being tokenized
+    /// is known.
     pub fn new_file_state(&self, path: &str) -> HighlightLines<'_> {
-        let syntax = self
-            .syntax_for(path)
-            .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text());
+        let Some(syntax) = self.syntax_for(path) else {
+            if let Some(ext) = self.note_missing_grammar(path) {
+                log::info!(
+                    "no syntax highlighting for .{ext} files — they render as plain text; \
+                     add `{ext} = \"<language>\"` under [diff.languages] in the config \
+                     to highlight them as something else (e.g. \"xml\")"
+                );
+            }
+            return HighlightLines::new(self.syntaxes.find_syntax_plain_text(), &self.theme);
+        };
         HighlightLines::new(syntax, &self.theme)
+    }
+
+    /// Record that `path`'s extension has no grammar, returning it the FIRST time only
+    /// — so the caller logs once per extension per session rather than once per file
+    /// per highlight pass, across every thread sharing this highlighter.
+    ///
+    /// `None` for a path with no extension at all (`Makefile`, `LICENSE`). Not an
+    /// oversight: `[diff.languages]` is keyed by extension, so there is nothing the
+    /// reader could add, and a line telling them to fix something unfixable is worse
+    /// than silence.
+    ///
+    /// Separate from the logging so the dedup is testable without capturing output. A
+    /// poisoned lock drops the report rather than propagating: this exists to make a
+    /// config gap visible, and it is not worth a panic on the highlight path.
+    fn note_missing_grammar(&self, path: &str) -> Option<String> {
+        let ext = std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())?
+            .to_ascii_lowercase();
+        self.reported
+            .lock()
+            .ok()
+            .and_then(|mut seen| seen.insert(ext.clone()).then_some(ext))
     }
 
     /// Force-compile the main-context regexes for the syntax matching `ext` by
@@ -618,6 +665,86 @@ mod tests {
         assert!(
             !hl.tokenize_line(&mut state, "<terms>", &mut String::new())
                 .is_empty()
+        );
+    }
+
+    /// The "no grammar" notice is once per extension, not once per file. A diff can
+    /// hold hundreds of files and the band warms dozens of rows across threads, so an
+    /// undeduped line would bury every other log.
+    #[test]
+    fn a_missing_grammar_is_announced_once_per_extension() {
+        let hl = test_highlighter();
+        assert_eq!(
+            hl.note_missing_grammar("data/master/ontology-master.oml"),
+            Some("oml".to_string()),
+            "first sighting is reported"
+        );
+        assert_eq!(
+            hl.note_missing_grammar("data/other.oml"),
+            None,
+            "a second file with the same extension is not"
+        );
+        assert_eq!(
+            hl.note_missing_grammar("x.OML"),
+            None,
+            "nor the same extension in another case"
+        );
+        assert_eq!(
+            hl.note_missing_grammar("infra/main.tfvars"),
+            Some("tfvars".to_string()),
+            "but a different extension is"
+        );
+    }
+
+    /// A mapped extension is not announced — the notice exists to name a gap, and a
+    /// mapping is the gap already closed. Checked through `new_file_state`, which is
+    /// what does the reporting: had it reported, the slot below would be taken.
+    #[test]
+    fn a_mapped_extension_is_not_announced() {
+        let hl = test_highlighter_with(&[("oml", "xml")]);
+        let _state = hl.new_file_state("data/master/ontology-master.oml");
+        assert_eq!(
+            hl.note_missing_grammar("data/master/ontology-master.oml"),
+            Some("oml".to_string()),
+            "new_file_state must not have reported a mapped extension"
+        );
+
+        // And it does report one that stays unmapped, through the same path.
+        let plain = test_highlighter();
+        let _state = plain.new_file_state("data/master/ontology-master.oml");
+        assert_eq!(
+            plain.note_missing_grammar("data/other.oml"),
+            None,
+            "new_file_state already reported .oml"
+        );
+    }
+
+    /// Nothing to say about a file with no extension: `[diff.languages]` is keyed by
+    /// extension, so there is no config line the reader could add. Telling them to fix
+    /// something unfixable is worse than silence.
+    #[test]
+    fn an_extensionless_file_is_not_announced() {
+        let hl = test_highlighter();
+        assert_eq!(hl.note_missing_grammar("Makefile"), None);
+        assert_eq!(hl.note_missing_grammar("LICENSE"), None);
+    }
+
+    /// The notice survives a theme swap and is shared with every clone the prefetch
+    /// pool holds — `reconfigured` passes the set on rather than starting a fresh one,
+    /// or a config reload would re-announce everything already said.
+    #[test]
+    fn the_announcement_is_not_repeated_after_a_rebuild() {
+        let hl = test_highlighter();
+        assert!(hl.note_missing_grammar("x.oml").is_some());
+        let rebuilt = hl.reconfigured(
+            EmbeddedThemeName::CatppuccinLatte,
+            FIXED_DEFAULT_BANDS,
+            &LanguageMap::new(),
+        );
+        assert_eq!(
+            rebuilt.note_missing_grammar("x.oml"),
+            None,
+            "the rebuilt highlighter shares what was already reported"
         );
     }
 
