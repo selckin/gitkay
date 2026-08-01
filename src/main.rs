@@ -142,20 +142,28 @@ struct CommitInfo {
     parents: Vec<git2::Oid>,
     refs: Vec<(String, RefKind)>,
     follow_path: Option<String>, // in --follow mode, the file's name at this commit
+    /// The commit's own time, kept RAW — deliberately not pre-formatted like the
+    /// fields below, which is why it sits up here with the base ones.
+    /// `[commit_list] date` picks between two renderings of it, and one of them
+    /// (the age) is measured against a `now` that moves, so it cannot be
+    /// precomputed at all. Pre-formatting only the other would leave `DateCol`
+    /// owning half of one decision and allocate a string per commit that the
+    /// relative setting never reads.
+    time: i64,
+    tz_offset_min: i32,
     // Derived once here, immutable per commit, so the hot paths don't recompute them:
     // the row render runs every frame, and search scans every commit each keystroke.
-    // `time`/`tz_offset_min` aren't stored — they're only needed to format `date_str`.
     summary_lc: String,   // lowercased summary, for case-insensitive search
     author_lc: String,    // lowercased author, for case-insensitive search
     refs_lc: Vec<String>, // lowercased ref names, for case-insensitive search
-    date_str: String,     // commit date formatted with its recorded UTC offset (row display)
     short_sha: String,    // 7-char abbreviation, empty for the virtual (uncommitted/staged) rows
 }
 
 impl CommitInfo {
     /// Build a `CommitInfo`, precomputing the search- and render-derived fields from the
     /// base ones so the per-keystroke search and per-frame row render read them instead of
-    /// recomputing `to_lowercase`, the date format, and the short SHA every time.
+    /// recomputing `to_lowercase` and the short SHA every time. The date is the
+    /// exception and is kept raw — see `time`.
     #[allow(clippy::too_many_arguments)]
     fn new(
         source: diff::DiffSource,
@@ -172,7 +180,8 @@ impl CommitInfo {
             summary_lc: summary.to_lowercase(),
             author_lc: author.to_lowercase(),
             refs_lc: refs.iter().map(|(r, _)| r.to_lowercase()).collect(),
-            date_str: format_commit_time(time, tz_offset_min, false),
+            time,
+            tz_offset_min,
             short_sha: if is_real_commit(oid) {
                 format!("{oid:.7}")
             } else {
@@ -1639,7 +1648,7 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
                 source,
                 title.to_string(),
                 String::new(),
-                chrono::Utc::now().timestamp(),
+                diff::now_unix_secs(),
                 local_tz_offset_min(),
                 parents,
                 vec![(chip.0.to_string(), chip.1)],
@@ -2021,11 +2030,87 @@ const SHA_SAMPLE: &str = "0000000";
 const AUTHOR_SAMPLE_CHAR: &str = "0";
 /// Gaps inside the right-hand meta group, and its margin from the row's right
 /// edge, in points. Named because `MetaCols::origins` is the only place they are
-/// summed, and a bare total there is a number a reader cannot check and the next
-/// column added silently invalidates.
+/// summed, and a bare total there (they used to be one `40.0`) is a number a
+/// reader cannot check and the next column added silently invalidates.
 const META_GAP_SHA_AUTHOR: f32 = 8.0;
 const META_GAP_AUTHOR_DATE: f32 = 24.0;
 const META_RIGHT_MARGIN: f32 = 8.0;
+/// How often an idle window re-reads the clock while showing relative dates.
+/// Not the finest granularity the format has (the first 90 seconds count in
+/// seconds) — an age is a coarse reading by construction, and waking a
+/// backgrounded window once a second to redraw "48 seconds ago" is not what the
+/// setting is for.
+const RELATIVE_DATE_TICK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What the date column holds this frame, resolved from `[commit_list] date`.
+///
+/// The two are one type rather than a bool because the relative form needs a
+/// reference instant, and that instant is sampled ONCE per frame and shared by
+/// every row: taken per row, a list drawn across a second boundary could show
+/// two commits a second apart as the same age, or one age twice.
+///
+/// Note the relative form only re-reads the clock when a frame is drawn, so a
+/// window left untouched shows ages from whenever it last painted. egui repaints
+/// on input, so it is current whenever anyone is looking at it.
+#[derive(Clone, Copy)]
+enum DateCol {
+    Absolute,
+    Relative { now: i64 },
+}
+
+impl DateCol {
+    fn of(style: config::DateStyle) -> Self {
+        match style {
+            config::DateStyle::Absolute => Self::Absolute,
+            config::DateStyle::Relative => Self::Relative {
+                now: diff::now_unix_secs(),
+            },
+        }
+    }
+
+    /// The widest string this column can hold — what its width is measured from.
+    fn sample(self) -> String {
+        match self {
+            // Formatted rather than written out as a literal, so the sample cannot
+            // drift from the format the rows use. Every absolute date is the same
+            // width, so which instant it is does not matter.
+            Self::Absolute => format_commit_time(0, 0, false),
+            Self::Relative { .. } => diff::RELATIVE_DATE_SAMPLE.to_string(),
+        }
+    }
+
+    /// What one row shows — both styles formatted here, from the raw time
+    /// `CommitInfo` keeps, so `sample` above cannot drift from either.
+    ///
+    /// **The two working-tree rows show nothing.** `load_commits` stamps them
+    /// with `now()` because `CommitInfo` needs some time, but that is the walk's
+    /// own clock, not a property of the row — the range row beside them takes its
+    /// endpoint's author date precisely because, as its comment says, the
+    /// working-tree rows "have none to offer". Absolute hid that: the stamp
+    /// renders as a plausible timestamp. Relative cannot, because the number
+    /// visibly grows — an hour after launch "Uncommitted changes" would claim to
+    /// be an hour old beside an edit made a moment ago. Blank in both styles, so
+    /// the two agree and neither invents an answer. Classified through
+    /// `CommitKind`, never by comparing sentinel oids, and `Range` is listed with
+    /// `Real` rather than with its fellow virtual rows because what matters here
+    /// is having a real timestamp, not being a real commit.
+    ///
+    /// The relative form has no empty case beyond that, where the absolute one
+    /// also blanks on a timezone offset chrono cannot represent. An age doesn't
+    /// involve the offset at all, so such a commit reads correctly here —
+    /// deliberately not blanked to match, which would suppress a good answer for
+    /// a bad reason.
+    fn text(self, commit: &CommitInfo) -> String {
+        match CommitKind::of(commit.oid) {
+            CommitKind::Uncommitted | CommitKind::Staged => return String::new(),
+            CommitKind::Real | CommitKind::Range => {}
+        }
+        match self {
+            Self::Absolute => format_commit_time(commit.time, commit.tz_offset_min, false),
+            Self::Relative { now } => diff::format_relative_time(commit.time, now),
+        }
+    }
+}
 
 /// The commit list's right-hand column widths, measured once a frame.
 ///
@@ -2043,30 +2128,37 @@ struct MetaCols {
     date: f32,
     /// One stats cell; `draw_stats_cells` reserves `stats_cell_count` of them.
     stats_cell: f32,
+    /// What the date column holds — carried here, not resolved per row, because
+    /// the `date` width above is measured from this and the two must answer for
+    /// the same frame.
+    date_col: DateCol,
 }
 
 impl MetaCols {
-    fn measure(painter: &egui::Painter, fonts: &config::Fonts, author_chars: usize) -> Self {
+    fn measure(
+        painter: &egui::Painter,
+        fonts: &config::Fonts,
+        cfg: config::CommitListSection,
+    ) -> Self {
         let font = fonts.font_id(Role::CommitMeta);
-        let author_sample = AUTHOR_SAMPLE_CHAR.repeat(author_chars);
+        let author_sample = AUTHOR_SAMPLE_CHAR.repeat(cfg.author_chars);
+        let date_col = DateCol::of(cfg.date);
         Self {
             sha: text_width(painter, SHA_SAMPLE, &font),
             author: text_width(painter, &author_sample, &font),
-            // Formatted rather than written out as a literal, so the sample cannot
-            // drift from the format the rows actually use. Every date is the same
-            // width, so which instant it is does not matter.
-            date: text_width(painter, &format_commit_time(0, 0, false), &font),
+            date: text_width(painter, &date_col.sample(), &font),
             stats_cell: text_width(painter, STATS_CELL_CHARS, &font),
+            date_col,
         }
     }
 
     /// Where each field begins in a row whose right edge is `right_x`, laid out
-    /// right to left. `sha` doubles as where the stats cells must stop.
+    /// right to left. `sha_x` doubles as where the stats cells must stop.
     ///
     /// The origins live here rather than in the row draw so the gaps are summed
-    /// once, in the type that knows the widths — otherwise the row derives its
-    /// own total and then repeats two of the three gaps as inline literals
-    /// further down the same function.
+    /// once, in the type that knows the widths — the row previously derived its
+    /// own from a bare `40.0` and then repeated two of the three gaps as inline
+    /// literals further down the same function.
     fn origins(self, right_x: f32) -> MetaOrigins {
         let date = right_x - META_RIGHT_MARGIN - self.date;
         let author = date - META_GAP_AUTHOR_DATE - self.author;
@@ -7506,8 +7598,9 @@ impl GitkApp {
         // colors are fixed, so they're baked in at build time). Both sides always
         // draw, zero included, as in the commit list: a file that only adds and one
         // that only deletes then differ by the digit rather than by which cell is
-        // there at all, and the pair sits at a fixed offset from the row's end
-        // instead of sliding left when a side happens to be empty.
+        // there at all. The block stays flush-right either way, so its left edge
+        // still moves with the digit count; what went away is the `-` slot
+        // collapsing and letting `+` slide right into it.
         let stat_gap = 3.0;
         let (add_galley, del_galley) = frame.cache.stats[idx]
             .get_or_insert_with(|| {
@@ -7874,7 +7967,7 @@ impl GitkApp {
         let at = cols.origins(right_x);
         let meta_font = self.fonts.font_id(Role::CommitMeta);
         let date_galley =
-            painter.layout_no_wrap(commit.date_str.clone(), meta_font.clone(), SUBTEXT);
+            painter.layout_no_wrap(cols.date_col.text(commit), meta_font.clone(), SUBTEXT);
         let sha_galley =
             painter.layout_no_wrap(commit.short_sha.clone(), meta_font.clone(), SUBTEXT);
 
@@ -7885,8 +7978,8 @@ impl GitkApp {
         // Laid out first and re-elided only on overflow, rather than passed
         // through `right_elide` unconditionally: that helper's fast path measures
         // the string itself, and `text_width` measures by laying out — so every
-        // name that fits (nearly all of them) would be laid out twice per frame,
-        // once to be measured and discarded and once to be drawn.
+        // name that fits (nearly all of them) was laid out twice per frame, once
+        // to be measured and discarded and once to be drawn.
         let a_color = author_color(&commit.author);
         let mut author_galley =
             painter.layout_no_wrap(commit.author.clone(), meta_font.clone(), a_color);
@@ -7932,21 +8025,24 @@ impl GitkApp {
         // Draw SHA, author, date — each from its own column's left edge, so a row
         // missing one (the virtual rows have no SHA, and an unrepresentable
         // timezone offset yields no date) leaves a gap rather than pulling the
-        // rest of the group sideways. All three the same way, with no field
-        // right-aligned against the row: a column the text is placed INTO is the
-        // whole point here, and one field aligned the other way is a rule the
-        // next variable-width field added to this group will not inherit.
+        // rest of the group sideways. The date is drawn the same way as the other
+        // two deliberately: right-aligning it was harmless while every date was
+        // `YYYY-MM-DD HH:MM`, but under `[commit_list] date = "relative"` widths
+        // run from `2 days ago` to `4 years, 11 months ago`, and right-aligning
+        // those makes the text *start* at a different x on every row — the exact
+        // raggedness these columns exist to remove, just moved one field over.
         //
         // Clipped to what is left of the row after the ref chips, which the
         // summary beside it has always been. Fixed columns made that necessary:
         // the group used to shrink with a short author name, so it ran out of
-        // room only on an unusually long one, and now it claims the same ~250
+        // room only on an unusually long one, and now it claims the same ~250-290
         // points on every row whatever the window width. Narrow enough — a split
-        // screen — and `at.sha` lands left of `cursor_x`, where an unclipped draw
-        // paints the SHA over the ref chips and the graph. One rect for the group
-        // rather than one per column: nothing can overflow its own column (the
-        // SHA is exactly 7 characters and the author is elided to fit), so the
-        // only two edges that can be crossed are the group's.
+        // screen, with relative dates costing another six characters — and `at.sha`
+        // lands left of `cursor_x`, where an unclipped draw paints the SHA over the
+        // ref chips and the graph. One rect for the group rather than one per
+        // column: nothing can overflow its own column (the SHA is exactly 7
+        // characters and the author is elided to fit), so the only two edges that
+        // can be crossed are the group's.
         let meta_y = y_center - date_galley.size().y / 2.0;
         let meta_clip = egui::Rect::from_min_max(
             egui::pos2(at.sha.max(cursor_x), row_rect.min.y),
@@ -7970,7 +8066,15 @@ impl GitkApp {
         let row_height = 20.0f32.max(text_h + 4.0);
         // The right-hand columns, measured once a frame rather than per row —
         // which is what lines them up down the list.
-        let cols = MetaCols::measure(ui.painter(), &self.fonts, self.commit_list_cfg.author_chars);
+        let cols = MetaCols::measure(ui.painter(), &self.fonts, self.commit_list_cfg);
+        // Relative dates are the one thing on screen that goes stale with no
+        // input to prompt a repaint, so ask for one. egui coalesces this with
+        // whatever else is pending, and an idle window wakes twice a minute to
+        // re-read a clock — cheap enough that living with ages frozen at the last
+        // paint (which is what this cost before) was never the better trade.
+        if matches!(cols.date_col, DateCol::Relative { .. }) {
+            ctx.request_repaint_after(RELATIVE_DATE_TICK);
+        }
         let max_graph_cols = 20;
 
         // ── Commit list: a resizable top panel. egui remembers its height
@@ -11886,6 +11990,7 @@ mod tests {
             author: 144.0,
             date: 115.0,
             stats_cell: 43.0,
+            date_col: DateCol::Absolute,
         };
         let right_x = 1000.0;
         let at = cols.origins(right_x);
@@ -12521,11 +12626,12 @@ mod tests {
         let commits = load_commits(&repo, 10, &scope(false, &[]));
         let info = commits.iter().find(|c| c.oid == oid).unwrap();
         // 1_600_000_000 is 2020-09; the 2023 committer time must not leak in
-        // (git log/git show print the author date).
+        // (git log/git show print the author date). Asserted through what the
+        // date column actually draws, since the row formats on demand.
+        let shown = DateCol::Absolute.text(info);
         assert!(
-            info.date_str.starts_with("2020-"),
-            "date column must show the AUTHOR date, got {}",
-            info.date_str
+            shown.starts_with("2020-"),
+            "date column must show the AUTHOR date, got {shown}"
         );
     }
 
