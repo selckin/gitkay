@@ -604,16 +604,16 @@ enum FileListRow {
     },
 }
 
+/// One file's cached `+n`/`-n` stat galleys. Both always exist — a zero count
+/// draws as `+0`/`-0`, so there is no "nothing to draw" case.
+type StatGalleys = (Arc<egui::Galley>, Arc<egui::Galley>);
+
 /// Lazily-built render caches for the file-list sidebar. The sidebar isn't
 /// row-virtualized — every row draws every frame — so per-row text is elided and
 /// laid out into galleys once, not re-allocated and re-measured per frame. Scoped
 /// to the current `file_rows`: `rebuild_file_rows` resets it (a font change must
 /// too), and `ensure` drops the elided labels whenever the row width changes
 /// (sidebar drag / window resize).
-/// One file's cached `+n`/`-n` stat galleys (an inner `None`: that count is zero,
-/// nothing to draw).
-type StatGalleys = (Option<Arc<egui::Galley>>, Option<Arc<egui::Galley>>);
-
 #[derive(Default)]
 struct SidebarCache {
     /// Per file index: the stat galleys, `None` until first drawn.
@@ -7425,39 +7425,29 @@ impl GitkApp {
         };
 
         // Stats (+adds / -dels), right-aligned — galleys built once per diff (the
-        // colors are fixed, so they're baked in at build time).
+        // colors are fixed, so they're baked in at build time). Both sides always
+        // draw, zero included, as in the commit list: a file that only adds and one
+        // that only deletes then differ by the digit rather than by which cell is
+        // there at all, and the pair sits at a fixed offset from the row's end
+        // instead of sliding left when a side happens to be empty.
         let stat_gap = 3.0;
         let (add_galley, del_galley) = frame.cache.stats[idx]
             .get_or_insert_with(|| {
                 let f = &self.diff_files[idx];
                 let stats_font = self.fonts.file_stats_font_id();
-                let add = (f.additions > 0).then(|| {
-                    ui.painter().layout_no_wrap(
-                        format!("+{}", f.additions),
-                        stats_font.clone(),
-                        GREEN,
-                    )
-                });
-                let del = (f.deletions > 0).then(|| {
-                    ui.painter()
-                        .layout_no_wrap(format!("-{}", f.deletions), stats_font, RED)
-                });
+                let add = ui.painter().layout_no_wrap(
+                    format!("+{}", f.additions),
+                    stats_font.clone(),
+                    GREEN,
+                );
+                let del = ui
+                    .painter()
+                    .layout_no_wrap(format!("-{}", f.deletions), stats_font, RED);
                 (add, del)
             })
             .clone();
-        let add_w = add_galley.as_ref().map_or(0.0, |g| g.size().x);
-        let del_w = del_galley.as_ref().map_or(0.0, |g| g.size().x);
-        let inner_gap = if add_galley.is_some() && del_galley.is_some() {
-            stat_gap
-        } else {
-            0.0
-        };
-        let stats_w = add_w + del_w + inner_gap;
-        let pad = if add_galley.is_some() || del_galley.is_some() {
-            6.0
-        } else {
-            0.0
-        };
+        let stats_w = add_galley.size().x + del_galley.size().x + stat_gap;
+        let pad = 6.0;
 
         // Label, elided into the width left of the stats — cached in PLACEHOLDER
         // color so the normal/hover color is applied at paint time (one galley
@@ -7480,14 +7470,11 @@ impl GitkApp {
 
         // Stats flush-right.
         let mut sx = right - stats_w;
-        if let Some(g) = add_galley {
+        for (g, color) in [(add_galley, GREEN), (del_galley, RED)] {
+            let w = g.size().x;
             let sy = cy - g.size().y / 2.0;
-            ui.painter().galley(egui::pos2(sx, sy), g, GREEN);
-            sx += add_w + stat_gap;
-        }
-        if let Some(g) = del_galley {
-            let sy = cy - g.size().y / 2.0;
-            ui.painter().galley(egui::pos2(sx, sy), g, RED);
+            ui.painter().galley(egui::pos2(sx, sy), g, color);
+            sx += w + stat_gap;
         }
 
         if resp.hovered() && !ui.input(egui::InputState::is_scrolling) {
@@ -7718,8 +7705,18 @@ impl GitkApp {
     /// predates this column, not part of it.
     ///
     /// A blank cell is what "not computed yet" looks like — no spinner, no
-    /// placeholder. A zero side is omitted rather than drawn as `+0`, matching
-    /// the file-list sidebar.
+    /// placeholder — which is why a zero side is drawn as `+0`/`-0` rather than
+    /// omitted (as the file-list sidebar does): omitting it makes "this commit
+    /// only adds" and "the worker hasn't answered yet" the same picture, and the
+    /// two are read constantly while scrolling. `0` in the side's own colour says
+    /// which.
+    ///
+    /// It does NOT make blank unambiguous. A row whose stats FAILED is recorded
+    /// as `Some(oid) -> None` (`install_stats_result`, so the dispatcher stops
+    /// re-queueing it) and renders identically blank, and unlike the pending case
+    /// it stays that way until a `.git` write runs `retry_failed_stats`. Telling
+    /// those two apart needs a third rendering, not a fourth reading of a blank
+    /// cell; the zero case is separated here because it is the common one.
     fn draw_stats_cells(
         &self,
         painter: &egui::Painter,
@@ -7773,18 +7770,8 @@ impl GitkApp {
                 compact_count_into(&mut t, n);
                 t
             };
-            cell(
-                lines
-                    .filter(|&(add, _)| add > 0)
-                    .map(|(add, _)| signed('+', add)),
-                GREEN,
-            );
-            cell(
-                lines
-                    .filter(|&(_, del)| del > 0)
-                    .map(|(_, del)| signed('-', del)),
-                RED,
-            );
+            cell(lines.map(|(add, _)| signed('+', add)), GREEN);
+            cell(lines.map(|(_, del)| signed('-', del)), RED);
         }
         start_x
     }
@@ -12832,7 +12819,7 @@ mod tests {
             let mut c = SidebarCache::default();
             c.ensure(2, 100.0);
             assert_eq!((c.stats.len(), c.elided.len()), (2, 2));
-            c.stats[0] = Some((Some(galley()), None));
+            c.stats[0] = Some((galley(), galley()));
             c.elided[0] = Some(galley());
             // Same shape ⇒ everything kept.
             c.ensure(2, 100.0);
