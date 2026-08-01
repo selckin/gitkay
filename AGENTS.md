@@ -345,6 +345,18 @@ parts run off the window-creation critical path:
   matched before the catch so it can report as itself and send `None`: `Outcome::Nothing`
   there would leave its oid in `busy_stats` forever AND leave the UI treating it as
   uncomputed, so the dispatcher would re-offer it every frame.
+  The one exit that produces no `Outcome` is a job that never reaches a worker, so
+  `Coordinator::send` undoes the hand-out itself: it takes the job back out of the
+  `SendError` and releases **both** kinds of claim — the warm key AND, for a stats row,
+  its oid in `busy_stats`. The stats half is the one that silently kills a cell for the
+  session, and it needs no thread to die mid-run: a worker whose `Repository::discover`
+  fails exits at once, and every send to it fails.
+  **Worker ids are positions, and are assigned from the vector's own length** — never
+  from the spawn loop's counter. A failed spawn is skipped, so a counter-derived id
+  names a slot the worker does not occupy: the coordinator addresses `mailboxes[id]`
+  while the worker reports as `ctx.id`, so a one-off leaks the key claim of every job it
+  runs, pushes a phantom id onto `idle`, and — once an id passes `mailboxes.len()` — has
+  `is_heavy` route pool work to the heavy lane.
   The dedup that used to live in `WorkPool::defer` is **gone, not moved**. The
   coordinator handed a row out exactly once, so it comes back exactly once — there is
   no second writer to disagree with. That is the class of bug this shape removes: the
@@ -354,9 +366,9 @@ parts run off the window-creation critical path:
   returned a dispatch later having lost 13 seconds of priority.
   The pool is **persistent**: `spawn_prefetch_pool` starts `prefetch_worker_count()` —
   **half the machine's cores**, floored at 1 and ceilinged at `PREFETCH_MAX_WORKERS`
-  (8) — threads on first dispatch and they live for the app's lifetime, parking on a
-  `Condvar` when the queue drains. A dispatch **replaces the queue's contents**
-  (`PrefetchShared::submit`) instead of building a job and spawning threads, so
+  (8) — threads on first dispatch and they live for the app's lifetime, each blocking on
+  its own mailbox (`jobs.recv()`) when the coordinator has nothing for it. A dispatch
+  **replaces the queue's contents** (`PoolHandle::submit`) instead of building a job and spawning threads, so
   concurrency is bounded by construction. That replacement is also the entire
   supersession mechanism — rows outside the new band are simply gone — which is why
   there is no prefetch epoch: a worker that popped a row moments before a dispatch
@@ -498,7 +510,14 @@ parts run off the window-creation critical path:
   so on a repo of 265MB blobs, leaving them unguarded had eight workers spend **24
   seconds** computing the column, and because stats outrank diffs, blocking every
   prefetch behind it; the user then clicked a row and paid the same ~11s again, because
-  the diff those seconds had computed was thrown away. Such a stats row sends its
+  the diff those seconds had computed was thrown away. **Real commits only**, because
+  deferring is a promise the row's diff will pay instead and only a real commit's diff
+  does: a prefetch never warms a virtual row, and both harvest sites (`cache_diff`,
+  `warm_row`) guard on `is_real_commit`. Deferring one would record its SENTINEL oid in
+  `measured`, which filters that row out of every later stats submission — so the
+  uncommitted/staged/range row would show a file count and a permanently blank `+`/`-`,
+  and keep it after the working-tree change that caused it was reverted, since a
+  sentinel oid never expires. Such a stats row sends its
   **file count immediately** (`StatsWant::FilesOnly` needs no content) and then **stops**,
   because its line counts cost the same blob reads the diff does and `cache_diff` takes
   the column off the diff for free when it lands. Computing them anyway would pay ~11s
@@ -561,10 +580,14 @@ parts run off the window-creation critical path:
   list every frame (a `diff_cache_key` and a pathspec-cloning `row_scope` per row) and
   replacing the pool's queue under it continuously. Half a window sits inside the band's
   one-window margin, so the user cannot scroll past warmed rows before it fires. The `diff_fully_highlighted` gate
-  stays — never compete with the foreground diff's own colouring.
-  It is **not** gated on `syntax_enabled` any more: a `DiffOnly` row needs no
-  highlighter (`PrefetchShared::hl` is an `Option`), so with `[diff] syntax = false`, where
-  nothing was prefetched at all before, every row now warms diff-only.
+  stays — never compete with the foreground diff's own colouring — but is asked **only
+  when syntax is on**: with it off no span is ever set, so that predicate answers false
+  for every non-empty diff forever and would keep the whole band cold. Dropping the
+  `syntax_enabled` gate on the dispatch without also skipping this one is a no-op, which
+  is exactly what shipped once.
+  A `DiffOnly` row needs no highlighter (`Job::Warm::hl` is an `Option`), so with
+  `[diff] syntax = false`, where nothing was prefetched at all before, every row now
+  warms diff-only.
   Accepted limit: a continuous fling still outruns the pool. Nothing that builds a real
   diff per row will not.
 - **Perf timing** — key startup phases log at `debug` (`perf: startup: …` / `perf:
@@ -621,6 +644,13 @@ parts run off the window-creation critical path:
   change and a mode-only change, under both `detect_renames` settings. **An earlier
   version of this file claimed the two counts differ and refused the derivation on that
   basis. It was wrong, and that test was already in the tree disproving it.**
+  Harvested only when the diff's `stats_relevant` settings match the CURRENT ones, and
+  that guard is load-bearing rather than defensive: `stash_current_diff` reaches
+  `cache_diff` with the **outgoing** diff, and the toolbar's rename/whitespace toggles
+  run `invalidate_stats_if_counts_changed` and *then* `load_selected_diff` — so without
+  it the just-cleared map is immediately repopulated for that one oid with the pre-toggle
+  numbers, `stats_targets` reads it as known, and the column disagrees with the pane
+  beside it permanently.
   Harvesting there also cancels the redundant job: a row whose numbers land stops being a
   `stats_targets` target, so the next dispatch submits a shorter list and `submit_stats` —
   which replaces the stats tiers rather than adding to them — drops any still-queued stats

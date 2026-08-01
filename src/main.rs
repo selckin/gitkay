@@ -839,8 +839,10 @@ enum WarmDepth {
     /// Diff built and cached, no spans. An un-highlighted entry is a state the
     /// cache already supports — a superseded highlight worker's diff is stashed
     /// exactly this way, `spans` is an `Option` per line, and
-    /// `ensure_diff_highlighted` colours it on install. Roughly an order of
-    /// magnitude cheaper per row in both CPU and memory (spans hold a `String` per
+    /// `ensure_diff_highlighted` colours it on install. Far cheaper per row in CPU
+    /// and meaningfully cheaper in memory (~170 B/line against ~370 B — see
+    /// `DIFF_CACHE_LINE_CEILING`; a `highlight::Span` is `(Color32, Range<usize>)`,
+    /// byte offsets into the line's shared `Arc<String>`, NOT an owned string per
     /// token), which is what makes a full-window band reachable at all.
     DiffOnly,
 }
@@ -978,9 +980,10 @@ fn prefetch_heavy_workers(budget: Option<u64>) -> usize {
 /// pool warms what is on screen instead of racing off to rows nobody is looking at.
 /// On a tie the row *below* (larger index, i.e. scrolling down) wins.
 ///
-/// Deliberately **uncapped**: the work is bounded by `PREFETCH_LINE_BUDGET` in the
-/// worker, which is the bound that matches the actual cost. A count cap here would
-/// silently truncate the band and make the widened window a no-op.
+/// Deliberately **uncapped**: the work is bounded by `Coordinator::line_budget` (a
+/// `PREFETCH_LINE_BUDGET_DIVISOR` share of the cache), which is the bound that matches
+/// the actual cost. A count cap here would silently truncate the band and make the
+/// widened window a no-op.
 ///
 /// Pure — fed the loaded commit list.
 fn prefetch_targets(
@@ -1050,8 +1053,8 @@ const fn stats_relevant(s: DiffSettings) -> (bool, bool, bool) {
 /// counts fill in.
 ///
 /// No in-flight parameter: a row being computed is not yet in `known`, so it reads as
-/// unknown and is re-offered. `WorkPool::claim_stats` is what makes that harmless —
-/// the second worker to reach an oid drops the job.
+/// unknown and is re-offered. `Coordinator::busy_stats` is what makes that harmless —
+/// the coordinator drops a re-offered row it has already handed out.
 ///
 /// Deduped by oid (first appearance wins, order otherwise preserved) — a `--reflog`
 /// view routinely shows the same oid at several visible indices (reset-and-back,
@@ -1125,6 +1128,25 @@ fn install_stats_result(
             known.entry(oid).or_insert(None);
         }
     }
+}
+
+/// Whether a diff about to be cached may hand its numbers to the commit-list column.
+///
+/// Two conditions, and the second is the load-bearing one. Real commits only, because
+/// the virtual rows are content-keyed and their stats are evicted by
+/// `sync_virtual_stats` on a content change, which this would race. And only a diff
+/// built under settings whose COUNTS match the current ones: `stash_current_diff`
+/// reaches `cache_diff` with the **outgoing** diff, and the toolbar's rename/whitespace
+/// toggles run `invalidate_stats_if_counts_changed` and *then* `load_selected_diff` —
+/// so without the check the just-cleared map is immediately repopulated for that one
+/// oid with the pre-toggle numbers, `stats_targets` reads it as known, and the column
+/// disagrees with the pane beside it permanently.
+///
+/// Free rather than inline in `cache_diff` so the regression test drives the real
+/// decision rather than a model of it (`GitkApp` needs a real
+/// `eframe::CreationContext`).
+fn stats_harvestable(key: &DiffCacheKey, current: DiffSettings) -> bool {
+    is_real_commit(key.oid) && stats_relevant(key.settings) == stats_relevant(current)
 }
 
 /// Drop every failed stats entry, keeping successes untouched, so a reload
@@ -3182,18 +3204,34 @@ impl Coordinator {
     }
 
     /// Post a job to one worker. `false` when that worker's thread is gone, in which
-    /// case its claim is released and it is simply never used again.
+    /// case everything handing the job out claimed is released and the worker is simply
+    /// never used again.
+    ///
+    /// A failed post must undo BOTH kinds of claim, which is why the job is taken back
+    /// out of the `SendError` rather than dropped. The warm key is the obvious one; the
+    /// stats oid is the one that silently kills a cell for the session — `next_pool_job`
+    /// put it in `busy_stats`, and nothing else would ever take it out, so the
+    /// coordinator would refuse to hand that row out again while `stats_targets`
+    /// re-offered it forever. Reachable without any thread dying mid-run: a worker whose
+    /// `Repository::discover` failed exits immediately, and every send to it fails.
     fn send(&mut self, id: usize, job: Job) -> bool {
         let mailbox = if self.is_heavy(id) {
             self.heavy.get(id - self.mailboxes.len())
         } else {
             self.mailboxes.get(id)
         };
-        let sent = mailbox.is_some_and(|tx| tx.send(job).is_ok());
-        if !sent {
-            drop(self.warming.remove(&id));
+        let unsent = match mailbox {
+            Some(tx) => match tx.send(job) {
+                Ok(()) => return true,
+                Err(mpsc::SendError(job)) => job,
+            },
+            None => job,
+        };
+        if let Job::Stats(job) = unsent {
+            self.busy_stats.remove(&job.scope.source.oid());
         }
-        sent
+        drop(self.warming.remove(&id));
+        false
     }
 }
 
@@ -3243,9 +3281,20 @@ fn spawn_prefetch_pool(
         .ok()
         .map(|_| job_tx)
     };
-    let mailboxes: Vec<_> = (0..count)
-        .filter_map(|i| spawn_one(i, format!("gitkay-prefetch-{i}")))
-        .collect();
+    // Ids are assigned from the vector's own length, never from the loop counter: a
+    // failed spawn is skipped, so a counter-derived id would name a different slot than
+    // the worker ends up occupying. The coordinator addresses a worker by index
+    // (`mailboxes[id]`) while the worker reports as `ctx.id`, so a one-off mismatch
+    // leaks the key claim of every job it runs, pushes a phantom id onto `idle`, and —
+    // once an id passes `mailboxes.len()` — has `is_heavy` route pool work to the heavy
+    // lane.
+    let mut mailboxes: Vec<mpsc::Sender<Job>> = Vec::with_capacity(count);
+    for _ in 0..count {
+        let id = mailboxes.len();
+        if let Some(tx) = spawn_one(id, format!("gitkay-prefetch-{id}")) {
+            mailboxes.push(tx);
+        }
+    }
     // A lane of its own, so an expensive row can never occupy a worker the next band
     // needs — and several threads on it, because on a repo where nearly every commit
     // is expensive this lane IS the prefetch. How many run at once is not this number:
@@ -3255,12 +3304,15 @@ fn spawn_prefetch_pool(
     // could not be compared against the lane's own commitments without double counting.
     // `usable_bytes` already holds back 10% of total for the machine.
     let heavy_budget = mem::usable_bytes();
-    let heavy: Vec<_> = (0..prefetch_heavy_workers(heavy_budget))
-        .filter_map(|k| {
-            let id = mailboxes.len() + k;
-            spawn_one(id, format!("gitkay-prefetch-heavy-{k}"))
-        })
-        .collect();
+    let mut heavy: Vec<mpsc::Sender<Job>> = Vec::new();
+    for _ in 0..prefetch_heavy_workers(heavy_budget) {
+        // Same rule as the pool: the id is where this worker will actually sit, so a
+        // skipped spawn cannot shift every later id off its mailbox.
+        let k = heavy.len();
+        if let Some(tx) = spawn_one(mailboxes.len() + k, format!("gitkay-prefetch-heavy-{k}")) {
+            heavy.push(tx);
+        }
+    }
     let coordinator = Coordinator {
         stats: VecDeque::new(),
         ready: VecDeque::new(),
@@ -3476,7 +3528,17 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
     // the diff reads. Unguarded, that had eight workers spend 24 seconds computing this
     // column on a repo of 265MB blobs, and (because stats outrank diffs) blocking every
     // prefetch behind it. `FilesOnly` needs no content, so it is never worth probing.
+    //
+    // Real commits only, because deferring is a promise the diff will pay instead — and
+    // only a real commit's diff does. A prefetch never warms a virtual row (its key is
+    // content-hashed only after the diff exists) and both harvest sites, `cache_diff`
+    // and `warm_row`, guard on `is_real_commit`. Deferring one would record its SENTINEL
+    // oid in the coordinator's `measured` map, which then filters that row out of every
+    // future stats submission — so the uncommitted/staged/range row would show a file
+    // count and a permanently blank `+`/`-`, and stay that way after the working-tree
+    // change that triggered it was reverted, since a sentinel oid never expires.
     if job.want == StatsWant::FilesAndLines
+        && is_real_commit(oid)
         && let Ok(cost) = diff::probe_row_cost(repo, &job.scope, job.settings)
         && cost.total_blob_bytes > ctx.limits.max_blob_bytes
     {
@@ -4792,17 +4854,14 @@ struct GitkApp {
     /// `sync_virtual_stats` turns a change in it into an eviction from
     /// `commit_stats`.
     virtual_diff_content: HashMap<git2::Oid, u64>,
-    /// Oids the stats worker is computing right now. Doubles as the "a batch is
-    /// running" flag, so the two can never disagree — which makes emptying it
-    /// load-bearing: see `invalidate_commit_stats`.
     /// The target list the pool was last handed, so a per-frame dispatch can compare
     /// before it rebuilds. Cleared by an invalidation, or the comparison would find an
     /// unchanged list and never re-queue.
     stats_submitted: Vec<git2::Oid>,
-    /// Bumped by `invalidate_commit_stats`. Its ONLY job is stopping a batch
-    /// that outlived an invalidation from writing stale numbers into the
-    /// freshly cleared map — with one batch at a time there is nothing to
-    /// order. Don't remove it on the grounds that nothing overlaps.
+    /// Bumped by `invalidate_commit_stats`. Its ONLY job is stopping a row that
+    /// outlived an invalidation from writing stale numbers into the freshly
+    /// cleared map. Don't remove it on the grounds that the queue is replaced:
+    /// a row already handed to a worker is not in any queue to clear.
     stats_epoch: Epoch,
     stats_tx: mpsc::Sender<StatsResult>,
     stats_rx: mpsc::Receiver<StatsResult>,
@@ -5724,10 +5783,11 @@ impl GitkApp {
     /// here, so its row keeps its own stats job, which is the correct outcome and needs
     /// no special case.
     ///
-    /// Real commits only: the virtual rows are content-keyed and their stats are evicted
-    /// by `sync_virtual_stats` on a content change, which this would race.
+    /// Which diffs may hand their numbers over is `stats_harvestable` — real commits
+    /// only, and only under settings whose counts match the current ones (the outgoing
+    /// diff `stash_current_diff` brings here need not).
     fn cache_diff(&mut self, key: DiffCacheKey, data: DiffData) {
-        if is_real_commit(key.oid) {
+        if stats_harvestable(&key, self.diff_settings) {
             install_stats_result(
                 &mut self.commit_stats,
                 key.oid,
@@ -6409,8 +6469,8 @@ impl GitkApp {
 
     /// Spawn the background prefetch pool over the rows in (and a full window past)
     /// the visible range — nearest-first, tiered by `WarmDepth`, bounded by
-    /// `PREFETCH_LINE_BUDGET` — skipping anything already cached or being computed by
-    /// another worker.
+    /// `Coordinator::line_budget` — skipping anything already cached or being computed
+    /// by another worker.
     ///
     /// Best-effort throughout: a spawn failure just means a smaller pool, and no
     /// highlighter just means every row warms `DiffOnly`.
@@ -8131,8 +8191,12 @@ impl GitkApp {
         if settled_diff_unwarmed || scrolled_off_band {
             self.last_highlight_check_gen = current_gen;
             // Still never compete with the foreground diff's own colouring: the reader
-            // is looking at that, not at a row they might scroll to.
-            if diff_fully_highlighted(&self.diff_lines, &self.diff_files) {
+            // is looking at that, not at a row they might scroll to. With syntax OFF
+            // there is no colouring to compete with — and no spans are ever set, so
+            // `diff_fully_highlighted` answers false for every non-empty diff forever.
+            // Asking it in that mode is what silently kept the whole band cold, making
+            // the removal of the `syntax_enabled` gate above a no-op.
+            if !self.syntax_enabled || diff_fully_highlighted(&self.diff_lines, &self.diff_files) {
                 self.prefetched_gen = current_gen;
                 self.dispatch_prefetch(ctx);
             }
@@ -10895,11 +10959,11 @@ mod tests {
     /// A `--reflog` view shows the same oid at several visible indices
     /// (reset-and-back, amends). `stats_targets` must yield exactly one
     /// target per distinct oid, in first-appearance order — not one per row —
-    /// because `stats_inflight` is a `HashSet`: a duplicated target would take
-    /// one claim but release it on the first of the worker's several results
-    /// for that oid, letting a second batch dispatch while the first is still
-    /// computing (the one-batch-at-a-time invariant `dispatch_commit_stats`
-    /// relies on).
+    /// because a duplicated target would put N jobs for one commit in the pool's
+    /// queue, where `Coordinator::busy_stats` makes all but one a wasted dequeue —
+    /// and because the returned list is what `dispatch_commit_stats` compares
+    /// against `stats_submitted`, so a list varying with row *positions* rather
+    /// than content would resubmit on every scroll.
     #[test]
     fn stats_targets_dedupes_reflog_repeated_oids() {
         // reset-and-back: oid(1) shows up again a couple of entries later.
@@ -11043,6 +11107,220 @@ mod tests {
             known.get(&oid(1)),
             Some(&Some(stats)),
             "a failure must not overwrite an already-succeeded row"
+        );
+    }
+
+    /// `cache_diff` harvests the column off a built diff, and the settings half of that
+    /// decision is not defensive — it is the only thing standing between the toolbar's
+    /// rename/whitespace toggles and a permanently wrong number.
+    ///
+    /// The sequence: the toggle runs `invalidate_stats_if_counts_changed` (clearing the
+    /// map), then `load_selected_diff`, whose `stash_current_diff` calls `cache_diff`
+    /// with the OUTGOING diff — built under the settings just toggled away from. Without
+    /// the check that pre-toggle count lands in the freshly cleared map, `stats_targets`
+    /// reads it as known, and the column disagrees with the pane beside it for good.
+    #[test]
+    fn a_diff_built_under_other_count_settings_may_not_feed_the_column() {
+        let k = |o: git2::Oid, settings| DiffCacheKey {
+            oid: o,
+            settings,
+            theme: highlight::EmbeddedThemeName::CatppuccinMocha,
+            enabled: true,
+            content: 0,
+        };
+        let now = ds();
+        assert!(
+            stats_harvestable(&k(oid(1), now), now),
+            "the ordinary path: same settings, real commit"
+        );
+        // `context` reshapes the patch but cannot move a COUNT, so widening it must not
+        // cost the column an otherwise free harvest.
+        assert!(
+            stats_harvestable(&k(oid(1), DiffSettings { context: 9, ..now }), now),
+            "context is not a count-relevant setting"
+        );
+        for (what, stale) in [
+            (
+                "detect_renames",
+                DiffSettings {
+                    detect_renames: !now.detect_renames,
+                    ..now
+                },
+            ),
+            (
+                "detect_copies",
+                DiffSettings {
+                    detect_copies: !now.detect_copies,
+                    ..now
+                },
+            ),
+            (
+                "ignore_ws",
+                DiffSettings {
+                    ignore_ws: !now.ignore_ws,
+                    ..now
+                },
+            ),
+        ] {
+            assert!(
+                !stats_harvestable(&k(oid(1), stale), now),
+                "a diff built under a different {what} counts differently than the \
+                 column now does"
+            );
+        }
+        // Virtual rows are content-keyed and evicted by `sync_virtual_stats`; harvesting
+        // one here would race that.
+        assert!(!stats_harvestable(&k(oid_uncommitted(), now), now));
+        assert!(!stats_harvestable(&k(oid_staged(), now), now));
+    }
+
+    /// A worktree-only edit never touches `.git`, so the watcher's debounced
+    /// reload — the only other thing that evicts the virtual rows' stats — never
+    /// fires. The diff PANE stays correct regardless (a virtual key carries a
+    /// content hash, so it re-keys and recomputes), and without this the column
+    /// would sit beside it showing the pre-edit numbers: exactly the
+    /// column-vs-pane disagreement the feature exists to make impossible.
+    #[test]
+    fn a_worktree_edit_drops_the_edited_virtual_rows_stats() {
+        let k = |o: git2::Oid, content: u64| DiffCacheKey {
+            oid: o,
+            settings: ds(),
+            theme: highlight::EmbeddedThemeName::CatppuccinMocha,
+            enabled: true,
+            content,
+        };
+        let st = |files| {
+            Some(CommitStats {
+                files,
+                lines: Some((1, 0)),
+            })
+        };
+        let mut seen: HashMap<git2::Oid, u64> = HashMap::new();
+        let mut known: HashMap<git2::Oid, Option<CommitStats>> = HashMap::new();
+        known.insert(oid_uncommitted(), st(1));
+        known.insert(oid_staged(), st(2));
+        known.insert(oid(9), st(3));
+
+        // First sighting of each virtual diff: recorded, nothing evicted.
+        sync_virtual_stats(&mut seen, &mut known, &k(oid_uncommitted(), 10));
+        sync_virtual_stats(&mut seen, &mut known, &k(oid_staged(), 20));
+        assert_eq!(known.len(), 3, "a first sighting is not a change");
+
+        // The same content again — re-selecting the row, a debounced refresh,
+        // an apply that changed nothing. Must not evict, or the column would
+        // blank and recompute on every visit to a virtual row.
+        sync_virtual_stats(&mut seen, &mut known, &k(oid_uncommitted(), 10));
+        assert_eq!(
+            known.len(),
+            3,
+            "recomputing identical content is not a change"
+        );
+
+        // A real commit's diff is immutable; it can never invalidate anything.
+        sync_virtual_stats(&mut seen, &mut known, &k(oid(9), 99));
+        assert!(
+            known.contains_key(&oid(9)),
+            "a real commit is never evicted"
+        );
+
+        // The edit: same diff, new content hash.
+        sync_virtual_stats(&mut seen, &mut known, &k(oid_uncommitted(), 11));
+        assert!(
+            !known.contains_key(&oid_uncommitted()),
+            "the edited row must be recomputed, not left showing pre-edit numbers"
+        );
+        assert!(
+            known.contains_key(&oid_staged()),
+            "the other virtual row did not change"
+        );
+        assert!(
+            known.contains_key(&oid(9)),
+            "and neither did any real commit"
+        );
+
+        // Widening the toolbar's context re-hashes the SAME working tree (more
+        // context lines in the diff text), so this eviction is pure waste — and
+        // it is still the right answer, because the case below is the same
+        // install seen from here and absorbing it is permanent.
+        let wider = DiffCacheKey {
+            settings: DiffSettings { context: 9, ..ds() },
+            ..k(oid_staged(), 21)
+        };
+        sync_virtual_stats(&mut seen, &mut known, &wider);
+        assert!(
+            !known.contains_key(&oid_staged()),
+            "a moved hash always recomputes — settings changed or not"
+        );
+
+        // The interleaving that makes a settings guard unsafe: the user edits
+        // the file, THEN clicks the toolbar's context `+`. That click is the
+        // re-diff trigger, so one install carries both a new hash and new
+        // settings, and it is indistinguishable from the pure re-layout above.
+        // Absorbing it would leave the row permanently wrong: the post-edit
+        // hash is recorded either way, so no later install could detect it.
+        known.insert(oid_uncommitted(), st(1));
+        let edited_and_widened = DiffCacheKey {
+            settings: DiffSettings { context: 9, ..ds() },
+            ..k(oid_uncommitted(), 12)
+        };
+        sync_virtual_stats(&mut seen, &mut known, &edited_and_widened);
+        assert!(
+            !known.contains_key(&oid_uncommitted()),
+            "an edit arriving with a settings change must not be absorbed"
+        );
+
+        // Same for a re-theme, which doesn't even reshape the diff.
+        known.insert(oid_staged(), st(2));
+        let retimed = DiffCacheKey {
+            theme: highlight::EmbeddedThemeName::CatppuccinLatte,
+            settings: DiffSettings { context: 9, ..ds() },
+            ..k(oid_staged(), 22)
+        };
+        sync_virtual_stats(&mut seen, &mut known, &retimed);
+        assert!(
+            !known.contains_key(&oid_staged()),
+            "a re-theme must not mask a working-tree change"
+        );
+
+        // The only thing that holds an eviction back is an unmoved hash — so
+        // the last install of each row, repeated, still changes nothing.
+        known.insert(oid_uncommitted(), st(1));
+        known.insert(oid_staged(), st(2));
+        sync_virtual_stats(&mut seen, &mut known, &edited_and_widened);
+        sync_virtual_stats(&mut seen, &mut known, &retimed);
+        assert_eq!(
+            known.len(),
+            3,
+            "a repeat of the same content is not a change"
+        );
+    }
+
+    /// `handle_git_reload` retries failed stats rows through this, because a
+    /// `.git` write (an NFS blip clearing, a `git worktree` shuffle finishing,
+    /// a moved repo path coming back) is precisely when a previously
+    /// unreadable object may have become readable again. A succeeded row must
+    /// survive untouched — this is a retry, not a second `invalidate_commit_stats`.
+    #[test]
+    fn retry_failed_stats_drops_only_the_failures() {
+        let mut known: HashMap<git2::Oid, Option<CommitStats>> = HashMap::new();
+        known.insert(
+            oid(1),
+            Some(CommitStats {
+                files: 1,
+                lines: Some((2, 0)),
+            }),
+        );
+        known.insert(oid(2), None); // previously failed
+
+        retry_failed_stats(&mut known);
+
+        assert!(
+            known.contains_key(&oid(1)),
+            "a succeeded row must survive a reload"
+        );
+        assert!(
+            !known.contains_key(&oid(2)),
+            "a failed row must be retried after a reload"
         );
     }
 
