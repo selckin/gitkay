@@ -191,6 +191,11 @@ pub struct CommitListSection {
     /// saving, not just a shorter column: the file count comes out of the tree
     /// walk, while line counts require diffing every changed blob.
     pub(crate) line_count: bool,
+    /// Width of the author column, in characters; longer names are elided.
+    /// Clamped as it parses, so there is no unclamped form for a reader to
+    /// reach for and no accessor to remember to call.
+    #[serde(deserialize_with = "clamped_author_chars")]
+    pub(crate) author_chars: usize,
 }
 
 impl Default for CommitListSection {
@@ -198,8 +203,31 @@ impl Default for CommitListSection {
         Self {
             file_count: true,
             line_count: true,
+            author_chars: DEFAULT_AUTHOR_CHARS,
         }
     }
+}
+
+/// Bounds for `[commit_list] author_chars`: room for one character and the
+/// ellipsis at the low end, past the longest name anyone has at the high end.
+/// Clamped, unlike `[cache] min_build_ms` — there `0` and "enormous" are both
+/// coherent requests, whereas a zero-wide author column draws nothing and a
+/// 10 000-wide one pushes the summary off the row. Neither is meant.
+const MIN_AUTHOR_CHARS: usize = 2;
+const MAX_AUTHOR_CHARS: usize = 80;
+/// Fits the ordinary "Firstname Lastname" and most bot names.
+const DEFAULT_AUTHOR_CHARS: usize = 20;
+
+/// Clamp `author_chars` where it enters — the one path an out-of-range value can
+/// arrive by, since `Default` supplies an in-range one.
+///
+/// A clamping accessor was the other option, and costs more than it looks: to be
+/// unskippable it needs the field private, which takes struct-update syntax away
+/// from every test in another module and drags a `#[cfg(test)]` constructor into
+/// this one. Left public with a same-named accessor beside it, `x.author_chars`
+/// and `x.author_chars()` would differ silently, which is worse than either.
+fn clamped_author_chars<'de, D: serde::Deserializer<'de>>(d: D) -> Result<usize, D::Error> {
+    Ok(usize::deserialize(d)?.clamp(MIN_AUTHOR_CHARS, MAX_AUTHOR_CHARS))
 }
 
 impl CommitListSection {
@@ -431,6 +459,10 @@ fn default_template() -> String {
          # cheaper: file counts come from the tree walk, line counts require\n\
          # diffing every changed blob.\n\
          # line_count = true\n\
+         # Width of the author column, in characters. Fixed rather than\n\
+         # per-row, so the sha and the counts line up down the list; longer\n\
+         # names are elided.\n\
+         # author_chars = 20\n\
          \n\
          [cache]\n\
          # Diffs are cached on disk at ~/.cache/gitkay/diffs so a commit whose\n\
@@ -1210,6 +1242,29 @@ mod tests {
     }
 
     #[test]
+    fn commit_list_author_chars_defaults_and_parses() {
+        assert_eq!(Config::default().commit_list.author_chars, 20);
+        let cfg: Config = toml::from_str("[commit_list]\nauthor_chars = 12\n").unwrap();
+        assert_eq!(cfg.commit_list.author_chars, 12);
+        assert!(
+            cfg.commit_list.file_count,
+            "untouched key keeps its default"
+        );
+    }
+
+    /// Unlike `[cache] min_build_ms`, both extremes here are incoherent rather
+    /// than merely unusual: 0 draws no author at all, and a huge value pushes the
+    /// summary off the row. Clamped as it parses, so a read site cannot see the
+    /// raw value at all.
+    #[test]
+    fn commit_list_author_chars_is_clamped() {
+        let zero: Config = toml::from_str("[commit_list]\nauthor_chars = 0\n").unwrap();
+        assert_eq!(zero.commit_list.author_chars, MIN_AUTHOR_CHARS);
+        let huge: Config = toml::from_str("[commit_list]\nauthor_chars = 100000\n").unwrap();
+        assert_eq!(huge.commit_list.author_chars, MAX_AUTHOR_CHARS);
+    }
+
+    #[test]
     fn commit_list_rejects_unknown_keys() {
         // deny_unknown_fields: a typo is an error, not a silently ignored line.
         assert!(toml::from_str::<Config>("[commit_list]\nline_counts = false\n").is_err());
@@ -1221,6 +1276,7 @@ mod tests {
         assert!(t.contains("[commit_list]"));
         assert!(t.contains("file_count ="));
         assert!(t.contains("line_count ="));
+        assert!(t.contains("author_chars ="));
     }
 
     /// `[cache] min_build_ms` parses and defaults to one second.

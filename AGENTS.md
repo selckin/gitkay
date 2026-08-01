@@ -937,11 +937,11 @@ parts run off the window-creation critical path:
   ambiguity resolves toward recomputing rather than toward a number that may be
   wrong forever. So the two virtual rows do blank briefly on a context change,
   unlike the real commits — two diffs, and only while those rows are visible.
-  Rendering is `draw_stats_cells`: fixed-width cells (`STATS_CELL_CHARS` measured
-  once a frame) right-aligned between the summary and the SHA. Fixed width buys
+  Rendering is `draw_stats_cells`: fixed-width cells (`STATS_CELL_CHARS`)
+  right-aligned between the summary and the SHA. Fixed width buys
   stability *within* a row — the slot exists before the number does, so a landing
-  result never reflows the row and a growing `+` never shifts the `-` — not
-  alignment down the list, since the cells hang off the per-row `author_date_x`.
+  result never reflows the row and a growing `+` never shifts the `-`. Alignment
+  *down the list* is a separate property, and comes from `MetaCols` (below).
   A blank cell is what "not computed yet" looks like, so a zero side is drawn as
   `+0`/`-0` in its own colour (as in the file-list sidebar): omitting it collides with
   that blank — "this commit only adds" and "the worker has not answered yet" would look
@@ -963,6 +963,41 @@ parts run off the window-creation critical path:
   instead of blanking the map — the file counts stay on screen while the line
   counts fill in. Switching the whole column OFF still clears the map, since
   nothing will read it again.
+- **Commit-list right-hand columns** (`MetaCols`, measured once a frame in
+  `show_commit_list` and handed to `draw_row_text`): stats cells, short SHA, author,
+  date. Measuring once a frame **is** the feature. These widths used to come off each
+  row's own text — `author_date_x` subtracted that row's author name — so every column
+  to the left of the widest field inherited its raggedness, and the SHAs and stat cells
+  stepped in and out down the list as the author changed. Each width is now a property
+  of the font and the config alone: `SHA_SAMPLE` (short SHAs are always 7 chars),
+  `STATS_CELL_CHARS`, the date measured by *running the formatter*
+  (`format_commit_time(0, 0, false)`, so the sample cannot drift from the format the
+  rows use), and the author at `[commit_list] author_chars` (default 20) `'0'` glyphs —
+  a digit rather than `M` or `i` because it sits near the average advance in a
+  proportional font and is exact in the default monospace one. `author_chars` is
+  clamped **as it parses** (`clamped_author_chars`), so no read site sees a raw value
+  and none has to remember an accessor — a clamping accessor was tried and needs the
+  field private to be unskippable, which costs struct-update syntax for every test in
+  another module.
+  A row lays its text out
+  INTO those columns and never the other way round: a long author is `right_elide`d
+  (colour still hashes the **full** name, so two authors sharing an elided prefix keep
+  their own colours), and a row missing a field — the virtual rows have no SHA, an
+  unrepresentable timezone offset yields no date — leaves a gap instead of pulling the
+  group sideways. **All three fields draw from their column's left edge**, none
+  right-aligned against the row: a field placed INTO a column is the point, and one
+  aligned the other way is a rule the next variable-width field will not inherit.
+  `MetaCols::origins` turns the widths into the per-row x positions
+  (`MetaOrigins`, whose `sha` is also where the stats cells stop), so the three gaps are
+  summed in one place rather than as a bare total in the row plus two repeated inline
+  literals. Pure, and pinned by `meta_origins_lay_the_columns_out_right_to_left`, since
+  a swapped gap reads on screen as a few points of drift. The author is laid out
+  **first and re-elided only on overflow**, not passed through `right_elide`
+  unconditionally: that helper measures by laying out, so every name that fits would be
+  laid out twice a frame. The group is **clipped** to what the ref chips leave, as the
+  summary always has been — fixed columns claim the same ~250pt on every row where the
+  old per-row widths shrank with a short author name, so on a narrow window `sha` can
+  land left of the chips, and an unclipped draw put the SHA over the graph.
 - **Bottom panel**: diff view (left, syntax-highlighted) + file list sidebar
   (right, dynamic width). Both remember their scroll position per commit for
   the session (`scroll_memory`, oid-keyed: saved by `stash_current_diff` when
