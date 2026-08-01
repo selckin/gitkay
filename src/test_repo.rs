@@ -115,6 +115,14 @@ pub fn read_file(repo: &git2::Repository, path: &str) -> String {
     std::fs::read_to_string(repo.workdir().unwrap().join(path)).unwrap()
 }
 
+/// Write a `.gitattributes` into the working tree. Not committed — which is the
+/// point: libgit2 resolves attributes from the WORKING TREE even for a
+/// tree-to-tree diff, so this changes a fixed commit's diff without touching
+/// the commit.
+pub fn write_attributes(repo: &git2::Repository, content: &str) {
+    write_file(repo, ".gitattributes", content);
+}
+
 /// The *staged* content of `path` — what a commit made right now would record.
 pub fn index_blob(repo: &git2::Repository, path: &str) -> String {
     let index = repo.index().unwrap();

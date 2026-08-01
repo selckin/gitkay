@@ -14,7 +14,7 @@ unchanged symlink and silently drops the change. `docs/` is excluded via
 ./build.sh                        # pre-push gate: fmt (applied) + clippy --all-targets + debug build
                                   # (stricter than CI: lints test code, --locked; fails if fmt reformatted anything)
 cargo build                       # debug; release: cargo build --release
-cargo test                        # all tests (main/diff/config/highlight/cli/diff_cache/word_diff modules)
+cargo test                        # all tests (main/diff/config/highlight/cli/diff_cache/diff_store/word_diff modules)
 cargo test test_pr_merge_pattern  # one test by name (substring match)
 cargo test config::               # one module's suite
 cargo clippy -- -D warnings       # CI gate: any warning fails CI — keep it clean
@@ -89,10 +89,13 @@ highlight orchestration, and rendering stay in `main.rs`), `src/apply.rs` (the
 write layer: `ApplyAction`/`ApplyRequest`/`ApplyError`, the
 `CommitKind`-driven verb mapping, and the three write mechanisms — see below),
 `src/config.rs`
-(`[fonts]`/`[text]`/`[diff]` config: TOML parsing, `[diff.bands]` resolution
+(`[fonts]`/`[text]`/`[diff]`/`[cache]` config: TOML parsing, `[diff.bands]` resolution
 (`resolve_diff_bg`), `[diff.languages]`, fontdb resolution + cache,
 role→FontId map), `src/highlight.rs` (syntect highlighter, theme/palette
 resolution, grammar selection, per-line tokenization), `src/diff_cache.rs` (line-budget LRU cache),
+`src/diff_store.rs` (the persistent layer below that cache: a hand-rolled binary
+codec for a diff's structure, key derivation, atomic load/save, and the
+budget-and-temp-sweep pruner),
 `src/mem.rs` (what the system will say about memory —
 `/proc/meminfo` plus the cgroup limit, Linux only, no `unsafe` and no dependency;
 advisory, `None` ⇒ the caller uses its static default. One consumer:
@@ -318,7 +321,13 @@ parts run off the window-creation critical path:
   laptop gets ~153MB and a squeezed one falls to the floor. Resolved ONCE in
   `GitkApp::new` and logged, because a value that varies by machine and by moment is
   otherwise unreadable from a bug report; the pool takes its two bounds from the same
-  resolved number (`line_budget`, `max_entry_lines`) rather than re-deriving.
+  resolved number rather than re-deriving. Those two travel as one `PrefetchBudget`
+  (`limits` + `line_budget`, built by `PrefetchBudget::of` — the single place either
+  divisor is applied), resolved in `GitkApp::new` and handed to `spawn_prefetch_pool`.
+  One value rather than two parameters because they are one decision, and because the
+  **diff-load worker applies the same `Limits`** the pool does (`build_or_load` gates the
+  persistent store on `max_entry_lines`): a second derivation would be a second chance
+  for the two to disagree about which diffs are worth keeping.
   The floor is the value gitkay shipped with, so it is known to work — and it is what
   keeps `max_entry_lines` above `PREFETCH_MAX_HIGHLIGHT_LINES` at *every* budget the
   derivation can produce, which the `const` block asserts.
@@ -640,6 +649,172 @@ parts run off the window-creation critical path:
   highlight batch has landed since a `false`, and never merely because it was asked.
   Accepted limit: a continuous fling still outruns the pool. Nothing that builds a real
   diff per row will not.
+- **Persistent diff store** (`DiffStore`, `src/diff_store.rs`) — the layer *below*
+  the in-memory `DiffCache`:
+  `~/.cache/gitkay/diffs`, one file per entry, so a diff an earlier launch already paid
+  for is read back instead of rebuilt. What it buys is the blob-heavy row — huge blobs,
+  tiny patch — where libgit2's cost tracks bytes read rather than changed lines: ~12s
+  becomes ~1ms, and a measured 25-row band that took ~28s to warm stopped re-paying it
+  every launch. Measured end to end over 40 commits of a 199MB repo, with the store
+  reconstructed between passes to mimic separate launches: **1.72s cold against 29.4ms
+  warm**, identical line/file/width shapes both ways, ~51KB an entry.
+  **A commit oid does NOT determine its diff**, and that is the premise the first design
+  rested on. The enumeration of *how* it does not has now been wrong **three** times,
+  each correction arriving after the previous list had been asserted complete: libgit2
+  resolves `.gitattributes` from the **working tree** even for a tree-to-tree diff
+  (`*.oml -diff` turned a fixed commit's 4 patch lines into 2); `git_diff_find_similar`
+  falls back to repo config for every `DiffFindOptions` field `detect_similar` leaves
+  unset (`diff.renameLimit=1` turned 4 changed files into 6); and the repo path, added
+  as "the conservative half that closes the whole class", does **not** close it — it
+  separates *different repos*, and says nothing about one repo whose own config or
+  attributes moved. So `StoreContext` folds in **four** inputs, hashed once at open into
+  a SHA-1: the canonicalized git dir, a fingerprint of the attribute sources' contents,
+  the diff-affecting git config, and the **crate version**.
+  The config half (`config_id`) lists its keys explicitly rather than hashing the whole
+  config — most of a config has nothing to do with diffs, and folding it in wholesale
+  would miss the store on every unrelated `git config` write. A key missing from that
+  list is a stale-hit bug, so it is written to be read alongside
+  `diff_opts`/`detect_similar`. Read through `Config::snapshot`, so one parse covers the
+  repo, global and system files.
+  The crate version is there because `VERSION` guards only the byte **layout**: a change
+  to what the diff *builder* emits — a header line, the stat block, how a bodyless file
+  renders, how `max_chars` is counted — never touches the codec, so nothing would prompt
+  a bump and an upgraded gitkay would render the old version's diff for every stored
+  commit. A release therefore invalidates the store, which is a cache miss, not a bug.
+  The attribute sources are the worktree `.gitattributes`, **`commondir()`**`/info/attributes`
+  — where git reads it, so a linked worktree (whose own gitdir has no such file) still
+  sees it — and the one out-of-tree file `global_attr_file` resolves: `core.attributesFile`
+  if set, **otherwise** `$XDG_CONFIG_HOME/git/attributes`, which is a default rather than
+  an addition, so exactly one of the two is ever read. That rule is a pure function and
+  tested as one: which branch applies depends on the developer's own global config, so an
+  integration test cannot reliably reach the fallback. Known gap: nested `.gitattributes`
+  in subdirectories, and the system-wide file, are not fingerprinted; the escape hatch is
+  deleting the directory.
+  Hashing is `git2::Oid::hash_object`, not `DefaultHasher`, whose instability across
+  toolchains would silently invalidate the store on a rustc bump — and it **fails
+  closed**: `StoreContext::of` returns `None` and the whole feature no-ops, because the
+  obvious alternative (a zero context) is one constant shared by every repository, so
+  failing open would serve one repo's entries to another exactly when we know least
+  about the repo.
+  **Three routes to a HIT serving wrong content**, so three tests, each demonstrated to
+  fail with its input removed: the **pathspec** (which `DiffCacheKey` omits — sound in
+  memory, where the scope is fixed for a run, and unsound on disk, where `gitkay` and
+  `gitkay -- sub/` are separate runs producing different diffs for one oid), the **repo
+  context**, and a **`DiffSettings` field left out of the encoding**. The third is
+  additionally compiler-enforced: `entry_key` destructures `DiffSource` and
+  `DiffSettings` exhaustively, because unlike `DiffCacheKey` — which embeds a
+  `DiffSettings` and derives `Hash`, so a new field joins the in-memory key with no
+  second edit site — a byte encoding cannot inherit a newly added field.
+  Only a **real commit** is persistable (a `match`, not an oid comparison, so a new row
+  kind must be classified): the working-tree rows change content under a fixed sentinel
+  oid, and the range row's key would move with `HEAD`, accruing one entry per HEAD
+  position for no reuse.
+  **Structure only, no spans** — they are theme-dependent, and recolouring is cheap next
+  to the build this exists to avoid. A loaded entry is exactly the `DiffOnly` state the
+  app already handles (`spans` is an `Option` per line), so `ensure_diff_highlighted`
+  finishes it on install and nothing downstream needed changing. Hand-rolled rather than
+  serde+bincode: the crate has no serialization dependency, `git2::Delta` is foreign and
+  would need a remote-derive, and a derived format changes silently when a field is
+  added — the `VERSION` bump has to be remembered by hand either way. Both tag mappings
+  are exhaustive, so a new variant is a compile error rather than a wrong byte on disk.
+  Every read is bounds-checked, and a count is capped by what the remaining bytes could
+  **describe** (`remaining / min_elem`), not merely by their number — the distinction is
+  the whole point, since an element costs at least 17 bytes on disk but ~72 in memory, so
+  a byte-cap let a 15MB entry with a corrupted count reserve ~1GB or abort the process
+  outright. Those minimums are measured against the real encoder by a test rather than
+  hand-copied. That bound is tested on `count` **directly**: through `decode` an
+  oversized count returns `None` either way (it runs out of data), so a round-trip
+  assertion passes with or without it while the oversized reserve still happens.
+  Every integer on disk is a fixed width — no native `usize`, or one `VERSION` would
+  cover two layouts and a store on a shared home read by the other word size would decode
+  as corrupt, deleting and rebuilding every entry each launch. `load` **deletes** a
+  corrupt entry on the way out, since leaving it would fail every future lookup for that
+  key forever.
+  **The write rule is build time, not the blob probe**: `build_or_load` (in `main.rs`)
+  reads on every build and writes when the build took at least `[cache] min_build_ms`,
+  the diff is `worth_persisting`, and — **on the speculative path only** — it fits
+  `Limits::max_entry_lines`. `min_build_ms` defaults to **1000** and
+  is deliberately **unclamped**, unlike the font sizes: `0` ("store everything") and a
+  very large value ("effectively off") are both coherent requests. It is compared as a
+  `Duration`, not against truncated millis — `as_millis() > n` would make `0` store
+  nothing built in under a millisecond, the opposite of what the setting says. 1s is the
+  conservative end of a very wide gap: on a repo of 265MB blobs builds are bimodal by
+  four orders of magnitude (ordinary rows at 1.8–3.1ms, blob-heavy rows at 11.7–14.3s),
+  so any threshold between them separates them identically and a repo with a genuine
+  middle stores less rather than more. One rule for both paths,
+  nothing added to the click path, and it catches a wide commit of thousands of small
+  files the probe cannot see. The probe verdict would leave a hole: a heavy row clicked
+  before the band reaches it is built in the foreground, cached in memory, and then
+  skipped by every later prefetch via `diff_cache.contains` — so it would never be
+  written and the next launch would pay in full. The entry cap is the other half: a diff
+  the in-memory cache refuses to hold is one nobody will ever hold (`warm_row` builds it,
+  drops it, and would do so again next run), so persisting it buys nothing and costs the
+  most disk of anything we could write. That reasoning is `warm_row`'s **alone**, which
+  is why `store_cap` is `Some` only there: the display path is deliberately uncapped
+  (`cache_diff` inserts whatever the user opened, however large), so capping it too would
+  exclude exactly the slow diffs this store exists for. It is a **write-side parameter
+  only** — it gates the store, never the key, so changing what the cache will hold can
+  never change what an existing entry is looked up under.
+  `worth_persisting` is the other half, and it exists because **`get_diff_data` has no
+  error channel**: every display builder folds "could not read" into a benign-looking
+  value, which is right for a pane and wrong for something written to disk and served for
+  weeks. Two shapes are refused. An **empty** diff is `DiffData::empty()`, returned when
+  `find_commit` or the diff build failed — a real commit diff always carries its header
+  lines, so an empty one is never legitimate. And a commit whose **first parent is
+  unreadable** diffs against the EMPTY tree, i.e. "this commit added every file", which
+  is exactly what a shallow clone's boundary commit produces: correct only while the repo
+  stays shallow, so caching it means `git fetch --unshallow` never takes effect. It is
+  large and slow, so it sails straight past the build-time gate. `parent_count` tells that
+  apart from a **root** commit, whose missing parent is legitimate and whose diff is
+  perfectly reproducible — the same distinction `parent_tree_for_write` makes.
+  All three sites that build a diff — `warm_row`, `diff_load_worker` and the synchronous
+  spawn-failure fallback — funnel through `build_or_load`, so the store cannot reach one
+  path and miss another. In `warm_row` the lookup sits at the existing build site,
+  **below** the cost probe, which makes it a one-line substitution. Hoisting it above
+  would skip the probe on a first visit but costs splitting `warm_row`'s tail (cap check,
+  stats harvest, colour, send, log) into a shared function both paths run verbatim — and
+  would **still not keep the row off the heavy lane**, because `Coordinator::take_band`
+  routes by its own `measured` map before `warm_row` runs. The extra hop is about a
+  millisecond.
+  `min_build_ms` applies **live**, like every other config key: it is an atomic on the
+  shared store, so a reload moves it in place rather than needing a reopen (which would
+  re-fingerprint the repo on the UI thread). And the store is **opened off-thread**, not
+  merely pruned there — opening it fingerprints the repo (canonicalize, three
+  attribute-file reads, and a config snapshot that can force a full parse of
+  `.git/config`, `~/.gitconfig` and `/etc/gitconfig`), and `GitkApp::new` blocks window
+  creation, where the rule is that no IO runs inline. It is published through a
+  `OnceLock` (`StoreSlot`) that every builder reads: "not ready yet" and "no store at
+  all" collapse to one `None` deliberately, since both mean "build it yourself", which is
+  what every caller did before this feature existed.
+  Writes go to a temp file and **rename**. Rename is what stops a reader seeing an
+  interleaved write; it does not stop a post-crash zero-length file, and `decode`'s
+  magic/version/length checks are what cover that — which is also why there is no
+  `fsync`, since losing a cache to a power cut is correct behaviour rather than a
+  failure. The temp name carries a counter alongside the pid, because pids are unique per
+  *machine* and `~/.cache` can live on a shared network home. Failures warn **once per
+  store**, not once per row: a whole band failing to write would otherwise print a line
+  per row per dispatch.
+  **The pruner** (`prune`, spawned as `gitkay-cache-prune` from `GitkApp::new` so the
+  directory walk never runs on the window-creation critical path) does one walk,
+  classifying by name — free, because it is already stat-ing everything to sum sizes and
+  order by mtime. Over `DEFAULT_BUDGET_BYTES` (256MB) entries go oldest-first, and
+  "oldest" means **least-recently-used** because `load` bumps an entry's mtime on every
+  hit — a touch that fails is ignored, since degrading a hit into a multi-second rebuild
+  over bookkeeping is the wrong trade on a read-only mount. Its summary line counts
+  evictions down as they happen: reporting the pre-eviction total is the one diagnostic
+  anybody reads to ask whether the pruner is working. The **stale-temp sweep** is
+  what stops a crashed writer leaking forever: a temp file is matched as no entry, so
+  without it the only way to reclaim one is to outlive it, which never happens while the
+  store stays under budget. **Stale only** (`TEMP_MAX_AGE`, 1 hour), deliberately —
+  unlinking a live writer's temp does not hurt the writer on Unix, but the rename that
+  follows fails with `ENOENT`, so a diff that cost seconds to build is silently thrown
+  away. Every error is ignored rather than propagated: a store that cannot be pruned is
+  still a store, and failing a launch over a cache would be worse than the disk it saves.
+  Two things deliberately NOT done. `run_stats_job` does **not** consult the store: a
+  blob-heavy row already sends its file count immediately and lets the diff supply the
+  line counts, and that diff is now instant — a fourth read site would put a disk lookup
+  on every stats row, most of which miss. And the **range row** is not persisted: its
+  endpoints are immutable so an entry would be sound, but its key moves with `HEAD`.
 - **Perf timing** — key startup phases log at `debug` (`perf: startup: …` / `perf:
   load_commits: …`). Run with `RUST_LOG=gitkay=debug` to see the per-phase breakdown.
 - **Logger setup** (`log_builder`) — warnings by default, and one module muted:
@@ -1137,7 +1312,9 @@ nothing left to re-arm it.
 Each module carries its own `#[cfg(test)]` suite: `config` (TOML parsing +
 clamping), `highlight` (theme/palette resolution), `cli` (rev-vs-path
 classification + pathspec/title helpers), `diff` (line/file lookups, windowed
-word-diff laziness, content hashing), `diff_cache` (LRU eviction), `word_diff` (LCS word
+word-diff laziness, content hashing), `diff_cache` (LRU eviction), `diff_store`
+(codec round trips including a non-UTF-8 path and every tag, key derivation, load/save
+over real temp repos, and the pruner's eviction + temp sweep), `word_diff` (LCS word
 alignment), `apply` (the largest suite — hunk matching and error phrasing as pure
 units, then stage/unstage/revert end-to-end over real temp repos: renames, binaries,
 symlinks, modes, and every refusal the write layer owes the user), and `main` (graph
@@ -1153,10 +1330,13 @@ file modes and symlinks, so without that the developer's own `~/.gitconfig` deci
 `cargo test` passes — a global `autocrlf = true` alone turns the suite red.
 
 `src/test_repo.rs` (`#[cfg(test)]`, so nothing lands in the binary) holds the temp-repo
-helpers the `apply` and `main` suites share — `temp_repo`, `write_file`/`stage`/
+helpers the `apply`, `diff_store` and `main` suites share — `temp_repo`,
+`write_file`/`stage`/
 `commit_index`/`commit_file`/`commit_bytes`/`commit_rename` to build history,
 `remove_loose_object`/`corrupt_head` to break a repo the way a pruned odb or a bad HEAD
-does (the failure-to-read guards need them), and `read_file`/`index_blob`
+does (the failure-to-read guards need them), `write_attributes` to change a fixed
+commit's diff without touching the commit (libgit2 reads `.gitattributes` from the
+working tree — the diff store's key depends on it), and `read_file`/`index_blob`
 to assert on the worktree vs. the index separately. Add fixtures there rather than
 re-rolling them per module.
 
@@ -1192,7 +1372,8 @@ ones that actually fail when the write is removed.
 - File-list sidebar is not row-virtualized — every row draws each frame, so per-row file text goes through `SidebarCache`: elided labels (laid out in `Color32::PLACEHOLDER` so normal/hover color applies at paint time) and `+n`/`-n` stat galleys are built once per (diff, width, font) — `rebuild_file_rows` and a font reload reset the cache, `ensure` re-keys it on width change. `build_file_rows` (pure) turns `(new_path, Option<old_path>)` pairs into header/file rows per `[diff] file_list` (`grouped` = one header per directory, files sorted by label; renames/copies group under their `rename_brace` common directory); `left_elide` left-truncates labels, measuring the full string once and binary-searching only when it overflows (directory headers still elide per frame — they're the minority of rows). `grouped` directory headers are drawn breadcrumb-style (`draw_dir_header` + `common_dir_prefix_len`): the ancestor path a header shares with the header drawn just above it is dimmed (`SUBTEXT_DIM`) and the distinguishing tail is `SUBTEXT`, so deep trees don't repeat the same long prefix on every header
 - Any new diff-*data*-affecting setting goes in `DiffSettings` only. `GitkApp` holds one `DiffSettings` field (the diff-shaping state — `context`/`ignore_ws` are toolbar-owned + persisted, `show_stats`/`detect_renames`/`detect_copies` come from `[diff]` config), and `DiffCacheKey` *embeds* a `DiffSettings`. So a field added to `DiffSettings` is automatically (a) part of the cache key — cached diffs invalidate when it changes, no second edit site — and (b) covered by the config-reload's whole-struct comparison (`new_settings != self.diff_settings`), which triggers the re-diff. The prefetch mapping reads it back as `key.settings`. Settings that only change *spans* (theme, syntax on/off, `diff_bg`, `[diff.languages]`) or *render* (`word_diff`, `file_list`) are handled by their own branches in the config-reload block, not `DiffSettings`.
   Only two of those four span settings are in `DiffCacheKey` — `theme` and `enabled` make a stale entry miss on their own; `diff_bg` and `languages` do not. So that reload branch **clears the diff cache** rather than keying on all four: every cached entry's spans were tokenized under the old settings, the pool refills the band within a dispatch, and the alternative is a neighbour holding yesterday's colours (or none, for the extension just mapped) until something unrelated evicts it. A span setting added later joins the clear, not the key.
-- **A missing grammar is invisible unless something reports it.** `Highlighter::new_file_state` resolves a syntax from the path's extension and falls back to syntect's **plain text** — which still sets a span on every line. So `diff_fully_highlighted` answers true, `ensure_diff_highlighted` skips the diff on selection, and it renders in one flat colour for the session with every log line calling it highlighted. `[diff.languages]` (`highlight::LanguageMap`) is the fix for a repo's own suffix — `oml = "xml"`, `tfvars = "hcl"` — consulted BEFORE the built-in lookup so it can also override one, and matched lower-cased and dot-insensitive; the built-in lookup still gets the extension as written, because syntect distinguishes `.C` from `.c`. First-line sniffing is not an alternative even when the content would give it away: a diff holds hunks, and the `<?xml` line of a large file is not in them. `has_grammar` is what makes the state reportable, and `warm_row` logs three outcomes rather than two — `Highlighted` / `PlainText` / `DiffOnly`. Measured on a repo of `.oml` ontologies: a whole band logged `Highlighted` at ~3µs/line against ~60µs/line for rows that really tokenized, and that ratio was the only clue.
+  **Clearing is not enough on its own**, and the reason is the same absence: warms already queued or running were dispatched under the OLD span settings, and because `diff_bg`/`languages` are not in the key, `key_is_current` waves their results through and they land back in the just-cleared cache carrying the old colours — after which every dispatch skips them via `contains`, so those rows stay flat for the session. So the reload also bumps a **`span_gen`**, stamped onto every warm at dispatch (on the job, like `hl`, so a reload cannot race a worker mid-row) and checked when it returns. Stale spans outrank `awaiting` deliberately: installing one puts plain spans on the live diff, and since `spans` would then be `Some`, `diff_fully_highlighted` reads true and nothing re-tokenizes it — dropping it costs only a wait for the diff-load worker dispatched alongside. The drain's precedence is the pure `warm_disposition`, so the case a live `GitkApp` makes hard to reach is testable.
+- **A missing grammar is invisible unless something reports it.** `Highlighter::new_file_state` resolves a syntax from the path's extension and falls back to syntect's **plain text** — which still sets a span on every line. So `diff_fully_highlighted` answers true, `ensure_diff_highlighted` skips the diff on selection, and it renders in one flat colour for the session with every log line calling it highlighted. `[diff.languages]` (`highlight::LanguageMap`) is the fix for a repo's own suffix — `oml = "xml"`, `tfvars = "hcl"` — consulted BEFORE the built-in lookup so it can also override one, and matched lower-cased and dot-insensitive; the built-in lookup still gets the extension as written, because syntect distinguishes `.C` from `.c`. First-line sniffing is not an alternative even when the content would give it away: a diff holds hunks, and the `<?xml` line of a large file is not in them. `has_grammar` is what makes the state reportable, and `warm_row` logs three outcomes rather than two — `Highlighted` / `PlainText` / `DiffOnly` — reporting a **count** where they are mixed (`Highlighted 1/501, rest PlainText`). A count and not `any`: one grammar-backed file among 500 `.oml` ones otherwise logged a flat `Highlighted`, which is the exact "looks like a success" reading this label exists to remove, and an empty diff logged `PlainText` though nothing had been left uncoloured. Measured on a repo of `.oml` ontologies: a whole band logged `Highlighted` at ~3µs/line against ~60µs/line for rows that really tokenized, and that ratio was the only clue.
   The gap itself is announced at **`warn`**, from `new_file_state` — the one place the fallback actually happens — **once per extension per session** (`note_missing_grammar`). `warn` is `env_logger`'s default filter here, so it shows on a plain run rather than only under `RUST_LOG`, and that is the point: it is a config gap the reader can close and would otherwise never learn about, since the fallback renders perfectly happily. Same reason `resolve_font_path` warns for an unresolvable font name. The dedup is what makes a level this loud affordable, and it is not a nicety either way: a diff holds hundreds of files and the band warms dozens of rows across threads, so a per-file line would bury every other log. Its `HashSet` is shared by `Arc` and passed *through* `reconfigured`, because the prefetch pool holds `Arc` clones of one highlighter whose workers must dedupe against each other, and a theme change would otherwise re-announce everything. A path with **no extension** (`Makefile`) is deliberately silent: `[diff.languages]` is keyed by extension, so there is nothing the reader could add. Split from the logging so the dedup is testable without capturing output; a poisoned lock drops the report rather than panicking on the highlight path.
 - The uncommitted/staged/combined-range rows are "virtual": each has a fixed sentinel oid (`oid_uncommitted`/`oid_staged`/`oid_range`) — which the graph layout needs as a node id — but is classified by `CommitKind::of(oid)`, the single place that maps oid → `Real`/`Uncommitted`/`Staged`/`Range`. `get_diff_data` classifies from the oid it was already given and dispatches on the `CommitKind` (exhaustive — a new kind can't fall through to the commit path), and the "virtual ⇒ content-keyed cache entry" rule lives only in `finalize_diff_key`. Don't re-derive virtual-ness by comparing sentinel oids at call sites; ask `CommitKind::of` (or `is_real_commit`, which delegates to it).
   The **range** row is virtual for the same reason the other two are: its sentinel is fixed while its endpoints move with `HEAD`, so content keying and every existing eviction path cover it without a second rule. Its endpoints ride on its own `CommitInfo::source` (a `DiffSource::Range`, resolved by `range_ends`), the way `--follow`'s per-commit path rides on `follow_path` — per-row scope data recomputed on every rebuild, never held beside the list it describes.

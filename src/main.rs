@@ -21,6 +21,7 @@ mod cli;
 mod config;
 mod diff;
 mod diff_cache;
+mod diff_store;
 mod highlight;
 mod mem;
 #[cfg(test)]
@@ -35,6 +36,7 @@ use diff::{
     next_file_line, oid_staged, pathspec_opts, resolve_anchor, staged_git_diff, worktree_git_diff,
 };
 use diff_cache::DiffCache;
+use diff_store::DiffStore;
 use highlight::{DiffBg, HighlightLines, Highlighter};
 
 /// A monotonic supersession token shared between the UI thread and a background worker.
@@ -2814,6 +2816,37 @@ struct Limits {
     max_entry_lines: usize,
 }
 
+/// Everything the speculative machinery bounds itself by, all of it derived from
+/// the one resolved cache line budget.
+///
+/// One value rather than two parameters because the two ARE one decision: a
+/// worker's `Limits` and a dispatch's line budget are both fractions of the same
+/// number, and the diff-load worker has to apply the same `Limits` the pool does
+/// or the two disagree about which diffs are worth keeping. Resolved once in
+/// `GitkApp::new`, so there is no second derivation to drift.
+#[derive(Clone, Copy)]
+struct PrefetchBudget {
+    /// The per-row bounds a worker applies, shared with the diff-load worker.
+    limits: Limits,
+    /// Lines one dispatch may warm before the coordinator clears both diff lanes,
+    /// so a dispatch cannot evict its own warms.
+    line_budget: usize,
+}
+
+impl PrefetchBudget {
+    /// The two bounds, from the cache's resolved line budget. The single place
+    /// either divisor is applied.
+    const fn of(cache_lines: usize) -> Self {
+        Self {
+            limits: Limits {
+                max_blob_bytes: PREFETCH_MAX_DIFF_BYTES,
+                max_entry_lines: cache_lines / PREFETCH_MAX_ENTRY_DIVISOR,
+            },
+            line_budget: cache_lines / PREFETCH_LINE_BUDGET_DIVISOR,
+        }
+    }
+}
+
 /// One unit of background work, as handed to a worker.
 ///
 /// Stats and diffs share the pool because they are the same shape — per-row git work,
@@ -3321,17 +3354,15 @@ impl Coordinator {
 /// notices when its mailbox send fails and stops using it.
 fn spawn_prefetch_pool(
     repo_path: &str,
-    cache_lines: usize,
+    budget: PrefetchBudget,
     inflight: InflightKeys,
     tx: &mpsc::Sender<(DiffCacheKey, DiffData)>,
     stats_tx: &mpsc::Sender<StatsResult>,
     ctx: &egui::Context,
+    store: &StoreSlot,
 ) -> PoolHandle {
     let (coord_tx, coord_rx) = mpsc::channel();
-    let limits = Limits {
-        max_blob_bytes: PREFETCH_MAX_DIFF_BYTES,
-        max_entry_lines: cache_lines / PREFETCH_MAX_ENTRY_DIVISOR,
-    };
+    let limits = budget.limits;
     let count = prefetch_worker_count();
     // Heavy ids continue straight on from the pool's, so `id >= mailboxes.len()` names
     // the lane — one comparison rather than a second collection to keep in step.
@@ -3344,6 +3375,7 @@ fn spawn_prefetch_pool(
             tx: tx.clone(),
             stats_tx: stats_tx.clone(),
             ctx: ctx.clone(),
+            store: Arc::clone(store),
         };
         let repo_path = repo_path.to_owned();
         spawn_guarded(
@@ -3403,7 +3435,7 @@ fn spawn_prefetch_pool(
         busy_stats: HashSet::new(),
         warming: HashMap::new(),
         warmed: 0,
-        line_budget: cache_lines / PREFETCH_LINE_BUDGET_DIVISOR,
+        line_budget: budget.line_budget,
         hl: None,
         stats_epoch: 0,
         mailboxes,
@@ -3550,6 +3582,9 @@ struct WorkerCtx {
     tx: mpsc::Sender<(DiffCacheKey, DiffData)>,
     stats_tx: mpsc::Sender<StatsResult>,
     ctx: egui::Context,
+    /// The shared store slot — one store per process, published once the repo has
+    /// been fingerprinted. A worker that starts before that simply builds.
+    store: StoreSlot,
 }
 
 /// One worker: take a job, do it, report what happened. Forever.
@@ -3691,6 +3726,119 @@ fn send_stats_result(ctx: &WorkerCtx, epoch: u64, oid: git2::Oid, stats: Option<
     }
 }
 
+/// The persistent diff store, shared by every thread that builds a diff and
+/// published once — by the `gitkay-cache-prune` thread, which fingerprints the
+/// repo off the window-creation critical path.
+///
+/// A `OnceLock` rather than a channel: there is exactly one value, it never
+/// changes, and every consumer (the pool's workers, the diff-load worker, the UI
+/// fallback) wants it without any of them being responsible for receiving it.
+/// "Not yet published" and "no store at all" collapse to the same `None`
+/// deliberately — both mean "build it yourself", which is what every caller did
+/// before this feature existed.
+type StoreSlot = Arc<std::sync::OnceLock<DiffStore>>;
+
+/// The store, if there is one yet. One relaxed atomic load.
+fn store_of(slot: &StoreSlot) -> Option<&DiffStore> {
+    slot.get()
+}
+
+/// Build a row's diff, or load it from the persistent store if an earlier run
+/// already paid for it — and record it if it was slow.
+///
+/// The single funnel every diff build passes through, so the store cannot reach
+/// one path and miss another. The key is derived from `scope` and `settings`
+/// alone (plus the store's own repo context), i.e. exactly `get_diff_data`'s
+/// arguments, so it cannot drift from the value it keys.
+///
+/// `store_cap` is a WRITE-side parameter only — it gates the store, never the
+/// key — and it is `Some` for the SPECULATIVE path alone. The cap's whole
+/// justification ("an entry the in-memory cache refuses to hold is one nobody
+/// will ever hold") is `warm_row`'s: that path builds an over-cap row and drops
+/// it. The display path is deliberately uncapped — `cache_diff` inserts whatever
+/// the user opened, however large — so capping there would exclude exactly the
+/// slow diffs this store exists for.
+fn build_or_load(
+    store: Option<&DiffStore>,
+    repo: &Repository,
+    scope: &RowScope,
+    settings: DiffSettings,
+    store_cap: Option<usize>,
+) -> DiffData {
+    if let Some(store) = store
+        && let Some(data) = store.load(scope, settings)
+    {
+        log::debug!(
+            "diff store: hit {} ({} lines)",
+            scope.source.oid(),
+            data.lines.len()
+        );
+        return data;
+    }
+    let t = std::time::Instant::now();
+    let data = get_diff_data(repo, scope, settings);
+    let built = t.elapsed();
+    if let Some(store) = store
+        && built >= store.min_build()
+        && store_cap.is_none_or(|cap| data.lines.len() <= cap)
+        && worth_persisting(repo, scope, &data)
+    {
+        log::debug!(
+            "diff store: saving {} ({} lines, built in {built:?})",
+            scope.source.oid(),
+            data.lines.len()
+        );
+        store.save(scope, settings, &data);
+    }
+    data
+}
+
+/// Is this diff a faithful answer, or the shape a FAILURE takes?
+///
+/// `get_diff_data` has no error channel — every display builder folds "could not
+/// read" into a benign-looking value, which is right for a pane and wrong for
+/// something written to disk and served for weeks. Two shapes to tell apart:
+///
+/// - **No lines at all** is `DiffData::empty()`, returned when `find_commit` or
+///   the diff build failed. A real commit diff always carries its header lines,
+///   so an empty one is never a legitimate result.
+/// - **An unreadable first parent** makes `commit_parent_diff` diff against the
+///   EMPTY tree, i.e. "this commit added every file" — exactly what a shallow
+///   clone's boundary commit produces. That answer is correct only while the repo
+///   stays shallow, so caching it means `git fetch --unshallow` never takes
+///   effect: the store keeps serving "adds everything" on every launch. It is
+///   also large and slow, so it sails straight past the build-time gate.
+///
+/// `parent_count` is what tells that apart from a ROOT commit, whose missing
+/// parent is legitimate and whose diff is perfectly reproducible — the same
+/// distinction `parent_tree_for_write` makes on the write path.
+///
+/// Asked only on the write path, which a slow build has already gated, so the
+/// extra `find_commit`/`parent` costs nothing measurable.
+fn worth_persisting(repo: &Repository, scope: &RowScope, data: &DiffData) -> bool {
+    if data.lines.is_empty() {
+        log::debug!(
+            "diff store: not storing {} — the build failed",
+            scope.source.oid()
+        );
+        return false;
+    }
+    let DiffSource::Commit(oid) = scope.source else {
+        return true; // no other source is persistable; `entry_key` refuses them
+    };
+    let Ok(commit) = repo.find_commit(oid) else {
+        return false;
+    };
+    if commit.parent_count() > 0 && commit.parent(0).is_err() {
+        log::debug!(
+            "diff store: not storing {oid} — its first parent is unreadable, so this \
+             diff is against the empty tree (a shallow boundary?)"
+        );
+        return false;
+    }
+    true
+}
+
 /// Warm one row into the cache: probe, build, cap, colour, send.
 ///
 /// Pure in the sense that matters: everything it learns comes back as the return value,
@@ -3735,7 +3883,25 @@ fn warm_row(
     // "taking" 11-13s in tight clusters while their neighbours finished in 1.4ms. A
     // timer must bracket the work and nothing else.
     let t = std::time::Instant::now();
-    let mut data = get_diff_data(repo, &target.scope, target.key.settings);
+    // Below the probe, deliberately, and it costs almost nothing to be here. A
+    // stored row that has not yet been measured is probed (~1-2ms), reported
+    // `TooBig`, and re-offered on the heavy lane, where the probe is skipped
+    // (`target.probed` is now `Some`) and this call hits the store — one extra
+    // hop of about a millisecond. Hoisting the lookup above the probe would
+    // save that hop but requires splitting `warm_row`'s tail (cap check, stats
+    // harvest, colour, send, log) into a shared function so both paths run it
+    // verbatim, and it would still not keep the row off the heavy lane:
+    // `Coordinator::take_band` routes by its own `measured` map before this
+    // function runs. Surgery on a delicate function for a millisecond, buying
+    // none of the thing it looks like it buys.
+    let mut data = build_or_load(
+        store_of(&ctx.store),
+        repo,
+        &target.scope,
+        target.key.settings,
+        // Speculative: capped, because the drop below would throw this away.
+        Some(ctx.limits.max_entry_lines),
+    );
     let built = t.elapsed();
     let (oid, lines) = (target.key.oid, data.lines.len());
     // Too big to hold alongside the rest of the band — caching it would evict many rows
@@ -3859,6 +4025,8 @@ struct DiffLoadJob {
     tx: mpsc::Sender<DiffLoadResult>,
     ctx: egui::Context,
     prehighlight: Option<PreHighlight>,
+    /// The shared store slot; see `StoreSlot`.
+    store: StoreSlot,
 }
 
 /// Deliver a `data: None` result for a diff-load worker exiting without a diff
@@ -3896,6 +4064,7 @@ fn diff_load_worker(job: DiffLoadJob) {
         tx,
         ctx,
         prehighlight,
+        store,
     } = job;
     // Superseded before we even ran — don't open the repo.
     if !current_epoch.is_current(epoch) {
@@ -3919,7 +4088,8 @@ fn diff_load_worker(job: DiffLoadJob) {
         return;
     }
     let t = std::time::Instant::now();
-    let mut data = get_diff_data(&repo, &scope, key.settings);
+    // The user is waiting on this one, so it is stored uncapped.
+    let mut data = build_or_load(store_of(&store), &repo, &scope, key.settings, None);
     // Content-key a working-tree row off-thread here so an unchanged working tree hits
     // the cache and reuses its highlighting.
     let key = finalize_diff_key(key, scope.source.kind(), &data);
@@ -4929,6 +5099,13 @@ struct GitkApp {
     /// session instead of reconnecting to the display server on every SHA click.
     clipboard: Option<arboard::Clipboard>,
     diff_cache: DiffCache<DiffCacheKey, DiffData>, // diffs the user navigated away from
+    /// The persistent diff store, once the `gitkay-cache-prune` thread has
+    /// fingerprinted the repo. Empty until then, and forever if there is no cache
+    /// directory or the repo could not be identified.
+    diff_store: StoreSlot,
+    /// The speculative bounds, resolved once so the prefetch pool and the
+    /// diff-load worker cannot disagree about what is too big to keep.
+    prefetch_budget: PrefetchBudget,
     current_diff_key: Option<DiffCacheKey>, // key the live diff_lines was built under (None ⇒ empty pane; virtual rows get a content-keyed one)
     prewarm_rx: Option<mpsc::Receiver<Arc<Highlighter>>>, // startup-prewarmed highlighter, until installed
     prefetch_tx: mpsc::Sender<(DiffCacheKey, DiffData)>,
@@ -4936,9 +5113,6 @@ struct GitkApp {
     /// The persistent worker pool, started on first dispatch. A dispatch replaces its
     /// queue rather than spawning threads, so concurrency is bounded by construction.
     prefetch_pool: Option<PoolHandle>,
-    /// The diff cache's resolved line budget (see `diff_cache_line_budget`). Kept
-    /// because the pool derives its own two bounds from it and is built later.
-    cache_line_budget: usize,
     prefetched_gen: u64, // diff_generation we last dispatched prefetch for
     /// The visible row range the last prefetch dispatch was aimed at. Re-aiming when
     /// the view scrolls half a window past it is what makes the band follow a scroll
@@ -5428,6 +5602,40 @@ impl GitkApp {
         // Resolved once, here: it is read from the system, so it must not be re-derived
         // per use or the cache and the pool could disagree about their own budget.
         let cache_line_budget = diff_cache_line_budget();
+        // Derived once too, and for the same reason: the prefetch pool and the
+        // diff-load worker both bound a build by these, and a second derivation
+        // is a second chance for them to disagree.
+        let prefetch_budget = PrefetchBudget::of(cache_line_budget);
+        // The store is OPENED off-thread too, not just pruned there. Opening it
+        // fingerprints the repo — canonicalize, up to three attribute-file reads,
+        // and a config snapshot that can force a full parse of .git/config,
+        // ~/.gitconfig and /etc/gitconfig — and `GitkApp::new` blocks window
+        // creation, where the rule is that no IO runs inline. Nothing needs the
+        // store until the first diff load, which is at least a frame away.
+        let diff_store = StoreSlot::default();
+        {
+            let slot = Arc::clone(&diff_store);
+            let repo_path = repo_path.clone();
+            let min_build = std::time::Duration::from_millis(cfg.cache.min_build_ms);
+            let _ = spawn_guarded(
+                "gitkay-cache-prune",
+                "cache store thread panicked; diffs will not be cached across runs",
+                move || {
+                    // Its own handle: git2's `Repository` is `Send` but not `Sync`,
+                    // and the UI thread's is not ours to borrow.
+                    let Ok(repo) = Repository::discover(&repo_path) else {
+                        return;
+                    };
+                    let Some(store) = DiffStore::open(&repo, min_build) else {
+                        return; // no cache dir, or the repo could not be fingerprinted
+                    };
+                    diff_store::prune(store.root(), diff_store::DEFAULT_BUDGET_BYTES);
+                    // Published last: every consumer reads through `store_of`, so
+                    // until this lands they simply build as they did before.
+                    let _ = slot.set(store);
+                },
+            );
+        }
         let (prefetch_tx, prefetch_rx) = mpsc::channel();
         let (diff_load_tx, diff_load_rx) = mpsc::channel();
         let (history_load_tx, history_load_rx) = mpsc::channel();
@@ -5508,7 +5716,8 @@ impl GitkApp {
             highlight_rx,
             highlight_priority: None,
             diff_cache: DiffCache::new(cache_line_budget),
-            cache_line_budget,
+            diff_store,
+            prefetch_budget,
             current_diff_key,
             prewarm_rx,
             prefetch_tx,
@@ -6136,6 +6345,7 @@ impl GitkApp {
             tx: self.diff_load_tx.clone(),
             ctx: self.egui_ctx.clone(),
             prehighlight,
+            store: Arc::clone(&self.diff_store),
         };
         let spawn = spawn_reporting(
             "gitkay-diff-load",
@@ -6167,7 +6377,13 @@ impl GitkApp {
             match Repository::discover(&self.repo_path) {
                 Ok(repo) => {
                     let scope = self.row_scope(oid);
-                    let data = get_diff_data(&repo, &scope, self.diff_settings);
+                    let data = build_or_load(
+                        store_of(&self.diff_store),
+                        &repo,
+                        &scope,
+                        self.diff_settings,
+                        None,
+                    );
                     let key =
                         finalize_diff_key(self.diff_cache_key(oid), scope.source.kind(), &data);
                     self.install_preferring_cache(key, data);
@@ -6681,11 +6897,12 @@ impl GitkApp {
         self.prefetch_pool.get_or_insert_with(|| {
             spawn_prefetch_pool(
                 &self.repo_path,
-                self.cache_line_budget,
+                self.prefetch_budget,
                 Arc::clone(&self.inflight_diffs),
                 &self.prefetch_tx,
                 &self.stats_tx,
                 ctx,
+                &self.diff_store,
             )
         })
     }
@@ -8142,6 +8359,13 @@ impl GitkApp {
                 // toolbar-owned, so the current values pass through (the ownership split
                 // lives in config_diff_settings). Comparing the whole DiffSettings means
                 // a field added to it can't silently skip the reload.
+                // `[cache] min_build_ms` applies live like every other key — the
+                // template promises it, and the store is shared as an `Arc`, so
+                // the threshold moves in place rather than needing a reopen (which
+                // would re-fingerprint the repo on the UI thread).
+                if let Some(store) = store_of(&self.diff_store) {
+                    store.set_min_build(std::time::Duration::from_millis(cfg.cache.min_build_ms));
+                }
                 let before_settings = self.diff_settings;
                 let new_settings = config_diff_settings(
                     &cfg.diff,
@@ -13071,5 +13295,276 @@ mod tests {
             ScrollPlan::of(Some(oid_uncommitted()), oid_uncommitted()),
             ScrollPlan::Anchor
         );
+    }
+
+    /// The diff-shaping settings the `build_or_load` tests share.
+    fn probe_settings() -> DiffSettings {
+        DiffSettings {
+            context: 3,
+            ignore_ws: false,
+            show_stats: true,
+            detect_renames: true,
+            detect_copies: false,
+        }
+    }
+
+    /// The store is read on every build and written only when the build was slow —
+    /// one rule for both the prefetch and the foreground path, so a heavy row
+    /// clicked before the band reaches it is recorded too. Using the blob probe
+    /// instead would leave that hole: the foreground caches the row in memory, and
+    /// every later prefetch then skips it via `diff_cache.contains`.
+    #[test]
+    fn build_or_load_writes_only_a_slow_build_and_reads_it_back() {
+        use crate::diff_store::{DiffStore, StoreContext};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.rs", "fn main() {}\n", "one");
+        let oid = commit_file(&repo, "a.rs", "fn main() {\n    todo!()\n}\n", "two");
+        let scope = RowScope::new(DiffSource::Commit(oid));
+        let s = DiffSettings {
+            context: 3,
+            ignore_ws: false,
+            show_stats: true,
+            detect_renames: true,
+            detect_copies: false,
+        };
+        let dir = tempfile::tempdir().unwrap();
+
+        // A threshold no real build can reach: nothing is written.
+        let never = DiffStore::at(
+            dir.path().to_path_buf(),
+            StoreContext::of(&repo).expect("hashable"),
+            std::time::Duration::from_hours(1),
+        );
+        let built = build_or_load(Some(&never), &repo, &scope, s, None);
+        assert!(!built.lines.is_empty(), "control: the diff is real");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).map_or(0, Iterator::count),
+            0,
+            "a fast build is not worth persisting"
+        );
+
+        // A zero threshold: written, and read back identically.
+        let always = DiffStore::at(
+            dir.path().to_path_buf(),
+            StoreContext::of(&repo).expect("hashable"),
+            std::time::Duration::ZERO,
+        );
+        let a = build_or_load(Some(&always), &repo, &scope, s, None);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "written");
+        let b = build_or_load(Some(&always), &repo, &scope, s, None);
+        assert_eq!(a.lines.len(), b.lines.len());
+        assert_eq!(a.max_chars, b.max_chars);
+    }
+
+    /// A diff built from a read that FAILED must not be persisted.
+    /// `get_diff_data` folds every failure into a benign-looking value — an
+    /// unreadable commit or a failed diff build becomes `DiffData::empty()` — so
+    /// `build_or_load` cannot tell one from a real result, and would cache the
+    /// failure forever.
+    #[test]
+    fn build_or_load_never_stores_a_diff_that_failed_to_build() {
+        use crate::diff_store::{DiffStore, StoreContext};
+        let (dir, repo) = temp_repo();
+        let oid = commit_file(&repo, "a.rs", "one\n", "one");
+        let scope = RowScope::new(DiffSource::Commit(oid));
+        let s = probe_settings();
+        let store_dir = tempfile::tempdir().unwrap();
+        let root = store_dir.path().to_path_buf();
+
+        // Make the commit unreadable, exactly as a pruned odb would.
+        let ctx = StoreContext::of(&repo).expect("hashable");
+        drop(repo);
+        crate::test_repo::remove_loose_object(dir.path(), oid);
+        let repo = Repository::open(dir.path()).unwrap();
+        let store = DiffStore::at(root, ctx, std::time::Duration::ZERO);
+
+        let data = build_or_load(Some(&store), &repo, &scope, s, None);
+        assert!(data.lines.is_empty(), "control: the build did fail");
+        assert_eq!(
+            std::fs::read_dir(store_dir.path()).map_or(0, Iterator::count),
+            0,
+            "a failed build must not become a permanent cache entry"
+        );
+    }
+
+    /// The empty-diff guard, isolated. Reached when the commit loads fine but the
+    /// DIFF build fails (an unreadable tree, a bad odb entry below the commit) —
+    /// `build_diff_data` logs and returns `DiffData::empty()`. The unreadable-
+    /// commit case is caught a line later by `find_commit`, so only a readable
+    /// commit with an empty result exercises this one.
+    #[test]
+    fn worth_persisting_refuses_an_empty_diff_from_a_readable_commit() {
+        let (_d, repo) = temp_repo();
+        let oid = commit_file(&repo, "a.rs", "one\n", "one");
+        let scope = RowScope::new(DiffSource::Commit(oid));
+        assert!(
+            repo.find_commit(oid).is_ok(),
+            "control: the commit itself reads fine"
+        );
+        assert!(
+            !worth_persisting(&repo, &scope, &DiffData::empty()),
+            "an empty diff is what a failed build looks like, never a real result"
+        );
+        // And the same commit's real diff IS worth persisting, so the guard is
+        // rejecting the failure rather than the commit.
+        let real = get_diff_data(&repo, &scope, probe_settings());
+        assert!(worth_persisting(&repo, &scope, &real));
+    }
+
+    /// A commit whose FIRST PARENT cannot be read diffs against the empty tree —
+    /// "this commit added every file" — which is what a shallow clone's boundary
+    /// commit looks like. That diff is correct only while the repo stays shallow,
+    /// so persisting it means `git fetch --unshallow` never takes effect: the
+    /// store keeps serving "adds everything" on every launch. A ROOT commit is
+    /// the legitimate no-parent case and must still be persisted.
+    #[test]
+    fn build_or_load_never_stores_a_commit_whose_parent_is_unreadable() {
+        use crate::diff_store::{DiffStore, StoreContext};
+        let (dir, repo) = temp_repo();
+        let root_oid = commit_file(&repo, "a.rs", "one\n", "one");
+        let child = commit_file(&repo, "a.rs", "two\n", "two");
+        let s = probe_settings();
+        let ctx = StoreContext::of(&repo).expect("hashable");
+
+        // A root commit has no parent legitimately — it must still be stored.
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = DiffStore::at(
+            store_dir.path().to_path_buf(),
+            ctx,
+            std::time::Duration::ZERO,
+        );
+        build_or_load(
+            Some(&store),
+            &repo,
+            &RowScope::new(DiffSource::Commit(root_oid)),
+            s,
+            None,
+        );
+        assert_eq!(
+            std::fs::read_dir(store_dir.path()).unwrap().count(),
+            1,
+            "a root commit's diff is reproducible and must be stored"
+        );
+
+        // The child's parent, made unreadable: a degraded diff, not a root commit.
+        let ctx = StoreContext::of(&repo).expect("hashable");
+        drop(repo);
+        crate::test_repo::remove_loose_object(dir.path(), root_oid);
+        let repo = Repository::open(dir.path()).unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = DiffStore::at(
+            store_dir.path().to_path_buf(),
+            ctx,
+            std::time::Duration::ZERO,
+        );
+        build_or_load(
+            Some(&store),
+            &repo,
+            &RowScope::new(DiffSource::Commit(child)),
+            s,
+            None,
+        );
+        assert_eq!(
+            std::fs::read_dir(store_dir.path()).map_or(0, Iterator::count),
+            0,
+            "an unreadable parent is a degraded diff, not a cacheable one"
+        );
+    }
+
+    /// The entry cap belongs to the SPECULATIVE path only. Its justification —
+    /// "a diff the in-memory cache refuses to hold is one nobody will ever hold"
+    /// — is `warm_row`'s: that path builds an over-cap row and drops it. The
+    /// display path is deliberately uncapped (`cache_diff` inserts whatever the
+    /// user opened), so applying the cap there excludes exactly the slow diffs
+    /// the store exists for.
+    #[test]
+    fn build_or_load_caps_only_the_speculative_path() {
+        use crate::diff_store::{DiffStore, StoreContext};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.rs", "one\n", "one");
+        let oid = commit_file(&repo, "a.rs", "two\n", "two");
+        let scope = RowScope::new(DiffSource::Commit(oid));
+        let s = probe_settings();
+        let mk = |dir: &std::path::Path| {
+            DiffStore::at(
+                dir.to_path_buf(),
+                StoreContext::of(&repo).expect("hashable"),
+                std::time::Duration::ZERO,
+            )
+        };
+
+        // Speculative, cap of 1: any real diff exceeds it, nothing is written.
+        let spec = tempfile::tempdir().unwrap();
+        build_or_load(Some(&mk(spec.path())), &repo, &scope, s, Some(1));
+        assert_eq!(
+            std::fs::read_dir(spec.path()).map_or(0, Iterator::count),
+            0,
+            "the prefetch would build and drop this row"
+        );
+
+        // Displayed: no cap, so the same diff IS worth keeping.
+        let shown = tempfile::tempdir().unwrap();
+        build_or_load(Some(&mk(shown.path())), &repo, &scope, s, None);
+        assert_eq!(
+            std::fs::read_dir(shown.path()).unwrap().count(),
+            1,
+            "a diff the user opened is theirs to keep, however large"
+        );
+    }
+
+    /// `[cache] min_build_ms` is documented as applying live on save, like every
+    /// other key. The store is shared as an Arc by the pool and the diff-load
+    /// worker, so the threshold has to be updatable in place rather than fixed
+    /// when the store was opened.
+    #[test]
+    fn the_store_threshold_can_be_changed_after_opening() {
+        use crate::diff_store::{DiffStore, StoreContext};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.rs", "one\n", "one");
+        let oid = commit_file(&repo, "a.rs", "two\n", "two");
+        let scope = RowScope::new(DiffSource::Commit(oid));
+        let s = probe_settings();
+        let dir = tempfile::tempdir().unwrap();
+        let store = DiffStore::at(
+            dir.path().to_path_buf(),
+            StoreContext::of(&repo).expect("hashable"),
+            std::time::Duration::from_hours(1),
+        );
+
+        build_or_load(Some(&store), &repo, &scope, s, None);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).map_or(0, Iterator::count),
+            0,
+            "control: nothing is worth an hour"
+        );
+        store.set_min_build(std::time::Duration::ZERO);
+        build_or_load(Some(&store), &repo, &scope, s, None);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "the new threshold applies without reopening the store"
+        );
+    }
+
+    /// No store (no cache directory) is a no-op, not a failure.
+    #[test]
+    fn build_or_load_without_a_store_still_builds() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.rs", "one\n", "one");
+        let oid = commit_file(&repo, "a.rs", "two\n", "two");
+        let data = build_or_load(
+            None,
+            &repo,
+            &RowScope::new(DiffSource::Commit(oid)),
+            DiffSettings {
+                context: 3,
+                ignore_ws: false,
+                show_stats: true,
+                detect_renames: true,
+                detect_copies: false,
+            },
+            None,
+        );
+        assert!(!data.lines.is_empty());
     }
 }
