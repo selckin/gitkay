@@ -830,7 +830,7 @@ pub fn append_diff_body(
 }
 
 /// A settings- and pathspec-scoped git diff, rename/copy-coalesced: `scoped_diff_opts`
-/// → `build` → `detect_similar`, the prologue every diff in the app shares.
+/// → `build` → `measure` → `detect_similar`, the prologue every diff in the app shares.
 ///
 /// The one place that sequence is written. `build_diff_data` (the pane, the file list)
 /// and `commit_stats` (the commit-list column) both run it, and the column's whole
@@ -838,24 +838,41 @@ pub fn append_diff_body(
 /// the other would break that silently, with nothing for the compiler to catch. Here a
 /// new stage reaches both by construction.
 ///
+/// `measure` observes the RAW diff, between the build and the post-pass, and that slot
+/// is the only correct one for it: `detect_similar` loads blob content to score
+/// similarity, so anything measuring what a row will COST has to look before it runs.
+/// `scoped_diff` passes a no-op; `measured_row_diff` passes `probe_deltas`.
+///
 /// Errors come back as errors: `build_diff_data` folds them into an empty `DiffData`,
 /// `commit_stats` propagates them, and neither decision belongs to the pipeline.
 ///
 /// (`apply.rs`'s `action_diff` deliberately stays out: it needs `reverse`, byte
 /// pathspecs and `disable_pathspec_match`, none of which fit here — it builds on
 /// `diff_opts` instead, which is where its own no-drift argument lives.)
+fn scoped_diff_with<'r, T>(
+    repo: &'r Repository,
+    settings: DiffSettings,
+    paths: &[String],
+    build: impl FnOnce(&'r Repository, &mut DiffOptions) -> Result<git2::Diff<'r>, git2::Error>,
+    measure: impl FnOnce(&'r Repository, &git2::Diff<'r>) -> T,
+) -> Result<(git2::Diff<'r>, T), git2::Error> {
+    let mut opts = scoped_diff_opts(settings, paths);
+    let mut diff = build(repo, &mut opts)?;
+    let measured = measure(repo, &diff);
+    // Rename/copy coalescing is a post-pass, not a DiffOptions flag: without it a
+    // rename counts as two changed files in the column and one in the pane.
+    detect_similar(&mut diff, settings);
+    Ok((diff, measured))
+}
+
+/// `scoped_diff_with` for a caller that wants only the diff. See it for the pipeline.
 fn scoped_diff<'r>(
     repo: &'r Repository,
     settings: DiffSettings,
     paths: &[String],
     build: impl FnOnce(&'r Repository, &mut DiffOptions) -> Result<git2::Diff<'r>, git2::Error>,
 ) -> Result<git2::Diff<'r>, git2::Error> {
-    let mut opts = scoped_diff_opts(settings, paths);
-    let mut diff = build(repo, &mut opts)?;
-    // Rename/copy coalescing is a post-pass, not a DiffOptions flag: without it a
-    // rename counts as two changed files in the column and one in the pane.
-    detect_similar(&mut diff, settings);
-    Ok(diff)
+    scoped_diff_with(repo, settings, paths, build, |_, _| ()).map(|(diff, ())| diff)
 }
 
 /// Shared pipeline tail for every diff build (commit, working-tree, staged): run
@@ -1170,14 +1187,13 @@ pub struct RowCostProbe {
     pub deltas: usize,
 }
 
-/// Measure `scope`'s diff without building it. See `RowCostProbe`.
-pub fn probe_row_cost(
-    repo: &Repository,
-    scope: &RowScope,
-    settings: DiffSettings,
-) -> Result<RowCostProbe, git2::Error> {
-    let mut opts = scoped_diff_opts(settings, &scope.paths);
-    let diff = source_diff(repo, scope, &mut opts)?;
+/// Measure an already-built diff from the odb headers, inflating nothing. See
+/// `RowCostProbe`.
+///
+/// Shared by both ways a row gets measured — before its diff exists (`probe_row_cost`,
+/// where the point is to decide *without* building) and while it is being built
+/// (`measured_row_diff`) — so the two can never threshold on differently-computed bytes.
+fn probe_deltas(repo: &Repository, diff: &git2::Diff<'_>) -> Result<RowCostProbe, git2::Error> {
     let odb = repo.odb()?;
     let mut probe = RowCostProbe::default();
     for delta in diff.deltas() {
@@ -1195,6 +1211,63 @@ pub fn probe_row_cost(
         }
     }
     Ok(probe)
+}
+
+/// Measure `scope`'s diff without building it. See `RowCostProbe`.
+///
+/// For the caller deciding whether to build at all — it stops at the raw diff and never
+/// runs `detect_similar`. A caller that is going to build the diff regardless wants
+/// `measured_row_diff`, which gets the same measurement off the diff it already has.
+pub fn probe_row_cost(
+    repo: &Repository,
+    scope: &RowScope,
+    settings: DiffSettings,
+) -> Result<RowCostProbe, git2::Error> {
+    let mut opts = scoped_diff_opts(settings, &scope.paths);
+    let diff = source_diff(repo, scope, &mut opts)?;
+    probe_deltas(repo, &diff)
+}
+
+/// A row's diff, built once through the shared pipeline, together with what reaching it
+/// cost.
+///
+/// The stats worker asks a row two questions — "is this too expensive to finish?" and
+/// "what are its numbers?" — and one diff answers both. Asking them separately meant
+/// `probe_row_cost` and `commit_stats` each ran `source_diff`, so every `FilesAndLines`
+/// row paid two tree-to-tree walks where one does, on the pool's top-priority tier and
+/// on every repo — including the ordinary ones where the cost guard never fires, so the
+/// second walk bought nothing at all.
+pub struct MeasuredDiff<'r> {
+    diff: git2::Diff<'r>,
+    /// What the build read, measured before the rename post-pass — see `RowCostProbe`
+    /// for why that ordering is required rather than incidental.
+    pub cost: RowCostProbe,
+}
+
+impl MeasuredDiff<'_> {
+    /// This row's commit-list numbers. The same diff and the same pipeline
+    /// `commit_stats` runs, so the two cannot disagree; `commit_stats` is now this
+    /// without the measurement.
+    pub fn stats(&self, want: StatsWant) -> Result<CommitStats, git2::Error> {
+        stats_of(&self.diff, want)
+    }
+}
+
+/// Build a row's diff through the shared pipeline, measuring it on the way. See
+/// `MeasuredDiff`.
+pub fn measured_row_diff<'r>(
+    repo: &'r Repository,
+    scope: &RowScope,
+    settings: DiffSettings,
+) -> Result<MeasuredDiff<'r>, git2::Error> {
+    let (diff, cost) = scoped_diff_with(
+        repo,
+        settings,
+        &scope.paths,
+        |repo, opts| source_diff(repo, scope, opts),
+        probe_deltas,
+    )?;
+    Ok(MeasuredDiff { diff, cost: cost? })
 }
 
 /// The commit-list numbers for a diff that has **already been built**.
@@ -1239,12 +1312,21 @@ pub fn commit_stats(
     let diff = scoped_diff(repo, settings, &scope.paths, |repo, opts| {
         source_diff(repo, scope, opts)
     })?;
+    stats_of(&diff, want)
+}
+
+/// The numbers `want` asks for, off a diff that has already been through the pipeline.
+/// Shared with `MeasuredDiff::stats` so a row measured on the way in and one that was
+/// not are counted identically.
+fn stats_of(diff: &git2::Diff<'_>, want: StatsWant) -> Result<CommitStats, git2::Error> {
     Ok(match want {
         StatsWant::FilesOnly => CommitStats {
             files: diff.deltas().len(),
             lines: None,
         },
         StatsWant::FilesAndLines => {
+            // Loads blob content — the expensive half, and what the cost guard exists
+            // to keep off a row whose blobs are enormous.
             let st = diff.stats()?;
             CommitStats {
                 files: st.files_changed(),
@@ -1974,6 +2056,39 @@ mod tests {
             .unwrap();
             assert_eq!(fast.files, full.files, "detect_renames = {detect_renames}");
             assert_eq!(fast.lines, None, "FilesOnly must not report line counts");
+        }
+    }
+
+    /// Measuring a row on the way in must not change what it counts.
+    ///
+    /// The stats worker builds one diff and asks it both questions, so `MeasuredDiff`
+    /// takes the measurement between the build and `detect_similar`. Slipping it after
+    /// the post-pass would still compile and still measure *something* — a rename
+    /// coalesced into one entry, its two blobs counted once — while quietly costing the
+    /// blob reads the guard exists to avoid. Pinned over the fixture holding a rename, a
+    /// binary and a mode-only change, under both `detect_renames` settings.
+    #[test]
+    fn measuring_a_row_does_not_change_the_numbers_it_reports() {
+        let (_d, repo, oid) = everything_repo();
+        for detect_renames in [false, true] {
+            let s = stats_settings(detect_renames);
+            let scope = RowScope::new(DiffSource::Commit(oid));
+            let measured = measured_row_diff(&repo, &scope, s).unwrap();
+            for want in [StatsWant::FilesOnly, StatsWant::FilesAndLines] {
+                assert_eq!(
+                    measured.stats(want).unwrap(),
+                    commit_stats(&repo, &scope, s, want).unwrap(),
+                    "{want:?}, detect_renames = {detect_renames}"
+                );
+            }
+            // And the measurement is the same one the un-built path reports, or the
+            // guard would threshold on two different numbers depending on which
+            // caller reached the row first.
+            assert_eq!(
+                measured.cost,
+                probe_row_cost(&repo, &scope, s).unwrap(),
+                "detect_renames = {detect_renames}"
+            );
         }
     }
 

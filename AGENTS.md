@@ -464,6 +464,16 @@ parts run off the window-creation critical path:
   Swapping either pairing reintroduces a bug that has already been fixed once. An earlier
   version of this file claimed the thread count bounded the stampede; it does not, and on
   a small machine it is not a bound at all.
+  That live reading is taken **once per dispatch and only if some row gets far enough to
+  need it**, as a `OnceCell` `dispatch` hands down to `heavy_fits` — `mem::usable_bytes`
+  parses `/proc/meminfo` plus up to four cgroup files, and asking per candidate row put
+  those reads inside two nested loops re-entered on every worker completion. Caching it
+  for the dispatch is not a shortcut but a match to what the reading is FOR: it answers
+  "has the machine got busy since startup", which does not move between two admissions
+  microseconds apart. What must stay live *within* a dispatch is the lane's own
+  commitment, and that is `heavy_outstanding` — updated per admission, and the bound that
+  actually stops the stampede. Passing the reading in is also what lets the lane's tests
+  state the machine they reason about instead of inheriting the one they run on.
   Ordering within the lane still matters more than in `ready`, because far fewer threads
   drain it: **the order is close to the schedule**. `Submit` therefore replaces
   `deferred` wholesale, re-sorted by the new band's priority, exactly as it does `ready`.
@@ -517,7 +527,19 @@ parts run off the window-creation critical path:
   `measured`, which filters that row out of every later stats submission — so the
   uncommitted/staged/range row would show a file count and a permanently blank `+`/`-`,
   and keep it after the working-tree change that caused it was reverted, since a
-  sentinel oid never expires. Such a stats row sends its
+  sentinel oid never expires.
+  It is measured on the diff it needs **anyway**, not by a second walk:
+  `diff::measured_row_diff` runs the shared `scoped_diff_with` pipeline and takes the
+  measurement in the one slot where it is both correct and free — between the build and
+  `detect_similar`, since the post-pass loads blob content to score similarity and so has
+  to come after anything measuring what the row will cost. Measuring separately meant
+  `probe_row_cost` and `commit_stats` each ran `source_diff`, so every `FilesAndLines` row
+  paid two tree-to-tree walks on every repo, including the ordinary ones where the guard
+  never fires and the second walk bought nothing.
+  `probe_row_cost` stays for the caller that has NOT built the diff and is deciding
+  whether to (the prefetch's own deferral); both share `probe_deltas`, so the two cannot
+  threshold on differently-computed bytes.
+  Such a stats row sends its
   **file count immediately** (`StatsWant::FilesOnly` needs no content) and then **stops**,
   because its line counts cost the same blob reads the diff does and `cache_diff` takes
   the column off the diff for free when it lands. Computing them anyway would pay ~11s
@@ -588,6 +610,15 @@ parts run off the window-creation critical path:
   A `DiffOnly` row needs no highlighter (`Job::Warm::hl` is an `Option`), so with
   `[diff] syntax = false`, where nothing was prefetched at all before, every row now
   warms diff-only.
+  That predicate is O(lines) and both triggers ask it every frame, so its **answer** is
+  memoized per `diff_generation` (`highlight_scan` / `highlight_scan_stale`). Memoizing
+  only the *fact of having checked* — as `last_highlight_check_gen` did — is enough for
+  the settled-diff trigger, which fires once, but the scroll trigger re-asks a
+  generation already answered on **every frame until a dispatch succeeds**: on a
+  133k-line diff still being coloured, ~8M line checks a second. Within a generation the
+  answer only ever goes false→true (spans are added, never removed; everything that
+  resets them bumps the generation), so it is recomputed on a new generation, or when a
+  highlight batch has landed since a `false`, and never merely because it was asked.
   Accepted limit: a continuous fling still outruns the pool. Nothing that builds a real
   diff per row will not.
 - **Perf timing** — key startup phases log at `debug` (`perf: startup: …` / `perf:
@@ -633,6 +664,19 @@ parts run off the window-creation critical path:
   is why `invalidate_commit_stats` must clear that list — leave it and the next dispatch
   finds it unchanged against a cleared map and never re-queues, the same silently-stuck
   column by a different route.
+  That comparison is the gate precisely because it **cannot go stale**: it is recomputed
+  every frame from the same state it gates on. A cheaper *precondition* in front of it —
+  "skip unless the view moved or the map changed" — has to enumerate every way the list
+  can change (the view, the commit list, the map, the config), and missing one strands
+  the column blank for the session with nothing logged, which is the same failure the two
+  paragraphs above describe arriving by two other routes. So on a **moving** view the
+  ~18-row list is rebuilt and resubmitted per frame, deliberately: it changed because
+  rows the reader is now looking at have no numbers, which is exactly when the pool
+  should be re-aimed, and `submit_stats` replaces the tier so those rows go to the front
+  rather than queueing behind the ones being scrolled away from. `view_moved_enough`-style
+  hysteresis, as the diff prefetch has, would buy the ~18 hash lookups and empty-`Vec`
+  clones back by delaying the numbers where the reader is — the one place this column is
+  supposed to be prompt. On a settled view the comparison matches and none of it runs.
   `dispatch_commit_stats` stays **two-phase**: `stats_targets` for the visible rows, and
   for `warm_band` — the same band the diff prefetch warms — only once those are all
   known, so the column fills where the user is looking before warming where they might
