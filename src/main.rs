@@ -2011,6 +2011,84 @@ const STATS_CELL_CHARS: &str = "-99999";
 /// Gap between adjacent stats cells, in points.
 const STATS_CELL_GAP: f32 = 6.0;
 
+/// A short SHA is always this many characters (`CommitInfo::new`), so one sample
+/// measures the column. Virtual rows carry an empty one and leave the slot blank.
+const SHA_SAMPLE: &str = "0000000";
+/// The character the author column's width is counted in. A digit, not `M` or
+/// `i`: in the default monospace `[text] commit_meta` font every glyph is the
+/// same width so the count is exact, and in a proportional one a digit sits near
+/// the average advance, where `M` would over-reserve by half a column.
+const AUTHOR_SAMPLE_CHAR: &str = "0";
+/// Gaps inside the right-hand meta group, and its margin from the row's right
+/// edge, in points. Named because `MetaCols::origins` is the only place they are
+/// summed, and a bare total there is a number a reader cannot check and the next
+/// column added silently invalidates.
+const META_GAP_SHA_AUTHOR: f32 = 8.0;
+const META_GAP_AUTHOR_DATE: f32 = 24.0;
+const META_RIGHT_MARGIN: f32 = 8.0;
+
+/// The commit list's right-hand column widths, measured once a frame.
+///
+/// Measured once a frame **is** the feature: taken per row — as they were, off
+/// each row's own author name — every column to the left of the widest field
+/// inherits its raggedness, so the SHAs and the stats cells stepped in and out
+/// as the author changed. Every width here is a property of the font and the
+/// config alone, never of a row's text: a long author is elided into `author`, a
+/// virtual row leaves `sha` and `date` empty, and in both cases the column stays
+/// exactly where it is.
+#[derive(Clone, Copy)]
+struct MetaCols {
+    sha: f32,
+    author: f32,
+    date: f32,
+    /// One stats cell; `draw_stats_cells` reserves `stats_cell_count` of them.
+    stats_cell: f32,
+}
+
+impl MetaCols {
+    fn measure(painter: &egui::Painter, fonts: &config::Fonts, author_chars: usize) -> Self {
+        let font = fonts.font_id(Role::CommitMeta);
+        let author_sample = AUTHOR_SAMPLE_CHAR.repeat(author_chars);
+        Self {
+            sha: text_width(painter, SHA_SAMPLE, &font),
+            author: text_width(painter, &author_sample, &font),
+            // Formatted rather than written out as a literal, so the sample cannot
+            // drift from the format the rows actually use. Every date is the same
+            // width, so which instant it is does not matter.
+            date: text_width(painter, &format_commit_time(0, 0, false), &font),
+            stats_cell: text_width(painter, STATS_CELL_CHARS, &font),
+        }
+    }
+
+    /// Where each field begins in a row whose right edge is `right_x`, laid out
+    /// right to left. `sha` doubles as where the stats cells must stop.
+    ///
+    /// The origins live here rather than in the row draw so the gaps are summed
+    /// once, in the type that knows the widths — otherwise the row derives its
+    /// own total and then repeats two of the three gaps as inline literals
+    /// further down the same function.
+    fn origins(self, right_x: f32) -> MetaOrigins {
+        let date = right_x - META_RIGHT_MARGIN - self.date;
+        let author = date - META_GAP_AUTHOR_DATE - self.author;
+        MetaOrigins {
+            sha: author - META_GAP_SHA_AUTHOR - self.sha,
+            author,
+            date,
+        }
+    }
+}
+
+/// The left edge of each right-hand field, for one row's width. Read through a
+/// binding that names it (`at.sha`), which is what keeps these apart from the
+/// same-named widths on `MetaCols` (`cols.sha`).
+#[derive(Clone, Copy)]
+struct MetaOrigins {
+    /// Also where the stats cells end, and so where the summary must stop.
+    sha: f32,
+    author: f32,
+    date: f32,
+}
+
 /// Append a count in at most five characters to `out`, so a fixed-width cell can
 /// never overflow: plain digits below 100 000, then thousands, then millions,
 /// and on up the ladder.
@@ -7697,12 +7775,10 @@ impl GitkApp {
     /// Fixed width, not per-row natural width, for stability WITHIN the row: the
     /// slot is reserved before the number arrives, so nothing reflows when the
     /// worker's result lands, and a `+` count that gains a digit cannot shove
-    /// the `-` count sideways. It does **not** line the column up down the list
-    /// — the cells hang off `author_date_x`, which moves row to row with the
-    /// author name's width. Anchoring them on a per-frame constant (the widest
-    /// meta group over the visible rows) would fix that, and would straighten
-    /// the existing SHA/author/date group with it: a change to layout that
-    /// predates this column, not part of it.
+    /// the `-` count sideways. Alignment DOWN the list is a separate property and
+    /// comes from `end_x`, which is `MetaCols`-derived and so identical on every
+    /// row; it did not hold while that x was computed from each row's own author
+    /// name.
     ///
     /// A blank cell is what "not computed yet" looks like — no spinner, no
     /// placeholder — which is why a zero side is drawn as `+0`/`-0` rather than
@@ -7779,8 +7855,9 @@ impl GitkApp {
     /// Draw a commit row's text: the summary (clipped so it can't overflow into the
     /// right-aligned block) plus short SHA, author, and date. `cursor_x` is where
     /// the ref chips ended; `is_branch_member` drives the branch-highlight dimming.
-    /// `stats_cell_w` is the stats column's per-cell width, measured once a frame
-    /// by `show_commit_list`.
+    /// `cols` holds the right-hand column widths, measured once a frame by
+    /// `show_commit_list` — the row lays its text out INTO them and never the
+    /// other way round.
     fn draw_row_text(
         &self,
         painter: &egui::Painter,
@@ -7788,35 +7865,43 @@ impl GitkApp {
         row_rect: egui::Rect,
         cursor_x: f32,
         is_branch_member: bool,
-        stats_cell_w: f32,
+        cols: MetaCols,
     ) {
         let y_center = row_rect.center().y;
 
-        // Author + date (right-aligned) — compute first to know where
-        // summary must stop. date_str / short_sha are precomputed per
-        // commit (see CommitInfo::new), so this per-frame path only lays
-        // them out, never re-formats.
+        // SHA + author + date — computed first to know where the summary must stop.
         let right_x = row_rect.max.x;
-        let date_font = self.fonts.font_id(Role::CommitMeta);
+        let at = cols.origins(right_x);
+        let meta_font = self.fonts.font_id(Role::CommitMeta);
         let date_galley =
-            painter.layout_no_wrap(commit.date_str.clone(), date_font.clone(), SUBTEXT);
-        let date_w = date_galley.size().x;
-
-        // Short SHA
+            painter.layout_no_wrap(commit.date_str.clone(), meta_font.clone(), SUBTEXT);
         let sha_galley =
-            painter.layout_no_wrap(commit.short_sha.clone(), date_font.clone(), SUBTEXT);
-        let sha_w = sha_galley.size().x;
+            painter.layout_no_wrap(commit.short_sha.clone(), meta_font.clone(), SUBTEXT);
 
+        // Elided into the author column, which is `[commit_list] author_chars`
+        // wide whatever this name needs. The colour hashes the FULL name, so
+        // two authors sharing an elided prefix keep their own colours.
+        //
+        // Laid out first and re-elided only on overflow, rather than passed
+        // through `right_elide` unconditionally: that helper's fast path measures
+        // the string itself, and `text_width` measures by laying out — so every
+        // name that fits (nearly all of them) would be laid out twice per frame,
+        // once to be measured and discarded and once to be drawn.
         let a_color = author_color(&commit.author);
-        let author_galley = painter.layout_no_wrap(commit.author.clone(), date_font, a_color);
-        let author_w = author_galley.size().x;
-
-        let author_date_x = right_x - date_w - author_w - sha_w - 40.0;
+        let mut author_galley =
+            painter.layout_no_wrap(commit.author.clone(), meta_font.clone(), a_color);
+        if author_galley.size().x > cols.author {
+            let measure = |s: &str| text_width(painter, s, &meta_font);
+            author_galley = painter.layout_no_wrap(
+                right_elide(&commit.author, cols.author, measure),
+                meta_font,
+                a_color,
+            );
+        }
 
         // The counts sit between the summary and the SHA; the summary clips to
         // where they start, exactly as it already clips to the meta group.
-        let stats_x =
-            self.draw_stats_cells(painter, commit.oid, author_date_x, y_center, stats_cell_w);
+        let stats_x = self.draw_stats_cells(painter, commit.oid, at.sha, y_center, cols.stats_cell);
 
         // Summary — truncate to available space before the counts
         let summary_max_w = (stats_x - cursor_x - 12.0).max(20.0);
@@ -7844,19 +7929,34 @@ impl GitkApp {
             TEXT,
         );
 
-        // Draw SHA, author, date (right-aligned)
+        // Draw SHA, author, date — each from its own column's left edge, so a row
+        // missing one (the virtual rows have no SHA, and an unrepresentable
+        // timezone offset yields no date) leaves a gap rather than pulling the
+        // rest of the group sideways. All three the same way, with no field
+        // right-aligned against the row: a column the text is placed INTO is the
+        // whole point here, and one field aligned the other way is a rule the
+        // next variable-width field added to this group will not inherit.
+        //
+        // Clipped to what is left of the row after the ref chips, which the
+        // summary beside it has always been. Fixed columns made that necessary:
+        // the group used to shrink with a short author name, so it ran out of
+        // room only on an unusually long one, and now it claims the same ~250
+        // points on every row whatever the window width. Narrow enough — a split
+        // screen — and `at.sha` lands left of `cursor_x`, where an unclipped draw
+        // paints the SHA over the ref chips and the graph. One rect for the group
+        // rather than one per column: nothing can overflow its own column (the
+        // SHA is exactly 7 characters and the author is elided to fit), so the
+        // only two edges that can be crossed are the group's.
         let meta_y = y_center - date_galley.size().y / 2.0;
-        let mut rx = author_date_x;
-        if sha_w > 0.0 {
-            painter.galley(egui::pos2(rx, meta_y), sha_galley, SUBTEXT);
-            rx += sha_w + 8.0;
-        }
-        painter.galley(egui::pos2(rx, meta_y), author_galley, a_color);
-        painter.galley(
-            egui::pos2(right_x - date_w - 8.0, meta_y),
-            date_galley,
-            SUBTEXT,
-        );
+        let meta_clip = egui::Rect::from_min_max(
+            egui::pos2(at.sha.max(cursor_x), row_rect.min.y),
+            egui::pos2(right_x, row_rect.max.y),
+        )
+        .intersect(painter.clip_rect());
+        let meta = painter.with_clip_rect(meta_clip);
+        meta.galley(egui::pos2(at.sha, meta_y), sha_galley, SUBTEXT);
+        meta.galley(egui::pos2(at.author, meta_y), author_galley, a_color);
+        meta.galley(egui::pos2(at.date, meta_y), date_galley, SUBTEXT);
     }
 
     fn show_commit_list(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -7868,13 +7968,9 @@ impl GitkApp {
                 .max(f.row_height(&self.fonts.font_id(Role::CommitMeta)))
         });
         let row_height = 20.0f32.max(text_h + 4.0);
-        // Every stats cell is this wide, whatever it holds — measured from the
-        // widest value one can carry, once a frame rather than per row.
-        let stats_cell_w = text_width(
-            ui.painter(),
-            STATS_CELL_CHARS,
-            &self.fonts.font_id(Role::CommitMeta),
-        );
+        // The right-hand columns, measured once a frame rather than per row —
+        // which is what lines them up down the list.
+        let cols = MetaCols::measure(ui.painter(), &self.fonts, self.commit_list_cfg.author_chars);
         let max_graph_cols = 20;
 
         // ── Commit list: a resizable top panel. egui remembers its height
@@ -8022,7 +8118,7 @@ impl GitkApp {
                                 row_rect,
                                 cursor_x,
                                 is_branch_member,
-                                stats_cell_w,
+                                cols,
                             );
                         }
 
@@ -11778,6 +11874,44 @@ mod tests {
         );
     }
 
+    /// The commit list's right-hand fields line up only because every row asks
+    /// one `MetaCols` for its x positions. That arithmetic is pure — three widths
+    /// and three gap constants — so it is pinned here rather than left to the eye
+    /// on a running app, where a swapped gap or a dropped margin looks like a few
+    /// points of drift.
+    #[test]
+    fn meta_origins_lay_the_columns_out_right_to_left() {
+        let cols = MetaCols {
+            sha: 50.0,
+            author: 144.0,
+            date: 115.0,
+            stats_cell: 43.0,
+        };
+        let right_x = 1000.0;
+        let at = cols.origins(right_x);
+
+        // Each field ends one gap before the next one starts, and the date ends
+        // one margin short of the row.
+        assert_eq!(at.date + cols.date, right_x - META_RIGHT_MARGIN);
+        assert_eq!(at.author + cols.author, at.date - META_GAP_AUTHOR_DATE);
+        assert_eq!(at.sha + cols.sha, at.author - META_GAP_SHA_AUTHOR);
+        // Left to right, so a swapped pair of gaps cannot pass the checks above
+        // by shuffling the fields.
+        assert!(at.sha < at.author && at.author < at.date);
+
+        // Widening any one column pushes everything to ITS LEFT over by exactly
+        // that much and moves nothing to its right — which is what lets the stats
+        // cells (which end at `sha`) reserve their space independently.
+        let wider = MetaCols {
+            author: cols.author + 10.0,
+            ..cols
+        };
+        let then = wider.origins(right_x);
+        assert_eq!(then.date, at.date, "the date column does not move");
+        assert_eq!(then.author, at.author - 10.0);
+        assert_eq!(then.sha, at.sha - 10.0);
+    }
+
     /// Counts are compacted so a fixed-width cell can never overflow: at most
     /// five characters, which with a sign fits the six-character cell.
     #[test]
@@ -11823,6 +11957,7 @@ mod tests {
         let cfg = |file_count, line_count| config::CommitListSection {
             file_count,
             line_count,
+            ..Default::default()
         };
         assert_eq!(stats_cell_count(cfg(true, true)), 3);
         assert_eq!(stats_cell_count(cfg(true, false)), 1);
