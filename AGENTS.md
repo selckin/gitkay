@@ -610,6 +610,22 @@ parts run off the window-creation critical path:
   A `DiffOnly` row needs no highlighter (`Job::Warm::hl` is an `Option`), so with
   `[diff] syntax = false`, where nothing was prefetched at all before, every row now
   warms diff-only.
+  With syntax ON, though, a dispatch **waits until a highlighter exists**
+  (`band_warmable`) — the condition that is easy to miss, because the gate looks like it
+  covers it and does not. A warm with no highlighter lands every row `DiffOnly` however
+  near the selection, and that entry is **sticky**: later dispatches skip it via
+  `diff_cache.contains`, so it keeps no colour for the session and every visit pays
+  on-demand tokenizing. `GitkApp` has no highlighter until `ensure_diff_highlighted`
+  collects the prewarmed one, which needs a diff to have arrived — and the FIRST dispatch
+  fires before that, off the scroll trigger, since `prefetched_view` starts empty. It
+  gets past the settled check because `diff_fully_highlighted` is **vacuously true over
+  an empty pane** (`.all()` over no files), so that predicate reads "nothing left to
+  colour" at the one moment it means "there is no diff yet". Measured on a 265MB-blob
+  repo: the whole 25-row startup band cached uncoloured, including the eight heavy rows
+  that had spent 11.5s each building. Waiting costs a few tens of ms of cold band once —
+  `ensure_diff_highlighted` runs earlier in the same frame as the drains, so it ends on
+  the frame the first diff installs — while dispatching early costs those rows their
+  colour for good.
   That predicate is O(lines) and both triggers ask it every frame, so its **answer** is
   memoized per `diff_generation` (`highlight_scan` / `highlight_scan_stale`). Memoizing
   only the *fact of having checked* — as `last_highlight_check_gen` did — is enough for
