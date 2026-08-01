@@ -2412,6 +2412,31 @@ fn file_fully_highlighted(lines: &[DiffLine], start: usize, end: usize) -> bool 
 /// lines outside them (e.g. a no-patch/binary file's placeholder, which is
 /// `Context` but excluded from `file_line_ranges`) are never tokenized, so
 /// checking the whole `[0, len)` range would never be satisfied.
+/// Must a memoized `diff_fully_highlighted` answer be recomputed?
+///
+/// Two ways, and only two. The generation moved, so the memo describes a different diff
+/// (or a different theme) entirely. Or a highlight batch landed since the memo said
+/// `false` — the one event that turns `false` into `true` in place, spans being added
+/// and never removed within a generation.
+///
+/// Note what is deliberately absent: the caller asking again. Both prefetch triggers
+/// re-ask every frame — the scroll one stays true until a dispatch succeeds — so a rule
+/// that recomputed on demand would put an O(lines) scan back on the frame loop, which is
+/// exactly what it costs on the large diff still being coloured.
+///
+/// Free rather than inline in `diff_highlight_settled` so the regression test drives the
+/// real rule (constructing a `GitkApp` needs a real `eframe::CreationContext`).
+const fn highlight_scan_stale(
+    memo: Option<(u64, bool)>,
+    generation: u64,
+    applied_highlight: bool,
+) -> bool {
+    match memo {
+        None => true,
+        Some((scanned, answer)) => scanned != generation || (!answer && applied_highlight),
+    }
+}
+
 fn diff_fully_highlighted(lines: &[DiffLine], files: &[FileEntry]) -> bool {
     file_line_ranges(files, lines.len())
         .iter()
@@ -3074,8 +3099,17 @@ impl Coordinator {
             self.deferred.clear();
             log::debug!("prefetch: line budget spent; dropped {dropped} rows of the band");
         }
+        // One live memory reading for the whole dispatch, taken lazily — `usable_bytes`
+        // parses /proc/meminfo and up to four cgroup files, and asking per candidate row
+        // put those reads inside two nested loops, re-run on every worker completion.
+        // Caching it here is not a shortcut but a match to what the reading is FOR: it
+        // answers "has the machine got busy since startup", which does not move between
+        // two admissions microseconds apart. What must stay live within a dispatch is the
+        // lane's own commitment — that is `heavy_outstanding`, updated per admission, and
+        // it is the bound that stops a stampede.
+        let usable = std::cell::OnceCell::new();
         while let Some(&id) = self.heavy_idle.last() {
-            let Some((job, need)) = self.next_heavy() else {
+            let Some((job, need)) = self.next_heavy(&usable) else {
                 break;
             };
             self.heavy_idle.pop();
@@ -3108,10 +3142,10 @@ impl Coordinator {
     /// whenever a worker reports, i.e. precisely when memory frees. That replaced a
     /// requeue-and-park loop with a retry interval; there is nothing to park on when
     /// the queue is the coordinator's own field.
-    fn next_heavy(&mut self) -> Option<(Job, u64)> {
+    fn next_heavy(&mut self, usable: &std::cell::OnceCell<Option<u64>>) -> Option<(Job, u64)> {
         loop {
             let need = self.deferred.front().map(Self::heavy_need)?;
-            if !self.heavy_fits(need) {
+            if !self.heavy_fits(need, usable) {
                 return None;
             }
             let target = self.deferred.pop_front()?;
@@ -3161,14 +3195,20 @@ impl Coordinator {
     ///
     /// `None` from `mem` means the platform will not say, and the thread count is the
     /// only bound, exactly as it is on a machine with room to spare.
-    fn heavy_fits(&self, need: u64) -> bool {
+    ///
+    /// `usable` is the dispatch's live reading, taken at most once and only if some row
+    /// gets far enough to need it — an idle lane admits before reading anything, which is
+    /// the common case on an ordinary repo. See the call site in `dispatch`.
+    fn heavy_fits(&self, need: u64, usable: &std::cell::OnceCell<Option<u64>>) -> bool {
         if self.heavy_outstanding.is_empty() {
             return true;
         }
         let held: u64 = self.heavy_outstanding.values().copied().sum();
         self.heavy_budget
             .is_none_or(|budget| held.saturating_add(need) <= budget)
-            && mem::usable_bytes().is_none_or(|usable| need <= usable)
+            && usable
+                .get_or_init(mem::usable_bytes)
+                .is_none_or(|usable| need <= usable)
     }
 
     /// The pool's next job: stats before any speculative diff. The pool never reads
@@ -3527,7 +3567,13 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
     // `FilesAndLines` calls `diff.stats()`, which loads blob content — the same bytes
     // the diff reads. Unguarded, that had eight workers spend 24 seconds computing this
     // column on a repo of 265MB blobs, and (because stats outrank diffs) blocking every
-    // prefetch behind it. `FilesOnly` needs no content, so it is never worth probing.
+    // prefetch behind it. `FilesOnly` needs no content, so there is nothing to guard and
+    // it takes the plain path below.
+    //
+    // The measurement rides on the diff this row needs anyway (`measured_row_diff`),
+    // taken between the build and `detect_similar` — the only slot where it is both
+    // correct and free. Measuring separately meant building the row's diff twice for
+    // every row, on every repo, to fire a guard that most repos never trip.
     //
     // Real commits only, because deferring is a promise the diff will pay instead — and
     // only a real commit's diff does. A prefetch never warms a virtual row (its key is
@@ -3537,42 +3583,53 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
     // future stats submission — so the uncommitted/staged/range row would show a file
     // count and a permanently blank `+`/`-`, and stay that way after the working-tree
     // change that triggered it was reverted, since a sentinel oid never expires.
+    let t = std::time::Instant::now();
     if job.want == StatsWant::FilesAndLines
         && is_real_commit(oid)
-        && let Ok(cost) = diff::probe_row_cost(repo, &job.scope, job.settings)
-        && cost.total_blob_bytes > ctx.limits.max_blob_bytes
+        && let Ok(measured) = diff::measured_row_diff(repo, &job.scope, job.settings)
     {
-        log::debug!(
-            "stats: defer {oid} — {} blob bytes over {} (largest {}, {} files)",
-            cost.total_blob_bytes,
-            ctx.limits.max_blob_bytes,
-            cost.max_blob_bytes,
-            cost.deltas
-        );
-        // Send the file count NOW, so the row shows something rather than staying blank.
-        // Deliberately the real `commit_stats` and not `cost.deltas`: the probe skips
-        // `detect_similar`, so it counts a rename as two files where the pane shows one,
-        // and a column that disagrees with the pane is the exact drift the shared
-        // pipeline exists to prevent.
-        send_stats(
-            ctx,
-            job,
-            commit_stats(repo, &job.scope, job.settings, StatsWant::FilesOnly).ok(),
-        );
-        // And then STOP. The line counts cost the same blob reads the diff does, and
-        // this row's diff goes to the heavy lane — `cache_diff` takes the column off it
-        // for free when it lands. Computing them here as well would pay ~11s twice for
-        // one set of bytes, which is the doubling this path exists to remove.
-        //
-        // A row whose diff is ALSO over `Limits::max_entry_lines` never reaches
-        // `cache_diff` either — `warm_row` sends the numbers off the built data at the
-        // drop site, which is the exact moment that becomes knowable.
-        return Outcome::Stats {
-            oid,
-            costly: Some(cost.total_blob_bytes),
-        };
+        let cost = measured.cost;
+        if cost.total_blob_bytes > ctx.limits.max_blob_bytes {
+            log::debug!(
+                "stats: defer {oid} — {} blob bytes over {} (largest {}, {} files)",
+                cost.total_blob_bytes,
+                ctx.limits.max_blob_bytes,
+                cost.max_blob_bytes,
+                cost.deltas
+            );
+            // Send the file count NOW, so the row shows something rather than staying
+            // blank. Deliberately counted off the pipeline's own diff and not from
+            // `cost.deltas`: the measurement is taken before `detect_similar`, so it
+            // counts a rename as two files where the pane shows one, and a column that
+            // disagrees with the pane is the exact drift the shared pipeline prevents.
+            send_stats(ctx, job, measured.stats(StatsWant::FilesOnly).ok());
+            // And then STOP. The line counts cost the same blob reads the diff does, and
+            // this row's diff goes to the heavy lane — `cache_diff` takes the column off
+            // it for free when it lands. Computing them here as well would pay ~11s twice
+            // for one set of bytes, which is the doubling this path exists to remove.
+            //
+            // A row whose diff is ALSO over `Limits::max_entry_lines` never reaches
+            // `cache_diff` either — `warm_row` sends the numbers off the built data at
+            // the drop site, which is the exact moment that becomes knowable.
+            return Outcome::Stats {
+                oid,
+                costly: Some(cost.total_blob_bytes),
+            };
+        }
+        // Under the cap: finish off the diff already in hand rather than building a
+        // second one. This is the ordinary path on an ordinary repo, where the guard
+        // never fires — so before, measuring cost anything at all.
+        let stats = measured
+            .stats(job.want)
+            .inspect_err(|e| log::debug!("stats: {oid} failed: {e}"))
+            .ok();
+        log::debug!("stats: done {oid} ({:?}) in {:?}", job.want, t.elapsed());
+        send_stats(ctx, job, stats);
+        return Outcome::Stats { oid, costly: None };
     }
-    let t = std::time::Instant::now();
+    // Either nothing to measure (`FilesOnly` needs no blob content, so it is never worth
+    // probing; a virtual row must not be deferred at all) or the measured build failed,
+    // in which case this surfaces the same error properly.
     let stats = commit_stats(repo, &job.scope, job.settings, job.want)
         .inspect_err(|e| log::debug!("stats: {oid} failed: {e}"))
         .ok();
@@ -4835,7 +4892,20 @@ struct GitkApp {
     /// shared claim set that stops overlapping dispatches from recomputing the
     /// same diff concurrently. See `InflightKeys`.
     inflight_diffs: InflightKeys,
-    last_highlight_check_gen: u64, // diff_generation we last ran diff_fully_highlighted for
+    /// Memoized `diff_fully_highlighted`: `(diff_generation, the answer)`.
+    ///
+    /// The scan is O(lines), and within one generation it can only ever go false→true —
+    /// spans are added, never removed, and everything that resets them bumps the
+    /// generation. So the answer is recomputed only when the generation moved, or when a
+    /// highlight batch has landed since a `false`.
+    ///
+    /// Memoizing the ANSWER rather than the fact of having scanned is what the scroll
+    /// trigger needs. Recording only "we checked this generation" is enough while the
+    /// trigger is a settled diff (it fires once), but a scroll asks the same question
+    /// again for a generation already answered — so on a diff that is still colouring,
+    /// the scan ran every frame the view sat off the prefetched band: ~8M line checks a
+    /// second on a 133k-line diff.
+    highlight_scan: Option<(u64, bool)>,
     commit_view_range: std::ops::Range<usize>, // visible commit-list rows (set each frame)
     /// Per-commit change counts for the commit-list column. `Some(None)` means
     /// "computed and failed" — distinct from a missing key ("not asked yet"),
@@ -5392,7 +5462,7 @@ impl GitkApp {
             prefetched_view: 0..0,
             inflight_diffs: Arc::default(),
             inflight_loads: HashSet::new(),
-            last_highlight_check_gen: 0,
+            highlight_scan: None,
             // Empty until the panel has rendered once, NOT a generous estimate: the
             // band is derived from this length, so an over-guess is tripled. The old
             // 0..64 placeholder made the first dispatch warm 127 rows before the
@@ -6366,10 +6436,29 @@ impl GitkApp {
     /// run `prefetch_worker_count()`-wide, ahead of every speculative diff, and a slow
     /// row costs one worker.
     ///
-    /// Called every frame, so it compares before it builds: `stats_targets` is a
-    /// handful of hash lookups, while `row_scope` clones a pathspec per row. Submitting
-    /// only when the target list actually changes keeps that off the frame loop without
-    /// reintroducing a gate that can strand.
+    /// Called every frame, so it compares before it builds: `stats_targets` is a hash
+    /// lookup per row in the range, while `row_scope` clones a pathspec per row and the
+    /// submission allocates a job queue. On a settled view the comparison matches and
+    /// none of the second group happens.
+    ///
+    /// On a MOVING view it does, every frame the visible row set changes — and that is
+    /// deliberate, not an oversight. The list changed because rows the user is now
+    /// looking at have no numbers yet, which is precisely when the pool should be
+    /// re-aimed; `submit_stats` replaces the tier, so the newly visible rows go to the
+    /// front instead of queueing behind the ones being scrolled away from. The cost is
+    /// ~18 hash lookups and as many empty-`Vec` clones, and the alternative — a
+    /// `view_moved_enough`-style hysteresis, as the diff prefetch has — buys that back by
+    /// delaying the numbers where the reader is, which is the one place this column is
+    /// supposed to be prompt.
+    ///
+    /// A cheaper *precondition* in front of the comparison is the thing not to reach for.
+    /// It has to know every way the target list can change — the view, the commit list,
+    /// the map, the config — and missing one strands the column blank for the session
+    /// with nothing logged. That failure has been shipped twice already by two different
+    /// routes (`stats_inflight` as a batch gate, and a `stats_submitted` left uncleared
+    /// across an invalidation), which is why the comparison against a freshly built list
+    /// is the gate: it cannot be stale, because it is recomputed from the state it gates
+    /// on.
     fn dispatch_commit_stats(&mut self, ctx: &egui::Context) {
         if !self.commit_list_cfg.any() {
             return;
@@ -8178,29 +8267,41 @@ impl GitkApp {
         // highlighter, so with `[diff] syntax = false` — where nothing was prefetched
         // at all before — every row now warms diff-only.
         let current_gen = self.diff_generation.current();
-        // diff_fully_highlighted is O(lines); it can only flip to true when new spans
-        // arrive (a batch was applied) or a fresh diff loaded. Skipping the scan on
-        // the other repaints during the highlight window (scroll, hover) avoids
-        // re-scanning the whole diff for nothing. A scrolled-away view scans until the
-        // foreground diff settles, which is bounded by the highlight window — and
-        // during it `applied_highlight` is generally true anyway, so it adds no scan
-        // that wasn't already happening.
-        let settled_diff_unwarmed = self.prefetched_gen != current_gen
-            && (applied_highlight || self.last_highlight_check_gen != current_gen);
+        let settled_diff_unwarmed = self.prefetched_gen != current_gen;
         let scrolled_off_band = view_moved_enough(&self.prefetched_view, &self.commit_view_range);
         if settled_diff_unwarmed || scrolled_off_band {
-            self.last_highlight_check_gen = current_gen;
             // Still never compete with the foreground diff's own colouring: the reader
             // is looking at that, not at a row they might scroll to. With syntax OFF
             // there is no colouring to compete with — and no spans are ever set, so
             // `diff_fully_highlighted` answers false for every non-empty diff forever.
             // Asking it in that mode is what silently kept the whole band cold, making
             // the removal of the `syntax_enabled` gate above a no-op.
-            if !self.syntax_enabled || diff_fully_highlighted(&self.diff_lines, &self.diff_files) {
+            //
+            // Both triggers go through the memo (`highlight_scan`), which is what keeps
+            // the O(lines) scan off the frame loop: the scroll trigger stays true for
+            // every frame until a dispatch actually succeeds, so an un-memoized question
+            // would be re-asked on all of them.
+            if !self.syntax_enabled || self.diff_highlight_settled(applied_highlight) {
                 self.prefetched_gen = current_gen;
                 self.dispatch_prefetch(ctx);
             }
         }
+    }
+
+    /// Is the current diff fully coloured? Memoized per `diff_generation`; see
+    /// `highlight_scan` for why the answer and not merely the check is cached.
+    ///
+    /// `applied_highlight` is the frame's "a batch of spans just landed" flag — the only
+    /// event that can turn a `false` into a `true` without the generation moving.
+    fn diff_highlight_settled(&mut self, applied_highlight: bool) -> bool {
+        let generation = self.diff_generation.current();
+        if highlight_scan_stale(self.highlight_scan, generation, applied_highlight) {
+            self.highlight_scan = Some((
+                generation,
+                diff_fully_highlighted(&self.diff_lines, &self.diff_files),
+            ));
+        }
+        self.highlight_scan.is_some_and(|(_, answer)| answer)
     }
 
     /// Global keyboard handling for the frame: focus-search-on-type, Up/Down
@@ -9850,6 +9951,49 @@ mod tests {
         assert!(!file_fully_highlighted(&partial, 0, 2));
     }
 
+    /// The memo keeps the O(lines) scan off the frame loop. The case that matters is a
+    /// generation already answered `true`: the scroll trigger re-asks on every frame it
+    /// is off-band, and a rule that recomputed on demand would scan the whole diff each
+    /// time — ~8M line checks a second on a 133k-line diff.
+    #[test]
+    fn a_settled_highlight_answer_is_not_rescanned() {
+        assert!(
+            highlight_scan_stale(None, 4, false),
+            "nothing memoized yet ⇒ scan"
+        );
+        assert!(
+            !highlight_scan_stale(Some((4, true)), 4, false),
+            "answered true for this generation ⇒ never scan again"
+        );
+        assert!(
+            !highlight_scan_stale(Some((4, true)), 4, true),
+            "not even when a batch lands: true cannot become truer"
+        );
+    }
+
+    /// A `false` is not cached forever — a landed batch of spans is the one event that
+    /// can flip it in place, and the generation moving invalidates it outright. Without
+    /// both, a diff finishing its colouring would never trigger the band warm.
+    #[test]
+    fn an_unfinished_highlight_answer_is_rescanned_when_it_can_have_changed() {
+        assert!(
+            highlight_scan_stale(Some((4, false)), 4, true),
+            "a batch landed ⇒ re-ask"
+        );
+        assert!(
+            !highlight_scan_stale(Some((4, false)), 4, false),
+            "but nothing landed ⇒ the answer cannot have changed"
+        );
+        assert!(
+            highlight_scan_stale(Some((4, false)), 5, false),
+            "a new generation is a different diff"
+        );
+        assert!(
+            highlight_scan_stale(Some((4, true)), 5, false),
+            "including one whose predecessor was finished"
+        );
+    }
+
     #[test]
     fn diff_fully_highlighted_ignores_untokenized_header_lines() {
         let span = || (egui::Color32::WHITE, 0..1);
@@ -10344,6 +10488,16 @@ mod tests {
         heavy_target(n).measured(bytes)
     }
 
+    /// A seeded stand-in for the dispatch's live memory reading.
+    ///
+    /// `heavy_fits` takes that reading as a parameter — one per dispatch rather than one
+    /// per candidate row — which is also what lets a test state the machine it is
+    /// reasoning about instead of inheriting whatever `/proc/meminfo` says right now.
+    /// 8GiB: room for any ordinary row, not room for a `u64::MAX`-sized one.
+    fn memory_reading() -> std::cell::OnceCell<Option<u64>> {
+        std::cell::OnceCell::from(Some(8 << 30))
+    }
+
     fn stats_job(n: u32) -> StatsJob {
         StatsJob {
             scope: RowScope::new(DiffSource::Commit(oid(n))),
@@ -10396,7 +10550,7 @@ mod tests {
              band needs"
         );
         assert!(
-            coord.next_heavy().is_some(),
+            coord.next_heavy(&memory_reading()).is_some(),
             "and the heavy lane does take it"
         );
     }
@@ -10472,6 +10626,34 @@ mod tests {
         }
     }
 
+    /// The live memory reading is taken lazily and at most once per dispatch, never per
+    /// candidate row. It costs a `/proc/meminfo` parse plus up to four cgroup reads, and
+    /// asking per row put those inside two nested loops re-entered on every worker
+    /// completion. An idle lane decides without it at all.
+    #[test]
+    fn a_dispatch_reads_memory_at_most_once_and_only_when_it_must() {
+        let (mut coord, _rxs) = test_coord_n(1, 2);
+        let untouched = std::cell::OnceCell::new();
+        coord.deferred.push_back(measured_target(1, 1_000));
+        assert!(coord.next_heavy(&untouched).is_some(), "idle lane admits");
+        assert!(
+            untouched.get().is_none(),
+            "and did so without reading anything"
+        );
+
+        // Loaded now, so this row's decision does need a reading — and it must be the
+        // one it was HANDED. Seeded too small for the row: were `heavy_fits` to take its
+        // own live reading again, the machine's real MemAvailable would admit this and
+        // the per-row /proc reads would be back.
+        coord.heavy_outstanding.insert(1, 1_000);
+        coord.deferred.push_back(measured_target(2, 1_000)); // need = 2_000
+        let seeded = std::cell::OnceCell::from(Some(500));
+        assert!(
+            coord.next_heavy(&seeded).is_none(),
+            "declined against the reading it was given"
+        );
+    }
+
     /// The lane runs several rows at once. One thread was tried and was wrong for the
     /// case that matters: where nearly every commit is expensive, this lane IS the
     /// prefetch, and 200 commits at ~11s each is 37 minutes that never catches up.
@@ -10494,7 +10676,7 @@ mod tests {
     fn an_idle_heavy_lane_admits_a_row_of_any_size() {
         let (mut coord, _rxs) = test_coord(1);
         coord.deferred.push_back(measured_target(1, u64::MAX / 2));
-        assert!(coord.next_heavy().is_some());
+        assert!(coord.next_heavy(&memory_reading()).is_some());
     }
 
     /// A row that will not fit stays exactly where it is rather than being popped and
@@ -10506,7 +10688,7 @@ mod tests {
         let (mut coord, _rxs) = test_coord_n(1, 2);
         coord.heavy_outstanding.insert(1, 1_000); // the lane is loaded
         coord.deferred.push_back(measured_target(1, u64::MAX / 2));
-        assert!(coord.next_heavy().is_none(), "declined");
+        assert!(coord.next_heavy(&memory_reading()).is_none(), "declined");
         assert_eq!(coord.deferred.len(), 1, "and kept, not dropped");
     }
 
@@ -10548,8 +10730,12 @@ mod tests {
         let (mut coord, _rxs) = test_coord_n(1, 4);
         coord.heavy_budget = Some(1_000);
         coord.heavy_outstanding.insert(1, 900);
-        assert!(!coord.heavy_fits(200), "900 + 200 is over a 1000 budget");
-        assert!(coord.heavy_fits(100), "900 + 100 is not");
+        let mem = memory_reading();
+        assert!(
+            !coord.heavy_fits(200, &mem),
+            "900 + 200 is over a 1000 budget"
+        );
+        assert!(coord.heavy_fits(100, &mem), "900 + 100 is not");
     }
 
     /// Eight rows admitted in one dispatch must not exceed the budget between them.
