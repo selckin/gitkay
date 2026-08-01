@@ -93,6 +93,10 @@ write layer: `ApplyAction`/`ApplyRequest`/`ApplyError`, the
 (`resolve_diff_bg`), fontdb resolution + cache,
 role→FontId map), `src/highlight.rs` (syntect highlighter, theme/palette
 resolution, per-line tokenization), `src/diff_cache.rs` (line-budget LRU cache),
+`src/mem.rs` (what the system will say about memory —
+`/proc/meminfo` plus the cgroup limit, Linux only, no `unsafe` and no dependency;
+advisory, `None` ⇒ the caller uses its static default. One consumer:
+`diff_cache_line_budget`),
 `src/cli.rs` (pure argv parser, rev-vs-path classification, pathspec
 resolution, window-title suffix, help/version text), and
 `src/word_diff.rs` (pure intra-line word diff: tokenizer + LCS alignment; the
@@ -159,7 +163,7 @@ parts run off the window-creation critical path:
   `load_selected_diff` on the next — the same path a commit-click takes.
 - **Async diff load** (`gitkay-diff-load` worker) — `load_selected_diff` never runs
   `get_diff_data` on the UI thread (bar a thread-spawn-failure fallback). A cache hit
-  (neighbours are prefetched — the common case) installs synchronously; a miss, or an
+  (the band around the view is prefetched — the common case) installs synchronously; a miss, or an
   uncommitted/staged row (whose key is only complete once its diff exists —
   `CommitKind::content_hashed_after_diff`), computes on a worker returning over
   `diff_load_rx`. The
@@ -220,8 +224,9 @@ parts run off the window-creation critical path:
   **same-oid rebuild**
   the worker also **pre-highlights** before sending (`highlight_diff_until`), so a
   toolbar toggle swaps in already coloured instead of flashing plain frames — the gap
-  that used to exist between this worker and `prefetch_worker`, which always
-  highlighted before display. Gated on `self.syntax_enabled`, not just on the rebuild
+  that used to exist between this worker and `prefetch_worker`, which back then
+  highlighted every row before display (it now colours only its `Highlighted` tier —
+  see **Diff prefetch**). Gated on `self.syntax_enabled`, not just on the rebuild
   being same-oid: `self.highlighter` outlives a syntax-off toggle (a live config
   reload keeps rebuilding it under the new theme whenever the theme changed too,
   whatever `enabled` ends up as), so `highlight_first` alone would still spend the
@@ -265,6 +270,303 @@ parts run off the window-creation critical path:
   commit's diff on screen longer is worse than a flash. Selecting the already-shown
   key early-returns and cancels any in-flight load — no re-dispatch or placeholder flash
   on refresh/back-navigation.
+- **Background work pool** (`gitkay-prefetch-coord`, `gitkay-prefetch-{i}`, plus
+  `gitkay-prefetch-heavy-{k}`) — one
+  `Coordinator` serving BOTH the commit-list stats column and the diff prefetch, because
+  they are the same shape (per-row git work, speculative, priority-ordered) and compete
+  for the same cores. Two pools could not express that the numbers on screen outrank a
+  diff nobody has clicked; one coordinator does, via the tier order in `next_pool_job`
+  (stats → ready diffs). Rows the probe finds expensive go to a **separate lane,
+  admitted against memory** instead — see below. The prefetch half warms the cache so a row is already there
+  when it scrolls into view. The band is `warm_band`: the visible rows plus **one
+  full window past each edge**, and the single definition of "a full window out of view"
+  — the commit-stats dispatch calls the same function, so the two cannot drift. It is
+  symmetric, and the upward half is nearly free: those rows were on screen a moment ago,
+  so `diff_cache.contains` drops them at dispatch and scrolling *up* gets the same
+  coverage for nothing.
+  Targets are tiered by `WarmDepth`: `Highlighted` within `PREFETCH_MARGIN` (8) of a
+  visible edge — an arrow-key step, which is all that constant means now, **not** the
+  band width — and `DiffOnly` beyond, cached with no spans. `WarmDepth` is only half the
+  question: it asks "would an arrow key land here", which says nothing about what the
+  pass costs, so the worker **downgrades** a row over `PREFETCH_MAX_HIGHLIGHT_LINES`
+  (10,000) to `DiffOnly` however near the view it is. Measured: a 133,460-line row took
+  10.65s highlighted against 761ms as `DiffOnly` — ~9.9s of one worker, a quarter of the
+  pool, to pre-colour tens of thousands of rows nobody would scroll to. That cap is an
+  absolute count, deliberately NOT a fraction of the cache like the other two, because it
+  bounds syntect time rather than memory; tying it to the budget would mean raising the
+  cache silently signs the pool up for longer stalls. The `done` log line reports the
+  depth actually applied, not the one requested. `DiffOnly` needed no new
+  machinery: an un-highlighted entry was already a supported state (a superseded
+  highlight worker's diff is stashed exactly that way, `spans` is an `Option` per line)
+  and `ensure_diff_highlighted` finishes it on install. It is far cheaper per row in
+  CPU and meaningfully cheaper in **memory** (~170 B/line vs ~370 B, the difference
+  being the span vector), which is part of what makes a band this wide reachable.
+  Do NOT repeat the old claim that spans hold a `String` per token — `highlight::Span`
+  is `(Color32, Range<usize>)`, byte offsets into the line's shared `Arc<String>`. That
+  error priced the cache ~3× too high and is why the budget sat at 100_000, holding
+  barely one band.
+  The budget is **derived from system memory**, not fixed: `diff_cache_line_budget()`
+  takes `mem::usable_bytes` (available, less 10% of total held back for the machine),
+  spends `CACHE_SHARE_PERCENT` of it, and converts at ~290 B/line. It is clamped to
+  `[DIFF_CACHE_LINE_FLOOR, DIFF_CACHE_LINE_CEILING]` = `[100_000, 1_200_000]`, so the
+  derivation can only ever **lower** the ceiling — that ceiling is a deliberate choice
+  (it admits the largest diff a real repo produced, 133,460 lines) and more cache buys
+  nothing, so any machine with ~3.2GB spare keeps today's behaviour exactly while a 4GB
+  laptop gets ~153MB and a squeezed one falls to the floor. Resolved ONCE in
+  `GitkApp::new` and logged, because a value that varies by machine and by moment is
+  otherwise unreadable from a bug report; the pool takes its two bounds from the same
+  resolved number (`line_budget`, `max_entry_lines`) rather than re-deriving.
+  The floor is the value gitkay shipped with, so it is known to work — and it is what
+  keeps `max_entry_lines` above `PREFETCH_MAX_HIGHLIGHT_LINES` at *every* budget the
+  derivation can produce, which the `const` block asserts.
+  **The pool is an actor.** One `Coordinator` thread owns every scheduling decision and
+  **nothing else touches its fields**, so the queues, the memos and the in-flight sets
+  are plain `VecDeque`/`HashMap`/`HashSet` — no mutexes, no RAII guards, no lock
+  ordering. Workers are pure: `worker()` receives a `Job`, does it, and reports an
+  `Outcome`. Everything they learn travels back as that return value; the coordinator
+  decides what any of it means. `PoolHandle` is the UI's whole surface — three sends
+  (`submit`, `submit_stats`, `clear_stats`) into one `CoordMsg` channel that also
+  carries every worker's completion, which is what makes the state single-owner.
+  Dispatch is **pull-based**: the coordinator hands a job to an idle worker, so
+  priority is evaluated at hand-out against the band as it is NOW, not at submit time.
+  Supersession stays free — the plan lives in the coordinator's own memory and is never
+  observed by anyone, so a new band is an assignment.
+  This replaced a shape where each of eight workers made these decisions itself against
+  six shared mutexes, a condvar and two atomics (`queue`, `costly_rows`,
+  `oversized_diffs`, `stats_claims`, `hl`, `deferred_busy`, `warmed`, `deferred_bytes`),
+  with four RAII guard types to release them. Only `InflightKeys` remains shared, and it
+  has to be: the foreground diff-load claims keys in the same set, so each skips what
+  the other is computing. The coordinator holds its claims in `warming`, keyed by worker
+  id, and drops them when that worker reports.
+  **Every job produces exactly one `Outcome`, including a panicking one.** `run_caught`
+  catches per JOB rather than per thread, so a bad row costs one job instead of a worker
+  for the session — and the report still goes out, which is what keeps a claim or an
+  idle slot from stranding with nothing to release it. A panicking *stats* row is
+  matched before the catch so it can report as itself and send `None`: `Outcome::Nothing`
+  there would leave its oid in `busy_stats` forever AND leave the UI treating it as
+  uncomputed, so the dispatcher would re-offer it every frame.
+  The dedup that used to live in `WorkPool::defer` is **gone, not moved**. The
+  coordinator handed a row out exactly once, so it comes back exactly once — there is
+  no second writer to disagree with. That is the class of bug this shape removes: the
+  old dedup read "measured" as "already queued", and because the stats path measures
+  visible rows FIRST, every heavy row on screen was silently dropped instead of
+  deferred. The rows built first were the ones out of view, and the on-screen ones
+  returned a dispatch later having lost 13 seconds of priority.
+  The pool is **persistent**: `spawn_prefetch_pool` starts `prefetch_worker_count()` —
+  **half the machine's cores**, floored at 1 and ceilinged at `PREFETCH_MAX_WORKERS`
+  (8) — threads on first dispatch and they live for the app's lifetime, parking on a
+  `Condvar` when the queue drains. A dispatch **replaces the queue's contents**
+  (`PrefetchShared::submit`) instead of building a job and spawning threads, so
+  concurrency is bounded by construction. That replacement is also the entire
+  supersession mechanism — rows outside the new band are simply gone — which is why
+  there is no prefetch epoch: a worker that popped a row moments before a dispatch
+  finishes it, and the result is still a valid cache entry. Each worker owns its own
+  `Repository` (git2's is `Send` but not `Sync`) opened once rather than once per
+  dispatch.
+  This replaced a pool-per-dispatch design whose concurrency was unbounded: a worker
+  only noticed supersession *between* rows, so overlapping dispatches stacked. Measured,
+  five dispatches inside one second put ~20 threads on the CPU alongside three
+  multi-second rows still running from earlier ones, and a 1,990-line diff took 2.9s
+  where an 8,627-line one had managed 1.13s. If you are tempted to spawn per dispatch
+  again, that is the failure you will get back.
+  The workers have **no scheduling priority of their own**, so `PREFETCH_MAX_WORKERS` is the
+  only thing keeping speculation from crowding out the diff the user is waiting on —
+  size it conservatively. Lowering thread priority would express the intent far better
+  (prefetch is the lowest-value work in the program), but every route to it is a raw
+  `setpriority` FFI call, and this crate does not use `unsafe`; a wrapper crate would
+  only move the same `unsafe` behind a dependency. Do not reach for it.
+  The coordinator's queue has **three tiers across two lanes**. `stats` and `ready` are
+  the pool's, popped from the front so every worker takes the globally highest-priority
+  row left; striping the list up front would leave one grinding the far band while
+  another idled on an exhausted stripe. `deferred` holds rows a blob probe found
+  expensive and is read only by `next_heavy`, which only ever feeds the heavy lane — so
+  "the pool never builds an expensive row" is a fact about which collection a function
+  reads.
+  The pool is bounded by cores — half of them, so the foreground keeps the rest — and
+  stops scaling early because a band is only ~54 rows of ~3ms each, which eight workers
+  drain in well under a frame. `cores - 1`, the old shape, was wrong twice over: it hands
+  nearly the whole machine to speculative work, and past five cores the ceiling did all
+  the deciding anyway (24 → 23 → clamped to 4), so the core count was not really an input.
+  **The heavy lane is separate threads, and how many RUN is decided by memory, not by a
+  count.** Being separate from the pool rather than a tier the pool may enter makes "an
+  expensive row never occupies a worker the next band needs" structural, not an
+  arithmetic invariant between a counter and a limit. `prefetch_heavy_workers(budget)`
+  sizes the lane at **as many threads as the pool, less whatever memory says** —
+  `budget / HEAVY_ROW_NOMINAL_BYTES` (1 GiB, the measured cost of the biggest rows seen),
+  clamped into `1..=pool`. That is only a thread bound and deliberately a pessimistic
+  one; it exists so a machine with 2GB spare does not start eight threads it can never
+  keep busy. `Coordinator::heavy_fits` is the bound that has to hold, deciding per row
+  against each row's ACTUAL measurement, since rows range from a few MB to over a
+  gigabyte.
+  Matching the pool is affordable because the two lanes are **complementary**: on an
+  ordinary repo heavy rows are rare and this lane sleeps, while on a repo of 265MB blobs
+  almost nothing is cheap and the pool sleeps — measured, eight pool workers idle for 36
+  seconds while four heavy ones did all the work. Whichever lane the repo needs gets the
+  whole speculative budget. It **scales at about 90% efficiency**, and the reason is
+  worth knowing: each row is ~12s of single-core zlib inflation over one blob pair, so it
+  is CPU work with no shared bottleneck — it spreads across cores well, though not
+  perfectly. Measured on the 265MB repo across three batches each way: four threads
+  sustained 4 rows per ~11.7s (0.34 rows/s), eight sustained 8 per ~13.0s (0.62 rows/s),
+  a 1.8× speedup with per-row builds ~11% slower. So the next bound is cores and
+  `heavy_fits`, and the return per thread is real but shrinking.
+  **Measure across several batches.** This file has carried two wrong numbers here, both
+  from one-batch samples, in opposite directions: first a contention story predicting
+  1.3–1.8× (from one slow batch of four — which was per-row variance, since those same
+  commits are equally slow at eight concurrent), then 2.2× (from one fast batch of eight,
+  faster than every batch since, and above the 2× ceiling doubling can even reach). A
+  single batch is not a measurement, and both mistakes looked convincing at the time.
+  **One thread was tried, and was wrong for the case that matters.** The argument for it
+  — nobody is waiting on a speculative row, so serialising costs nothing — holds only
+  where heavy rows are the exception. On a repo where nearly every commit touches a 265MB
+  blob this lane IS the prefetch, and 200 commits at ~11s each is 37 minutes of warming
+  that never catches up with the user. Do not re-serialise it on the "speculative work
+  has no latency requirement" argument alone: it is true, and it is not sufficient.
+  Rules that make the admission safe without the subsystem it replaced —
+  `reserve_memory`, `wait_for_memory`, `requeue_deferred`, `deferred_bytes`,
+  `MemoryReservation`, `MEMORY_RETRY_INTERVAL`, `deferred_limit`, `DeferredSlot` and
+  `POOL_WORKERS_KEPT_FREE`, all gone. **An idle lane always admits**, whatever the size:
+  progress must be guaranteed, since nothing would re-trigger a dispatch for a lane
+  holding nothing, and one row is exactly what the **foreground** allocates when the user
+  clicks that commit, which has never been guarded either. And a row that does not fit is
+  **inspected before it is popped**, so it stays at the front and is reconsidered on the
+  next dispatch — which runs whenever a worker reports, i.e. precisely when memory frees.
+  There is nothing to park on when the queue is the coordinator's own field, which is
+  what replaced a spin measured at ~120 refusals a second.
+  Then **two** bounds, because they fail differently and neither covers the other.
+  **Self-accounting** — `held + need <= heavy_budget`, the budget resolved ONCE at
+  startup from `mem::usable_bytes` — is what stops a **stampede**, which is the real
+  crash risk here: `dispatch` hands out every free worker in one tight loop, so without
+  it all eight rows are admitted against the same `MemAvailable` reading (none has
+  allocated yet) and then collectively ask for 8.5GB on a machine that had 4. Pinned by
+  `a_whole_dispatch_cannot_overcommit_the_lane`, which without this commits 8000 against
+  a 3000 budget. A budget fixed at startup is what makes this comparison legitimate — it
+  is not itself moving as the lane's own blobs land.
+  **A live reading** — `need <= usable` — is what notices the machine getting busy after
+  startup, which a fixed budget never would. Against `need` **alone**, deliberately, and
+  never against `held + need`: `MemAvailable` already reflects the blobs of rows that
+  have been running a while, so adding them subtracts the same memory twice — measured on
+  a 31GB machine reporting 13.2GB available, that made ~5.9GB look spendable and refused
+  rows that fit several times over.
+  Each bound is compared against the quantity it can measure without double counting:
+  our own commitments against a fixed budget, one row's need against a live figure.
+  Swapping either pairing reintroduces a bug that has already been fixed once. An earlier
+  version of this file claimed the thread count bounded the stampede; it does not, and on
+  a small machine it is not a bound at all.
+  Ordering within the lane still matters more than in `ready`, because far fewer threads
+  drain it: **the order is close to the schedule**. `Submit` therefore replaces
+  `deferred` wholesale, re-sorted by the new band's priority, exactly as it does `ready`.
+  That probe (`diff::probe_row_cost` → `RowCostProbe`) is there because **a diff's cost
+  tracks bytes read, not changed lines**: libgit2 loads both sides of every changed file
+  and runs xdiff over them, so a few-line change inside a 265MB file measured ~11s of one
+  core, and four workers on such rows pinned four CPUs warming commits nobody had opened.
+  No line-based cap can see that coming — the resulting patch is three lines long.
+  It thresholds `total_blob_bytes`, and that is a **correction, not the original design**:
+  the first version guarded the largest blob, and a row whose largest blob was well under
+  the cap still took 5.6s to build where a row of comparable line count took 40ms. Many
+  medium files have a small maximum and a large total. The probe still reports
+  `max_blob_bytes` and `deltas` and the defer log prints all three, because they read very
+  differently — one enormous file versus a wide shallow commit — and this guard has
+  already had to move dimensions once. (`deltas` would be the one to watch if rename
+  detection were ever the cost; it probably is not, since libgit2 leaves `rename_limit` at
+  its default 200 and *skips* detection above it rather than going quadratic.)
+  The probe is cheap for two reasons that must both hold: a tree-to-tree diff compares
+  tree *entries* and loads no content, and `Odb::read_header` reads a size from the object
+  header without inflating the payload. It deliberately does NOT run `detect_similar`,
+  which loads blob content to score similarity — the very cost being avoided. It runs
+  BEFORE the `InflightKeys` claim, so deferring has no claim to release.
+  Such a row is **postponed, not dropped**: the cache is sized to hold it and revisiting
+  it should still be instant, it simply must not stand in front of fifty cheap rows.
+  `PrefetchTarget::probed` carries the measurement so the second visit skips the probe
+  rather than postponing the row forever.
+  A row reported `Outcome::TooBig` returns to `deferred` carrying its measurement, with
+  no dedup needed at all — see the actor note above for why, and for the bug that
+  disappeared with it. `a_row_reported_too_big_lands_on_the_heavy_lane_measured` pins it.
+  A row's cost is **remembered**, in two coordinator fields that are deliberately not
+  one: `measured` (the probe's bytes, keyed by **oid**) and `oversized` (a built
+  diff over `PREFETCH_MAX_ENTRY_LINES`, keyed by **`DiffCacheKey`**). They differ in
+  validity domain — blob size depends on the commit and its pathspec, while a line count
+  depends on the context width and `ignore_ws`, which the key carries and an oid does
+  not — and the oid key is what lets stats and diff jobs share one verdict, since they
+  read the same blobs. Without the first, every dispatch re-probed the whole deferred
+  tier (18 rows on the second dispatch alone, and a dispatch fires every half-window
+  while scrolling); without the second, an over-cap row was rebuilt in full on every
+  dispatch purely to be discarded again — measured, a 292,503-line row built twice in two
+  seconds at 629ms each. A line count cannot be probed ahead of the build, which is
+  exactly why that verdict has to be kept after it.
+  **Stats jobs are probed too**, though they never reach the heavy lane. `commit_stats` with
+  `FilesAndLines` calls `diff.stats()`, which loads the same blob content the diff does —
+  so on a repo of 265MB blobs, leaving them unguarded had eight workers spend **24
+  seconds** computing the column, and because stats outrank diffs, blocking every
+  prefetch behind it; the user then clicked a row and paid the same ~11s again, because
+  the diff those seconds had computed was thrown away. Such a stats row sends its
+  **file count immediately** (`StatsWant::FilesOnly` needs no content) and then **stops**,
+  because its line counts cost the same blob reads the diff does and `cache_diff` takes
+  the column off the diff for free when it lands. Computing them anyway would pay ~11s
+  twice for one set of bytes, which is what the user saw as "11s for the numbers, then
+  another 11s for the diff".
+  The one row that would get nothing that way is one whose diff is ALSO over
+  `Limits::max_entry_lines`, since it is built and dropped uncached, so `cache_diff`
+  never harvests it. `warm_row` covers that at the drop site: the numbers are a sum over
+  the `FileEntry` list already in hand, and that is the exact moment the case becomes
+  knowable. `Job::Warm` carries the `stats_epoch` for it — uniform across a stats batch,
+  so the coordinator takes it off the front job; a stale one is dropped by the UI's own
+  epoch check, leaving the cell as blank as it was. (Two earlier versions of this file
+  described a `queue_stats_fallback` covering this; no such function ever existed.)
+  Measured: no commit in any captured log hit both conditions, but one sat at 72% of the
+  line cap while blob-deferred, so they are not structurally exclusive.
+  `SubmitStats` **filters measured rows out entirely** rather than queueing them anyway.
+  Queueing them is how the doubling came back once already: the diff probe records the
+  oid, the next dispatch re-offers the row (its line counts are still unknown), that
+  stats job starts, and the diff lands ten seconds later with numbers the job is still
+  grinding out — measured, 10.7s spent on an answer that had already arrived. Declining
+  inside `run_stats_job` is not enough on its own; the UI side must not re-add it.
+  A stats row reports its measurement back as `Outcome::Stats { costly: Some(_) }`,
+  which is what keeps the row from being re-probed on every dispatch. The file count comes from
+  the real `commit_stats`, NOT from `RowCostProbe::deltas`: the probe skips
+  `detect_similar`, so it counts a rename as two files where the pane shows one, and a
+  column disagreeing with the pane is the exact drift the shared pipeline exists to
+  prevent. `SubmitStats` replaces the `stats` tier rather than extending it — a measured
+  row reads as "unknown" to `stats_targets` until its line counts land, so every scroll
+  re-offers it and an extend would stack a duplicate each time. `busy_stats` is what
+  stops the same row being handed to two workers meanwhile.
+  `diff::source_diff` is the single `DiffSource` → `git2::Diff` dispatch shared by
+  `commit_stats` and the probe, so a new row kind cannot reach one and miss the other.
+  Concurrency is safe because the coordinator hands each key out once, and `InflightKeys`
+  covers the one case it cannot see: the foreground diff-load. A pool is not a nicety: one serial worker managed ~5 diffs/second
+  against the ~18/second a page-per-second scroll needs, so the wider band alone would
+  have changed nothing.
+  Two bounds, and they answer different failures. `PREFETCH_LINE_BUDGET` (half the
+  cache) is accumulated in the workers — a diff's line count is unknown until it is
+  built — and the coordinator clears both diff lanes once it is crossed, so a
+  dispatch cannot evict its own warms. It bounds a **dispatch**, not the band, so it is
+  no defence against one enormous row; `PREFETCH_MAX_ENTRY_LINES` (an eighth of the
+  cache) is. A row over that is built and **dropped**, never sent: every row in the band
+  is about equally likely to be opened, so caching one giant row costs a dozen ordinary
+  ones — and past the budget entirely it is catastrophic, because `DiffCache::insert`
+  keeps at least one entry, so the row evicts everything and then sits alone until the
+  next insert evicts it too. Measured: a 133,460-line diff evicted all 51 warmed entries
+  (98,507 lines). Lines built-then-dropped still count toward the dispatch budget — a
+  worker that spent six seconds on a diff it discarded did a dispatch's worth of harm.
+  The **display** path is deliberately uncapped: a diff the user actually opened is
+  theirs to cache however large.
+  The old `PREFETCH_MAX` count cap is **gone**: at 24 it would silently truncate a
+  ~54-row band and make the whole widening a no-op.
+  Ranking is by distance from **the selection clamped into the view**
+  (`sel.clamp(view.start, view.end - 1)`), identical to the old behaviour while the
+  selection is on screen and, once the user has scrolled away from it, aimed at the
+  visible edge they scrolled toward rather than at rows nobody is looking at.
+  Dispatch fires per settled diff (as before) **and** whenever `view_moved_enough` —
+  half a window off `prefetched_view` — so the band follows a *scroll*, not only a
+  selection change. The hysteresis keeps the UI thread from rebuilding a ~54-row target
+  list every frame (a `diff_cache_key` and a pathspec-cloning `row_scope` per row) and
+  replacing the pool's queue under it continuously. Half a window sits inside the band's
+  one-window margin, so the user cannot scroll past warmed rows before it fires. The `diff_fully_highlighted` gate
+  stays — never compete with the foreground diff's own colouring.
+  It is **not** gated on `syntax_enabled` any more: a `DiffOnly` row needs no
+  highlighter (`PrefetchShared::hl` is an `Option`), so with `[diff] syntax = false`, where
+  nothing was prefetched at all before, every row now warms diff-only.
+  Accepted limit: a continuous fling still outruns the pool. Nothing that builds a real
+  diff per row will not.
 - **Perf timing** — key startup phases log at `debug` (`perf: startup: …` / `perf:
   load_commits: …`). Run with `RUST_LOG=gitkay=debug` to see the per-phase breakdown.
 
@@ -286,11 +588,43 @@ parts run off the window-creation critical path:
   `diff::commit_stats` — the same `scoped_diff` prologue the pane's own
   `build_diff_data` runs (options, builder, rename post-pass), so the column can
   never disagree with the sidebar and a new pipeline stage reaches both by
-  construction. Computed lazily by the
-  `gitkay-stats` worker for the **visible rows only**, one batch at a time (a
-  fling-scroll would otherwise spawn a thread per frame), and cached in an
-  oid-keyed map that survives history rebuilds because a real commit's diff is
-  immutable. The pathspec `commit_stats` diffs against (`paths` — under
+  construction. Computed on the **shared work
+  pool** (see **Background work pool**) as one `Job::Stats` per row, and cached in
+  an oid-keyed map that survives history rebuilds because a real commit's diff is
+  immutable.
+  They ride in the pool's **top tier**, ahead of every speculative diff: a blank cell is
+  visible, a cold cache entry is not. This replaced a dedicated single-threaded
+  `gitkay-stats` worker that took one batch at a time — a screenful went through one
+  thread in series AND re-dispatch was gated until the whole batch landed, so one large
+  commit blanked the numbers of every smaller commit behind it and kept them blank while
+  you scrolled past. As queue items they run pool-wide and a slow row costs one worker.
+  Two things went away with the batch, and both were scaffolding for it rather than for
+  the feature. `stats_inflight` was a UI-owned claim set that doubled as the "a batch is
+  running" gate, so any worker exit that skipped its report stranded a claim and silently
+  killed the column for the session — `report_batch_failed` existed solely to make
+  "every dispatched target reports back" true by construction. The coordinator owns
+  that claim now (`busy_stats`), releasing it when the worker reports, and every job
+  reports exactly once — a panicking one included — so neither the hazard nor its
+  remedy exists. **Do not reintroduce a dispatch gate**: what stops
+  per-frame resubmission is comparing the target list against `stats_submitted`, which
+  is why `invalidate_commit_stats` must clear that list — leave it and the next dispatch
+  finds it unchanged against a cleared map and never re-queues, the same silently-stuck
+  column by a different route.
+  `dispatch_commit_stats` stays **two-phase**: `stats_targets` for the visible rows, and
+  for `warm_band` — the same band the diff prefetch warms — only once those are all
+  known, so the column fills where the user is looking before warming where they might
+  scroll. Stats **are** derived from a built `DiffData` — `diff::stats_from_data`, called by
+  `cache_diff` on every real commit it caches, which is what stops the same blobs being
+  read twice (once for the column, once for the pane). Safe and not a shortcut: summing
+  `FileEntry` is exactly what `commit_stats` returns, pinned by
+  `commit_stats_agrees_with_the_panes_own_per_file_counts` over a repo holding a binary
+  change and a mode-only change, under both `detect_renames` settings. **An earlier
+  version of this file claimed the two counts differ and refused the derivation on that
+  basis. It was wrong, and that test was already in the tree disproving it.**
+  Harvesting there also cancels the redundant job: a row whose numbers land stops being a
+  `stats_targets` target, so the next dispatch submits a shorter list and `submit_stats` —
+  which replaces the stats tiers rather than adding to them — drops any still-queued stats
+  job for it. Whichever finishes first wins; the other is dequeued. The pathspec `commit_stats` diffs against (`paths` — under
   `--follow`, `CommitInfo::follow_path`, recomputed on every rebuild) is an
   input to the cached value but is part of neither the map's key nor
   `stats_relevant`; a scope-mutating feature must classify that deliberately

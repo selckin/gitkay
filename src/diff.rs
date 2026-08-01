@@ -1111,6 +1111,118 @@ pub struct CommitStats {
     pub lines: Option<(usize, usize)>,
 }
 
+/// Build the raw git2 diff a row names — before any rename post-pass, and before any
+/// patch text is generated.
+///
+/// The single place a `DiffSource` becomes a `git2::Diff`, so `commit_stats` and
+/// `max_blob_bytes` cannot drift and a new row kind cannot reach one while missing the
+/// other. Exhaustive on `CommitKind`'s four shapes for the same reason.
+fn source_diff<'r>(
+    repo: &'r Repository,
+    scope: &RowScope,
+    opts: &mut DiffOptions,
+) -> Result<git2::Diff<'r>, git2::Error> {
+    match scope.source {
+        DiffSource::Uncommitted => worktree_git_diff(repo, opts),
+        DiffSource::Staged => staged_git_diff(repo, opts),
+        DiffSource::Range(ends) => range_git_diff(repo, ends, opts),
+        DiffSource::Commit(oid) => {
+            let commit = repo.find_commit(oid)?;
+            commit_parent_diff(repo, &commit, Some(opts))
+        }
+    }
+}
+
+/// What a row's diff will cost to build, measured **without loading any blob**.
+///
+/// Three dimensions rather than one because the first attempt measured the wrong thing.
+/// libgit2's content diff loads both sides and runs xdiff over them, so cost tracks
+/// BYTES READ, not the number of changed lines — a three-line change in a 265MB file
+/// measured ~11s of one core. Guarding on the *largest* blob catches that shape and
+/// misses the other one: a commit touching many medium files has a small maximum and a
+/// large total, and one such row measured **5.6s to build** while a row of comparable
+/// line count took 40ms.
+///
+/// `deltas` is carried for the same reason — it is free here, and it is the dimension
+/// that would matter if rename detection were the cost. (It probably is not: libgit2
+/// leaves `rename_limit` at its default 200 and *skips* detection above it rather than
+/// going quadratic. Collected anyway, because that reasoning deserves to be checked
+/// against a log rather than believed.)
+///
+/// Cheap by construction, and both halves matter: a tree-to-tree diff compares tree
+/// *entries* (oid + mode) and loads no content, and `Odb::read_header` reads a size
+/// from the object header without inflating the payload. So this costs a tree walk plus
+/// two index lookups per changed file. It deliberately does NOT run `detect_similar`,
+/// which loads blob content to score similarity — the very cost being avoided.
+///
+/// A header that cannot be read contributes 0 rather than failing the probe: an
+/// unreadable object will fail the real build too, and refusing to *estimate* is not a
+/// reason to refuse to warm.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RowCostProbe {
+    /// Every changed blob, both sides, summed. The best single predictor of build cost,
+    /// and what the prefetch guard thresholds on.
+    pub total_blob_bytes: u64,
+    /// The largest single blob. Kept because it is what a "one enormous file" row looks
+    /// like, and it reads very differently in a log from a wide-but-shallow one.
+    pub max_blob_bytes: u64,
+    /// Changed files.
+    pub deltas: usize,
+}
+
+/// Measure `scope`'s diff without building it. See `RowCostProbe`.
+pub fn probe_row_cost(
+    repo: &Repository,
+    scope: &RowScope,
+    settings: DiffSettings,
+) -> Result<RowCostProbe, git2::Error> {
+    let mut opts = scoped_diff_opts(settings, &scope.paths);
+    let diff = source_diff(repo, scope, &mut opts)?;
+    let odb = repo.odb()?;
+    let mut probe = RowCostProbe::default();
+    for delta in diff.deltas() {
+        probe.deltas += 1;
+        for file in [delta.old_file(), delta.new_file()] {
+            let id = file.id();
+            if id.is_zero() {
+                continue; // that side has no blob (an add, or a delete)
+            }
+            if let Ok((size, _)) = odb.read_header(id) {
+                let size = size as u64;
+                probe.total_blob_bytes = probe.total_blob_bytes.saturating_add(size);
+                probe.max_blob_bytes = probe.max_blob_bytes.max(size);
+            }
+        }
+    }
+    Ok(probe)
+}
+
+/// The commit-list numbers for a diff that has **already been built**.
+///
+/// Exactly what `commit_stats` would return for the same row — the identity is pinned
+/// by `commit_stats_agrees_with_the_panes_own_per_file_counts`, over a repo containing
+/// the cases most likely to drift (a binary change, a mode-only change) and under both
+/// `detect_renames` settings.
+///
+/// It exists because the two paths were doing the same expensive work twice. Both
+/// `commit_stats` and `build_diff_data` run `scoped_diff` and then force libgit2 to load
+/// blob content — one to call `diff.stats()`, the other to walk hunks — so on a repo of
+/// 265MB blobs the column and the pane each paid ~11s for the same bytes, independently.
+/// Once a `DiffData` exists, its numbers are a sum over `files`: microseconds.
+///
+/// Note this is a *sum over the built entries*, so it is correct only for a `DiffData`
+/// built under settings whose counts match — which is why `stats_relevant` excludes
+/// `context` (surrounding lines are never counted) and includes the rename toggles.
+pub fn stats_from_data(data: &DiffData) -> CommitStats {
+    CommitStats {
+        files: data.files.len(),
+        lines: Some((
+            data.files.iter().map(|f| f.additions).sum(),
+            data.files.iter().map(|f| f.deletions).sum(),
+        )),
+    }
+}
+
 /// The diffstat for one commit-list row.
 ///
 /// Runs the SAME `scoped_diff` pipeline `build_diff_data` does — the same options,
@@ -1125,15 +1237,7 @@ pub fn commit_stats(
     want: StatsWant,
 ) -> Result<CommitStats, git2::Error> {
     let diff = scoped_diff(repo, settings, &scope.paths, |repo, opts| {
-        match scope.source {
-            DiffSource::Uncommitted => worktree_git_diff(repo, opts),
-            DiffSource::Staged => staged_git_diff(repo, opts),
-            DiffSource::Range(ends) => range_git_diff(repo, ends, opts),
-            DiffSource::Commit(oid) => {
-                let commit = repo.find_commit(oid)?;
-                commit_parent_diff(repo, &commit, Some(opts))
-            }
-        }
+        source_diff(repo, scope, opts)
     })?;
     Ok(match want {
         StatsWant::FilesOnly => CommitStats {
@@ -1601,6 +1705,83 @@ mod tests {
         assert_eq!(data.files[0].path, "f.txt");
     }
 
+    /// The whole point of the probe: cost tracks BYTES READ, not patch size. A one-line
+    /// change inside a large file must report that file, or the guard it feeds would
+    /// wave through exactly the rows that pin a core for seconds.
+    #[test]
+    fn probe_reports_the_blob_not_the_patch() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        let big = "x".repeat(200_000);
+        commit_file(&repo, "big.txt", &format!("head\n{big}\n"), "base");
+        let oid = commit_file(&repo, "big.txt", &format!("HEAD\n{big}\n"), "one line");
+
+        let got = probe_row_cost(
+            &repo,
+            &RowScope::new(DiffSource::Commit(oid)),
+            base_settings(),
+        )
+        .unwrap();
+        assert!(
+            got.max_blob_bytes > 200_000,
+            "a 1-line patch over a 200KB blob must report the blob: {got:?}"
+        );
+        assert!(
+            got.total_blob_bytes > got.max_blob_bytes,
+            "a modify reads BOTH sides, so the total must exceed the largest: {got:?}"
+        );
+        assert_eq!(got.deltas, 1);
+    }
+
+    /// Total and max are different dimensions, and the total is the one the guard uses:
+    /// many medium files have a small maximum and a large total, which is the shape a
+    /// max-only guard waved through at 5.6s a row.
+    #[test]
+    fn probe_totals_across_files_not_just_the_largest() {
+        use crate::test_repo::{commit_index, stage, temp_repo, write_file};
+        let (_d, repo) = temp_repo();
+        for i in 0..5 {
+            write_file(&repo, &format!("f{i}.txt"), &"x".repeat(10_000));
+            stage(&repo, &format!("f{i}.txt"));
+        }
+        let mut index = repo.index().unwrap();
+        let oid = commit_index(&repo, &mut index, "five files");
+
+        let got = probe_row_cost(
+            &repo,
+            &RowScope::new(DiffSource::Commit(oid)),
+            base_settings(),
+        )
+        .unwrap();
+        assert_eq!(got.deltas, 5);
+        assert!(
+            got.total_blob_bytes >= 5 * got.max_blob_bytes,
+            "five equal files must total ~5x the largest: {got:?}"
+        );
+    }
+
+    /// An added file has no old side, and a zero oid must not be looked up as if it
+    /// were an object — the add's own blob is still what the row costs.
+    #[test]
+    fn probe_handles_a_one_sided_delta() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "keep.txt", "k\n", "base");
+        let oid = commit_file(&repo, "added.txt", "one\ntwo\n", "add");
+
+        let got = probe_row_cost(
+            &repo,
+            &RowScope::new(DiffSource::Commit(oid)),
+            base_settings(),
+        )
+        .unwrap();
+        assert_eq!(got.total_blob_bytes, "one\ntwo\n".len() as u64);
+        assert_eq!(
+            got.max_blob_bytes, got.total_blob_bytes,
+            "only one side exists"
+        );
+    }
+
     #[test]
     fn commit_stats_counts_a_range() {
         use crate::test_repo::{commit_file, temp_repo};
@@ -1735,12 +1916,15 @@ mod tests {
         assert_eq!((bin.old_lineno, bin.new_lineno), (None, None));
     }
 
-    /// The column and the file-list sidebar must never show different numbers
-    /// for the same commit. They can't, by construction — `commit_stats` runs
-    /// the same builders, options and rename post-pass `get_diff_data` does —
-    /// and this is what pins that. Measured during design: a binary change and
-    /// a mode-only change each count as one changed file with zero lines on
-    /// BOTH sides, which is the case most likely to drift.
+    /// The column and the file-list sidebar must never show different numbers for the
+    /// same commit. They can't, by construction — `commit_stats` runs the same builders,
+    /// options and rename post-pass `get_diff_data` does — and this is what pins that.
+    /// Measured during design: a binary change and a mode-only change each count as one
+    /// changed file with zero lines on BOTH sides, which is the case most likely to drift.
+    ///
+    /// Load-bearing beyond documentation: `stats_from_data` reads the column straight off
+    /// a built diff so the expensive work is done once instead of twice, and this
+    /// equality is the entire licence for that.
     #[test]
     fn commit_stats_agrees_with_the_panes_own_per_file_counts() {
         let (_d, repo, oid) = everything_repo();
@@ -1755,14 +1939,14 @@ mod tests {
             .unwrap();
 
             let data = get_diff_data(&repo, &RowScope::new(DiffSource::Commit(oid)), s);
-            let want = CommitStats {
-                files: data.files.len(),
-                lines: Some((
-                    data.files.iter().map(|f| f.additions).sum(),
-                    data.files.iter().map(|f| f.deletions).sum(),
-                )),
-            };
-            assert_eq!(got, want, "detect_renames = {detect_renames}");
+            // Through the production function, not a copy of it: `cache_diff` derives
+            // the column from a built diff by calling exactly this, so a divergence
+            // here is a divergence the user would see.
+            assert_eq!(
+                got,
+                stats_from_data(&data),
+                "detect_renames = {detect_renames}"
+            );
         }
     }
 
