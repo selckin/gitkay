@@ -8834,9 +8834,69 @@ impl eframe::App for GitkApp {
     }
 }
 
+/// The logger: warnings by default, `RUST_LOG=gitkay=debug` for timing logs.
+///
+/// Built here rather than inline in `main` so the directives are reachable from a test
+/// — the muting below is the kind of thing that silently starts covering more than it
+/// meant to.
+///
+/// **`egui_winit::clipboard` is muted to `error`.** egui initializes its own clipboard
+/// at startup, and on a Wayland session with no reachable X11 server arboard's fallback
+/// takes the timeout and logs a `WARN` every run:
+///
+/// > Failed to initialize arboard clipboard: … X11 server connection timed out
+///
+/// It is noise, not news: nothing gitkay does depends on egui's clipboard. gitkay's own
+/// SHA copy runs through its own `arboard::Clipboard` (`GitkApp::clipboard`), which
+/// reports its own failures. Muted to `error` rather than `off` so a real clipboard
+/// error still surfaces — only the routine warning goes.
+///
+/// **How `RUST_LOG` interacts with it, which is not what insertion order suggests.**
+/// `env_logger` sorts its directives by module-name LENGTH and takes the longest one
+/// that prefixes the target, so specificity decides, not the order they went in.
+/// `RUST_LOG=egui_winit=warn` therefore does NOT bring the message back — the longer
+/// `egui_winit::clipboard` still wins. Naming the module exactly does:
+///
+/// ```text
+/// RUST_LOG=egui_winit::clipboard=warn
+/// ```
+///
+/// and that works only because the mute goes in FIRST and `parse_env` appends after:
+/// the sort is stable, so between two directives of equal length the later one is
+/// checked first. Build it the other way round — `from_env(..)` then `filter_module` —
+/// and the mute becomes unconditional, with no spelling that can lift it.
+///
+/// **The baseline level is `parse_env`'s job, not a directive here.** See `log_defaults`
+/// for why that distinction is load-bearing rather than stylistic.
+///
+/// Every one of these is pinned by a test. They are all easy to assume backwards, and
+/// two of them were: that a broader `RUST_LOG` prefix would lift the mute, and that
+/// setting the baseline as a directive was the same as letting `parse_env` supply it.
+fn log_builder() -> env_logger::Builder {
+    let mut builder = log_defaults();
+    builder.parse_env(env_logger::Env::default().default_filter_or("warn"));
+    builder
+}
+
+/// gitkay's own directives, before any `RUST_LOG` is applied. Split out so the tests
+/// can supply a filter string in place of the environment and still exercise the real
+/// mute rather than a copy of it.
+///
+/// It holds ONLY the mute. The baseline level is deliberately left to `parse_env`'s
+/// `default_filter_or("warn")` and is NOT set here as a `filter_level` directive: a
+/// `None`-named directive would survive `RUST_LOG` instead of being replaced by it, so
+/// `RUST_LOG=gitkay=debug` would newly print warnings from wgpu, winit and every other
+/// dependency, where `env_logger`'s own semantics are that an explicit `RUST_LOG`
+/// replaces the default outright. That regression shipped once and is pinned now by
+/// `rust_log_replaces_the_baseline_rather_than_adding_to_it`.
+fn log_defaults() -> env_logger::Builder {
+    let mut builder = env_logger::Builder::new();
+    builder.filter_module("egui_winit::clipboard", log::LevelFilter::Error);
+    builder
+}
+
 fn main() -> eframe::Result {
-    // Warnings show by default; set e.g. RUST_LOG=gitkay=debug for timing logs.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    log_builder().init();
     let startup_t0 = std::time::Instant::now();
 
     let raw = match cli::parse_flags(std::env::args().skip(1)) {
@@ -10902,6 +10962,87 @@ mod tests {
         // No window ⇒ nothing to warm, rather than an unbounded band.
         assert_eq!(warm_band(&(0..0)), 0..0);
         assert_eq!(warm_band(&(7..7)), 7..7);
+    }
+
+    /// Whether `logger` would emit `level` from `target`. `Log::enabled` is the same
+    /// question the macros ask, so this exercises the real directives rather than a
+    /// model of them; `build()` does not install anything globally.
+    fn logs(logger: &impl log::Log, target: &str, level: log::Level) -> bool {
+        logger.enabled(&log::Metadata::builder().level(level).target(target).build())
+    }
+
+    /// egui's clipboard init warns on every run of a Wayland session with no reachable
+    /// X11 server. Muted — but only that module, and only below `error`, so a real
+    /// clipboard failure still reaches the terminal.
+    #[test]
+    fn the_routine_clipboard_warning_is_muted_and_nothing_else_is() {
+        // "warn" is what `default_filter_or` supplies when RUST_LOG is unset.
+        let logger = log_defaults().parse_filters("warn").build();
+        assert!(
+            !logs(&logger, "egui_winit::clipboard", log::Level::Warn),
+            "the arboard init warning is noise, not news"
+        );
+        assert!(
+            logs(&logger, "egui_winit::clipboard", log::Level::Error),
+            "a real clipboard error still surfaces"
+        );
+        assert!(
+            logs(&logger, "egui_winit", log::Level::Warn),
+            "the rest of egui_winit is untouched"
+        );
+        assert!(
+            logs(&logger, "gitkay::highlight", log::Level::Warn),
+            "and so is gitkay — the missing-grammar warning has to arrive"
+        );
+        assert!(
+            !logs(&logger, "gitkay", log::Level::Debug),
+            "debug still needs asking for"
+        );
+    }
+
+    /// The mute is liftable, but only by naming the module exactly — `env_logger` picks
+    /// the LONGEST directive prefixing the target, so a broader `egui_winit=warn` loses
+    /// to our `egui_winit::clipboard`. Insertion order decides only between names of
+    /// equal length, which is exactly the case that matters here: it is what lets the
+    /// reader's own `egui_winit::clipboard=warn` outrank ours, and it holds only
+    /// because `log_builder` sets its defaults before `parse_env` appends.
+    #[test]
+    fn the_mute_is_liftable_only_by_naming_the_module_exactly() {
+        let muted = |spec: &str| {
+            let logger = log_defaults().parse_filters(spec).build();
+            !logs(&logger, "egui_winit::clipboard", log::Level::Warn)
+        };
+        assert!(
+            !muted("egui_winit::clipboard=warn"),
+            "the exact module name lifts it"
+        );
+        assert!(
+            muted("egui_winit=warn"),
+            "a shorter prefix does not — the longer directive still wins"
+        );
+        assert!(muted("debug"), "nor does turning everything up");
+    }
+
+    /// An explicit `RUST_LOG` REPLACES the default level rather than adding to it —
+    /// `env_logger`'s own semantics, and what `RUST_LOG=gitkay=debug` has always meant
+    /// here: gitkay's timing logs, and silence from everything else.
+    ///
+    /// Which is why `log_defaults` holds only the mute. Setting the baseline there as a
+    /// `filter_level` directive looks equivalent and is not: a `None`-named directive
+    /// survives `RUST_LOG` instead of being replaced by it, so asking for gitkay's own
+    /// debug output would newly drag in warnings from wgpu, winit and everything else
+    /// linked in. That shipped once; this is the test that would have caught it.
+    #[test]
+    fn rust_log_replaces_the_baseline_rather_than_adding_to_it() {
+        let logger = log_defaults().parse_filters("gitkay=debug").build();
+        assert!(
+            logs(&logger, "gitkay", log::Level::Debug),
+            "what was asked for"
+        );
+        assert!(
+            !logs(&logger, "wgpu_hal::vulkan", log::Level::Warn),
+            "and nothing else, not even at warn"
+        );
     }
 
     #[test]
