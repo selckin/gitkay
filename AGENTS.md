@@ -642,6 +642,28 @@ parts run off the window-creation critical path:
   diff per row will not.
 - **Perf timing** — key startup phases log at `debug` (`perf: startup: …` / `perf:
   load_commits: …`). Run with `RUST_LOG=gitkay=debug` to see the per-phase breakdown.
+- **Logger setup** (`log_builder`) — warnings by default, and one module muted:
+  `egui_winit::clipboard` to `error`. egui initializes its own clipboard at startup, and
+  on a Wayland session with no reachable X11 server arboard's fallback takes the timeout
+  and warns every run. Noise, not news — nothing gitkay does depends on egui's
+  clipboard; its own SHA copy runs through `GitkApp::clipboard` and reports its own
+  failures. Muted to `error`, not `off`, so a real one still surfaces.
+  **`RUST_LOG` does not interact with this the way insertion order suggests.**
+  `env_logger` sorts directives by module-name LENGTH and takes the longest one
+  prefixing the target, so specificity decides: `RUST_LOG=egui_winit=warn` does NOT lift
+  the mute, and only `RUST_LOG=egui_winit::clipboard=warn` does. That works solely
+  because `log_defaults` runs BEFORE `parse_env` appends — the sort is
+  stable, so between equal-length names the later one is checked first. Built the other
+  way round (`from_env` then `filter_module`) the mute is unconditional and no spelling
+  can lift it.
+  `log_defaults` holds **only the mute**; the baseline level is left to `parse_env`'s
+  `default_filter_or("warn")` and must NOT be a `filter_level` directive. That looks
+  equivalent and is not: a `None`-named directive survives `RUST_LOG` instead of being
+  replaced by it, so `RUST_LOG=gitkay=debug` would newly print warnings from wgpu, winit
+  and every other dependency, where env_logger's semantics are that an explicit
+  `RUST_LOG` replaces the default outright. Every one of these has a test — they are all
+  easy to assume backwards, and two of them were: that a broader `RUST_LOG` prefix would
+  lift the mute, and that setting the baseline as a directive was the same thing.
 
 ### Graph Layout (`layout_graph()`)
 - **Pipes**: `Vec<Option<(Oid, color_index)>>` — fixed column slots, `None` = empty
