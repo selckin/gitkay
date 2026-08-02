@@ -23,8 +23,11 @@ jobs:
 
       - name: Install system dependencies
         run: |
+          # libgit2-sys compiles the bundled libgit2 with cc (not cmake) and
+          # probes with pkg-config; nothing in the tree links GTK, graphene or
+          # OpenSSL (git2 is built with default-features = []).
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libgraphene-1.0-dev libssl-dev pkg-config cmake
+          sudo apt-get install -y build-essential pkg-config
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -44,11 +47,23 @@ jobs:
       - name: Format
         run: cargo fmt --check
 
+      # --locked here, not just in release.yml: without it a hand-edited
+      # Cargo.toml version lets CI rewrite Cargo.lock in the runner and merge
+      # green, and the mismatch only surfaces once a tag has been pushed.
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --locked
 
+      # The DEV profile, deliberately, though the build above is release. There is
+      # no [profile.release] in Cargo.toml, so release means debug-assertions =
+      # false and overflow-checks = false: run the suite there and every
+      # `debug_assert!` is compiled out — including the two that guard
+      # layout_graph's pipe invariants, the exact regression AGENTS.md says that
+      # suite exists to catch — and every integer overflow in tested code wraps
+      # silently instead of panicking. release.yml runs the same tests under
+      # --release on both targets at tag time, so the shipped configuration is
+      # still covered; this is the gate that has to hold the assertions.
       - name: Test
-        run: cargo test
+        run: cargo test --locked
 
       - name: Clippy
         run: cargo clippy -- -D warnings

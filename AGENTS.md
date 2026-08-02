@@ -12,7 +12,7 @@ unchanged symlink and silently drops the change. `docs/` is excluded via
 
 ```sh
 ./build.sh                        # pre-push gate: fmt (applied) + clippy --all-targets + debug build
-                                  # (stricter than CI: lints test code, --locked; fails if fmt reformatted anything)
+                                  # (stricter than CI: lints test code; fails if fmt reformatted anything)
 cargo build                       # debug; release: cargo build --release
 cargo test                        # all tests (main/diff/config/highlight/cli/diff_cache/diff_store/word_diff modules)
 cargo test test_pr_merge_pattern  # one test by name (substring match)
@@ -35,8 +35,10 @@ cp target/release/gitkay ~/.local/bin/   # install
 - Editor/IDE diagnostics can lag mid-edit and report phantom errors (walls of `dead_code`, a
   bogus `E0004`). Confirm with a forced recompile before acting:
   `touch src/*.rs && cargo clippy --all-targets -- -D warnings`.
-- System deps (Ubuntu/Debian): `libgtk-4-dev libgraphene-1.0-dev libssl-dev pkg-config cmake`
-  (openSUSE: `gtk4-devel libgraphene-devel openssl-devel`).
+- System deps: a C compiler and `pkg-config`, nothing more — Ubuntu/Debian
+  `build-essential pkg-config`, Fedora/openSUSE `gcc pkg-config`. **Not** GTK,
+  graphene, OpenSSL or cmake; see **Build dependencies** under CI & Release for
+  why that list (inherited from the original project) matches nothing in the tree.
 - Rust deps of note: `fontdb` (system-font name → file lookup), `dirs` (XDG paths),
   `serde` + `toml` (config).
 - CLI: `gitkay [-C <dir>] [--all] [--combined] [<rev>…] [-- <path>…]`,
@@ -59,12 +61,82 @@ cp target/release/gitkay ~/.local/bin/   # install
 
 - CI (`.github/workflows/ci.yml`): push/PR to master → release build, tests,
   then the clippy gate above.
+  **The tests run in the DEV profile, deliberately, though the build beside them
+  is release.** There is no `[profile.release]` in `Cargo.toml`, so release means
+  `debug-assertions = false` and `overflow-checks = false`: run the suite there
+  and every `debug_assert!` is compiled out — including the two guarding
+  `layout_graph`'s pipe invariants, which is exactly the regression that suite
+  exists to catch — and every integer overflow in tested code wraps silently
+  instead of panicking. CI ran `cargo test --release` for a while and had neither.
+  The shipped configuration is still covered: `release.yml` runs the same tests
+  under `--release` on both targets at tag time, as do `packaging/gitkay.spec`'s
+  `%check`, `PKGBUILD`'s `check()` and `debian/rules`. Those verify the artifact;
+  CI is the gate that has to hold the assertions. Note `./build.sh` runs no tests
+  at all, so CI is the only place either profile's suite runs automatically.
 - Release (`.github/workflows/release.yml`): pushing a `v*` tag builds
   x86_64 + aarch64 Linux tarballs, repacks the x86_64 binary into an RPM and a
   deb, and uploads all four to the GitHub release. The workflow embeds its own
   binary-repack RPM spec / deb control — deliberately distinct from the
   source-build `packaging/` files (`gitkay.spec`, `debian/`, `PKGBUILD`), but
-  keep the shared metadata (Summary, description, maintainer) in sync.
+  keep the shared metadata (Summary, description, URL, maintainer) in sync.
+  Neither repack gets its dependencies for free, and both used to declare
+  **none**, so the package installed onto a system missing the libraries and
+  failed at launch instead of at install. The deb computes `Depends` with
+  `dpkg-shlibdeps` off the actual ELF and **dies** rather than shipping an
+  empty one; the RPM leaves rpm's auto-requires on (no `AutoReq: no`), whose
+  SONAME requires resolve on any target distro. Both are only exercised by a
+  tag push.
+  **Reading the ELF is not enough, and that half was missing from all four
+  packaging files.** winit/glutin/wayland-sys **dlopen** everything
+  windowing-related, so the binary's `NEEDED` entries are just glibc and libgcc
+  — `dpkg-shlibdeps` and rpm's auto-requires both compute a dependency list
+  that omits Wayland, EGL and xkbcommon entirely, and the package installs
+  cleanly on a minimal desktop and aborts at launch on
+  `dlopen("libxkbcommon.so.0")`. That is the same failure the paragraph above
+  describes, arriving by a route neither generator can see, so the sonames the
+  binary actually names (`strings target/release/gitkay`) are stated by hand in
+  **all four**: the two repacks in `release.yml` and the source-build
+  `packaging/gitkay.spec` + `packaging/debian/control`. Wayland + EGL +
+  xkbcommon are `Depends`/`Requires`; the X11 set is the fallback backend and is
+  `Recommends`, so a Wayland-only system is not made to pull it in. The rpm side
+  states **sonames**, not package names — those differ per distro
+  (`libwayland-client` on Fedora, `libwayland-client0` on openSUSE) while every
+  rpm distro's auto-PROVIDES emits the soname — and hardcodes the `()(64bit)`
+  suffix, which is part of the provide's name on a 64-bit build and has no macro
+  that renders both widths correctly. Keep the four lists in step.
+- **Versioning: this fork numbers from 0.0.1, below the original project's 1.x
+  line.** The version lives in five places that must move together —
+  `Cargo.toml`, `Cargo.lock`, `packaging/gitkay.spec`, `packaging/PKGBUILD`,
+  `packaging/debian/changelog`. **Never edit them by hand:**
+  `./packaging/set-version.sh <version>` rewrites all five (and generates both
+  changelog entries from the commit subjects since the previous tag, so the two
+  formats cannot tell different stories). Then commit and tag. `Cargo.lock` is
+  in that list because it pins `gitkay`'s own version: bump `Cargo.toml` alone
+  and every `--locked` build fails, which is why "just `sed` it in CI" does not
+  work.
+  The release workflow derives the .rpm/.deb version from the **tag**, so the
+  committed sites drifting from it is silent — v0.0.1–v0.0.4 all shipped a
+  binary reporting `gitkay 1.2.0`. The `version` job is what makes it loud:
+  it runs `set-version.sh --check "${REF_NAME#v}"` and every other job needs
+  it, so a mismatched tag fails in seconds rather than producing a bad
+  release. One script owns both directions, so "where the version lives"
+  cannot be listed correctly in one place and wrongly in the other.
+  The drift is not only cosmetic — `CARGO_PKG_VERSION` is folded into
+  `StoreContext` (`diff_store.rs`) precisely so a release invalidates the
+  persistent diff store, and a version that never moves leaves that lever dead
+  while the diff builder's output changes underneath it.
+- **Build dependencies are a C compiler and `pkg-config`, nothing more.** Not
+  GTK, graphene, OpenSSL or cmake — those were inherited from the original
+  project and match nothing in the tree: no such crate exists in `Cargo.lock`,
+  `git2` is built with `default-features = []` (so no `openssl-sys`), and
+  `libgit2-sys` compiles the bundled libgit2 with `cc`, never cmake. libgit2
+  and zlib are compiled in unless `pkg-config` finds system copies. The MSRV is
+  **1.91** — edition 2024 needs 1.85, the let-chains in `diff.rs`/`apply.rs`/
+  `main.rs` need 1.88, and `diff_store.rs`'s const `Duration::from_hours` needs
+  1.91. Stating it in `Cargo.toml`'s `rust-version` is what makes it *checked*:
+  `clippy::incompatible_msrv` is what found the 1.91 item under a hand-guessed
+  1.88, so raise it there and let clippy confirm rather than reasoning it out.
+  Mirrored by the spec's `BuildRequires` and debian's `Build-Depends`.
 - Design specs for larger features live in `docs/superpowers/specs/`.
 
 ## Architecture

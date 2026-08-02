@@ -180,55 +180,66 @@ lists every selectable slug.
 
 ## Install
 
-### Gentoo
+### Prebuilt packages (easiest)
 
-Packaged in the [GURU](https://wiki.gentoo.org/wiki/Project:GURU) overlay.
-
-```sh
-# Enable the GURU repository (needs app-eselect/eselect-repository)
-sudo eselect repository enable guru
-sudo emaint sync -r guru
-
-sudo emerge --ask dev-vcs/gitkay
-```
-
-### From source (recommended)
+Every release ships x86_64 and aarch64 tarballs plus an x86_64 `.rpm` and
+`.deb` on the [releases page](https://github.com/selckin/gitkay/releases):
 
 ```sh
-git clone https://github.com/Marenz/gitkay
-cd gitkay
-cargo build --release
-sudo cp target/release/gitkay /usr/local/bin/
+# Tarball — just a binary, put it anywhere on your PATH
+tar xzf gitkay-v*-x86_64-unknown-linux-gnu.tar.gz
+install -Dm755 gitkay ~/.local/bin/gitkay
+
+# Or the distro package
+sudo rpm -i gitkay-*.x86_64.rpm
+sudo dpkg -i gitkay_*_amd64.deb
 ```
 
 ### Build dependencies
 
-**openSUSE Tumbleweed:**
+A Rust toolchain of **1.91 or newer**, a C compiler, and `pkg-config`. If your
+distro's `rustc` is older, use [rustup](https://rustup.rs). Nothing else is
+needed: libgit2 and zlib are compiled in unless `pkg-config` finds system
+copies to link against.
+
+| Distro | Command |
+|---|---|
+| Ubuntu / Debian | `sudo apt install build-essential pkg-config` |
+| Fedora | `sudo dnf install gcc pkg-config` |
+| openSUSE Tumbleweed | `sudo zypper install gcc pkg-config` |
+| Arch | `sudo pacman -S base-devel` |
+
+### From source
+
 ```sh
-sudo zypper install gtk4-devel libgraphene-devel openssl-devel
+git clone https://github.com/selckin/gitkay
+cd gitkay
+./install.sh                    # cargo install --path . --locked → ~/.cargo/bin
 ```
 
-**Ubuntu / Debian:**
+Or build and place the binary yourself:
+
 ```sh
-sudo apt install libgtk-4-dev libgraphene-1.0-dev libssl-dev pkg-config cmake
+cargo build --release
+sudo install -Dm755 target/release/gitkay /usr/local/bin/gitkay
 ```
 
-**Fedora:**
-```sh
-sudo dnf install gtk4-devel graphene-devel openssl-devel
-```
+### openSUSE / Fedora RPM
 
-### openSUSE RPM
-
-`rpmbuild` expects the source tarball in `~/rpmbuild/SOURCES`, so create it
-first (from the release tag matching `packaging/gitkay.spec`'s `Version:`):
+`rpmbuild` expects the source tarball in `~/rpmbuild/SOURCES`, named for the
+`Version:` in `packaging/gitkay.spec`:
 
 ```sh
+VERSION=$(sed -n 's/^Version: *//p' packaging/gitkay.spec)
 mkdir -p ~/rpmbuild/SOURCES
-git archive --format=tar.gz --prefix=gitkay-1.2.0/ -o ~/rpmbuild/SOURCES/gitkay-1.2.0.tar.gz v1.2.0
+git archive --format=tar.gz --prefix="gitkay-$VERSION/" \
+  -o ~/rpmbuild/SOURCES/"gitkay-$VERSION.tar.gz" HEAD
 rpmbuild -ba packaging/gitkay.spec
 sudo rpm -i ~/rpmbuild/RPMS/x86_64/gitkay-*.rpm
 ```
+
+Substitute a tag (`v$VERSION`) for `HEAD` to package a release rather than
+your working tree.
 
 ### Ubuntu / Debian .deb
 
@@ -240,6 +251,30 @@ ln -s packaging/debian debian
 dpkg-buildpackage -us -uc -b
 sudo dpkg -i ../gitkay_*.deb
 ```
+
+`dpkg-buildpackage` resolves `rustc (>= 1.91)` against dpkg's package database,
+not your `PATH`, so it cannot see a rustup toolchain and no current Debian or
+Ubuntu ships a new enough `rustc`. On a rustup toolchain, add `-d` to skip the
+build-dependency check:
+
+```sh
+dpkg-buildpackage -us -uc -b -d
+```
+
+### Arch
+
+Build from a scratch directory, **not** from the checkout — `makepkg` derives
+`$srcdir` from the working directory, so running it at the repo root unpacks
+the release tarball into gitkay's own `src/`, and `-c`/`-C` would delete it:
+
+```sh
+mkdir -p /tmp/gitkay-build
+cp packaging/PKGBUILD /tmp/gitkay-build/
+cd /tmp/gitkay-build && makepkg -si
+```
+
+Note this downloads and builds the tagged release named by `pkgver`, not your
+working tree.
 
 ## License
 
