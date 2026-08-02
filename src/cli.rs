@@ -2,7 +2,7 @@
 //! helpers around it (pathspec resolution, the window-title suffix, help/version
 //! text). Knows nothing of git or egui: `classify` takes `is_rev`/`is_path`
 //! predicates so it's testable without a repo.
-//! Grammar: `gitkay [-C <dir>] [--all] [--combined] [<rev>...] [-- <path>...]`.
+//! Grammar: `gitkay [-C <dir>] [--all] [--combined] [--first-parent] [<rev>...] [-- <path>...]`.
 
 /// The resolved command-line scope.
 #[derive(Default, Clone)]
@@ -13,6 +13,9 @@ pub struct Scope {
     pub reflog: bool,   // --reflog: show the ref's reflog instead of its history
     pub follow: bool,   // --follow: follow a single path across renames
     pub combined: bool, // --combined: open on the combined range row
+    /// `--first-parent`: the mainline only, hiding the commits merged in from
+    /// topic branches. Restricts the walk AND truncates each row's drawn parents.
+    pub first_parent: bool,
 }
 
 /// Flags + raw positional tokens, before rev/path classification.
@@ -20,13 +23,14 @@ pub struct Scope {
 pub struct RawArgs {
     pub repo_dir: Option<String>,
     pub all: bool,
-    pub reflog: bool,      // --reflog: show the reflog instead of history
-    pub follow: bool,      // --follow: follow a single path across renames
-    pub combined: bool,    // --combined: open on the combined range row
-    pub help: bool,        // -h / --help: print usage and exit
-    pub version: bool,     // -V / --version: print version and exit
-    pub pre: Vec<String>,  // positional tokens before `--`
-    pub post: Vec<String>, // positional tokens after `--` (always paths)
+    pub reflog: bool,       // --reflog: show the reflog instead of history
+    pub follow: bool,       // --follow: follow a single path across renames
+    pub combined: bool,     // --combined: open on the combined range row
+    pub first_parent: bool, // --first-parent: the mainline only
+    pub help: bool,         // -h / --help: print usage and exit
+    pub version: bool,      // -V / --version: print version and exit
+    pub pre: Vec<String>,   // positional tokens before `--`
+    pub post: Vec<String>,  // positional tokens after `--` (always paths)
 }
 
 /// The shape of a single `<rev>` token.
@@ -46,6 +50,7 @@ pub fn parse_flags(args: impl Iterator<Item = String>) -> Result<RawArgs, String
     let mut reflog = false;
     let mut follow = false;
     let mut combined = false;
+    let mut first_parent = false;
     let mut pre = Vec::new();
     let mut post = Vec::new();
     let mut after_dashdash = false;
@@ -76,6 +81,8 @@ pub fn parse_flags(args: impl Iterator<Item = String>) -> Result<RawArgs, String
             follow = true;
         } else if arg == "--combined" {
             combined = true;
+        } else if arg == "--first-parent" {
+            first_parent = true;
         } else if arg == "-C" {
             repo_dir = Some(iter.next().ok_or("-C requires a directory argument")?);
         } else if let Some(dir) = arg.strip_prefix("-C") {
@@ -92,6 +99,7 @@ pub fn parse_flags(args: impl Iterator<Item = String>) -> Result<RawArgs, String
         reflog,
         follow,
         combined,
+        first_parent,
         pre,
         post,
         ..Default::default()
@@ -154,6 +162,11 @@ pub fn classify(
 pub fn validate(scope: &Scope) -> Result<(), String> {
     if scope.follow && scope.reflog {
         return Err("--follow and --reflog cannot be combined".to_string());
+    }
+    if scope.first_parent && scope.reflog {
+        // Reflog mode has its own loader and never builds a revwalk, so the flag
+        // would be silently inert. Name it, like `combined_conflict` does.
+        return Err("--first-parent and --reflog cannot be combined".to_string());
     }
     if scope.follow && scope.paths.len() != 1 {
         return Err("--follow requires exactly one path".to_string());
@@ -333,6 +346,9 @@ pub fn scope_title_suffix(scope: &Scope) -> String {
     if scope.all {
         head.push("--all".to_string());
     }
+    if scope.first_parent {
+        head.push("--first-parent".to_string());
+    }
     head.extend(scope.revs.iter().cloned());
     let mut s = head.join(" ");
     if !scope.paths.is_empty() {
@@ -350,7 +366,7 @@ pub fn print_help() {
         r"gitkay — a git history viewer
 
 USAGE:
-    gitkay [-C <dir>] [--all] [--combined] [<rev>...] [-- <path>...]
+    gitkay [-C <dir>] [--all] [--combined] [--first-parent] [<rev>...] [-- <path>...]
     gitkay [-C <dir>] --reflog [<ref>]
     gitkay [-C <dir>] --follow [<rev>...] <path>
 
@@ -359,6 +375,8 @@ OPTIONS:
     --all           Show all refs (branches, remotes, tags), not just the current branch
     --combined      Open on the combined diff of a single <a>..<b> range
                     (the row is always present for a range; this selects it)
+    --first-parent  Follow only the first parent of each merge: show the mainline,
+                    hiding the commits merged in from topic branches
     --reflog        Show <ref>'s reflog (default HEAD) instead of its history
     --follow        Follow a single <path> across renames (exactly one path)
     -h, --help      Print this help and exit
@@ -730,6 +748,72 @@ mod tests {
             ..range_scope(&["a..b"])
         };
         assert_eq!(scope_title_suffix(&s), "combined a..b");
+    }
+
+    #[test]
+    fn parse_flags_first_parent() {
+        let r = parse_flags(v(&["--first-parent", "main"]).into_iter()).unwrap();
+        assert!(r.first_parent);
+        assert_eq!(r.pre, v(&["main"]));
+        assert!(!parse_flags(v(&["main"]).into_iter()).unwrap().first_parent);
+    }
+
+    #[test]
+    fn scope_title_suffix_marks_first_parent() {
+        let s = Scope {
+            all: true,
+            first_parent: true,
+            revs: v(&["main"]),
+            ..Default::default()
+        };
+        assert_eq!(scope_title_suffix(&s), "--all --first-parent main");
+    }
+
+    /// Reflog mode never calls `history_revwalk`, so the flag would be silently
+    /// inert. Name it rather than ignore it — the `combined_conflict` precedent.
+    #[test]
+    fn validate_rejects_first_parent_with_reflog() {
+        assert!(
+            validate(&Scope {
+                first_parent: true,
+                reflog: true,
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
+
+    /// Everything else composes: the walk simplification is orthogonal to the
+    /// range row, the path filter and rename tracing.
+    #[test]
+    fn validate_accepts_first_parent_with_everything_else() {
+        assert!(
+            validate(&Scope {
+                first_parent: true,
+                all: true,
+                ..Default::default()
+            })
+            .is_ok()
+        );
+        assert!(
+            validate(&Scope {
+                first_parent: true,
+                follow: true,
+                paths: v(&["f.rs"]),
+                ..Default::default()
+            })
+            .is_ok()
+        );
+        assert!(
+            validate(&Scope {
+                first_parent: true,
+                combined: true,
+                revs: v(&["a..b"]),
+                paths: v(&["src"]),
+                ..Default::default()
+            })
+            .is_ok()
+        );
     }
 
     #[test]

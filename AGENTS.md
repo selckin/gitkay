@@ -41,7 +41,7 @@ cp target/release/gitkay ~/.local/bin/   # install
   why that list (inherited from the original project) matches nothing in the tree.
 - Rust deps of note: `fontdb` (system-font name → file lookup), `dirs` (XDG paths),
   `serde` + `toml` (config).
-- CLI: `gitkay [-C <dir>] [--all] [--combined] [<rev>…] [-- <path>…]`,
+- CLI: `gitkay [-C <dir>] [--all] [--combined] [--first-parent] [<rev>…] [-- <path>…]`,
   `gitkay --reflog [<ref>]`, `gitkay --follow [<rev>…] <path>` (`--follow` needs exactly
   one path). The rev-vs-path classification of positional tokens lives in `cli.rs`, as do
   `range_tokens`/`combined_range` — the single answer to "is this scope a lone `A..B`?",
@@ -56,6 +56,20 @@ cp target/release/gitkay ~/.local/bin/   # install
   `all`/`reflog`/`follow`/`combined` plus the revs, and four bool params would trip
   `clippy::fn_params_excessive_bools`; `main()` therefore builds the `Scope` *before*
   validating it.
+  `--first-parent` restricts the walk (`Revwalk::simplify_first_parent`, set in
+  `history_revwalk` so both walks get it) **and** truncates each row's drawn parents to
+  the first (`commit_parents`, applied at the three sites that read parents off git2).
+  Both halves are needed: an out-of-scope parent draws a continuation stub, so the walk
+  alone would give every merge a dangling lane. Truncating where the parents are READ,
+  rather than over the finished list, is load-bearing — the path filter resolves
+  `nearest` from the lists it collects mid-walk, and `provisional_commits` pushes them
+  onto its heap, so a later truncation would rewrite through parents the walk never
+  yielded and traverse the whole DAG respectively. Matches
+  `git log --graph --first-parent`, which draws one lane and no diagonals; note that
+  `git rev-list --parents --first-parent` still *prints* both parents — the graph is
+  what is being matched, not the plumbing. It composes with `--all`, a path filter,
+  `--follow` and `--combined`; `validate` rejects it alongside `--reflog`, which has its
+  own loader and never builds a revwalk, so the flag would be silently inert there.
 
 ## CI & Release
 
@@ -394,6 +408,20 @@ parts run off the window-creation critical path:
   real work in that sentence. Deliberately NOT marked
   in the UI: on every repo measured the first 200 rows are identical to the real
   ones, so a badge would advertise a difference that is not there.
+  **`--first-parent` does not disqualify the scope, and changes the guarantee.**
+  Pushing only the first parent leaves the heap holding at most one element, so the
+  walk degenerates to following `parent(0)` down a chain — and a chain has exactly one
+  topological order, so it is **exact**, measured identical to the real walk at
+  200/700/5000 rows on git.git, elasticsearch and xmp. git.git is the point: that is
+  where the unrestricted walk diverges. It is still needed, because
+  `simplify_first_parent` is only 2.4–4× faster and stays past the deadline (git.git
+  2.23s → 552ms, elasticsearch 1.69s → 706ms; xmp is near-linear already at
+  208ms → 198ms, which is the shape of most repos and why the flag is aimed at the
+  other kind). The exactness is deliberately NOT used to unblock the scroll extension:
+  ~335ms on git.git against conditioning `history_is_provisional` on a flag.
+  `note_slow_history_walk`'s "the displayed commits may have changed" is correspondingly
+  left hedged rather than made scope-dependent — under this flag they provably did not
+  change, and a second variant is the sprawl that line was already cut back from once.
   A walk over `SLOW_HISTORY_WALK` (500ms) explains itself at **`warn`**, once per
   process (`note_slow_history_walk`; the threshold and latch are the pure
   `should_note_slow_walk`, so both are testable without capturing output). `warn`

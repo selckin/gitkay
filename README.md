@@ -105,6 +105,7 @@
 gitkay                          # the current branch, in the repo you're standing in
 gitkay -C /path/to/repo         # a repo elsewhere
 gitkay --all                    # every ref: branches, remotes, tags
+gitkay --first-parent           # the mainline only: one row per merge
 gitkay main                     # one revision's history
 gitkay v1.0..main               # a range (adds a row for the range as a whole)
 gitkay --combined v1.0..main    # ...and open on that combined row
@@ -120,6 +121,7 @@ gitkay --reflog origin/main     # some other ref's reflog
 |---|---|
 | `-C <dir>` | Run as if started in `<dir>` |
 | `--all` | Show all refs (branches, remotes, tags), not just the current branch |
+| `--first-parent` | Follow only the first parent of each merge — show the mainline, hiding commits merged in from topic branches. The graph collapses to a single lane |
 | `--combined` | Open on the combined diff of a single `<a>..<b>` range. The row is always present for a range; this selects it |
 | `--reflog [<ref>]` | Show `<ref>`'s reflog (default `HEAD`) instead of its history |
 | `--follow <path>` | Follow exactly one path across renames |

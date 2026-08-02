@@ -1471,7 +1471,34 @@ fn history_revwalk<'r>(repo: &'r Repository, scope: &cli::Scope) -> Option<git2:
             push_rev_token(&mut revwalk, repo, tok);
         }
     }
+    if scope.first_parent {
+        // After the pushes — the order this was measured in. Simplification is not
+        // free on a merge-heavy repo, just much cheaper: git.git 2.23s → 552ms,
+        // elasticsearch 1.69s → 706ms, both still past PROVISIONAL_HISTORY_DELAY.
+        if let Err(e) = revwalk.simplify_first_parent() {
+            log::warn!("gitkay: cannot restrict the walk to first parents: {e}");
+        }
+    }
     Some(revwalk)
+}
+
+/// The parents to record for a row: all of them, or the first alone under
+/// `--first-parent`.
+///
+/// Truncating HERE, where the parents are read off git2, rather than over the
+/// finished list, is load-bearing at two of the three call sites. The path filter
+/// resolves `nearest` from the parent lists it collects while walking, so a later
+/// truncation would leave it rewriting through second parents this walk never
+/// yielded; and `provisional_commits` pushes these oids onto its heap, so a later
+/// truncation would leave it traversing the whole DAG rather than the mainline —
+/// the wrong SET of commits, not merely the wrong edges.
+fn commit_parents(commit: &git2::Commit, first_parent: bool) -> Vec<git2::Oid> {
+    let ids = commit.parent_ids();
+    if first_parent {
+        ids.take(1).collect()
+    } else {
+        ids.collect()
+    }
 }
 
 /// Build one real commit's `CommitInfo`. Lossy conversions: legacy repos carry
@@ -1512,6 +1539,7 @@ fn build_commits_from_walk(
     seen: &mut HashSet<git2::Oid>,
     ref_map: &std::collections::HashMap<git2::Oid, Vec<(String, RefKind)>>,
     max: usize,
+    first_parent: bool,
 ) -> Vec<CommitInfo> {
     let mut commits = Vec::new();
     for oid in walk {
@@ -1522,7 +1550,7 @@ fn build_commits_from_walk(
             commits.push(build_commit_info(
                 oid,
                 &commit,
-                commit.parent_ids().collect(),
+                commit_parents(&commit, first_parent),
                 ref_map,
             ));
             if commits.len() >= max {
@@ -1705,7 +1733,14 @@ fn load_commits_inner(
             }
             // `all` is already deduped, so this pass needs its own (empty) seen set.
             let mut built = HashSet::new();
-            real = build_commits_from_walk(repo, all.iter().copied(), &mut built, &ref_map, max);
+            real = build_commits_from_walk(
+                repo,
+                all.iter().copied(),
+                &mut built,
+                &ref_map,
+                max,
+                scope.first_parent,
+            );
             walk_oids = Some(all);
         } else {
             // Path filter: drop commits that don't touch the pathspec, then rewrite each
@@ -1728,7 +1763,7 @@ fn load_commits_inner(
                 let Ok(commit) = repo.find_commit(oid) else {
                     continue;
                 };
-                let parents: Vec<git2::Oid> = commit.parent_ids().collect();
+                let parents: Vec<git2::Oid> = commit_parents(&commit, scope.first_parent);
                 walked.push((oid, parents.clone()));
                 let touched = follow_path.as_ref().map_or_else(
                     || commit_touches_paths(repo, &commit, &scope.paths),
@@ -1951,7 +1986,8 @@ fn load_commits_tail(
         return None;
     }
     let ref_map = build_ref_map(repo);
-    let commits = build_commits_from_walk(repo, iter, &mut seen, &ref_map, max_new);
+    let commits =
+        build_commits_from_walk(repo, iter, &mut seen, &ref_map, max_new, scope.first_parent);
     log::debug!(
         "perf: load_commits_tail: +{} commits (skipped {skip}) {:?}",
         commits.len(),
@@ -2061,7 +2097,16 @@ const fn provisional_scope(scope: &cli::Scope) -> bool {
 ///
 /// What it does NOT diverge on is topology, because `topo_window` settles that
 /// over the rows actually emitted. The heap alone cannot: see there.
-fn provisional_commits(repo: &Repository, max: usize) -> Vec<CommitInfo> {
+///
+/// **Under `--first-parent` it is exact.** Pushing one parent leaves the heap
+/// holding at most one element, so the walk degenerates to following `parent(0)`
+/// down a linear chain — and a chain has exactly one topological order. Measured
+/// identical to the real walk at 200/700/5000 rows on git.git, elasticsearch and
+/// xmp, git.git being precisely where the unrestricted walk diverges. That
+/// exactness is deliberately NOT exploited to unblock the scroll extension: it
+/// buys ~335ms on git.git and would cost conditioning `history_is_provisional`
+/// on a flag.
+fn provisional_commits(repo: &Repository, max: usize, first_parent: bool) -> Vec<CommitInfo> {
     let ref_map = build_ref_map(repo);
     let Ok(head) = repo.head().and_then(|h| h.peel_to_commit()) else {
         return Vec::new();
@@ -2082,7 +2127,7 @@ fn provisional_commits(repo: &Repository, max: usize) -> Vec<CommitInfo> {
         let Ok(commit) = repo.find_commit(oid) else {
             continue;
         };
-        let parents: Vec<git2::Oid> = commit.parent_ids().collect();
+        let parents: Vec<git2::Oid> = commit_parents(&commit, first_parent);
         for p in &parents {
             if seen.insert(*p)
                 && let Ok(pc) = repo.find_commit(*p)
@@ -5088,8 +5133,14 @@ fn history_job(repo: &Repository, job: HistoryJob) {
             let t = std::time::Instant::now();
             let ref_map = build_ref_map(repo);
             let mut seen = HashSet::new();
-            let new =
-                build_commits_from_walk(repo, oids.iter().copied(), &mut seen, &ref_map, max_new);
+            let new = build_commits_from_walk(
+                repo,
+                oids.iter().copied(),
+                &mut seen,
+                &ref_map,
+                max_new,
+                scope.first_parent,
+            );
             log::debug!(
                 "history-load: hydrated {} rows from the cached walk in {:?}",
                 new.len(),
@@ -10386,6 +10437,7 @@ fn main() -> eframe::Result {
         reflog: raw.reflog,
         follow: raw.follow,
         combined: raw.combined,
+        first_parent: raw.first_parent,
     };
     // Reject flag/positional misuse (--follow needs exactly one path, etc.).
     if let Err(e) = cli::validate(&scope) {
@@ -10470,13 +10522,14 @@ fn main() -> eframe::Result {
     let (quick_tx, quick_rx) = mpsc::channel();
     let provisional_rx = if provisional_scope(&scope) {
         let repo_path = repo_path.clone();
+        let first_parent = scope.first_parent;
         if spawn_guarded(
             "gitkay-history-quick",
             "provisional history thread panicked",
             move || {
                 if let Ok(repo) = Repository::discover(&repo_path) {
                     let t = std::time::Instant::now();
-                    let commits = provisional_commits(&repo, INITIAL_COMMITS);
+                    let commits = provisional_commits(&repo, INITIAL_COMMITS, first_parent);
                     log::debug!(
                         "perf: startup: provisional history ({} rows, off-thread) {:?}",
                         commits.len(),
@@ -10627,7 +10680,7 @@ mod tests {
         }
         expected.reverse(); // newest first, as both walks emit
 
-        let got: Vec<git2::Oid> = provisional_commits(&repo, 100)
+        let got: Vec<git2::Oid> = provisional_commits(&repo, 100, false)
             .iter()
             .map(|c| c.oid)
             .collect();
@@ -10640,42 +10693,13 @@ mod tests {
     #[test]
     fn the_provisional_walk_covers_both_sides_of_a_merge() {
         let (_d, repo) = temp_repo();
-        let root = commit_file(&repo, "f.txt", "0", "root");
-        // Read the initial branch back rather than naming it: `Repository::init`
-        // honours the developer's own `init.defaultBranch`, so a hardcoded
-        // "refs/heads/master" on a machine defaulting to `main` leaves HEAD
-        // attached-unborn and the checkout below panics on GIT_EUNBORNBRANCH.
-        let mainline = repo.head().unwrap().name().unwrap().to_string();
-        repo.branch("side", &repo.find_commit(root).unwrap(), false)
-            .unwrap();
-        let main_c = commit_file(&repo, "f.txt", "main", "on-main");
-        repo.set_head("refs/heads/side").unwrap();
-        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
-            .unwrap();
-        let side_c = commit_file(&repo, "g.txt", "side", "on-side");
-        // merge side into main
-        repo.set_head(&mainline).unwrap();
-        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
-            .unwrap();
-        let sig = repo.signature().unwrap();
-        let tree = repo
-            .find_tree(repo.index().unwrap().write_tree().unwrap())
-            .unwrap();
-        let merge = repo
-            .commit(
-                Some("HEAD"),
-                &sig,
-                &sig,
-                "merge",
-                &tree,
-                &[
-                    &repo.find_commit(main_c).unwrap(),
-                    &repo.find_commit(side_c).unwrap(),
-                ],
-            )
-            .unwrap();
+        // Through the shared fixture, which reads the initial branch back off HEAD.
+        // Naming it is a bug: `Repository::init` honours the developer's own
+        // `init.defaultBranch`, so `set_head("refs/heads/master")` on a machine
+        // defaulting to `main` leaves HEAD attached-unborn and the checkout panics.
+        let (root, main_c, side_c, merge) = merged_history(&repo);
 
-        let rows = provisional_commits(&repo, 100);
+        let rows = provisional_commits(&repo, 100, false);
         let oids: Vec<git2::Oid> = rows.iter().map(|c| c.oid).collect();
         for want in [merge, main_c, side_c, root] {
             assert!(oids.contains(&want), "missing {want} from {oids:?}");
@@ -10784,7 +10808,7 @@ mod tests {
             .unwrap();
         repo.set_head("refs/heads/topo").unwrap();
 
-        let rows = provisional_commits(&repo, 100);
+        let rows = provisional_commits(&repo, 100, false);
         let oids: Vec<git2::Oid> = rows.iter().map(|c| c.oid).collect();
         assert_eq!(oids.len(), 4, "the whole history is in the window");
         let pos: std::collections::HashMap<git2::Oid, usize> =
@@ -14564,6 +14588,144 @@ mod tests {
 
         let got = load_commits(&repo, 100, &cli::Scope::default());
         assert!(got.iter().all(|c| c.oid != diff::oid_range()));
+    }
+
+    /// A mainline with a merged side branch:
+    ///
+    /// ```text
+    ///   merge      <- adds g.txt to the mainline
+    ///   |\
+    ///   | side_c   <- adds g.txt on the side branch
+    ///   main_c |
+    ///   |/
+    ///   root
+    /// ```
+    ///
+    /// The branch name is read back rather than hardcoded: `Repository::init`
+    /// honours the developer's `init.defaultBranch`, so "master" is not a given.
+    fn merged_history(repo: &git2::Repository) -> (git2::Oid, git2::Oid, git2::Oid, git2::Oid) {
+        use crate::test_repo::{commit_file, commit_merge, stage, write_file};
+        let root = commit_file(repo, "f.txt", "0", "root");
+        let mainline = repo.head().unwrap().name().unwrap().to_string();
+        repo.branch("side", &repo.find_commit(root).unwrap(), false)
+            .unwrap();
+        let main_c = commit_file(repo, "f.txt", "main", "on-main");
+
+        repo.set_head("refs/heads/side").unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        let side_c = commit_file(repo, "g.txt", "side", "on-side");
+
+        repo.set_head(&mainline).unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        // The force-checkout dropped g.txt; put the side's contribution back so the
+        // merge commit really carries it. Without this the merge tree equals
+        // main_c's and the path-filter test below has nothing to find.
+        write_file(repo, "g.txt", "side");
+        stage(repo, "g.txt");
+        let merge = commit_merge(repo, main_c, side_c, "merge");
+        (root, main_c, side_c, merge)
+    }
+
+    fn first_parent_scope() -> cli::Scope {
+        cli::Scope {
+            first_parent: true,
+            ..Default::default()
+        }
+    }
+
+    /// An out-of-scope parent draws a continuation stub, so a merge that kept both
+    /// parents would sprout a dangling lane under --first-parent — the opposite of
+    /// what the flag was asked for. git draws a single lane here.
+    #[test]
+    fn first_parent_truncates_a_merges_parents() {
+        use crate::test_repo::temp_repo;
+        let (_d, repo) = temp_repo();
+        let (_root, main_c, side_c, merge) = merged_history(&repo);
+
+        let full = load_commits(&repo, 100, &cli::Scope::default());
+        let m = full.iter().find(|c| c.oid == merge).unwrap();
+        assert_eq!(m.parents, vec![main_c, side_c], "both, without the flag");
+
+        let fp = load_commits(&repo, 100, &first_parent_scope());
+        let m = fp.iter().find(|c| c.oid == merge).unwrap();
+        assert_eq!(m.parents, vec![main_c], "the mainline parent alone");
+    }
+
+    #[test]
+    fn first_parent_hides_the_merged_side_branch() {
+        use crate::test_repo::temp_repo;
+        let (_d, repo) = temp_repo();
+        let (root, main_c, side_c, merge) = merged_history(&repo);
+
+        let fp: Vec<git2::Oid> = load_commits(&repo, 100, &first_parent_scope())
+            .iter()
+            .filter(|c| is_real_commit(c.oid))
+            .map(|c| c.oid)
+            .collect();
+        assert!(!fp.contains(&side_c), "off the mainline");
+        for want in [root, main_c, merge] {
+            assert!(fp.contains(&want), "missing {want} from {fp:?}");
+        }
+
+        assert!(
+            load_commits(&repo, 100, &cli::Scope::default())
+                .iter()
+                .any(|c| c.oid == side_c),
+            "present without the flag"
+        );
+    }
+
+    /// The reason `--first-parent -- <path>` is useful at all: a merge that brought
+    /// the change onto the mainline is kept, because `commit_touches_paths` diffs
+    /// against the FIRST parent. The side commit that originally made it is not.
+    #[test]
+    fn first_parent_path_filter_keeps_the_merge_that_brought_the_change_in() {
+        use crate::test_repo::temp_repo;
+        let (_d, repo) = temp_repo();
+        let (_root, _main_c, side_c, merge) = merged_history(&repo);
+
+        let sc = cli::Scope {
+            paths: vec!["g.txt".to_string()],
+            ..first_parent_scope()
+        };
+        let got: Vec<git2::Oid> = load_commits(&repo, 100, &sc)
+            .iter()
+            .filter(|c| is_real_commit(c.oid))
+            .map(|c| c.oid)
+            .collect();
+        assert!(
+            got.contains(&merge),
+            "the merge introduced g.txt on the mainline"
+        );
+        assert!(
+            !got.contains(&side_c),
+            "the side commit is off the mainline"
+        );
+    }
+
+    /// Normally this walk is an approximation — on git.git it emits a parent
+    /// before its child from ~row 253. Under --first-parent it is EXACT: one
+    /// parent pushed means the heap holds at most one element, so it degenerates
+    /// to following parent(0) down a chain, and a chain has one topological order.
+    #[test]
+    fn the_provisional_walk_is_exact_under_first_parent() {
+        use crate::test_repo::temp_repo;
+        let (_d, repo) = temp_repo();
+        merged_history(&repo);
+
+        let real: Vec<git2::Oid> = load_commits(&repo, 100, &first_parent_scope())
+            .iter()
+            .filter(|c| is_real_commit(c.oid))
+            .map(|c| c.oid)
+            .collect();
+        let provisional: Vec<git2::Oid> = provisional_commits(&repo, 100, true)
+            .iter()
+            .map(|c| c.oid)
+            .collect();
+
+        assert_eq!(provisional, real);
     }
 
     /// `--combined` selects the row; without it the launch selection is unchanged.
