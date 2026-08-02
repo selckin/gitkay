@@ -23,4 +23,4 @@ Recommends: libx11-6, libx11-xcb1, libxcb1, libxcursor1, libxi6,
 Description: Fast, native Wayland git history viewer
  gitkay is a gitk replacement built with Rust + egui. Features a commit
  graph with colored branch lanes, syntax-highlighted diffs, file list
- sidebar, search, and Catppuccin Mocha dark theme. Starts in under 200ms.
+ sidebar, search, and Catppuccin Mocha dark theme.

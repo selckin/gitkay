@@ -188,7 +188,9 @@ The big picture, ahead of the detail sections below:
   tracking with a load-bearing "first parent always continues straight"
   invariant. Its test suite uses fake OIDs (`oid(n)`), so no real repo is
   needed; change it only with those tests green.
-- **Startup is latency-critical** (gitkay advertises sub-200ms): heavy/IO-bound
+- **Startup is latency-critical** (the window should be up before anything
+  expensive finishes; the old "sub-200ms" figure is no longer claimed anywhere
+  user-facing, but the budget it implied still governs this code): heavy/IO-bound
   work is prefetched on threads or deferred — never run inline in
   `GitkApp::new`. See **Startup & timing**.
 - **Immediate mode means explicit virtualization:** the commit list and diff
@@ -1023,8 +1025,16 @@ parts run off the window-creation critical path:
   the cell).
   `[commit_list] file_count` / `line_count` choose the cells
   (either enables the column, `stats_cell_count` turns them into reserved width);
-  `line_count = false` is markedly cheaper, since the file count comes from the
-  tree walk while line counts need every changed blob diffed (`StatsWant`).
+  `line_count = false` is **modestly** cheaper, not markedly — roughly 20-45% of
+  the column's cost (`StatsWant`). Measured warm, per commit: 15.4ms vs 19.7ms on
+  a 67k-commit repo, 7.7ms vs 14.1ms on a 13k-commit one. Both variants build the
+  same diff and only `diff.stats()` is skipped, so the file count does NOT "come
+  from the tree walk" — an earlier version of this file, the config template and
+  the README all said it did, and the measurement says otherwise. What it does cap
+  is the tail: the worst commit in that sample took 66ms with line counts against
+  24ms without. Rename detection, measured at the same time, is nearly free for
+  this column (+0.3ms and +1.3ms respectively), so it is not the lever it looks
+  like either.
   "Already computed" is therefore relative to the `StatsWant` being asked for,
   and `stats_targets` is where that lives: it skips a cached entry only when that
   entry *satisfies* the want (`CommitStats::lines` is `None` exactly when only

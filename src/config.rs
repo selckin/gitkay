@@ -199,9 +199,13 @@ pub enum DateStyle {
 pub struct CommitListSection {
     /// Number of files the commit touched ("5f").
     pub(crate) file_count: bool,
-    /// Lines added and removed ("+42  -7"). Turning this off is a real cost
-    /// saving, not just a shorter column: the file count comes out of the tree
-    /// walk, while line counts require diffing every changed blob.
+    /// Lines added and removed ("+42  -7"). Turning this off saves roughly
+    /// 20-45% of the column's cost — NOT the bulk of it. Measured warm, per
+    /// commit: 15.4ms vs 19.7ms on a 67k-commit repo, 7.7ms vs 14.1ms on a
+    /// 13k-commit one. Both variants build the same diff; only `diff.stats()`
+    /// (which loads blob content) is skipped, so this shortens the work rather
+    /// than removing it. It does cap the tail — the worst commit in that sample
+    /// was 66ms with line counts and 24ms without.
     pub(crate) line_count: bool,
     /// Width of the author column, in characters; longer names are elided.
     /// Clamped as it parses, so there is no unclamped form for a reader to
@@ -470,9 +474,9 @@ fn default_template() -> String {
          # The column appears when either is enabled.\n\
          # Number of files the commit touched (\"5f\"):\n\
          # file_count = true\n\
-         # Lines added and removed (\"+42  -7\"). Turning this off is markedly\n\
-         # cheaper: file counts come from the tree walk, line counts require\n\
-         # diffing every changed blob.\n\
+         # Lines added and removed (\"+42  -7\"). Turning this off saves roughly\n\
+         # a fifth to a half of the column's cost — both counts need the same\n\
+         # diff built; only the blob-content pass is skipped.\n\
          # line_count = true\n\
          # Width of the author column, in characters. Fixed rather than\n\
          # per-row, so the sha and the counts line up down the list; longer\n\
