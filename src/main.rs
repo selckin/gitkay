@@ -8359,9 +8359,28 @@ impl GitkApp {
         if resp.clicked() { line_idx } else { None }
     }
 
+    /// The screen x of lane column `col`'s centre, saturated into the `cols` the
+    /// layout reserved room for — see `draw_graph_cell`, whose every coordinate
+    /// comes from here.
+    fn graph_col_x(left_x: f32, col: usize, cols: usize) -> f32 {
+        let last = cols.saturating_sub(1);
+        left_x + col.min(last) as f32 * GRAPH_COL_W + GRAPH_COL_W / 2.0
+    }
+
     /// Draw one commit's graph cell: its lane lines (edges to/from the rows above
     /// and below, split around the dot) and the commit dot itself. `left_x` is the
     /// graph area's left edge; the row spans `y_center ± row_height / 2`.
+    ///
+    /// `cols` is how many columns the layout reserved room for, and every x is
+    /// **saturated** into it. A row's `node_col` is not bounded by that reservation
+    /// — an integration repo keeping dozens of topic branches open (git.git does)
+    /// puts nodes in column 21+ — so without the clamp such a row draws its dot and
+    /// every line touching it outside the reserved width, where the caller's clip
+    /// erases them: a completely blank graph cell, with no dot and no lane, for a
+    /// commit that is on the graph. Saturating instead collapses the overflowing
+    /// lanes onto the last column, which reads as a gutter of "more lanes than fit"
+    /// and always keeps the node visible. Only the x mapping saturates — every
+    /// topology decision below still compares the true columns.
     fn draw_graph_cell(
         &self,
         painter: &egui::Painter,
@@ -8369,11 +8388,12 @@ impl GitkApp {
         left_x: f32,
         y_center: f32,
         row_height: f32,
+        cols: usize,
     ) {
         let gr = &self.graph_rows[idx];
         let y_top = y_center - row_height / 2.0;
         let y_bottom = y_center + row_height / 2.0;
-        let gx = |col: usize| -> f32 { left_x + col as f32 * GRAPH_COL_W + GRAPH_COL_W / 2.0 };
+        let gx = |col: usize| -> f32 { Self::graph_col_x(left_x, col, cols) };
 
         // Whether this node has an incoming line from the row above is
         // loop-invariant — compute it once per row, not once per graph line.
@@ -8736,10 +8756,14 @@ impl GitkApp {
                 // Reflog rows are parentless, so the graph is just a column of
                 // disconnected dots — drop it and reclaim the width for the text.
                 let reflog_mode = self.scope.reflog;
+                // One number decides both the reserved width and where a lane may
+                // be drawn — see `draw_graph_cell`, which saturates into it. Split
+                // them and a row past the cap loses its dot.
+                let graph_cols = self.graph_max_cols.min(max_graph_cols);
                 let graph_width = if reflog_mode {
                     4.0
                 } else {
-                    (self.graph_max_cols.min(max_graph_cols) as f32) * GRAPH_COL_W + 8.0
+                    (graph_cols as f32) * GRAPH_COL_W + 8.0
                 };
 
                 let graph_scroll_to = self.graph_scroll_to.take();
@@ -8853,8 +8877,29 @@ impl GitkApp {
                             }
 
                             if !reflog_mode {
+                                // Clip the RIGHT EDGE only, to the width the
+                                // layout reserved, so no stroke width or dot
+                                // radius can bleed over the commit text.
+                                // `draw_graph_cell` saturates its columns into the
+                                // same `graph_cols`, so this clips nothing the
+                                // reader needs — it used to be the only guard, and
+                                // erased the dot of every row whose lane exceeded
+                                // the cap. Tightening the existing clip rather than
+                                // building a new one keeps the vertical extent
+                                // exactly as it was: a rect of one row's height
+                                // would clip the line ends at the row boundary
+                                // and leave a seam between rows, and one built
+                                // from `top_left` — the whole list's origin, not
+                                // this row's — blanks every row but the first.
+                                let mut graph_clip = painter.clip_rect();
+                                graph_clip.max.x = graph_clip.max.x.min(top_left.x + graph_width);
                                 self.draw_graph_cell(
-                                    &painter, idx, top_left.x, y_center, row_height,
+                                    &painter.with_clip_rect(graph_clip),
+                                    idx,
+                                    top_left.x,
+                                    y_center,
+                                    row_height,
+                                    graph_cols,
                                 );
                             }
 
@@ -10645,6 +10690,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A row's `node_col` is not bounded by the width the layout reserved, so the
+    /// lane mapping must saturate into it: without that, the caller's right-edge
+    /// clip erases the dot and every line touching it, leaving a blank cell for a
+    /// commit that is on the graph. The reserved width has to contain the result,
+    /// or the clip erases it just the same.
+    #[test]
+    fn a_lane_past_the_reserved_width_is_drawn_at_its_edge_not_off_it() {
+        let cols = 20;
+        let width = cols as f32 * GRAPH_COL_W + 8.0;
+        let edge = GitkApp::graph_col_x(0.0, cols - 1, cols);
+
+        // Within the reservation: exact, one column apart.
+        assert!((GitkApp::graph_col_x(0.0, 0, cols) - GRAPH_COL_W / 2.0).abs() < f32::EPSILON);
+        assert!(
+            (GitkApp::graph_col_x(0.0, 3, cols) - GitkApp::graph_col_x(0.0, 2, cols) - GRAPH_COL_W)
+                .abs()
+                < f32::EPSILON
+        );
+        // Past it: collapsed onto the last column, and still inside the width.
+        for col in [cols, cols + 5, 1000] {
+            let x = GitkApp::graph_col_x(0.0, col, cols);
+            assert!((x - edge).abs() < f32::EPSILON, "column {col} drew at {x}");
+            assert!(
+                x < width,
+                "column {col} drew at {x}, past the reserved {width}"
+            );
+        }
+        // A degenerate reservation must still land somewhere drawable.
+        assert!(GitkApp::graph_col_x(0.0, 7, 0) >= 0.0);
     }
 
     /// `topo_window` orders ready rows by the key the WALK popped them at, never by

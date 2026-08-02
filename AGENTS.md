@@ -1459,7 +1459,21 @@ parts run off the window-creation critical path:
   rename whose old path falls outside an active pathspec is undetectable
   (`apply_pathspec` filters before `detect_similar`). The `--follow` tracer
   (`rename_source`) walks parent trees directly and is unaffected by both.
-- **Graph rendering**: each edge `(from, to, color)` = one line segment. Lines touching node split around dot. No incoming line for first commits (no parent above)
+- **Graph rendering**: lane columns are **saturated into the width the layout
+  reserved** (`graph_cols` = `graph_max_cols.min(max_graph_cols)`, cap 20), in
+  `GitkApp::graph_col_x` — the single source of every x in `draw_graph_cell`, so a
+  new coordinate cannot escape it. The cap bounds the reserved width and NOT the
+  lanes a row has: an integration repo keeping dozens of topic branches open at once
+  (git.git does) puts nodes in column 21+, so clipping alone — which is what this
+  was at first — erased the dot and every line touching it, leaving a completely
+  blank cell for a commit that is on the graph. Saturating collapses the overflowing
+  lanes onto the last column, reading as a gutter of "more lanes than fit", and
+  always keeps the node visible. Only the x mapping saturates; every topology
+  decision still compares the true columns. The right-edge clip stays as a second
+  line, so no stroke width or dot radius bleeds over the commit text.
+  `a_lane_past_the_reserved_width_is_drawn_at_its_edge_not_off_it` pins both halves.
+  Each edge
+  `(from, to, color)` = one line segment. Lines touching node split around dot. No incoming line for first commits (no parent above)
 - **Text**: summary clipped via `with_clip_rect`. Authors colored by hash. Refs colored by name hash (12-color extended palette)
 - **Clipboard**: SHA copied to both clipboard + primary selection on click
 
