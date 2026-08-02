@@ -2827,6 +2827,25 @@ fn file_order(ranges: &[(usize, usize, usize)], first_file: usize) -> Vec<(usize
     ranges[at..].iter().chain(&ranges[..at]).copied().collect()
 }
 
+/// The file ranges the highlighter will tokenize: `file_line_ranges` minus the
+/// binary files, whose body is git's "Binary files … differ" marker — no source
+/// to tokenize, and asking for a grammar would report `.png`/`.jar` as a config
+/// gap the reader could never usefully close.
+///
+/// **Every** highlight-side consumer derives from this rather than from
+/// `file_line_ranges`, and that is what keeps the skip sound. The marker is a
+/// `LineKind::Context` row, so `is_code()` is true for it, and the file has a
+/// patch body so it IS in `file_line_ranges` — skip it only in the pass that
+/// writes spans and `diff_fully_highlighted` answers false forever, which pins
+/// `band_warmable` shut and turns off the prefetch band for every commit
+/// touching a binary blob.
+fn highlight_ranges(files: &[FileEntry], total_lines: usize) -> Vec<(usize, usize, usize)> {
+    file_line_ranges(files, total_lines)
+        .into_iter()
+        .filter(|&(fi, _, _)| !files[fi].is_binary)
+        .collect()
+}
+
 /// Tokenize file by file, starting at `first_file` and wrapping, until
 /// `deadline` passes. `None` means no bound — the whole diff.
 ///
@@ -2858,7 +2877,7 @@ fn highlight_diff_until(
     } else {
         HIGHLIGHT_CHUNK
     };
-    for (fi, start, end) in file_order(&file_line_ranges(files, lines.len()), first_file) {
+    for (fi, start, end) in file_order(&highlight_ranges(files, lines.len()), first_file) {
         let mut state = hl.new_file_state(&files[fi].path);
         let mut pos = start;
         while pos < end {
@@ -2932,11 +2951,6 @@ fn file_fully_highlighted(lines: &[DiffLine], start: usize, end: usize) -> bool 
         .all(|l| !l.kind.is_code() || l.spans.is_some())
 }
 
-/// True when the foreground worker has finished colouring the whole diff: every
-/// code line *inside a file range* is highlighted. Only file ranges are checked —
-/// lines outside them (e.g. a no-patch/binary file's placeholder, which is
-/// `Context` but excluded from `file_line_ranges`) are never tokenized, so
-/// checking the whole `[0, len)` range would never be satisfied.
 /// May the band be warmed this frame?
 ///
 /// With syntax off there is nothing to wait for and nothing to compete with, so every
@@ -2998,8 +3012,14 @@ const fn highlight_scan_stale(
     }
 }
 
+/// True when the foreground worker has finished colouring the whole diff: every
+/// code line *inside a tokenizable file range* is highlighted. Only those ranges
+/// are checked — lines outside them (a no-patch file has none at all; a binary
+/// file's marker is `Context` but its file is dropped by `highlight_ranges`) are
+/// never tokenized, so checking the whole `[0, len)` range would never be
+/// satisfied.
 fn diff_fully_highlighted(lines: &[DiffLine], files: &[FileEntry]) -> bool {
-    file_line_ranges(files, lines.len())
+    highlight_ranges(files, lines.len())
         .iter()
         .all(|&(_, start, end)| file_fully_highlighted(lines, start, end))
 }
@@ -3007,9 +3027,10 @@ fn diff_fully_highlighted(lines: &[DiffLine], files: &[FileEntry]) -> bool {
 /// File ranges `(file_index, start, end)` that still need highlighting: every
 /// file with at least one not-yet-highlighted (`None`) code line, in file order.
 /// Fully-highlighted files (and structural-only files) are dropped so a cached
-/// or partially-highlighted diff only re-tokenizes what's missing.
+/// or partially-highlighted diff only re-tokenizes what's missing, and binary
+/// files never appear at all — see `highlight_ranges`.
 fn pending_files(lines: &[DiffLine], files: &[FileEntry]) -> Vec<(usize, usize, usize)> {
-    file_line_ranges(files, lines.len())
+    highlight_ranges(files, lines.len())
         .into_iter()
         .filter(|&(_, start, end)| !file_fully_highlighted(lines, start, end))
         .collect()
@@ -3099,8 +3120,10 @@ fn highlight_worker(job: HighlightJob) {
         let hi = priority.hi.load(Ordering::Relaxed);
         let page_lo = priority.page_lo.load(Ordering::Relaxed);
         let page_hi = priority.page_hi.load(Ordering::Relaxed);
+        // Binary files are already absent — `pending_files` derives from
+        // `highlight_ranges`, so no skip is needed (or wanted: one here would let
+        // `pending_files` disagree without failing to compile).
         let (fi, start, end) = pending.remove(pick_file(&pending, lo, hi, page_lo, page_hi));
-
         let mut state = hl.new_file_state(&files[fi].path);
         let mut pos = start;
         while pos < end {
@@ -4577,12 +4600,15 @@ fn warm_row(
         // PlainText label exists to remove. `any` also called an empty diff
         // PlainText, though nothing had been left uncoloured.
         Some(hl) if colour => {
-            let with = data
-                .files
+            // Binary files are not part of the denominator: the highlighter skips
+            // them, so counting them as un-highlighted would report a commit that
+            // only touches a .png as "PlainText" — a coverage gap that isn't one.
+            let candidates: Vec<&FileEntry> = data.files.iter().filter(|f| !f.is_binary).collect();
+            let with = candidates
                 .iter()
                 .filter(|f| hl.has_grammar(&f.path))
                 .count();
-            match (with, data.files.len()) {
+            match (with, candidates.len()) {
                 (_, 0) => "Highlighted (no files)".to_owned(),
                 (w, n) if w == n => "Highlighted".to_owned(),
                 (0, _) => "PlainText".to_owned(),
@@ -10482,6 +10508,62 @@ mod tests {
     use crate::test_repo::{
         commit_file, commit_index, commit_rename, stage, temp_repo, write_file,
     };
+
+    /// A binary file must not be reported as a missing grammar. `.png`/`.jar` have
+    /// no source to highlight, so telling the reader to map them under
+    /// `[diff.languages]` names a fix that could never work. Pinned end to end: git
+    /// decides what is binary (the `'B'` patch origin), so this asserts on a real
+    /// diff of real bytes rather than on a hand-built `FileEntry`.
+    #[test]
+    fn a_binary_file_is_never_reported_as_a_missing_grammar() {
+        use crate::test_repo::commit_bytes;
+        let (_d, repo) = temp_repo();
+        commit_bytes(&repo, "logo.zzz", b"\x00\x01\x02binary\x00", "add binary");
+        let oid = commit_bytes(
+            &repo,
+            "logo.zzz",
+            b"\x00\x01\x02CHANGED\x00",
+            "change binary",
+        );
+
+        let data = diff::get_diff_data(
+            &repo,
+            &diff::RowScope::new(diff::DiffSource::Commit(oid)),
+            probe_settings(),
+        );
+        let entry = data
+            .files
+            .iter()
+            .find(|f| f.path == "logo.zzz")
+            .expect("the binary file is in the diff");
+        assert!(entry.is_binary, "git marked this delta binary; so must we");
+
+        // ...and the highlighter leaves it entirely alone: no grammar lookup means
+        // no report, and there is nothing in a binary body worth tokenizing.
+        let hl = highlight::test_highlighter();
+        let mut lines = data.lines.clone();
+        highlight_diff(&mut lines, &data.files, &hl);
+        let start = entry.diff_line_idx.expect("binary file has a patch header");
+        assert!(
+            lines[start..].iter().all(|l| l.spans.is_none()),
+            "a binary file's rows must not be tokenized"
+        );
+
+        // ...and skipping it must not leave the diff looking forever unfinished.
+        // git's "Binary files … differ" marker is a `LineKind::Context` row, so
+        // `is_code()` is true for it and the file has a patch body — check the
+        // untokenizable range and the answer is false however complete the pass
+        // was, which pins `band_warmable` shut and disables the prefetch band for
+        // every commit touching a binary blob.
+        assert!(
+            diff_fully_highlighted(&lines, &data.files),
+            "a fully highlighted diff must report as such even with a binary file in it"
+        );
+        assert!(
+            pending_files(&lines, &data.files).is_empty(),
+            "a binary file must never be queued for a highlight pass that skips it"
+        );
+    }
 
     /// The provisional list is shown to a real reader, so it must at minimum agree
     /// with the real walk on an ordinary history — the approximation is only

@@ -486,16 +486,17 @@ impl Highlighter {
     /// this is the one place it actually happens, and where the file being tokenized
     /// is known.
     ///
-    /// At `warn`, which is `env_logger`'s default filter here, so it shows on a plain
-    /// run rather than only under `RUST_LOG`. That is the point: this is a config gap
-    /// the reader can close and would otherwise never learn about, since the fallback
-    /// renders perfectly happily — the same reason `resolve_font_path` warns for a font
-    /// name fontdb cannot resolve. The once-per-extension dedup is what makes a level
-    /// this loud affordable.
+    /// At `info`, so a plain run stays quiet. It reads as a defect otherwise: most
+    /// repos contain a few suffixes syntect has no grammar for, nothing is broken
+    /// when they render as plain text, and there is no obligation to act — unlike
+    /// `resolve_font_path`'s warning, which reports a setting that did not take
+    /// effect. Visible under `RUST_LOG=gitkay=info` when someone wonders why a file
+    /// looks flat. The once-per-extension dedup still applies: a diff holds hundreds
+    /// of files and the prefetch band warms dozens of rows across threads.
     pub fn new_file_state(&self, path: &str) -> HighlightLines<'_> {
         let Some(syntax) = self.syntax_for(path) else {
             if let Some(ext) = self.note_missing_grammar(path) {
-                log::warn!(
+                log::info!(
                     "no syntax highlighting for .{ext} files — they render as plain text; \
                      add `{ext} = \"<language>\"` under [diff.languages] in the config \
                      to highlight them as something else (e.g. \"xml\")"
