@@ -91,6 +91,52 @@ pub fn commit_rename(repo: &git2::Repository, old: &str, new: &str, msg: &str) -
     commit_index(repo, &mut index, msg)
 }
 
+/// Commit the current index at an explicit committer time, onto explicit parents,
+/// without moving any ref. Returns the new commit's oid.
+///
+/// The other helpers inherit `now()`, which stamps every commit in a test with the
+/// same second — fine when the test asserts on content, useless when it asserts on
+/// an *order derived from time*. The provisional heap walk sorts on exactly this
+/// field, and the orderings that break it (a parent dated newer than its child, a
+/// merge base newer than the side branch below it) are ones a test can only reach
+/// by stating the timestamps.
+pub fn commit_at(
+    repo: &git2::Repository,
+    msg: &str,
+    when: i64,
+    parents: &[git2::Oid],
+) -> git2::Oid {
+    let base = repo.signature().unwrap();
+    let time = git2::Time::new(when, 0);
+    let sig = git2::Signature::new(base.name().unwrap(), base.email().unwrap(), &time).unwrap();
+    let tree = repo
+        .find_tree(repo.index().unwrap().write_tree().unwrap())
+        .unwrap();
+    let parents: Vec<git2::Commit<'_>> = parents
+        .iter()
+        .map(|p| repo.find_commit(*p).unwrap())
+        .collect();
+    let refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
+    repo.commit(None, &sig, &sig, msg, &tree, &refs).unwrap()
+}
+
+/// `commit_at`, having first written and staged `path` so the commit has a tree of
+/// its own.
+pub fn commit_file_at(
+    repo: &git2::Repository,
+    path: &str,
+    content: &str,
+    msg: &str,
+    when: i64,
+    parents: &[git2::Oid],
+) -> git2::Oid {
+    write_file(repo, path, content);
+    let mut index = repo.index().unwrap();
+    index.add_path(Path::new(path)).unwrap();
+    index.write().unwrap();
+    commit_at(repo, msg, when, parents)
+}
+
 /// Delete one loose object from `dir`'s odb, making it unreadable — a pruned or
 /// corrupt odb, a treeless partial clone, a shallow clone's boundary commit.
 ///
