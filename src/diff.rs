@@ -471,6 +471,14 @@ pub struct FileEntry {
     /// file" for a `Copied` one, and a whole-file Stage must know whether the
     /// pane showed a deletion before it records one.
     pub status: git2::Delta,
+    /// Did git treat this file as binary? Set from libgit2's own `'B'` patch
+    /// origin during printing, not from `DiffDelta::flags()` — the BINARY flag is
+    /// only settled while the diff is generated, and the delta loop that builds
+    /// these entries runs before that. A binary file has no source lines, so the
+    /// highlighter skips it: tokenizing "Binary files … differ" is pointless, and
+    /// reporting a missing grammar for `.png` would advise a config change that
+    /// could never help.
+    pub is_binary: bool,
     pub additions: usize,
     pub deletions: usize,
     /// `Some(n)`: this file's patch starts at `diff_lines[n]`. `None`: the file
@@ -814,6 +822,7 @@ pub fn append_diff_body(
             path_bytes: bytes.to_vec(),
             old_path_bytes: old_bytes,
             status: delta.status(),
+            is_binary: false,
             additions: 0,
             deletions: 0,
             diff_line_idx: None,
@@ -869,6 +878,14 @@ pub fn append_diff_body(
                     files[fi].deletions += 1;
                 }
                 LineKind::Del
+            }
+            // libgit2's binary marker. Recorded rather than merely rendered, so
+            // the highlighter can skip the file (see `FileEntry::is_binary`).
+            'B' => {
+                if let Some(fi) = current_file_idx {
+                    files[fi].is_binary = true;
+                }
+                LineKind::Context
             }
             'H' => LineKind::Hunk,
             // The file-header block; per-piece FileMeta/FileName refinement below.

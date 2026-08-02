@@ -77,6 +77,7 @@ pub fn file_entry(path: &str, diff_line_idx: Option<usize>) -> crate::diff::File
         path_bytes: path.as_bytes().to_vec(),
         old_path_bytes: None,
         status: git2::Delta::Modified,
+        is_binary: false,
         additions: 0,
         deletions: 0,
         diff_line_idx,

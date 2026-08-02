@@ -319,8 +319,12 @@ dark band colours to match the theme you choose.
 
 Map a file extension to a syntax. Without one, a file whose suffix syntect has
 no grammar for falls back to plain text — which still renders, just in a single
-flat colour, and *looks* highlighted. gitkay warns once per unknown extension
-per session so you know a mapping is missing.
+flat colour, and *looks* highlighted. gitkay reports each such extension once
+per session, at `info`: most repos hold a few suffixes with no grammar and
+nothing is broken when they fall back, so a plain run stays quiet. Run
+`RUST_LOG=gitkay=info gitkay` when a file renders flat and you want to know
+whether a mapping would fix it. A file git calls binary is never reported — no
+`[diff.languages]` entry could help it.
 
 ```toml
 [diff.languages]
@@ -414,9 +418,16 @@ Nothing outside these is touched, and every one of them is safe to delete.
 
 ### Logging
 
-Warnings go to stderr by default — an unresolvable font name, a missing
-grammar, a config parse error. For the full startup and per-phase timing
-breakdown:
+Warnings go to stderr by default — an unresolvable font name, a config parse
+error, a history walk slow enough to have changed the rows under you. A missing
+grammar is one level quieter, at `info`, since falling back to plain text breaks
+nothing:
+
+```sh
+RUST_LOG=gitkay=info gitkay
+```
+
+For the full startup and per-phase timing breakdown:
 
 ```sh
 RUST_LOG=gitkay=debug gitkay

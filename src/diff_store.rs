@@ -24,7 +24,7 @@ const MAGIC: &[u8; 8] = b"gitkayD\x00";
 /// build. Note this guards the LAYOUT only — a change to what the diff BUILDER
 /// emits is invisible here, which is why `StoreContext` mixes in the crate
 /// version.
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
@@ -144,8 +144,8 @@ impl<'a> Reader<'a> {
 /// encoder rather than restating by hand.
 const LINE_MIN_BYTES: usize = 1 + 8 + 4 + 4;
 /// The same for a file: two empty length-prefixed paths, the two optional-path
-/// tags, the status tag, and three `u64`s.
-const FILE_MIN_BYTES: usize = 8 + 1 + 8 + 1 + 1 + 8 + 8 + 8;
+/// tags, the status tag, the binary flag, and three `u64`s.
+const FILE_MIN_BYTES: usize = 8 + 1 + 8 + 1 + 1 + 1 + 8 + 8 + 8;
 
 /// Exhaustive both ways: a new `LineKind` variant fails to compile here rather
 /// than silently decoding as something else.
@@ -241,6 +241,7 @@ fn encode(data: &DiffData) -> Vec<u8> {
         put_bytes(&mut out, &f.path_bytes);
         put_opt_bytes(&mut out, f.old_path_bytes.as_deref());
         out.push(delta_tag(f.status));
+        out.push(u8::from(f.is_binary));
         put_u64(&mut out, f.additions as u64);
         put_u64(&mut out, f.deletions as u64);
         // `usize + 1`, so 0 is `None` — the same sentinel trick the line numbers
@@ -292,6 +293,7 @@ fn decode(bytes: &[u8]) -> Option<DiffData> {
         let path_bytes = r.bytes()?.to_vec();
         let old_path_bytes = r.opt_bytes()?;
         let status = delta_from_tag(r.u8()?)?;
+        let is_binary = r.u8()? != 0;
         let additions = usize::try_from(r.u64()?).ok()?;
         let deletions = usize::try_from(r.u64()?).ok()?;
         let diff_line_idx = match r.u64()? {
@@ -304,6 +306,7 @@ fn decode(bytes: &[u8]) -> Option<DiffData> {
             path_bytes,
             old_path_bytes,
             status,
+            is_binary,
             additions,
             deletions,
             diff_line_idx,
@@ -802,6 +805,7 @@ mod tests {
                 path_bytes: b"x.rs".to_vec(),
                 old_path_bytes: Some(b"y.rs".to_vec()),
                 status: git2::Delta::Renamed,
+                is_binary: false,
                 additions: 1,
                 deletions: 1,
                 diff_line_idx: Some(0),
@@ -846,6 +850,7 @@ mod tests {
                 path_bytes: raw.clone(),
                 old_path_bytes: None,
                 status: git2::Delta::Added,
+                is_binary: false,
                 additions: 0,
                 deletions: 0,
                 diff_line_idx: None,
