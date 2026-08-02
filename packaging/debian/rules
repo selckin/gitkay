@@ -3,10 +3,10 @@
 	dh $@
 
 override_dh_auto_build:
-	cargo build --release
+	cargo build --release --locked
 
 override_dh_auto_install:
 	install -Dm755 target/release/gitkay debian/gitkay/usr/bin/gitkay
 
 override_dh_auto_test:
-	cargo test
+	cargo test --release --locked

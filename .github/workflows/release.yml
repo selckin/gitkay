@@ -2,7 +2,12 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    # MAJOR.MINOR.PATCH only, matching set-version.sh's --check exactly. Under
+    # the old "v*" a pre-release tag started a run the version gate then failed,
+    # producing no artifacts at all where it once produced a release; a
+    # pre-release would need an rpm Release: field and a deb `~rc` version,
+    # which nothing here builds. Keep the two in step.
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -11,9 +16,27 @@ permissions:
   contents: read
 
 jobs:
+  version:
+    name: Verify version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # The .rpm and .deb take their version from the tag, so the committed
+      # version sites drifting from it is otherwise SILENT: v0.0.1..v0.0.4 all
+      # shipped a binary reporting `gitkay 1.2.0`. Everything else needs this
+      # job, so a mismatched tag costs seconds instead of a bad release.
+      - name: Check the tag matches every version site
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: ./packaging/set-version.sh --check "${REF_NAME#v}"
+
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    needs: version
     strategy:
       matrix:
         include:
@@ -31,8 +54,11 @@ jobs:
 
       - name: Install system dependencies
         run: |
+          # libgit2-sys compiles the bundled libgit2 with cc (not cmake) and
+          # probes with pkg-config; nothing in the tree links GTK, graphene or
+          # OpenSSL (git2 is built with default-features = []).
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libgraphene-1.0-dev libssl-dev pkg-config cmake
+          sudo apt-get install -y build-essential pkg-config
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -40,10 +66,10 @@ jobs:
           toolchain: stable
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Test
-        run: cargo test
+        run: cargo test --release --locked
 
       - name: Package binary
         env:
@@ -87,16 +113,48 @@ jobs:
           tar czf rpmbuild/SOURCES/gitkay-${VERSION}.tar.gz gitkay-${VERSION}
           # This is the BINARY-repack spec (prebuilt tarball, no cargo build) —
           # distinct from the source-build packaging/gitkay.spec by design, but
-          # keep the shared metadata (Summary, description) in sync with it.
+          # keep the shared metadata (Summary, description, URL) in sync with it.
+          #
+          # Auto-requires is deliberately LEFT ON (no `AutoReq: no`): rpm reads
+          # the ELF and emits SONAME requires, which resolve on any target
+          # distro. Without them the package installs onto a system whose glibc
+          # is older than the runner's and fails at launch instead. The binary's
+          # NEEDED entries are only glibc and libgcc — libgit2 and zlib are
+          # compiled in, since no -dev packages are installed above.
+          #
+          # Which is exactly why auto-requires is not enough on its own, the same
+          # gap the .deb's dpkg-shlibdeps has: winit/glutin/wayland-sys DLOPEN
+          # everything windowing-related, and nothing that reads the ELF can see a
+          # dlopen. So the sonames the binary names (strings target/release/gitkay)
+          # are stated here, or a minimal Wayland desktop installs the package
+          # cleanly and then aborts at launch on dlopen("libxkbcommon.so.0").
+          # SONAME form rather than package names, because those differ per distro
+          # (libwayland-client on Fedora, libwayland-client0 on openSUSE) while
+          # every rpm distro's auto-PROVIDES emits the soname. `(64bit)` is safe:
+          # this job repacks the x86_64 artifact only. Wayland + EGL + xkbcommon
+          # are required; the X11 set is the fallback backend, so it is Recommends
+          # and a Wayland-only system is not made to pull it in — mirroring the
+          # Depends/Recommends split in the deb job below.
           cat > rpmbuild/SPECS/gitkay.spec << 'SPEC'
           Name:           gitkay
           Version:        VERSION_PLACEHOLDER
           Release:        1%{?dist}
           Summary:        A fast, native Wayland git history viewer
           License:        MIT
-          URL:            https://github.com/Marenz/gitkay
+          URL:            https://github.com/selckin/gitkay
           Source0:        gitkay-VERSION_PLACEHOLDER.tar.gz
-          AutoReq:        no
+
+          Requires:       libwayland-client.so.0()(64bit)
+          Requires:       libwayland-egl.so.1()(64bit)
+          Requires:       libxkbcommon.so.0()(64bit)
+          Requires:       libEGL.so.1()(64bit)
+          Recommends:     libX11.so.6()(64bit)
+          Recommends:     libX11-xcb.so.1()(64bit)
+          Recommends:     libxcb.so.1()(64bit)
+          Recommends:     libxkbcommon-x11.so.0()(64bit)
+          Recommends:     libXcursor.so.1()(64bit)
+          Recommends:     libXi.so.6()(64bit)
+          Recommends:     libvulkan.so.1()(64bit)
 
           %description
           gitkay is a native Wayland git history viewer — gitk, but okay.
@@ -142,12 +200,39 @@ jobs:
         env:
           REF_NAME: ${{ github.ref_name }}
         run: |
+          die() { echo "::error::$*"; exit 1; }
           VERSION="${REF_NAME}"
           VERSION="${VERSION#v}"
+          sudo apt-get update || die "apt-get update failed"
+          sudo apt-get install -y dpkg-dev || die "cannot install dpkg-dev"
           mkdir -p pkg/DEBIAN
           mkdir -p pkg/usr/bin
-          tar xzf "gitkay-${REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" -C pkg/usr/bin/
+          tar xzf "gitkay-${REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" -C pkg/usr/bin/ \
+            || die "cannot unpack the release tarball"
           chmod 755 pkg/usr/bin/gitkay
+          # Compute Depends from the ELF instead of hardcoding it: the repack has
+          # no shlibs machinery of its own, and a .deb with no Depends installs
+          # onto a system missing the libraries and fails at launch instead. The
+          # binary links only glibc and libgcc (libgit2 and zlib are compiled
+          # in), both of which the runner already has, so nothing extra needs
+          # installing for dpkg-shlibdeps to resolve them.
+          mkdir -p debian
+          printf 'Source: gitkay\n\nPackage: gitkay\nArchitecture: amd64\n' > debian/control
+          DEPS=$(dpkg-shlibdeps -O --ignore-missing-info pkg/usr/bin/gitkay) \
+            || die "dpkg-shlibdeps failed; refusing to ship a .deb with no Depends"
+          DEPS=${DEPS#shlibs:Depends=}
+          [ -n "$DEPS" ] || die "dpkg-shlibdeps produced no dependencies"
+          # dpkg-shlibdeps reads ELF NEEDED entries only, and winit/glutin/
+          # wayland-sys dlopen everything windowing-related — so the computed
+          # list is just libc6/libgcc-s1 and a minimal system would install
+          # cleanly then abort on dlopen("libxkbcommon.so.0"). These are the
+          # sonames the binary actually names (strings target/release/gitkay).
+          # Wayland + EGL + xkbcommon are required; the X11 set is the fallback
+          # backend, so it is Recommends rather than Depends and a Wayland-only
+          # system is not made to pull it in.
+          DEPS="$DEPS, libwayland-client0, libwayland-egl1, libxkbcommon0, libegl1"
+          RECOMMENDS="libx11-6, libx11-xcb1, libxcb1, libxcursor1, libxi6, libxkbcommon-x11-0, libvulkan1"
+          echo "computed Depends: $DEPS"
           # This is the BINARY control (dpkg-deb repack) — distinct from the
           # source-build packaging/debian/control by design, but keep the shared
           # metadata (Section, Maintainer, Description) in sync with it.
@@ -157,13 +242,18 @@ jobs:
           Section: devel
           Priority: optional
           Architecture: amd64
-          Maintainer: Marenz <marenz@supradigital.org>
+          Depends: ${DEPS}
+          Recommends: ${RECOMMENDS}
+          Maintainer: Thomas Matthijs <github@selckin.be>
           Description: Fast, native Wayland git history viewer
            gitkay is a gitk replacement built with Rust + egui. Features a commit
            graph with colored branch lanes, syntax-highlighted diffs, file list
            sidebar, search, and Catppuccin Mocha dark theme. Starts in under 200ms.
           EOF
-          dpkg-deb --build pkg gitkay_${VERSION}_amd64.deb
+          # --root-owner-group or the binary ships owned by the runner's uid and
+          # installs as a non-root-owned /usr/bin/gitkay.
+          dpkg-deb --root-owner-group --build pkg gitkay_${VERSION}_amd64.deb \
+            || die "dpkg-deb failed"
 
       - name: Upload deb
         uses: actions/upload-artifact@v7

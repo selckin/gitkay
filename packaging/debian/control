@@ -1,15 +1,25 @@
 Source: gitkay
 Section: devel
 Priority: optional
-Maintainer: Marenz <marenz@supradigital.org>
-Build-Depends: debhelper-compat (= 13), cargo, rustc (>= 1.75),
- libgtk-4-dev, libgraphene-1.0-dev, libssl-dev, pkg-config, cmake
+Maintainer: Thomas Matthijs <github@selckin.be>
+Build-Depends: debhelper-compat (= 13), cargo, rustc (>= 1.91), pkg-config
 Standards-Version: 4.6.0
-Homepage: https://github.com/Marenz/gitkay
+Homepage: https://github.com/selckin/gitkay
 
 Package: gitkay
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}
+# dpkg-shlibdeps, which fills ${shlibs:Depends}, reads ELF NEEDED entries only —
+# and winit/glutin/wayland-sys dlopen everything windowing-related, so it sees
+# just libc6/libgcc-s1. Without the rest stated by hand the package installs
+# cleanly on a minimal desktop and then aborts at launch on
+# dlopen("libxkbcommon.so.0"). Wayland + EGL + xkbcommon are required; the X11
+# set is the fallback backend, so it is Recommends and a Wayland-only system is
+# not made to pull it in. The release workflow's binary repack computes the same
+# split — keep the two lists in step.
+Depends: ${shlibs:Depends}, ${misc:Depends},
+ libwayland-client0, libwayland-egl1, libxkbcommon0, libegl1
+Recommends: libx11-6, libx11-xcb1, libxcb1, libxcursor1, libxi6,
+ libxkbcommon-x11-0, libvulkan1
 Description: Fast, native Wayland git history viewer
  gitkay is a gitk replacement built with Rust + egui. Features a commit
  graph with colored branch lanes, syntax-highlighted diffs, file list

@@ -1,3 +1,13 @@
+gitkay (0.0.5-1) unstable; urgency=low
+
+  * This fork numbers its own releases from 0.0.1, below the original
+    project's 1.x line; the entries below are the original project's.
+  * Build-Depends corrected to match the dependency tree (no GTK, graphene,
+    OpenSSL or cmake) and rustc raised to the version edition 2024 and
+    let-chains actually require.
+
+ -- Thomas Matthijs <github@selckin.be>  Sun, 02 Aug 2026 12:00:00 +0200
+
 gitkay (1.2.0-1) unstable; urgency=low
 
   * Any keypress focuses search bar instantly

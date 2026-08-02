@@ -1509,7 +1509,7 @@ dependencies = [
 
 [[package]]
 name = "gitkay"
-version = "1.2.0"
+version = "0.0.5"
 dependencies = [
  "arboard",
  "chrono",

@@ -1,8 +1,10 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: gitkay
-Upstream-Contact: Marenz <marenz@supradigital.org>
-Source: https://github.com/Marenz/gitkay
+Upstream-Contact: Thomas Matthijs <github@selckin.be>
+Source: https://github.com/selckin/gitkay
+Comment: A fork of https://github.com/Marenz/gitkay, originally written by Marenz.
 
 Files: *
 Copyright: 2026 Marenz
+           2026 Thomas Matthijs
 License: MIT

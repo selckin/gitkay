@@ -1,21 +1,42 @@
+# Maintainer: Thomas Matthijs <github@selckin.be>
+# Original project by Marenz <marenz@supradigital.org>
 pkgname=gitkay
-pkgver=1.2.0
+pkgver=0.0.5
 pkgrel=1
 pkgdesc="A fast, native Wayland git history viewer — gitk, but okay"
-arch=(x86_64)
-url="https://github.com/Marenz/gitkay"
+arch=(x86_64 aarch64)
+url="https://github.com/selckin/gitkay"
 license=(MIT)
-depends=(gtk4 graphene openssl)
-makedepends=(cargo cmake)
-source=("$pkgname-$pkgver.tar.gz::https://github.com/Marenz/gitkay/archive/refs/tags/v$pkgver.tar.gz")
+# libgit2.so, not libgit2: libgit2-sys links the system copy when pkg-config
+# finds one and silently vendors when it does not, so an unversioned name is
+# both a phantom dependency in the vendored case and, in the linked case, still
+# "satisfied" after a soname bump removes the .so the binary needs. makepkg
+# resolves a `.so` entry to the exact provider version at build time
+# (libgit2.so=1.9-64), and listing it also guarantees the linked case: makepkg
+# installs deps before building, so pkg-config always finds one.
+# Wayland/X11/xkbcommon are dlopened at runtime, so they are named here too —
+# nothing in the ELF would reveal them.
+depends=(gcc-libs libgit2.so wayland libxkbcommon libglvnd)
+optdepends=('libx11: X11 fallback backend'
+            'libxcursor: X11 fallback backend'
+            'libxi: X11 fallback backend'
+            'libxkbcommon-x11: X11 fallback backend')
+makedepends=(cargo)
+source=("$pkgname-$pkgver.tar.gz::https://github.com/selckin/gitkay/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=(SKIP)
 
 options=(!lto)
 
 build() {
-    cargo build --release --manifest-path="$pkgname-$pkgver/Cargo.toml"
+    cargo build --release --locked --manifest-path="$pkgname-$pkgver/Cargo.toml"
+}
+
+check() {
+    cargo test --release --locked --manifest-path="$pkgname-$pkgver/Cargo.toml"
 }
 
 package() {
     install -Dm755 "$pkgname-$pkgver/target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+    install -Dm644 "$pkgname-$pkgver/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 "$pkgname-$pkgver/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
 }
