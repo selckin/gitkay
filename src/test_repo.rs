@@ -92,6 +92,33 @@ pub fn commit_rename(repo: &git2::Repository, old: &str, new: &str, msg: &str) -
     commit_index(repo, &mut index, msg)
 }
 
+/// Commit the current index as a merge of `first` and `second` onto HEAD.
+/// A two-parent commit is what `--first-parent` is about, and building one was
+/// previously open-coded in the single test that needed it.
+pub fn commit_merge(
+    repo: &git2::Repository,
+    first: git2::Oid,
+    second: git2::Oid,
+    msg: &str,
+) -> git2::Oid {
+    let sig = repo.signature().unwrap();
+    let tree = repo
+        .find_tree(repo.index().unwrap().write_tree().unwrap())
+        .unwrap();
+    repo.commit(
+        Some("HEAD"),
+        &sig,
+        &sig,
+        msg,
+        &tree,
+        &[
+            &repo.find_commit(first).unwrap(),
+            &repo.find_commit(second).unwrap(),
+        ],
+    )
+    .unwrap()
+}
+
 /// Commit the current index at an explicit committer time, onto explicit parents,
 /// without moving any ref. Returns the new commit's oid.
 ///
