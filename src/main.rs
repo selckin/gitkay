@@ -1596,7 +1596,25 @@ fn startup_selection(commits: &[CommitInfo], combined: bool) -> Option<usize> {
         .or_else(|| (!commits.is_empty()).then_some(0))
 }
 
-fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitInfo> {
+/// How many ordered oids the walk keeps for later pages. Draining the whole walk
+/// is FREE — the ordering pass produces the list internally and `take(200)` merely
+/// throws the rest away (measured: 67,677 oids in 1.566s against 1.583s for 200) —
+/// so the only reason to bound it is memory, at 20 bytes an oid. 200k covers every
+/// repo anyone browses (git.git is 82k) at ~4MB; past it, extensions fall back to
+/// re-walking.
+const HISTORY_OID_CAP: usize = 200_000;
+
+/// `load_commits`, plus the ordered oid list the walk produced. That list is what
+/// makes page two cheap: without it every extension re-pays the whole ordering pass
+/// (1.6s on a 67k-commit repo, and again on every page, because `history_worker`
+/// opens a fresh `Repository` each time). `None` for scopes whose walk output is not
+/// a plain prefix — a path filter drops and rewrites as it goes, so draining it is
+/// neither free nor a list of what the next page holds.
+fn load_commits_inner(
+    repo: &Repository,
+    max: usize,
+    scope: &cli::Scope,
+) -> (Vec<CommitInfo>, Option<Vec<git2::Oid>>) {
     let t = std::time::Instant::now();
     let ref_map = build_ref_map(repo);
     log::debug!(
@@ -1615,32 +1633,13 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
     // `gitkay foobar`, is "a different branch than checked out" and hides them.
     let show_local = scope.all || scope.revs.is_empty();
 
-    // The staged/uncommitted probes and rows are symmetric — one probe and one row
-    // builder keep the pair in lockstep (same pathspec scoping, same timestamp
-    // source), so a change to one can't silently miss the other.
-    // Probes are scoped to the active `-- <path>` filter, so a change outside the
-    // path doesn't add a virtual row on its own lane.
-    let probe = |label: &str,
-                 build: for<'r> fn(
-        &'r Repository,
-        &mut git2::DiffOptions,
-    ) -> Result<git2::Diff<'r>, git2::Error>| {
-        let t = std::time::Instant::now();
-        let hit = show_local && {
-            let mut opts = pathspec_opts(&scope.paths);
-            build(repo, &mut opts)
-                .ok()
-                .is_some_and(|diff| diff.deltas().len() > 0)
-        };
-        log::debug!(
-            "perf: load_commits: {label} probe -> {hit} {:?}",
-            t.elapsed()
-        );
-        hit
-    };
-    // Staged = index vs HEAD tree; uncommitted = workdir vs index.
-    let has_staged = probe("staged (diff_tree_to_index)", staged_git_diff);
-    let has_uncommitted = probe("uncommitted (diff_index_to_workdir)", worktree_git_diff);
+    // Probe the index and worktree OFF-THREAD, and join only once the walk below is
+    // done. Both are full diffs whose cost tracks the size of the working tree, not
+    // the size of the change: measured on a 67k-commit checkout, 162ms (index vs
+    // HEAD) + 358ms (workdir vs index) — half a second that used to sit in front of
+    // the walk purely because the rows they decide render above it. Neither feeds
+    // the walk, so overlapping them hides both entirely.
+    let probes = spawn_local_probes(repo, &scope.paths, show_local);
 
     let virtual_row =
         |source: diff::DiffSource, title: &str, parents: Vec<git2::Oid>, chip: (&str, RefKind)| {
@@ -1677,9 +1676,119 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
         ));
     }
 
-    // Add virtual entries at the top
+    // Load real commits. This runs BEFORE the probes are joined, which is the whole
+    // point of spawning them: the virtual rows they decide are prepended afterwards,
+    // so their cost overlaps the walk instead of preceding it. `max` budgets real
+    // commits (matching the path-filter branch's `kept.len() >= max`), so the window
+    // doesn't shrink by the virtual count.
+    let t = std::time::Instant::now();
+    let mut real: Vec<CommitInfo> = Vec::new();
+    let mut walk_oids: Option<Vec<git2::Oid>> = None;
+    // The path filter's parent rewrite, kept so the virtual rows can be rewritten
+    // through the same map once they exist (a dropped HEAD must not orphan them).
+    let mut nearest_map: Option<std::collections::HashMap<git2::Oid, Vec<git2::Oid>>> = None;
+    if let Some(revwalk) = history_revwalk(repo, scope) {
+        let mut seen = HashSet::new();
+        if scope.paths.is_empty() {
+            // Drain the walk, not just the first `max`: the ordering pass has already
+            // built this list internally, so the remaining oids cost nothing and are
+            // exactly what the next page needs.
+            let mut all: Vec<git2::Oid> = Vec::new();
+            for oid in revwalk.flatten() {
+                if !seen.insert(oid) {
+                    continue;
+                }
+                all.push(oid);
+                if all.len() >= HISTORY_OID_CAP {
+                    break;
+                }
+            }
+            // `all` is already deduped, so this pass needs its own (empty) seen set.
+            let mut built = HashSet::new();
+            real = build_commits_from_walk(repo, all.iter().copied(), &mut built, &ref_map, max);
+            walk_oids = Some(all);
+        } else {
+            // Path filter: drop commits that don't touch the pathspec, then rewrite each
+            // surviving commit's parents to its nearest surviving ancestor — git's history
+            // simplification. Without the rewrite the graph can't connect kept commits
+            // across the dropped ones, so every commit lands on its own lane.
+            // 1. Walk newest→oldest, recording every commit's parents; keep the ones that
+            //    touch the path until we have `max` of them.
+            let mut walked: Vec<(git2::Oid, Vec<git2::Oid>)> = Vec::new();
+            let mut kept: Vec<CommitInfo> = Vec::new();
+            let mut kept_set: HashSet<git2::Oid> = HashSet::new();
+            // In --follow mode we track the single path's name as it changes across
+            // renames, recording each kept commit's name so its diff can follow too.
+            let mut follow_path: Option<String> =
+                scope.follow.then(|| scope.paths.first().cloned()).flatten();
+            for oid in revwalk.flatten() {
+                if !seen.insert(oid) {
+                    continue;
+                }
+                let Ok(commit) = repo.find_commit(oid) else {
+                    continue;
+                };
+                let parents: Vec<git2::Oid> = commit.parent_ids().collect();
+                walked.push((oid, parents.clone()));
+                let touched = follow_path.as_ref().map_or_else(
+                    || commit_touches_paths(repo, &commit, &scope.paths),
+                    |p| commit_touches_paths(repo, &commit, std::slice::from_ref(p)),
+                );
+                if touched {
+                    kept_set.insert(oid);
+                    let mut info = build_commit_info(oid, &commit, parents, &ref_map);
+                    if let Some(p) = follow_path.clone() {
+                        info.follow_path = Some(p.clone());
+                        // If the file was renamed into `p` at this commit, follow the
+                        // old name back through the rest of history.
+                        if file_added(&commit, &p)
+                            && let Some(old) = rename_source(repo, &commit, &p)
+                        {
+                            follow_path = Some(old);
+                        }
+                    }
+                    kept.push(info);
+                    if kept.len() >= max {
+                        break;
+                    }
+                }
+            }
+            // 2. nearest[oid] = its nearest kept ancestors. `walked` is topological (each
+            //    child precedes its parents), so a single oldest→newest pass resolves every
+            //    parent before its child — no recursion, safe on deep histories.
+            let mut nearest: std::collections::HashMap<git2::Oid, Vec<git2::Oid>> =
+                std::collections::HashMap::new();
+            for (oid, parents) in walked.iter().rev() {
+                let resolved = if kept_set.contains(oid) {
+                    vec![*oid]
+                } else {
+                    rewrite_parents(parents, &nearest)
+                };
+                nearest.insert(*oid, resolved);
+            }
+            // 3. Rewrite the kept commits' parents to the nearest kept ancestors. The
+            //    virtual entries get the same treatment below, once the probes have
+            //    said whether they exist — a dropped HEAD must not orphan them.
+            for info in &mut kept {
+                info.parents = rewrite_parents(&info.parents, &nearest);
+            }
+            real = kept;
+            nearest_map = Some(nearest);
+        }
+    }
+    log::debug!(
+        "perf: load_commits: revwalk + build ({} real commits, sort=TIME|TOPOLOGICAL) {:?}",
+        real.len(),
+        t.elapsed()
+    );
+    note_slow_history_walk(t.elapsed(), real.len(), provisional_scope(scope));
+
+    // Join the probes now — their half-second ran alongside the walk above — and put
+    // the rows they decide at the top, ahead of the real commits.
+    let (has_staged, has_uncommitted) = probes.join(repo, &scope.paths);
+    let mut locals = Vec::new();
     if has_uncommitted {
-        commits.push(virtual_row(
+        locals.push(virtual_row(
             diff::DiffSource::Uncommitted,
             "Uncommitted changes",
             if has_staged {
@@ -1691,105 +1800,115 @@ fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<Commit
         ));
     }
     if has_staged {
-        commits.push(virtual_row(
+        locals.push(virtual_row(
             diff::DiffSource::Staged,
             "Staged changes",
             head_oid.into_iter().collect(),
             ("index", RefKind::Index),
         ));
     }
-
-    // Load real commits
-    let t = std::time::Instant::now();
-    let Some(revwalk) = history_revwalk(repo, scope) else {
-        return commits;
-    };
-
-    let mut seen = HashSet::new();
-    // Virtual uncommitted/staged rows are already pushed; `max` budgets real commits
-    // (matching the path-filter branch's `kept.len() >= max`), so the window doesn't
-    // shrink by the virtual count.
-    let virtual_count = commits.len();
-    if scope.paths.is_empty() {
-        commits.extend(build_commits_from_walk(
-            repo,
-            revwalk.flatten(),
-            &mut seen,
-            &ref_map,
-            max,
-        ));
-    } else {
-        // Path filter: drop commits that don't touch the pathspec, then rewrite each
-        // surviving commit's parents to its nearest surviving ancestor — git's history
-        // simplification. Without the rewrite the graph can't connect kept commits
-        // across the dropped ones, so every commit lands on its own lane.
-        // 1. Walk newest→oldest, recording every commit's parents; keep the ones that
-        //    touch the path until we have `max` of them.
-        let mut walked: Vec<(git2::Oid, Vec<git2::Oid>)> = Vec::new();
-        let mut kept: Vec<CommitInfo> = Vec::new();
-        let mut kept_set: HashSet<git2::Oid> = HashSet::new();
-        // In --follow mode we track the single path's name as it changes across
-        // renames, recording each kept commit's name so its diff can follow too.
-        let mut follow_path: Option<String> =
-            scope.follow.then(|| scope.paths.first().cloned()).flatten();
-        for oid in revwalk.flatten() {
-            if !seen.insert(oid) {
-                continue;
-            }
-            let Ok(commit) = repo.find_commit(oid) else {
-                continue;
-            };
-            let parents: Vec<git2::Oid> = commit.parent_ids().collect();
-            walked.push((oid, parents.clone()));
-            let touched = follow_path.as_ref().map_or_else(
-                || commit_touches_paths(repo, &commit, &scope.paths),
-                |p| commit_touches_paths(repo, &commit, std::slice::from_ref(p)),
-            );
-            if touched {
-                kept_set.insert(oid);
-                let mut info = build_commit_info(oid, &commit, parents, &ref_map);
-                if let Some(p) = follow_path.clone() {
-                    info.follow_path = Some(p.clone());
-                    // If the file was renamed into `p` at this commit, follow the
-                    // old name back through the rest of history.
-                    if file_added(&commit, &p)
-                        && let Some(old) = rename_source(repo, &commit, &p)
-                    {
-                        follow_path = Some(old);
-                    }
-                }
-                kept.push(info);
-                if kept.len() >= max {
-                    break;
-                }
-            }
+    if let Some(nearest) = &nearest_map {
+        for info in &mut locals {
+            info.parents = rewrite_parents(&info.parents, nearest);
         }
-        // 2. nearest[oid] = its nearest kept ancestors. `walked` is topological (each
-        //    child precedes its parents), so a single oldest→newest pass resolves every
-        //    parent before its child — no recursion, safe on deep histories.
-        let mut nearest: std::collections::HashMap<git2::Oid, Vec<git2::Oid>> =
-            std::collections::HashMap::new();
-        for (oid, parents) in walked.iter().rev() {
-            let resolved = if kept_set.contains(oid) {
-                vec![*oid]
-            } else {
-                rewrite_parents(parents, &nearest)
-            };
-            nearest.insert(*oid, resolved);
-        }
-        // 3. Rewrite the kept commits' parents (and the virtual entries', so a dropped
-        //    HEAD doesn't orphan them) to the nearest kept ancestors.
-        for info in commits[..virtual_count].iter_mut().chain(kept.iter_mut()) {
-            info.parents = rewrite_parents(&info.parents, &nearest);
-        }
-        commits.extend(kept);
     }
-    log::debug!(
-        "perf: load_commits: revwalk + build ({} real commits, sort=TIME|TOPOLOGICAL) {:?}",
-        commits.len() - virtual_count,
-        t.elapsed()
-    );
-    commits
+    commits.extend(locals);
+    commits.extend(real);
+    (commits, walk_oids)
+}
+
+/// The commit list alone, without the cached walk. Test-only: the app always wants
+/// the oids too (`load_history`), but the suite asserts on row content and
+/// reads better without unpacking a struct it does not exercise.
+#[cfg(test)]
+fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitInfo> {
+    load_commits_inner(repo, max, scope).0
+}
+
+/// The index/worktree probes, running on their own thread so their cost overlaps the
+/// revwalk rather than preceding it. `git2::Repository` is `Send` but not `Sync`, so
+/// the thread opens its own from the same path.
+enum LocalProbes {
+    /// Nothing to probe (a scope that hides the rows), or a spawn failure already
+    /// resolved inline.
+    Ready(bool, bool),
+    /// `None` from the thread means it could not answer, not that the tree is clean
+    /// — see `join`.
+    Threaded(std::thread::JoinHandle<Option<(bool, bool)>>),
+}
+
+impl LocalProbes {
+    /// `(has_staged, has_uncommitted)`, probing inline on `repo` when the thread
+    /// could not answer — its own `Repository::open` failed, or it panicked.
+    ///
+    /// Never defaulting to "clean" is the point, and it is the same rule the
+    /// spawn-failure branch of `spawn_local_probes` states: a false negative here
+    /// omits the "Uncommitted changes" and "Staged changes" rows from a list whose
+    /// working tree really is dirty, so the reader is shown no sign of their
+    /// unstaged work and has no way to open its diff. Inline is merely slower —
+    /// and it runs on the handle `load_commits` already holds, which is the one
+    /// thing the thread could fail to obtain.
+    fn join(self, repo: &Repository, paths: &[String]) -> (bool, bool) {
+        match self {
+            Self::Ready(s, u) => (s, u),
+            Self::Threaded(h) => h.join().ok().flatten().unwrap_or_else(|| {
+                log::warn!("gitkay: probe thread gave no answer; probing inline");
+                run_local_probes(repo, paths)
+            }),
+        }
+    }
+}
+
+/// Staged = index vs HEAD tree; uncommitted = workdir vs index. Both are scoped to
+/// the active `-- <path>` filter, so a change outside the path doesn't add a virtual
+/// row on its own lane. The probes and the rows they gate stay symmetric — one probe
+/// helper and one row builder — so a change to one can't silently miss the other.
+fn run_local_probes(repo: &Repository, paths: &[String]) -> (bool, bool) {
+    let probe = |label: &str,
+                 build: for<'r> fn(
+        &'r Repository,
+        &mut git2::DiffOptions,
+    ) -> Result<git2::Diff<'r>, git2::Error>| {
+        let t = std::time::Instant::now();
+        let mut opts = pathspec_opts(paths);
+        let hit = build(repo, &mut opts)
+            .ok()
+            .is_some_and(|diff| diff.deltas().len() > 0);
+        log::debug!(
+            "perf: load_commits: {label} probe -> {hit} {:?}",
+            t.elapsed()
+        );
+        hit
+    };
+    (
+        probe("staged (diff_tree_to_index)", staged_git_diff),
+        probe("uncommitted (diff_index_to_workdir)", worktree_git_diff),
+    )
+}
+
+fn spawn_local_probes(repo: &Repository, paths: &[String], show_local: bool) -> LocalProbes {
+    if !show_local {
+        return LocalProbes::Ready(false, false);
+    }
+    let git_dir = repo.path().to_path_buf();
+    let owned: Vec<String> = paths.to_vec();
+    match std::thread::Builder::new()
+        .name("gitkay-probes".to_string())
+        .spawn(move || {
+            Repository::open(&git_dir)
+                .inspect_err(|e| log::warn!("gitkay: probe thread cannot open the repo: {e}"))
+                .ok()
+                .map(|r| run_local_probes(&r, &owned))
+        }) {
+        Ok(h) => LocalProbes::Threaded(h),
+        Err(e) => {
+            // Rare. Inline is correct, just slower — never skip the probes, or the
+            // rows silently vanish while the working tree really does have changes.
+            log::warn!("gitkay: cannot spawn probe thread ({e}); probing inline");
+            let (staged, uncommitted) = run_local_probes(repo, paths);
+            LocalProbes::Ready(staged, uncommitted)
+        }
+    }
 }
 
 /// Incremental history extension for the plain (no path filter, non-reflog) scope:
@@ -1854,13 +1973,247 @@ fn diff_paths_for(scope: &cli::Scope, commit: Option<&CommitInfo>) -> Vec<String
     }
 }
 
+/// A history walk slower than this is worth explaining. Well above the ~17ms a
+/// 13k-commit repo takes and the ~155ms a *second* walk costs in the same process,
+/// so an ordinary repo never trips it.
+const SLOW_HISTORY_WALK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Latch for `note_slow_history_walk`: the explanation is about the repo, not about
+/// this particular walk, so it is worth saying once and never again.
+static SLOW_WALK_REPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Should this walk be explained? Split from the logging so the threshold and the
+/// once-only latch are testable without capturing output.
+fn should_note_slow_walk(
+    elapsed: std::time::Duration,
+    latch: &std::sync::atomic::AtomicBool,
+) -> bool {
+    elapsed >= SLOW_HISTORY_WALK && !latch.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Explain a slow history walk, once per process.
+///
+/// `warn`, so it shows on a plain run: the delay is visible and otherwise
+/// unattributable — the window is up and responsive, which makes it look like
+/// gitkay has lost the repo rather than like work in progress.
+///
+/// **One sentence.** Nothing here is actionable, so anything beyond "what happened,
+/// why, and what it did to the view" is a lecture in a log file — earlier versions
+/// also explained that the window had not blocked and that later loads are faster,
+/// which made the line unreadable. It does not name libgit2 either: that reads as
+/// blame, and wrongly, since ordering the graph is inherent to the problem.
+///
+/// `replaced_rows` earns its clause where the others did not, because it is the one
+/// consequence the reader can SEE: rows they were already reading have just been
+/// swapped underneath them. Appended only when a provisional list was possible for
+/// this scope — under `--all` or a path filter there is no stand-in, the list is
+/// appearing for the first time, and nothing changed.
+fn note_slow_history_walk(elapsed: std::time::Duration, rows: usize, replaced_rows: bool) {
+    if !should_note_slow_walk(elapsed, &SLOW_WALK_REPORTED) {
+        return;
+    }
+    if replaced_rows {
+        log::warn!(
+            "best-effort pass rendered the first {rows} commits; the final result \
+             needed the whole history walked and sorted, which took {elapsed:.1?} — the \
+             displayed commits may have changed"
+        );
+    } else {
+        log::warn!(
+            "no best-effort pass for this scope: the first {rows} commits needed the \
+             whole history walked and sorted, which took {elapsed:.1?}"
+        );
+    }
+}
+
+/// How long the real walk gets before the provisional one is shown instead.
+///
+/// Chosen so ordinary repos never show provisional rows AT ALL: their sorted walk
+/// finishes in single-digit ms (1–6ms up to ~4k commits, ~250ms at 13k), so the
+/// provisional list is computed, unused and discarded. Only a repo where waiting is
+/// genuinely intolerable — 1.6s at 67k commits, 2.0s at 82k — ever reaches the
+/// deadline. Same reasoning as `DIFF_PLACEHOLDER_DELAY`: wait long enough that the
+/// fast path never flashes something it is about to replace.
+const PROVISIONAL_HISTORY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Can this scope be walked provisionally? Only the plain one — the heap walk below
+/// reproduces neither the path filter's parent rewrite, the reflog's `@{n}`
+/// numbering, nor `--all`'s multi-tip seeding, and each of those is a whole-list
+/// computation rather than a per-row one.
+const fn provisional_scope(scope: &cli::Scope) -> bool {
+    !scope.all && !scope.reflog && !scope.follow && scope.revs.is_empty() && scope.paths.is_empty()
+}
+
+/// A lazy newest-first walk: a heap keyed by committer time (libgit2's own sort
+/// key), seeded from HEAD, popping rows and pushing only their parents. Touches
+/// O(rows + frontier) commits where the sorted walk touches the whole history —
+/// 2ms against 2.0s for 200 rows on an 82k-commit repo.
+///
+/// **This is an approximation and is only ever shown provisionally.** It selects
+/// exactly the same SET of commits as the sorted walk (verified at 200/700/2000
+/// rows on five repos), and the same ORDER for the first 200 everywhere tested,
+/// git.git included; past that it can diverge. Exact global order cannot be
+/// produced lazily — "no parent before all its children" needs the whole DAG,
+/// which is precisely the pass this avoids — so the caller must not extend this
+/// list on scroll (`load_commits_tail` would resume off a prefix the real walk did
+/// not produce), and must replace it with the real walk when that lands.
+///
+/// What it does NOT diverge on is topology, because `topo_window` settles that
+/// over the rows actually emitted. The heap alone cannot: see there.
+fn provisional_commits(repo: &Repository, max: usize) -> Vec<CommitInfo> {
+    let ref_map = build_ref_map(repo);
+    let Ok(head) = repo.head().and_then(|h| h.peel_to_commit()) else {
+        return Vec::new();
+    };
+    let mut heap: std::collections::BinaryHeap<(i64, git2::Oid)> =
+        std::collections::BinaryHeap::new();
+    let mut seen: HashSet<git2::Oid> = HashSet::new();
+    heap.push((head.time().seconds(), head.id()));
+    seen.insert(head.id());
+    // Each row is kept with the heap key it popped at — its COMMITTER time, clamped
+    // below its discovering child. `topo_window` re-sorts on it, and `CommitInfo`
+    // cannot supply it: its `time` is the AUTHOR date (what `git log` shows, and what
+    // a rebase leaves untouched), which is a different order on any repo that has been
+    // rebased, cherry-picked or imported — exactly the repos this walk exists for.
+    let mut out: Vec<(i64, CommitInfo)> = Vec::with_capacity(max);
+    while out.len() < max {
+        let Some((key, oid)) = heap.pop() else { break };
+        let Ok(commit) = repo.find_commit(oid) else {
+            continue;
+        };
+        let parents: Vec<git2::Oid> = commit.parent_ids().collect();
+        for p in &parents {
+            if seen.insert(*p)
+                && let Ok(pc) = repo.find_commit(*p)
+            {
+                // Sort a parent strictly below the child that found it, rather than
+                // on its own timestamp. Two commits sharing a second — routine for
+                // scripted commits, rebases and imports — otherwise tie, and the
+                // tie-break (oid) can pop a parent before its child, which draws the
+                // graph upside down. This also absorbs a parent dated NEWER than its
+                // child, which is what an amend or a cherry-pick produces.
+                heap.push((pc.time().seconds().min(key.saturating_sub(1)), *p));
+            }
+        }
+        out.push((key, build_commit_info(oid, &commit, parents, &ref_map)));
+    }
+    topo_window(out)
+}
+
+/// Reorder one provisional window so no row is drawn above its own parent.
+///
+/// The heap picks the right SET but cannot pick a topological order. It emits the
+/// highest key first, and clamping a parent below the child that DISCOVERED it —
+/// which is all the walk can do — says nothing about a child it has not reached
+/// yet. A merge base dated newer than the side branch below it is the shape that
+/// breaks: walking the mainline reaches the base while the side commits are still
+/// in the heap, so the base out-ranks its own descendants and pops above them.
+/// That is not a different order but an invalid one, and `layout_graph` rests on
+/// it not happening. No lazy walk can avoid it, and a decrease-key heap does not
+/// either: by the time the second child arrives, the parent has popped.
+///
+/// Settling it globally is the whole-DAG pass being avoided — but the invariant is
+/// only about the rows emitted, and there are at most `INITIAL_COMMITS` of those.
+/// So: Kahn's algorithm over the in-window edges, taking the newest ready row each
+/// time, which is exactly the real walk's rule of time order constrained to
+/// topological. An induced subgraph's constraints are a subset of the whole
+/// graph's, so this can never contradict the real walk; parents outside the window
+/// are unconstrained and draw a continuation stub, as they already do.
+///
+/// "Newest" is each row's HEAP KEY, paired with it by the caller, and that pairing
+/// is the whole reason this takes a tuple. `CommitInfo::time` is the AUTHOR date —
+/// what `git log` shows, and what a rebase, cherry-pick or `git am` leaves untouched
+/// while moving the committer date — so sorting on it reorders topologically
+/// unrelated rows against both the heap and the real walk, on precisely the
+/// rebased/imported histories this walk exists for. Since a re-sort that changes
+/// nothing is invisible, the symptom is indirect: rows shuffle when the real list
+/// lands, and the warm band turns out to have been aimed at the wrong commits.
+fn topo_window(rows: Vec<(i64, CommitInfo)>) -> Vec<CommitInfo> {
+    let index: HashMap<git2::Oid, usize> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, (_, c))| (c.oid, i))
+        .collect::<HashMap<_, _>>();
+    // How many in-window CHILDREN a row is still waiting on; it is ready at zero.
+    let mut waiting = vec![0usize; rows.len()];
+    for (_, c) in &rows {
+        for p in &c.parents {
+            if let Some(&j) = index.get(p) {
+                waiting[j] += 1;
+            }
+        }
+    }
+    // Newest ready row first, by the heap's own key — NOT by `CommitInfo::time`,
+    // which is the author date and orders differently on any rebased or imported
+    // history. Oid as the deterministic tie-break: commits sharing a second are
+    // routine (scripts, rebases, imports) and must not order by chance.
+    let key = |i: usize| (rows[i].0, rows[i].1.oid, i);
+    let mut ready: std::collections::BinaryHeap<(i64, git2::Oid, usize)> = waiting
+        .iter()
+        .enumerate()
+        .filter(|&(_, &w)| w == 0)
+        .map(|(i, _)| key(i))
+        .collect();
+    let mut order = Vec::with_capacity(rows.len());
+    while let Some((_, _, i)) = ready.pop() {
+        order.push(i);
+        for p in &rows[i].1.parents {
+            if let Some(&j) = index.get(p) {
+                waiting[j] -= 1;
+                if waiting[j] == 0 {
+                    ready.push(key(j));
+                }
+            }
+        }
+    }
+    let mut slots: Vec<Option<CommitInfo>> = rows.into_iter().map(|(_, c)| Some(c)).collect();
+    let mut out: Vec<CommitInfo> = order.into_iter().filter_map(|i| slots[i].take()).collect();
+    // A git DAG is acyclic, so nothing is left over; a repo that somehow disagrees
+    // keeps those rows in walk order rather than losing them off the list.
+    out.extend(slots.into_iter().flatten());
+    out
+}
+
+/// An empty view (bad path filter, or an unknown/empty reflog ref) is otherwise a
+/// silent blank window; say so once, when the rows arrive. Paths are matched
+/// repo-root-relative (a path given from a subdirectory won't match — a known
+/// limitation). Called from whichever side installs the first history: `new()` when
+/// the walk beat window creation, `apply_pending_history` when it did not.
+fn warn_if_empty_view(scope: &cli::Scope, commits: &[CommitInfo]) {
+    if scope.reflog && commits.is_empty() {
+        log::warn!(
+            "--reflog: no entries for {} (unknown ref or empty reflog)",
+            scope.revs.first().map_or("HEAD", String::as_str)
+        );
+    } else if !scope.paths.is_empty() && !commits.iter().any(|c| is_real_commit(c.oid)) {
+        log::warn!(
+            "no commits match path filter {:?} (paths are repo-root-relative)",
+            scope.paths
+        );
+    }
+}
+
+/// One history walk's output: the rows to show, and the ordered oids behind them
+/// when the scope has a cacheable prefix (see `load_commits_inner`). The reflog is
+/// its own loader and caches nothing — `@{n}` numbering is a whole-list computation
+/// and reflogs are short.
+struct HistoryWalk {
+    commits: Vec<CommitInfo>,
+    oids: Option<Vec<git2::Oid>>,
+}
+
 /// Load the commit list for the active scope: the reflog when `--reflog` is set,
 /// otherwise the normal history walk.
-fn load_history(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitInfo> {
+fn load_history(repo: &Repository, max: usize, scope: &cli::Scope) -> HistoryWalk {
     if scope.reflog {
-        load_reflog(repo, max, scope)
+        HistoryWalk {
+            commits: load_reflog(repo, max, scope),
+            oids: None,
+        }
     } else {
-        load_commits(repo, max, scope)
+        let (commits, oids) = load_commits_inner(repo, max, scope);
+        HistoryWalk { commits, oids }
     }
 }
 
@@ -4302,7 +4655,6 @@ struct PreHighlight {
 /// diff-shaping settings (`key.settings`), and the row's kind (`CommitKind::of`) all
 /// come from `key` — carrying them separately could only let them disagree.
 struct DiffLoadJob {
-    repo_path: String,
     key: DiffCacheKey,
     scope: RowScope,
     epoch: u64,
@@ -4339,9 +4691,16 @@ fn report_failed_diff_load(
 /// `get_diff_data` (a large diff, plus rename/copy detection, can take hundreds of ms)
 /// — and hand the finished `DiffData` back for the UI to display. Every early exit
 /// reports through `report_failed_diff_load` (see its doc for why that's load-bearing).
-fn diff_load_worker(job: DiffLoadJob) {
+/// Run one diff load against a repo handle the worker already owns.
+///
+/// The handle is NOT opened here, and that is the point: `Repository::discover`
+/// costs ~150ms of first-touch on a large repo (measured on a 67k-commit checkout:
+/// the same 352-line diff builds in 146–188ms through a fresh handle against 17–19ms
+/// through a reused one), and this used to run per dispatch — so every uncached diff
+/// the user clicked paid it. The prefetch pool never did; that is why its builds show
+/// as ~20ms in the same log where a foreground load showed 657ms.
+fn diff_load_job(repo: &Repository, job: DiffLoadJob) {
     let DiffLoadJob {
-        repo_path,
         key,
         scope,
         epoch,
@@ -4351,30 +4710,14 @@ fn diff_load_worker(job: DiffLoadJob) {
         prehighlight,
         store,
     } = job;
-    // Superseded before we even ran — don't open the repo.
-    if !current_epoch.is_current(epoch) {
-        report_failed_diff_load(&tx, epoch, key, &ctx);
-        return;
-    }
-    let repo = match Repository::discover(&repo_path) {
-        Ok(r) => r,
-        Err(e) => {
-            // Report so the UI clears the loading state instead of sticking on
-            // the placeholder (the epoch check on the UI side ignores it if the
-            // user has since moved on).
-            log::debug!("diff-load: repo discover failed: {e}");
-            report_failed_diff_load(&tx, epoch, key, &ctx);
-            return;
-        }
-    };
-    // Superseded while discovering.
+    // Superseded before we even ran.
     if !current_epoch.is_current(epoch) {
         report_failed_diff_load(&tx, epoch, key, &ctx);
         return;
     }
     let t = std::time::Instant::now();
     // The user is waiting on this one, so it is stored uncapped.
-    let mut data = build_or_load(store_of(&store), &repo, &scope, key.settings, None);
+    let mut data = build_or_load(store_of(&store), repo, &scope, key.settings, None);
     // Content-key a working-tree row off-thread here so an unchanged working tree hits
     // the cache and reuses its highlighting.
     let key = finalize_diff_key(key, scope.source.kind(), &data);
@@ -4437,7 +4780,7 @@ fn diff_load_worker(job: DiffLoadJob) {
 }
 
 /// What a background history load should produce.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum HistoryJobKind {
     /// Append up to `max_new` commits after the `skip`-long loaded prefix
     /// (anchored at `expect_last`, the last loaded real commit). Falls back to
@@ -4448,19 +4791,199 @@ enum HistoryJobKind {
         expect_last: git2::Oid,
         max_new: usize,
     },
+    /// Build rows for oids the UI already has in order, from the cached walk.
+    /// No revwalk at all — the ordering pass that produced these is long since
+    /// paid, and re-running it is what made every page cost a fresh 1.6s.
+    Hydrate {
+        oids: Vec<git2::Oid>,
+        max_new: usize,
+    },
     /// Rebuild the whole list at `count` commits (the watcher reload).
     Rebuild { count: usize },
 }
 
+/// How to fetch the next page: from the cached walk when it holds this range, else
+/// by re-walking.
+///
+/// The cache must line up with what is on screen or the page would splice a
+/// different history into the list, so `oids[skip - 1]` is checked against the last
+/// loaded commit — the same anchor `load_commits_tail` verifies, for the same
+/// reason. Falling back is always correct, just slow, which is why every uncertain
+/// case takes that branch: no cache, a `skip` past its end, or an anchor that does
+/// not match.
+///
+/// A **short** page is the subtle one, because it is not merely slower to get wrong
+/// — the caller reads a short answer as "the history ended" and latches
+/// `all_loaded`, which stops the scroll extension for the session. That reading is
+/// only true when the cache holds the whole history, i.e. when the walk was drained
+/// rather than truncated at `HISTORY_OID_CAP`. So a short page from a capped list
+/// re-walks; from a complete one it is handed over and correctly ends the list.
+/// Truncation is *derived* from the length rather than stored, so it cannot drift
+/// from what the walk actually did.
+fn next_history_page(
+    oids: Option<&[git2::Oid]>,
+    skip: usize,
+    expect_last: git2::Oid,
+    max_new: usize,
+) -> HistoryJobKind {
+    let fallback = HistoryJobKind::Extend {
+        skip,
+        expect_last,
+        max_new,
+    };
+    let Some(oids) = oids else { return fallback };
+    if skip == 0 || skip > oids.len() || oids[skip - 1] != expect_last {
+        return fallback;
+    }
+    let page: Vec<git2::Oid> = oids[skip..].iter().copied().take(max_new).collect();
+    if page.len() < max_new && oids.len() >= HISTORY_OID_CAP {
+        // The cache ran out, but it was capped — there is more history behind it,
+        // and handing a short page over would tell the UI there is not.
+        return fallback;
+    }
+    if page.is_empty() {
+        // Exhausted a complete cache. Re-walk rather than dispatch a hydrate of
+        // nothing: the walk's own short answer is what tells the UI the end.
+        return fallback;
+    }
+    HistoryJobKind::Hydrate {
+        oids: page,
+        max_new,
+    }
+}
+
 /// Everything a background history load owns for one dispatch.
 struct HistoryJob {
-    repo_path: String,
     scope: cli::Scope,
     kind: HistoryJobKind,
     epoch: u64,
     current_epoch: Epoch,
     tx: mpsc::Sender<HistoryResult>,
     ctx: egui::Context,
+}
+
+/// How many foreground workers own a repo handle. Foreground loads are already
+/// superseded by epoch, so one would usually do — but a single worker would queue a
+/// fresh click behind a heavy row that takes seconds to build, which is exactly the
+/// wait this whole path exists to avoid. Four is enough that a slow load never
+/// blocks the next one, and cheap: an idle worker is a parked thread plus its repo
+/// handle.
+const FOREGROUND_WORKERS: usize = 4;
+
+/// Work that needs a repo handle and that the user is waiting on.
+///
+/// One pool for both because `git2::Repository` is `Send` but **not `Sync`**: it
+/// cannot be shared between threads at all, so the best available is one handle per
+/// long-lived thread, opened once. Both of these used to open their own per
+/// dispatch, and on a large repo that is ~150ms of first-touch every time — the
+/// difference between a 17ms diff build and a 188ms one, and it applied to every
+/// uncached click and every scroll past a page boundary.
+enum ForegroundJob {
+    Diff(DiffLoadJob, Option<InflightClaim>),
+    History(HistoryJob),
+}
+
+/// Start the foreground workers. `None` if not one could be spawned, which leaves
+/// every caller on its synchronous fallback.
+fn spawn_foreground_workers(repo_path: &str) -> Option<mpsc::Sender<ForegroundJob>> {
+    let (tx, rx) = mpsc::channel::<ForegroundJob>();
+    let rx = Arc::new(Mutex::new(rx));
+    let mut live = 0;
+    for i in 0..FOREGROUND_WORKERS {
+        let rx = Arc::clone(&rx);
+        let path = repo_path.to_string();
+        if std::thread::Builder::new()
+            .name(format!("gitkay-fg-{i}"))
+            .spawn(move || foreground_worker(&path, &rx))
+            .is_ok()
+        {
+            live += 1;
+        }
+    }
+    if live == 0 {
+        log::warn!("no foreground workers could be spawned; loading synchronously");
+        return None;
+    }
+    log::debug!("foreground: {live} workers, each opening its repo handle on first use");
+    Some(tx)
+}
+
+/// How long a foreground worker waits before trying `Repository::discover` again
+/// after it failed. Not per job — a held arrow key dispatches diff loads faster than
+/// a failing `discover` costs, so a missing repo would become an IO storm. Not once
+/// per worker either: see `foreground_worker`.
+const FOREGROUND_REPO_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// One worker: open the repo, then serve jobs until the channel closes.
+///
+/// A handle that cannot be opened does NOT end the thread — every job still has to
+/// be answered or the UI sticks on its loading state forever, which is the same
+/// invariant the per-dispatch version kept by reporting before returning. But it
+/// must not be answered with a failure *forever*: an open can fail transiently (the
+/// repo directory replaced mid-write, an ENFILE while the prefetch pool and heavy
+/// lane are opening their own handles, an EIO on a network home), and latching that
+/// leaves this worker failing every job it is ever handed. The queue is shared and
+/// pulled from by whichever worker is free, so a worker that fails instantly takes
+/// *more* than its share: diff clicks blank the pane back to the previous diff and
+/// history extensions silently stop loading, all session, behind one warn line.
+///
+/// So it retries, rate-limited by `FOREGROUND_REPO_RETRY`.
+fn foreground_worker(repo_path: &str, rx: &Arc<Mutex<mpsc::Receiver<ForegroundJob>>>) {
+    // Opened on the FIRST job, not at spawn: `GitkApp::new` starts these workers and
+    // blocks window creation until it returns, so discovering four handles there put
+    // repo IO back on the very path the rest of this module keeps clear. Most
+    // sessions never use all four, and the one that runs first pays no more than it
+    // would have anyway.
+    let mut repo: Option<Repository> = None;
+    let mut last_try: Option<std::time::Instant> = None;
+    loop {
+        // Take one job and release the lock before running it, or the workers
+        // serialise on the queue instead of on the work.
+        let job = match rx.lock() {
+            Ok(guard) => guard.recv(),
+            Err(_) => return, // poisoned: another worker panicked holding the lock
+        };
+        let Ok(job) = job else { return }; // channel closed — app is going away
+        if repo.is_none() && last_try.is_none_or(|t| t.elapsed() >= FOREGROUND_REPO_RETRY) {
+            last_try = Some(std::time::Instant::now());
+            repo = Repository::discover(repo_path)
+                .inspect_err(|e| log::warn!("foreground worker: repo discover failed: {e}"))
+                .ok();
+        }
+        run_foreground_job(repo.as_ref(), job);
+    }
+}
+
+/// Run one job, catching a panic so a bad row costs that job rather than the worker
+/// — and still reporting it, since a silent exit strands the UI's loading state.
+fn run_foreground_job(repo: Option<&Repository>, job: ForegroundJob) {
+    match job {
+        ForegroundJob::Diff(job, claim) => {
+            let _claim = claim; // released when this job ends, panic included
+            let (tx, epoch, key, ctx) =
+                (job.tx.clone(), job.epoch, job.key.clone(), job.ctx.clone());
+            let ran = repo.is_some_and(|r| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| diff_load_job(r, job)))
+                    .is_ok()
+            });
+            if !ran {
+                log::warn!("diff-load did not complete; reporting the load as failed");
+                report_failed_diff_load(&tx, epoch, key, &ctx);
+            }
+        }
+        ForegroundJob::History(job) => {
+            let (tx, epoch, ctx) = (job.tx.clone(), job.epoch, job.ctx.clone());
+            let ran = repo.is_some_and(|r| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| history_job(r, job)))
+                    .is_ok()
+            });
+            if !ran {
+                log::warn!("history-load did not complete; reporting it as failed");
+                let _ = tx.send(HistoryResult { epoch, load: None });
+                ctx.request_repaint();
+            }
+        }
+    }
 }
 
 /// A finished background history load handed back to the UI, with the epoch it
@@ -4487,18 +5010,33 @@ enum HistoryLoad {
         commits: Vec<CommitInfo>,
         count: usize,
         derived: Box<DerivedHistory>,
+        /// This walk's ordered oids, replacing the cached ones — see
+        /// `rebuild_load`.
+        oids: Option<Vec<git2::Oid>>,
     },
 }
 
-/// Package a rebuilt commit list as a `HistoryLoad::Rebuild`, deriving the graph
-/// layout and lookup maps here on the worker — a rebuild relays the whole loaded
-/// history, which would stall the frame loop if left to the install.
-fn rebuild_load(commits: Vec<CommitInfo>, count: usize) -> HistoryLoad {
+/// Package a rebuilt walk as a `HistoryLoad::Rebuild`, deriving the graph layout
+/// and lookup maps here on the worker — a rebuild relays the whole loaded history,
+/// which would stall the frame loop if left to the install.
+///
+/// It takes the whole `HistoryWalk`, not just its rows, because the rebuilt list
+/// and the cached oid list must move together. `next_history_page` serves whole
+/// pages out of that cache after checking a single anchor oid, and a rebuild is
+/// precisely the event that can change the history *behind* the rows on screen: a
+/// `git fetch` whose commits are all older than the last loaded row leaves the
+/// anchor matching while making every later page wrong, and since each of those
+/// pages then supplies the next anchor from the same stale list, nothing ever
+/// notices. Carrying the walk's own oids means the cache is replaced by the same
+/// walk that produced the rows it must agree with.
+fn rebuild_load(walk: HistoryWalk, count: usize) -> HistoryLoad {
+    let HistoryWalk { commits, oids } = walk;
     let derived = Box::new(derive_from_commits(&commits));
     HistoryLoad::Rebuild {
         commits,
         count,
         derived,
+        oids,
     }
 }
 
@@ -4506,9 +5044,8 @@ fn rebuild_load(commits: Vec<CommitInfo>, count: usize) -> HistoryLoad {
 /// per commit, and per-commit tree diffs under a path filter, so on a long-loaded
 /// history it is far too slow for the frame loop. Bails without a result as soon
 /// as a newer dispatch supersedes it.
-fn history_worker(job: HistoryJob) {
+fn history_job(repo: &Repository, job: HistoryJob) {
     let HistoryJob {
-        repo_path,
         scope,
         kind,
         epoch,
@@ -4519,34 +5056,34 @@ fn history_worker(job: HistoryJob) {
     if !current_epoch.is_current(epoch) {
         return;
     }
-    let repo = match Repository::discover(&repo_path) {
-        Ok(r) => r,
-        Err(e) => {
-            // Report the failure so the UI clears the in-flight state; the epoch
-            // check on the UI side ignores it if a newer dispatch superseded us.
-            log::debug!("history-load: repo discover failed: {e}");
-            let _ = tx.send(HistoryResult { epoch, load: None });
-            ctx.request_repaint();
-            return;
-        }
-    };
     let t = std::time::Instant::now();
     let load = match kind {
+        HistoryJobKind::Hydrate { oids, max_new } => {
+            let t = std::time::Instant::now();
+            let ref_map = build_ref_map(repo);
+            let mut seen = HashSet::new();
+            let new =
+                build_commits_from_walk(repo, oids.iter().copied(), &mut seen, &ref_map, max_new);
+            log::debug!(
+                "history-load: hydrated {} rows from the cached walk in {:?}",
+                new.len(),
+                t.elapsed()
+            );
+            HistoryLoad::Extend { new, max_new }
+        }
         HistoryJobKind::Extend {
             skip,
             expect_last,
             max_new,
-        } => load_commits_tail(&repo, &scope, skip, expect_last, max_new).map_or_else(
+        } => load_commits_tail(repo, &scope, skip, expect_last, max_new).map_or_else(
             || {
                 // Full-rebuild fallback: everything requested so far, in one walk.
                 let requested = skip + max_new;
-                rebuild_load(load_history(&repo, requested, &scope), requested)
+                rebuild_load(load_history(repo, requested, &scope), requested)
             },
             |new| HistoryLoad::Extend { new, max_new },
         ),
-        HistoryJobKind::Rebuild { count } => {
-            rebuild_load(load_history(&repo, count, &scope), count)
-        }
+        HistoryJobKind::Rebuild { count } => rebuild_load(load_history(repo, count, &scope), count),
     };
     // Completion log with shape + duration, like the diff-load/prefetch/highlight
     // workers — without it a wasted walk (superseded, duplicated) is invisible in
@@ -5353,6 +5890,32 @@ struct GitkApp {
     // cold fontdb scan outlives window-init, so the window paints in default fonts and
     // swaps to the configured ones once the scan lands (polled in ui()). None once applied.
     pending_fonts: Option<mpsc::Receiver<(egui::FontDefinitions, Vec<String>)>>,
+    /// The startup history walk, when it hadn't finished by the time the window was
+    /// created. `Some` ⇒ the commit list on screen is empty or provisional.
+    pending_history: Option<mpsc::Receiver<HistoryWalk>>,
+    /// The approximate walk racing it. Read only once `PROVISIONAL_HISTORY_DELAY`
+    /// has passed with no real result, so a fast repo never shows it.
+    pending_provisional: Option<mpsc::Receiver<Vec<CommitInfo>>>,
+    /// When the window was created — the clock `PROVISIONAL_HISTORY_DELAY` runs on.
+    history_wait_since: std::time::Instant,
+    /// Is the list on screen the approximate one? While true it must NOT be
+    /// extended on scroll: `provisional_commits` can order rows past ~250 wrongly,
+    /// and `load_commits_tail`'s resume assumes the prefix came from the real walk.
+    history_is_provisional: bool,
+    /// The row `install_startup_history` picked on the reader's behalf, as opposed
+    /// to one they chose. What separates "the selection did not move" from "the
+    /// reader settled on the tip commit" when the real list replaces a provisional
+    /// one — see there.
+    startup_auto_selected: Option<git2::Oid>,
+    /// The ordered oids the last full walk produced, when the scope has one (see
+    /// `load_commits_inner`). Pages after the first are hydrated from this instead
+    /// of re-walking, which is the difference between ~2ms and a fresh 1.6s
+    /// ordering pass per page.
+    history_oids: Option<Vec<git2::Oid>>,
+    /// Workers that own a repo handle each and serve the loads the user waits on.
+    /// `None` only if not one could be spawned; every caller then falls back to
+    /// loading synchronously, exactly as it did on a spawn failure before.
+    foreground: Option<mpsc::Sender<ForegroundJob>>,
     config_path: Option<std::path::PathBuf>, // ~/.config/gitkay/config.toml (for live reload)
     needs_config_reload: Arc<AtomicBool>,    // set by the config-file watcher
     _config_watcher: Option<RecommendedWatcher>, // watches the config's parent dir so atomic-rename saves are caught
@@ -5715,7 +6278,8 @@ impl GitkApp {
         cc: &eframe::CreationContext<'_>,
         repo_path: String,
         scope: cli::Scope,
-        history_rx: &mpsc::Receiver<Vec<CommitInfo>>,
+        history_rx: mpsc::Receiver<HistoryWalk>,
+        provisional_rx: Option<mpsc::Receiver<Vec<CommitInfo>>>,
         font_rx: mpsc::Receiver<(egui::FontDefinitions, Vec<String>)>,
         prewarm_rx: Option<mpsc::Receiver<Arc<Highlighter>>>,
     ) -> Result<Self, String> {
@@ -5811,32 +6375,40 @@ impl GitkApp {
             .map_err(|e| format!("not a git repository: {repo_path}: {e}"))?;
         log::debug!("perf: startup: repo discover {:?}", t_discover.elapsed());
 
-        // Receive the prefetched history (started in main(), overlapped with window
-        // init). recv() blocks only if the off-thread walk hasn't finished yet; on a
-        // disconnected channel (prefetch failed to spawn/discover) load synchronously.
+        // Take the prefetched history (started in main(), overlapped with window
+        // init) only if it is ALREADY there. `new()` must not wait: window creation
+        // blocks until it returns, so a repo whose sorted revwalk is slow would hold
+        // the window back by exactly that walk — measured 1.6s on a 67k-commit
+        // checkout, where libgit2 traverses the whole history before yielding the
+        // first oid however few rows we asked for. Not ready ⇒ start empty and let
+        // `apply_pending_history` install it a few frames later; the window is up
+        // and interactive meanwhile. A disconnected channel (the prefetch failed to
+        // spawn or discover) still loads synchronously — there is nothing to wait
+        // for, and an empty list would be permanent.
         let t_history = std::time::Instant::now();
-        let commits = history_rx
-            .recv()
-            .unwrap_or_else(|_| load_history(&repo, INITIAL_COMMITS, &scope));
-        log::debug!(
-            "perf: startup: history ready ({} rows, new() waited {:?})",
-            commits.len(),
-            t_history.elapsed()
-        );
-        // An empty view (bad path filter, or an unknown/empty reflog ref) is
-        // otherwise a silent blank window; say so once at startup. Paths are matched
-        // repo-root-relative (a path given from a subdirectory won't match — a known
-        // limitation).
-        if scope.reflog && commits.is_empty() {
-            log::warn!(
-                "--reflog: no entries for {} (unknown ref or empty reflog)",
-                scope.revs.first().map_or("HEAD", String::as_str)
-            );
-        } else if !scope.paths.is_empty() && !commits.iter().any(|c| is_real_commit(c.oid)) {
-            log::warn!(
-                "no commits match path filter {:?} (paths are repo-root-relative)",
-                scope.paths
-            );
+        // One handle per worker, opened once — see `ForegroundJob`.
+        let foreground_workers = spawn_foreground_workers(&repo_path);
+
+        let (commits, walk_oids, pending_history) = match history_rx.try_recv() {
+            Ok(HistoryWalk { commits, oids }) => {
+                log::debug!(
+                    "perf: startup: history ready ({} rows, new() waited {:?})",
+                    commits.len(),
+                    t_history.elapsed()
+                );
+                (commits, oids, None)
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                log::debug!("perf: startup: history still walking — window first, rows to follow");
+                (Vec::new(), None, Some(history_rx))
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let walk = load_history(&repo, INITIAL_COMMITS, &scope);
+                (walk.commits, walk.oids, None)
+            }
+        };
+        if pending_history.is_none() {
+            warn_if_empty_view(&scope, &commits);
         }
         let t_layout = std::time::Instant::now();
         let DerivedHistory {
@@ -5983,6 +6555,13 @@ impl GitkApp {
             diff_toolbar_rect: None,
             fonts,
             pending_fonts,
+            pending_history,
+            pending_provisional: provisional_rx,
+            history_wait_since: std::time::Instant::now(),
+            history_is_provisional: false,
+            startup_auto_selected: None,
+            history_oids: walk_oids,
+            foreground: foreground_workers,
             config_path,
             needs_config_reload,
             _config_watcher: config_watcher,
@@ -6579,11 +7158,10 @@ impl GitkApp {
         }
 
         let oid = key.oid;
-        // The worker thread must own its inputs. repo_path is borrowed from self so it's
-        // cloned; paths and key are moved in (not cloned) — on the common spawn-succeeds
-        // path the originals would otherwise be dropped unused. The rare spawn-failure
-        // fallback re-resolves them instead.
-        let repo_path = self.repo_path.clone();
+        // The job owns its inputs: paths and key are moved in (not cloned) — on the
+        // common queued path the originals would otherwise be dropped unused. The
+        // rare no-worker fallback re-resolves them instead. The repo handle is not
+        // among them: the worker already owns one (see `ForegroundJob`).
         // Claim the key so a prefetch dispatched while this load runs skips it. The
         // reverse — loading a key a prefetch already claimed — still proceeds: the
         // user is waiting on THIS result now, and the prefetch may sit behind other
@@ -6626,7 +7204,6 @@ impl GitkApp {
                 visible_rows: self.diff_visible_rows.load(Ordering::Relaxed),
             });
         let job = DiffLoadJob {
-            repo_path,
             key,
             scope,
             epoch,
@@ -6636,22 +7213,17 @@ impl GitkApp {
             prehighlight,
             store: Arc::clone(&self.diff_store),
         };
-        let spawn = spawn_reporting(
-            "gitkay-diff-load",
-            "diff-load worker panicked; reporting the load as failed",
-            move || {
-                // Hold the claim for the worker's lifetime; a panic still
-                // releases it on unwind. (On spawn failure the unspawned
-                // closure is dropped, releasing it before the sync fallback.)
-                let _claim = claim;
-                diff_load_worker(job);
-            },
-            move || {
-                let (tx, key, ctx) = fail;
-                report_failed_diff_load(&tx, epoch, key, &ctx);
-            },
-        );
-        if spawn.is_ok() {
+        // Hand it to a worker that already owns a repo handle. The claim rides
+        // along and is released when the job ends, panic included.
+        let queued = self.foreground.as_ref().is_some_and(|tx| {
+            tx.send(ForegroundJob::Diff(job, claim))
+                .inspect_err(|_| {
+                    let (tx, key, ctx) = &fail;
+                    report_failed_diff_load(tx, epoch, key.clone(), ctx);
+                })
+                .is_ok()
+        });
+        if queued {
             // Track the worker so a bounce-back to this commit adopts it instead of
             // stacking a duplicate; the drain removes the entry when its (always
             // delivered) result arrives.
@@ -6659,7 +7231,7 @@ impl GitkApp {
                 self.inflight_loads.insert(k);
             }
         } else {
-            log::warn!("diff-load thread spawn failed; loading synchronously");
+            log::warn!("no foreground worker took the diff load; loading synchronously");
             // scope/key were moved into the (dropped) closure; re-resolve them for the
             // synchronous fallback. Only this rare path needs a repo handle, so discover
             // it here rather than on every navigation.
@@ -7024,6 +7596,35 @@ impl GitkApp {
     /// across an invalidation), which is why the comparison against a freshly built list
     /// is the gate: it cannot be stale, because it is recomputed from the state it gates
     /// on.
+    /// Is the pane still waiting for its FIRST diff?
+    ///
+    /// While it is, speculative work stands down. Both pools are sized to fill the
+    /// machine — eight stats workers, eight prefetch — and neither has any thread
+    /// priority, so at startup they race the one diff the reader is actually looking
+    /// at: measured on a 67k-commit repo, eight stats jobs at 1.2–1.4s each and a
+    /// 63-row prefetch band, alongside a foreground diff that took 997ms. Waiting
+    /// costs the band nothing, since it is warm long before anyone can scroll to it.
+    ///
+    /// Only ever true at startup: `current_diff_key` is `Some` from the first
+    /// install onward, so this stops gating anything the moment a diff exists.
+    ///
+    /// `startup_diff` is half the answer and is easy to leave out — the first frame
+    /// deliberately paints the commit list BEFORE dispatching any diff
+    /// (`StartupDiff::NeedsPaint`), so on that frame no load has started and a check
+    /// on `diff_load_started_at` alone reads as "nothing is loading". Measured with
+    /// only that half: the prefetch band waited correctly while eight stats jobs went
+    /// out on the first frame and finished at 631–700ms, straddling the 692ms diff
+    /// they were supposed to yield to.
+    ///
+    /// Both halves release on failure rather than sticking: a failed load clears
+    /// `diff_load_started_at`, and `StartupDiff` reaches `Done` whether or not a diff
+    /// arrived — including when there are no commits to load one for.
+    const fn awaiting_first_diff(&self) -> bool {
+        self.current_diff_key.is_none()
+            && (self.diff_load_started_at.is_some()
+                || !matches!(self.startup_diff, StartupDiff::Done))
+    }
+
     fn dispatch_commit_stats(&mut self, ctx: &egui::Context) {
         if !self.commit_list_cfg.any() {
             return;
@@ -7207,8 +7808,9 @@ impl GitkApp {
     fn dispatch_history_load(&mut self, kind: HistoryJobKind) {
         let epoch = self.history_epoch.bump();
         self.history_inflight = true;
-        let make_job = || HistoryJob {
-            repo_path: self.repo_path.clone(),
+        // `kind` now carries a Vec (Hydrate's page), so the job builder clones it
+        // rather than copying — the sync fallback below builds a second job.
+        let make_job = |kind: HistoryJobKind| HistoryJob {
             scope: self.scope.clone(),
             kind,
             epoch,
@@ -7225,22 +7827,21 @@ impl GitkApp {
                 ctx.request_repaint();
             }
         };
-        let spawn = {
-            let job = make_job();
-            spawn_reporting(
-                "gitkay-history-load",
-                "history-load worker panicked; reporting the load as failed",
-                move || history_worker(job),
-                on_panic,
-            )
-        };
-        if spawn.is_err() {
+        let queued = self.foreground.as_ref().is_some_and(|tx| {
+            tx.send(ForegroundJob::History(make_job(kind.clone())))
+                .inspect_err(|_| on_panic())
+                .is_ok()
+        });
+        if !queued {
             // Run the worker inline (accepting the UI stall): its result flows
             // through the channel into drain_history_results exactly like the
             // async path's, so the install/re-anchor logic stays in one place
             // and the incremental Extend resume still applies.
-            log::warn!("history-load thread spawn failed; loading synchronously");
-            history_worker(make_job());
+            log::warn!("no foreground worker took the history load; loading synchronously");
+            run_foreground_job(
+                Repository::discover(&self.repo_path).ok().as_ref(),
+                ForegroundJob::History(make_job(kind)),
+            );
         }
     }
 
@@ -7275,10 +7876,29 @@ impl GitkApp {
                     commits,
                     count,
                     derived,
+                    oids,
                 }) => {
+                    // A rebuild is a newer view of the repo than the startup walk,
+                    // which was begun in `main()` before the window existed — so it
+                    // retires it. Without this, a commit made while a 1.6s walk is
+                    // still running lands as a rebuild and is then overwritten by
+                    // that walk's pre-commit history: the two paths share no epoch,
+                    // so nothing supersedes it, and nothing re-arms a reload either.
+                    // Clearing `history_is_provisional` here for the same reason —
+                    // this list is real, and only ever cleared by an install that
+                    // this path does not go through.
+                    self.pending_history = None;
+                    self.pending_provisional = None;
+                    self.history_is_provisional = false;
                     let previous_oid = self.selected_oid();
                     let previous_index = self.selected;
                     self.commits = commits;
+                    // Assigned, not merged: the rebuilt rows and the cached oids
+                    // must describe the same walk, and a `None` here (reflog, path
+                    // filter) means this scope has no cacheable prefix — keeping an
+                    // older list would leave `next_history_page` serving pages for
+                    // a history nobody is looking at.
+                    self.history_oids = oids;
                     self.install_derived(*derived);
                     self.finish_resync(count, None, previous_oid, previous_index);
                 }
@@ -8248,17 +8868,24 @@ impl GitkApp {
                         // fall back to a full background rebuild. The in-flight
                         // flag keeps this from re-dispatching every frame; the
                         // result lands in drain_history_results.
+                        // Never extend a provisional list: its tail order is
+                        // approximate, and `load_commits_tail` resumes by skipping a
+                        // prefix it assumes the real walk produced. The real walk is
+                        // already in flight and replaces the whole list.
                         if !self.all_loaded
+                            && !self.history_is_provisional
                             && last_row + 50 >= num_commits
                             && !self.history_inflight
                             && let Some(last_real) =
                                 self.commits.iter().rev().find(|c| is_real_commit(c.oid))
                         {
-                            self.dispatch_history_load(HistoryJobKind::Extend {
-                                skip: real_commit_count(&self.commits),
-                                expect_last: last_real.oid,
-                                max_new: LOAD_BATCH,
-                            });
+                            let skip = real_commit_count(&self.commits);
+                            self.dispatch_history_load(next_history_page(
+                                self.history_oids.as_deref(),
+                                skip,
+                                last_real.oid,
+                                LOAD_BATCH,
+                            ));
                         }
                     });
             });
@@ -8269,7 +8896,10 @@ impl GitkApp {
             commit_panel.response.rect.height(),
         );
         // After the panel has rendered, so `commit_view_range` is this frame's.
-        self.dispatch_commit_stats(ctx);
+        // Not while the first diff is still loading — see `awaiting_first_diff`.
+        if !self.awaiting_first_diff() {
+            self.dispatch_commit_stats(ctx);
+        }
     }
 
     /// The diff-options hover toolbar: hidden until the pointer is near the top of
@@ -8474,6 +9104,151 @@ impl GitkApp {
             file_panel.response.rect.width(),
         );
         Some(file_panel.response.rect)
+    }
+
+    /// Install the startup history once the walk lands, for the case where it hadn't
+    /// finished by window creation. The diff goes through the same `StartupDiff`
+    /// deferral, so the rows paint one frame before the diff is built.
+    fn apply_pending_history(&mut self, ctx: &egui::Context) {
+        if self.pending_history.is_none() {
+            return;
+        }
+        // The real walk always wins, whenever it lands — before the deadline (the
+        // usual case, and then no provisional row is ever shown) or after it,
+        // replacing the approximate list.
+        match self.pending_history.as_ref().map(mpsc::Receiver::try_recv) {
+            Some(Ok(walk)) => {
+                self.pending_history = None;
+                self.pending_provisional = None;
+                self.install_startup_history(walk, false, ctx);
+                return;
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                // The walker died without sending — a panic inside it, or its own
+                // `Repository::discover` failing. Nothing else produces a list, and
+                // what is on screen is not a usable stand-in: under `--all` or a
+                // path filter there is no provisional list at all, so the window
+                // would stay empty for the session with nothing on screen saying
+                // why; and in the plain scope the approximate rows would be frozen
+                // at `INITIAL_COMMITS`, because `history_is_provisional` blocks the
+                // scroll extension and only a real install clears it.
+                //
+                // So retry, once, down the ordinary background path — never inline,
+                // which is the 1.6s frame-loop stall this whole module is built to
+                // avoid. One shot, not a loop: `pending_history` is cleared here, so
+                // this arm cannot be reached again, and a repo that really is
+                // unreadable installs an empty list and stops.
+                log::warn!("gitkay: history walk ended without a result; retrying");
+                self.pending_history = None;
+                self.pending_provisional = None;
+                self.dispatch_history_load(HistoryJobKind::Rebuild {
+                    count: INITIAL_COMMITS,
+                });
+                return;
+            }
+            _ => {}
+        }
+
+        // Still walking. Once the deadline passes, show the approximate list rather
+        // than an empty window — but only once, and never over the real one.
+        if !self.history_is_provisional
+            && self.history_wait_since.elapsed() >= PROVISIONAL_HISTORY_DELAY
+            && let Some(Ok(commits)) = self
+                .pending_provisional
+                .as_ref()
+                .map(mpsc::Receiver::try_recv)
+        {
+            self.pending_provisional = None;
+            self.install_startup_history(
+                HistoryWalk {
+                    commits,
+                    oids: None,
+                },
+                true,
+                ctx,
+            );
+        }
+        // Poll rather than block: neither walk has an egui Context to wake us with,
+        // the same shape as apply_pending_fonts.
+        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+    }
+
+    /// Install a startup commit list, real or provisional.
+    ///
+    /// Sets exactly what `new()` sets from a commit list and nothing more, except
+    /// that a list replacing a PROVISIONAL one keeps the reader's selection by oid
+    /// instead of resetting: by then they may have clicked, and the whole point of
+    /// showing early rows is that they are usable.
+    ///
+    /// "The reader's" is the load-bearing word, and it is why the app's own pick is
+    /// remembered rather than merely the selection. The provisional list holds no
+    /// virtual rows — the probes that decide those cost 162ms + 358ms, far past the
+    /// deadline — so its auto-pick is the tip commit where the real list's is
+    /// "Uncommitted changes". Carrying that over would open a slow repo on the tip
+    /// commit while every other repo opens on the working tree, so a reader with
+    /// local edits on a 67k-commit checkout would simply not be shown them. A reader
+    /// who re-clicked that same already-selected row is the one case this cannot
+    /// tell from no click at all, and it lands them on the standard startup state.
+    fn install_startup_history(
+        &mut self,
+        walk: HistoryWalk,
+        provisional: bool,
+        ctx: &egui::Context,
+    ) {
+        let HistoryWalk { commits, oids } = walk;
+        let t = std::time::Instant::now();
+        let chosen_by_reader = self
+            .history_is_provisional
+            .then(|| self.selected_oid())
+            .flatten()
+            .filter(|oid| Some(*oid) != self.startup_auto_selected);
+        if !provisional {
+            warn_if_empty_view(&self.scope, &commits);
+        }
+        let derived = derive_from_commits(&commits);
+        self.commits = commits;
+        self.install_derived(derived);
+        // A provisional list is never "all there is", however short: the real walk
+        // decides that. Leaving it true would also let the scroll extension run
+        // against a prefix load_commits_tail cannot resume from.
+        self.all_loaded = !provisional && real_commit_count(&self.commits) < INITIAL_COMMITS;
+        self.history_is_provisional = provisional;
+        // A provisional list has no cacheable walk behind it; the real one that
+        // replaces it brings the oids with it.
+        self.history_oids = oids;
+        // A query typed while the list was empty matched nothing; re-run it now
+        // that there are rows to match.
+        self.refresh_search_matches();
+        // The selection, and with it the branch highlight, which holds row INDICES.
+        // This list is a different list: the real one prepends the working-tree rows
+        // the provisional one has none of, so an index computed against that one
+        // names a different commit here. Carrying a reader's choice over therefore
+        // goes through `set_selected`, which recomputes the highlight exactly as a
+        // click does; the app's own pick clears it, which is the empty-highlight
+        // state `new()` starts in and the reason nothing is dimmed before the reader
+        // has chosen a row.
+        if let Some(i) =
+            chosen_by_reader.and_then(|oid| self.commit_index_by_oid.get(&oid).copied())
+        {
+            self.startup_auto_selected = None;
+            self.set_selected(i);
+        } else {
+            self.selected = startup_selection(&self.commits, self.scope.combined);
+            self.startup_auto_selected = self.selected_oid();
+            self.branch_highlight.clear();
+        }
+        self.startup_diff = if self.selected.is_none() {
+            StartupDiff::Done
+        } else {
+            StartupDiff::NeedsPaint
+        };
+        log::debug!(
+            "perf: startup: {} history installed ({} rows) {:?}",
+            if provisional { "provisional" } else { "real" },
+            self.commits.len(),
+            t.elapsed()
+        );
+        ctx.request_repaint();
     }
 
     /// Apply deferred fonts once an off-thread build finishes — the startup
@@ -8914,9 +9689,11 @@ impl GitkApp {
             // would be re-asked on all of them.
             let syntax = self.syntax_enabled;
             let have_highlighter = self.highlighter.is_some();
-            if band_warmable(syntax, have_highlighter, || {
-                self.diff_highlight_settled(applied_highlight)
-            }) {
+            if !self.awaiting_first_diff()
+                && band_warmable(syntax, have_highlighter, || {
+                    self.diff_highlight_settled(applied_highlight)
+                })
+            {
                 self.prefetched_gen = current_gen;
                 self.dispatch_prefetch(ctx);
             }
@@ -9109,6 +9886,10 @@ impl eframe::App for GitkApp {
             StartupDiff::Done => {}
         }
 
+        // Before the fonts: this is the one that puts rows on an empty window, and
+        // it must run ahead of the drains and the render so the frame that installs
+        // the history is the frame that draws it.
+        self.apply_pending_history(&ctx);
         self.apply_pending_fonts(&ctx);
         self.handle_git_reload(&ctx);
         self.handle_search_debounce(&ctx);
@@ -9595,12 +10376,12 @@ fn main() -> eframe::Result {
             move || {
                 if let Ok(repo) = Repository::discover(&repo_path) {
                     let t = std::time::Instant::now();
-                    let commits = load_history(&repo, INITIAL_COMMITS, &scope);
+                    let walk = load_history(&repo, INITIAL_COMMITS, &scope);
                     log::debug!(
                         "perf: startup: history prefetch (off-thread) {:?}",
                         t.elapsed()
                     );
-                    let _ = history_tx.send(commits);
+                    let _ = history_tx.send(walk);
                 }
             },
         )
@@ -9609,6 +10390,41 @@ fn main() -> eframe::Result {
             log::warn!("history prefetch thread spawn failed; loading synchronously");
         }
     }
+
+    // The provisional walk, racing the real one above. Its result is used ONLY if
+    // the real walk is still going at PROVISIONAL_HISTORY_DELAY, so on an ordinary
+    // repo this thread's few milliseconds of work are computed and discarded — that
+    // is the design, not waste: it is what keeps a fast repo from ever showing rows
+    // it is about to reorder.
+    let (quick_tx, quick_rx) = mpsc::channel();
+    let provisional_rx = if provisional_scope(&scope) {
+        let repo_path = repo_path.clone();
+        if spawn_guarded(
+            "gitkay-history-quick",
+            "provisional history thread panicked",
+            move || {
+                if let Ok(repo) = Repository::discover(&repo_path) {
+                    let t = std::time::Instant::now();
+                    let commits = provisional_commits(&repo, INITIAL_COMMITS);
+                    log::debug!(
+                        "perf: startup: provisional history ({} rows, off-thread) {:?}",
+                        commits.len(),
+                        t.elapsed()
+                    );
+                    let _ = quick_tx.send(commits);
+                }
+            },
+        )
+        .is_err()
+        {
+            log::warn!("provisional history thread spawn failed; no early rows");
+            None
+        } else {
+            Some(quick_rx)
+        }
+    } else {
+        None
+    };
 
     // Build the font set on a background thread too: fontdb's system-font scan
     // (~150ms when a font is configured by name and not yet cached) overlaps with
@@ -9641,7 +10457,15 @@ fn main() -> eframe::Result {
             log::debug!("perf: startup: window + GL init {:?}", startup_t0.elapsed());
             // …and this end-to-end figure covers the whole path from process start
             // to a built app: pre-eframe work, window/GL init, and GitkApp::new.
-            let app = GitkApp::new(cc, repo_path, scope, &history_rx, font_rx, prewarm_rx)?;
+            let app = GitkApp::new(
+                cc,
+                repo_path,
+                scope,
+                history_rx,
+                provisional_rx,
+                font_rx,
+                prewarm_rx,
+            )?;
             log::debug!(
                 "perf: startup: ready (process start -> app built) {:?}",
                 startup_t0.elapsed()
@@ -9658,6 +10482,266 @@ mod tests {
     use crate::test_repo::{
         commit_file, commit_index, commit_rename, stage, temp_repo, write_file,
     };
+
+    /// The provisional list is shown to a real reader, so it must at minimum agree
+    /// with the real walk on an ordinary history — the approximation is only
+    /// licensed for the deep tail of a merge-dense repo, not for everyday rows.
+    #[test]
+    fn the_provisional_walk_matches_the_real_one_on_ordinary_history() {
+        let (_d, repo) = temp_repo();
+        let mut expected = Vec::new();
+        for i in 0..25 {
+            expected.push(commit_file(
+                &repo,
+                "f.txt",
+                &format!("{i}"),
+                &format!("c{i}"),
+            ));
+        }
+        expected.reverse(); // newest first, as both walks emit
+
+        let got: Vec<git2::Oid> = provisional_commits(&repo, 100)
+            .iter()
+            .map(|c| c.oid)
+            .collect();
+        assert_eq!(got, expected);
+    }
+
+    /// Merges are the case the heap walk exists to handle cheaply, and the one where
+    /// a naive walk goes wrong first: both parents must be reachable and every row
+    /// must still precede its own parents.
+    #[test]
+    fn the_provisional_walk_covers_both_sides_of_a_merge() {
+        let (_d, repo) = temp_repo();
+        let root = commit_file(&repo, "f.txt", "0", "root");
+        // Read the initial branch back rather than naming it: `Repository::init`
+        // honours the developer's own `init.defaultBranch`, so a hardcoded
+        // "refs/heads/master" on a machine defaulting to `main` leaves HEAD
+        // attached-unborn and the checkout below panics on GIT_EUNBORNBRANCH.
+        let mainline = repo.head().unwrap().name().unwrap().to_string();
+        repo.branch("side", &repo.find_commit(root).unwrap(), false)
+            .unwrap();
+        let main_c = commit_file(&repo, "f.txt", "main", "on-main");
+        repo.set_head("refs/heads/side").unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        let side_c = commit_file(&repo, "g.txt", "side", "on-side");
+        // merge side into main
+        repo.set_head(&mainline).unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        let sig = repo.signature().unwrap();
+        let tree = repo
+            .find_tree(repo.index().unwrap().write_tree().unwrap())
+            .unwrap();
+        let merge = repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "merge",
+                &tree,
+                &[
+                    &repo.find_commit(main_c).unwrap(),
+                    &repo.find_commit(side_c).unwrap(),
+                ],
+            )
+            .unwrap();
+
+        let rows = provisional_commits(&repo, 100);
+        let oids: Vec<git2::Oid> = rows.iter().map(|c| c.oid).collect();
+        for want in [merge, main_c, side_c, root] {
+            assert!(oids.contains(&want), "missing {want} from {oids:?}");
+        }
+        // Every row must come before its own parents, or the graph draws upside down.
+        let pos: std::collections::HashMap<git2::Oid, usize> =
+            oids.iter().enumerate().map(|(i, o)| (*o, i)).collect();
+        for (i, row) in rows.iter().enumerate() {
+            for p in &row.parents {
+                if let Some(&j) = pos.get(p) {
+                    assert!(j > i, "parent {p} drawn above its child {}", row.oid);
+                }
+            }
+        }
+    }
+
+    /// `topo_window` orders ready rows by the key the WALK popped them at, never by
+    /// `CommitInfo::time`. Those are different clocks: the key is the committer time
+    /// (clamped below the discovering child), `time` is the author date, and a rebase,
+    /// cherry-pick, `git am` or import moves one without the other — on the very
+    /// histories this walk exists for. Sorting on the wrong one can reorder
+    /// topologically unrelated rows away from the real walk's order; it stays a valid
+    /// topological order, so the graph is fine and what would show is rows shuffling
+    /// when the real list lands. The fixture is synthetic because it has to be: on
+    /// elasticsearch and git.git both keys give byte-identical first-200 lists, so no
+    /// repo here makes the two clocks disagree.
+    #[test]
+    fn the_window_is_ordered_by_the_walks_key_not_the_rows_author_date() {
+        // Two independent branches off a root, so nothing but the tie-break decides
+        // their order. Author dates rank them the opposite way round from the keys.
+        let authored = |id: u32, parents: &[u32], when: i64| {
+            CommitInfo::new(
+                DiffSource::Commit(oid(id)),
+                format!("Commit {id}"),
+                "test".into(),
+                when,
+                0,
+                parents.iter().map(|p| oid(*p)).collect(),
+                vec![],
+                None,
+            )
+        };
+        let rows = vec![
+            (4000, authored(1, &[2, 3], 4000)), // merge
+            (3000, authored(2, &[4], 100)),     // newer by key, OLDER by author date
+            (2000, authored(3, &[4], 200)),     // older by key, NEWER by author date
+            (1000, authored(4, &[], 1000)),     // root
+        ];
+
+        let got: Vec<git2::Oid> = topo_window(rows).iter().map(|c| c.oid).collect();
+        assert_eq!(
+            got,
+            vec![oid(1), oid(2), oid(3), oid(4)],
+            "the walk popped 2 before 3; only the author dates say otherwise"
+        );
+    }
+
+    /// The shape the heap walk alone cannot order: a merge base dated NEWER than
+    /// the side branch hanging below it — what `git am --committer-date-is-author-date`,
+    /// a rebase, `filter-repo` and `fast-import` all produce. Walking the mainline
+    /// reaches the base while the side commits are still in the heap, and clamping a
+    /// parent below the child that DISCOVERED it cannot see the other child, which
+    /// has not been reached. So the base out-ranks its own descendants and pops
+    /// above them, which is the ordering `layout_graph` treats as an invariant.
+    #[test]
+    fn a_merge_base_newer_than_its_side_branch_is_still_drawn_below_it() {
+        use crate::test_repo::commit_file_at;
+        let (_d, repo) = temp_repo();
+        // base(1000) ← mainline(2000), and base ← side(500); merged at 3000.
+        let base = commit_file_at(&repo, "f.txt", "0", "base", 1000, &[]);
+        let mainline = commit_file_at(&repo, "f.txt", "main", "on-main", 2000, &[base]);
+        let side = commit_file_at(&repo, "g.txt", "side", "on-side", 500, &[base]);
+        let merge = commit_file_at(&repo, "h.txt", "m", "merge", 3000, &[mainline, side]);
+        repo.reference("refs/heads/topo", merge, true, "test")
+            .unwrap();
+        repo.set_head("refs/heads/topo").unwrap();
+
+        let rows = provisional_commits(&repo, 100);
+        let oids: Vec<git2::Oid> = rows.iter().map(|c| c.oid).collect();
+        assert_eq!(oids.len(), 4, "the whole history is in the window");
+        let pos: std::collections::HashMap<git2::Oid, usize> =
+            oids.iter().enumerate().map(|(i, o)| (*o, i)).collect();
+        assert!(
+            pos[&side] < pos[&base],
+            "the base must be drawn below the side branch it is the parent of: {oids:?}"
+        );
+        for (i, row) in rows.iter().enumerate() {
+            for p in &row.parents {
+                if let Some(&j) = pos.get(p) {
+                    assert!(j > i, "parent {p} drawn above its child {}", row.oid);
+                }
+            }
+        }
+    }
+
+    /// The cached walk is what makes page two cost ~2ms instead of a fresh 1.6s
+    /// ordering pass, but serving a page from it is only sound while it still
+    /// describes what is on screen — otherwise the list would splice in a different
+    /// history. Every uncertain case must fall back to re-walking, which is always
+    /// correct and merely slow.
+    #[test]
+    fn the_next_page_comes_from_the_cached_walk_only_when_it_still_lines_up() {
+        let ids: Vec<git2::Oid> = (0..10).map(oid).collect();
+        let hydrated = |k: &HistoryJobKind| match k {
+            HistoryJobKind::Hydrate { oids, .. } => Some(oids.clone()),
+            HistoryJobKind::Extend { .. } | HistoryJobKind::Rebuild { .. } => None,
+        };
+
+        // In range and anchored on the last loaded row: serve rows 3..6 from cache.
+        let page = next_history_page(Some(&ids), 3, oid(2), 3);
+        assert_eq!(hydrated(&page), Some(vec![oid(3), oid(4), oid(5)]));
+
+        // A short tail out of a COMPLETE cache is fine — it tells the UI the
+        // history ended, which it did.
+        let page = next_history_page(Some(&ids), 8, oid(7), 500);
+        assert_eq!(hydrated(&page), Some(vec![oid(8), oid(9)]));
+
+        // ...but out of a CAPPED one the same short page is a lie: the caller
+        // latches `all_loaded` off it, so every commit past the cap would become
+        // unreachable for the session. Re-walk instead.
+        let cap = u32::try_from(HISTORY_OID_CAP).expect("the cap fits a fake oid");
+        let capped: Vec<git2::Oid> = (0..cap).map(oid).collect();
+        let last = HISTORY_OID_CAP - 1;
+        assert!(
+            hydrated(&next_history_page(
+                Some(&capped),
+                last,
+                oid(cap - 2),
+                LOAD_BATCH
+            ))
+            .is_none(),
+            "a short page from a truncated cache must re-walk, not end the list"
+        );
+        // A FULL page from the same capped list is still served from cache — the
+        // cap only makes the *end* of the list untrustworthy.
+        assert_eq!(
+            hydrated(&next_history_page(Some(&capped), 3, oid(2), 3)),
+            Some(vec![oid(3), oid(4), oid(5)])
+        );
+
+        // No cache at all (path filter, reflog, or a walk that never cached).
+        assert!(hydrated(&next_history_page(None, 3, oid(2), 3)).is_none());
+        // Anchor mismatch: the cache is from a different walk than the rows on
+        // screen. Serving it would silently graft one history onto another.
+        assert!(hydrated(&next_history_page(Some(&ids), 3, oid(99), 3)).is_none());
+        // Past the end — an oid list truncated at HISTORY_OID_CAP.
+        assert!(hydrated(&next_history_page(Some(&ids), 20, oid(2), 3)).is_none());
+        // Exactly exhausted: nothing left to hand over, so re-walk and let the
+        // walk itself say whether more exists.
+        assert!(hydrated(&next_history_page(Some(&ids), 10, oid(9), 3)).is_none());
+        // A zero prefix has no anchor to check against.
+        assert!(hydrated(&next_history_page(Some(&ids), 0, oid(0), 3)).is_none());
+    }
+
+    #[test]
+    fn only_the_plain_scope_gets_a_provisional_walk() {
+        let with = |f: fn(&mut cli::Scope)| {
+            let mut s = cli::Scope::default();
+            f(&mut s);
+            s
+        };
+        assert!(provisional_scope(&cli::Scope::default()));
+        // Each of these needs a whole-list computation the heap walk cannot do:
+        // multi-tip seeding, the path filter's parent rewrite, reflog numbering.
+        assert!(!provisional_scope(&with(|s| s.all = true)));
+        assert!(!provisional_scope(&with(|s| s.reflog = true)));
+        assert!(!provisional_scope(&with(|s| s.follow = true)));
+        assert!(!provisional_scope(&with(|s| s.revs = vec!["main".into()])));
+        assert!(!provisional_scope(&with(|s| s.paths = vec!["src".into()])));
+    }
+
+    #[test]
+    fn a_slow_walk_is_explained_once_and_a_fast_one_never() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+        let latch = AtomicBool::new(false);
+
+        // An ordinary repo's walk says nothing, however many times it runs.
+        assert!(!should_note_slow_walk(Duration::from_millis(17), &latch));
+        assert!(!should_note_slow_walk(
+            SLOW_HISTORY_WALK.saturating_sub(Duration::from_millis(1)),
+            &latch
+        ));
+        // A second walk in the same process (~155ms measured) is still silent.
+        assert!(!should_note_slow_walk(Duration::from_millis(155), &latch));
+
+        // The first slow one explains itself...
+        assert!(should_note_slow_walk(SLOW_HISTORY_WALK, &latch));
+        // ...and no later walk repeats it: the explanation is about the repo, and a
+        // line per watcher reload would bury every other log.
+        assert!(!should_note_slow_walk(Duration::from_secs(5), &latch));
+        assert!(!should_note_slow_walk(Duration::from_mins(1), &latch));
+    }
 
     /// Make a fake OID from an integer for testing.
     fn oid(n: u32) -> git2::Oid {
@@ -12883,6 +13967,37 @@ mod tests {
         // c1 is a root commit: no parents.
         assert_eq!(real[1].oid, c1);
         assert!(real[1].parents.is_empty());
+    }
+
+    #[test]
+    fn path_filter_rewrites_the_uncommitted_rows_parent_too() {
+        // The virtual rows hang off HEAD, so when the path filter DROPS the head
+        // commit their parent names a row that isn't in the list and the lane is
+        // orphaned. They must be rewritten across it like any kept commit — and
+        // they are built after the walk now (the probes run alongside it), so the
+        // rewrite reaches them through the retained `nearest` map rather than by
+        // being in the vec when step 3 runs.
+        let (_d, repo) = temp_repo();
+        let c1 = commit_file(&repo, "a.txt", "1", "a-1");
+        commit_file(&repo, "b.txt", "1", "b-only"); // HEAD, dropped by the a.txt filter
+        write_file(&repo, "a.txt", "edited"); // uncommitted, inside the filter
+
+        let s = cli::Scope {
+            all: false,
+            revs: Vec::new(),
+            paths: vec!["a.txt".to_string()],
+            ..Default::default()
+        };
+        let got = load_commits(&repo, 100, &s);
+        let row = got
+            .iter()
+            .find(|c| c.oid == oid_uncommitted())
+            .expect("uncommitted row for an edit inside the path filter");
+        assert_eq!(
+            row.parents,
+            vec![c1],
+            "parent must be rewritten across the dropped head commit to the nearest kept ancestor"
+        );
     }
 
     #[test]

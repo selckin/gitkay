@@ -213,10 +213,231 @@ The big picture, ahead of the detail sections below:
 Startup work is structured so the window paints as soon as possible; the heavy/IO-bound
 parts run off the window-creation critical path:
 - **History prefetch** — `main()` spawns a `gitkay-history` thread running `load_history`
-  while eframe does window + GL init (the larger, ~400ms+ cost). `GitkApp::new` receives
-  the walk over a channel, blocking only if it hasn't finished; on spawn/discover failure
-  it loads synchronously. The walk's cost is cold first-touch IO (~1ms warm) — overlap it,
-  don't "optimise" it.
+  while eframe does window + GL init (the larger, ~400ms+ cost). **`GitkApp::new` never
+  waits for it**: it `try_recv`s, and on `Empty` starts with an empty list and defers to
+  `apply_pending_history`, which polls each frame exactly like `pending_fonts` and
+  installs the rows when they land. The install
+  sets precisely what `new()` sets from a commit list — derived state, `all_loaded`
+  against `INITIAL_COMMITS`, search matches, `startup_selection`, and `StartupDiff`.
+  A *disconnected* channel — the walker panicked, or its own `Repository::discover`
+  failed — **retries once** through the ordinary background path
+  (`HistoryJobKind::Rebuild`), never inline, which would be the 1.6s frame-loop
+  stall this module exists to avoid. Doing nothing was the bug: under `--all` or a
+  path filter there is no provisional stand-in, so the window sat empty for the
+  session with nothing on screen saying why, and in the plain scope
+  `history_is_provisional` — only ever cleared by an install — stayed true, freezing
+  the approximate rows at `INITIAL_COMMITS` because it blocks the scroll extension.
+  One shot, not a loop: `pending_history` is cleared before the dispatch, so a repo
+  that really is unreadable installs an empty list and stops.
+  **A landed rebuild retires the startup walk**, in `drain_history_results`. The
+  walk begins in `main()` before the window exists, so any rebuild is a newer view;
+  without this, a commit made during a 1.6s walk lands as a rebuild and is then
+  overwritten wholesale by that walk's pre-commit history — the two paths share no
+  epoch, so nothing supersedes it and nothing re-arms a reload either. That branch
+  clears `history_is_provisional` for the same reason: the list it installs is real,
+  and it is not an install that would otherwise clear it.
+  **`branch_highlight` holds row INDICES**, so it cannot simply be carried across an
+  install: the real list prepends the working-tree rows the provisional one has
+  none of, and an index computed against that one names a different commit here.
+  A carried-over reader selection therefore goes through `set_selected`, which
+  recomputes it exactly as a click does; the app's own pick clears it, which is the
+  empty-highlight state `new()` starts in and why nothing is dimmed before the
+  reader has chosen a row.
+  **`startup_auto_selected` is what separates the two**, and the distinction is not
+  cosmetic. The provisional list has no virtual rows — the probes deciding those
+  cost 162ms + 358ms, far past the deadline — so its auto-pick is the tip commit
+  where the real list's is "Uncommitted changes". Preserving "the selection"
+  unconditionally therefore opened a slow repo on the tip commit while every
+  smaller repo opens on the working tree, so a reader with local edits on a
+  67k-commit checkout was simply not shown them. Remembering the row the app picked
+  makes it "preserve what the READER chose". A reader who re-clicked that same
+  already-selected row is the one case this cannot tell from no click at all, and
+  it lands them on the standard startup state.
+  **Do not "simplify" this back to a blocking `recv()`.** The walk is NOT the ~1ms
+  warm cost an earlier version of this file claimed. libgit2's *sorted* revwalk
+  traverses and parses the entire history before yielding the first oid, so its cost
+  is the repo's whole history regardless of the 200-row limit — measured on a
+  67k-commit checkout: **1.6s**, and identical whether 200 or 700 rows are taken.
+  Three plausible culprits were measured and cleared: it is not cold cache (it
+  reproduces across fresh processes), not the missing commit-graph (writing one
+  changed 1.61s → 1.61s; libgit2 does not use it here), and not `TOPOLOGICAL` — on
+  fresh `Repository` handles, `NONE` is 12.8ms while `TIME`, `TOPOLOGICAL` and
+  `TIME|TOPOLOGICAL` are 1.66s/1.61s/1.61s. *Any* ordering pays it, so the sort flags
+  are not a lever. A second walk **through the same `Repository` handle** costs ~165ms — libgit2's
+  odb cache holds the parsed commits — but that discount is NOT reached today:
+  `history_worker` calls `Repository::discover` per dispatch, so every scroll past a
+  page boundary opens a cold handle and re-pays the whole ordering pass. Measured on
+  the 67k-commit repo: `load_commits_tail(skip 200, +500)` takes **1.60s on a fresh
+  handle and does so every time**, against 165ms on the second call through a reused
+  one. (An earlier version of this file claimed the extension and the watcher reload
+  "don't re-pay it". They did.)
+- **The walk's whole oid list is cached, and that is what pages two onward come
+  from** (`HISTORY_OID_CAP`, `GitkApp::history_oids`, `next_history_page` →
+  `HistoryJobKind::Hydrate`). Draining the revwalk is **free**: the ordering pass
+  builds the list internally and `take(200)` merely throws the rest away — measured,
+  67,677 oids in 1.566s against 1.583s for 200. Keeping it turns a page from a fresh
+  1.6s ordering pass into a `find_commit` per row: **~10ms for 500 rows**, measured
+  on the same repo for pages 2, 3 and 4.
+  A history actor holding a live `Revwalk` was considered first and is **strictly
+  worse**: same benefit, but a thread owning a `Repository` plus an iterator, with
+  teardown and restart on every repo change. Its only advantage would have been
+  avoiding the drain, and the drain costs nothing. A bigger `INITIAL_COMMITS` is not
+  a fix either — libgit2 cannot resume a revwalk, so each extension re-walks from the
+  tip wherever it resumes.
+  Serving a page from the cache is sound only while the cache still describes what is
+  on screen, so `next_history_page` checks `oids[skip - 1]` against the last loaded
+  commit — the same anchor `load_commits_tail` verifies, for the same reason — and
+  falls back to re-walking on any doubt: no cache, a `skip` past the end, a
+  mismatched anchor, or nothing left to hand over. Falling
+  back is always correct and merely slow, which is why it is the default for every
+  uncertain case. Cached for the plain scope only: a path filter drops and rewrites
+  as it walks, so draining it is neither free nor a list of what the next page holds.
+  The cap is memory alone at 20 bytes an oid — 200k is ~4MB and covers every repo
+  anyone browses (git.git is 82k).
+  **A SHORT page is the uncertain case that is not merely slow to get wrong**, and it
+  needs the cap taken into account rather than only the anchor. The caller reads a
+  short answer as "the history ended" and latches `all_loaded`, which stops the
+  scroll extension for the session — so serving a short page out of a list truncated
+  at `HISTORY_OID_CAP` made every commit past 200,000 unreachable. A short page is
+  handed over only when the cache holds the WHOLE history (`oids.len() <
+  HISTORY_OID_CAP`, derived from the length rather than stored, so it cannot drift
+  from what the walk did); from a capped list it re-walks and lets the walk itself
+  say whether more exists.
+  **A rebuild replaces the cache, and must**: `rebuild_load` takes the whole
+  `HistoryWalk` rather than just its rows, precisely so the rebuilt list and the
+  cached oids come from one walk. The cache used to be written only at startup, and
+  a rebuild is the event that changes the history *behind* the rows on screen — a
+  `git fetch` whose commits are all older than the last loaded row leaves the anchor
+  matching while making every later page wrong, and since each of those pages then
+  supplies the next anchor from the same stale list, nothing ever notices and the
+  fetched commits are silently absent however far the reader scrolls. Assigned, not
+  merged: `None` (reflog, path filter) means this scope has no cacheable prefix, and
+  keeping an older list would serve pages for a history nobody is looking at.
+  **`Sort::NONE` was tried as a fast path and is WRONG — do not retry it.** It is
+  ~150× faster (13ms vs 1.6s on a 67k-commit repo) and looks correct for a single
+  tip: identical output to `TIME|TOPOLOGICAL` on five real repos at 200 *and* 700
+  rows, on a range with exclusions, and on two synthetic shapes built to break it (a
+  long-lived branch merged late; two lines interleaving by date). All of that is
+  true and all of it is insufficient. On **git.git** — 82k commits where the first
+  500 rows are *every one* a merge — the unsorted walk agrees for exactly **252
+  rows** and then diverges, and past that emits **parents BEFORE their children**: 2
+  violations at 700 rows, 5 at 2000, 22 at 10000. That is not a different order, it
+  is an invalid one, and it breaks the layout invariant the whole graph rests on.
+  The 200-row initial load hides it; `INITIAL_COMMITS` + one `+500` scroll does not.
+  The lesson generalises past this one idea: a property that holds on every repo to
+  hand can still be false, and "merge-heavy" is not one axis — git.git diverges
+  where elasticsearch (equally merge-heavy at the tip) does not. Test any ordering
+  change against git.git specifically, at 700+ rows, checking parent-before-child
+  and not just prefix equality.
+- **The provisional first screenful** (`provisional_commits`, `gitkay-history-quick`)
+  fills the gap on a repo whose real walk takes seconds. A heap keyed by committer
+  time, seeded from HEAD, popping rows and pushing only parents: O(rows + frontier)
+  instead of the whole history, ~12–29ms against ~2s for 200 rows.
+  **The real walk is the primary path and always wins.** The provisional list is
+  installed only if `PROVISIONAL_HISTORY_DELAY` (200ms) passes with no real result,
+  so on an ordinary repo (single-digit ms up to ~4k commits, ~250ms at 13k) it is
+  computed, unused and discarded — that is the design, and it is what keeps a fast
+  repo from ever showing rows it is about to reorder. Only 67k/82k-commit repos
+  reach the deadline. Same reasoning as `DIFF_PLACEHOLDER_DELAY`.
+  It is an **approximation, and deliberately capped**. It selects exactly the same
+  SET as the real walk (verified at 200/700/2000 rows on five repos) and the same
+  ORDER for the first 200 everywhere tested, git.git included; past that it can
+  diverge, because exact global order cannot be produced lazily ("no parent before
+  all its children" needs the whole DAG, which is the pass being avoided). Hence
+  `history_is_provisional`, which blocks the scroll extension: it keeps
+  `load_commits_tail` from resuming off a prefix it did not produce, and the list
+  stays at `INITIAL_COMMITS` until the real walk replaces it.
+  A parent's sort key is `min(own time, child key - 1)`, not its own timestamp.
+  Two commits sharing a second — scripted commits, rebases, imports — otherwise tie
+  and the oid tie-break can pop a parent first; an amend or cherry-pick can even
+  date a parent NEWER than its child. `the_provisional_walk_covers_both_sides_of_a_merge`
+  caught exactly that on a four-commit fixture, so this is not theoretical.
+  **That clamp is necessary and not sufficient, and `topo_window` is the rest of
+  it.** The clamp only relates a parent to the child that DISCOVERED it, which says
+  nothing about a child the walk has not reached: a merge base dated newer than the
+  side branch below it (what `git am --committer-date-is-author-date`, a rebase,
+  `filter-repo` and `fast-import` all produce) is reached down the mainline while
+  the side commits are still in the heap, so it out-ranks its own descendants and
+  pops above them. Not a different order but an invalid one, and `layout_graph`
+  rests on it not happening. A decrease-key heap does not help either — by the time
+  the second child arrives, the parent has popped. So the walk emits its window and
+  `topo_window` settles the topology *over the rows emitted*, which is the only
+  place the invariant is actually about: Kahn's algorithm over the in-window edges,
+  taking the newest ready row each time, i.e. the real walk's own rule of time order
+  constrained to topological. An induced subgraph's constraints are a subset of the
+  whole graph's, so it can never contradict the real walk, and it is ≤
+  `INITIAL_COMMITS` rows. `a_merge_base_newer_than_its_side_branch_is_still_drawn_below_it`
+  pins it and fails without it.
+  **"Newest" there is the HEAP KEY, which is why the walk hands `topo_window` a
+  `(key, CommitInfo)` pair rather than the rows alone.** `CommitInfo::time` is the
+  AUTHOR date — what `git log` and gitk show, and what a rebase, cherry-pick, `git am`
+  or import leaves untouched while moving the committer date — whereas the heap, and
+  libgit2's `TIME` sort, order by the COMMITTER date. Sorting the window on the author
+  date therefore *can* reorder topologically unrelated rows away from the real walk's
+  order, on exactly the histories this walk exists for. It stays a valid topological
+  order, so the graph is fine either way; what would show is rows shuffling when the
+  real list lands.
+  **Measured, it changes nothing on the repos to hand**: elasticsearch (67k commits,
+  1308 refs) and git.git both produce byte-identical first-200 lists under either key.
+  So this is the `Sort::NONE` lesson applied in the other direction — the wrong key
+  is not *observably* wrong here, and is kept correct anyway because "every repo I
+  tried" is not an argument, as that entry records at length. Do not "simplify" it
+  back to `CommitInfo::time` on the grounds that a diff shows no change.
+  `the_window_is_ordered_by_the_walks_key_not_the_rows_author_date` pins it on a
+  fixture whose two clocks disagree, since no real repo to hand supplies one.
+  Scope-limited by `provisional_scope` to the plain view: `--all` needs multi-tip
+  seeding, a path filter needs the parent rewrite, `--reflog` needs `@{n}` numbering
+  — each a whole-list computation. A list replacing a provisional one keeps the
+  reader's selection by oid rather than resetting; by then they may have
+  clicked, which is the entire point of showing early rows — see
+  `startup_auto_selected` under **History prefetch** for why "the reader's" is doing
+  real work in that sentence. Deliberately NOT marked
+  in the UI: on every repo measured the first 200 rows are identical to the real
+  ones, so a badge would advertise a difference that is not there.
+  A walk over `SLOW_HISTORY_WALK` (500ms) explains itself at **`warn`**, once per
+  process (`note_slow_history_walk`; the threshold and latch are the pure
+  `should_note_slow_walk`, so both are testable without capturing output). `warn`
+  rather than `debug` precisely because the window now opens first: the symptom is a
+  list that is empty, or briefly out of date, on a live and responsive window — which
+  reads as gitkay having lost the repo rather than as work in progress. It is
+  deliberately an explanation and not advice: nothing the reader can configure
+  changes it, and the three obvious remedies were measured and do not work (see
+  above). It does NOT name libgit2 — that reads as blame, and misleadingly, since
+  establishing the order is inherent to the problem rather than to whoever implements
+  it. **Keep it to one sentence**: what happened, why, and what it did to
+  the view. Nothing else about it is actionable, so anything more is a lecture in a
+  log file — it grew to three sentences and two scope-dependent variants once
+  (the window had not blocked; later loads are faster; which of two experiences the
+  reader had just had), every clause true and the result unreadable. The one
+  consequence worth stating is the one the reader can SEE: under `provisional_scope`
+  the rows they were already reading have just been swapped, so the line reads
+  "best-effort pass rendered the first 200 commits; the final result needed the whole
+  history walked and sorted, which took 1.6s — the displayed commits may have
+  changed". For `--all` and path filters there is no stand-in and the list is
+  appearing for the first time, so it says so instead of claiming a change that did
+  not happen.
+  Once per process because the fact is about the repo, and a line per watcher reload
+  would bury every other log.
+- **The index/worktree probes run off-thread** (`spawn_local_probes` →
+  `gitkay-probes`), joined only after the revwalk. They are full diffs whose cost
+  tracks the size of the *working tree*, not of the change — 162ms + 358ms on that
+  same checkout — and they feed nothing the walk needs; they merely decide two rows
+  that render above it. So `load_commits` walks first and prepends the virtual rows
+  after. The subtlety that keeps: under a path filter those rows' parents must still
+  be rewritten across dropped commits, and since they no longer exist when step 3
+  runs, `load_commits` retains the `nearest` map and rewrites them on the way out
+  (`path_filter_rewrites_the_uncommitted_rows_parent_too` fails without it). A spawn
+  failure probes inline rather than skipping — skipping would silently hide rows for
+  a working tree that really is dirty.
+  **Every other way the thread can fail to answer probes inline too**, which is the
+  same rule and was the half that was missing: the thread's own `Repository::open`
+  failing, and the thread panicking, both used to collapse to `(false, false)` —
+  "index clean, worktree clean". That is not a benign default but the exact outcome
+  the spawn-failure branch exists to prevent, arriving silently: the "Uncommitted
+  changes" and "Staged changes" rows are simply absent, so the reader sees no sign of
+  their unstaged work and has no way to open its diff. `LocalProbes::join` therefore
+  takes the repo handle `load_commits` already holds — the one thing the thread could
+  fail to obtain — and probes on it, which is merely slower.
 - **Font prefetch + deferred swap** — `main()` spawns a `gitkay-fonts` thread running
   `build_fonts` so fontdb's system scan overlaps window init. The scan only runs when a
   font is configured *by name* and not path-cached in `~/.cache/gitkay/fonts.toml` (~150ms
@@ -723,6 +944,57 @@ parts run off the window-creation critical path:
   highlight batch has landed since a `false`, and never merely because it was asked.
   Accepted limit: a continuous fling still outruns the pool. Nothing that builds a real
   diff per row will not.
+- **Foreground loads run on workers that own a repo handle** (`ForegroundJob`,
+  `spawn_foreground_workers`, `gitkay-fg-{i}`), shared by the diff pane and the
+  history extension. `git2::Repository` is `Send` but **not `Sync`**, so a handle
+  cannot be shared between threads at all; one per long-lived worker, opened once, is
+  the best available — and it is what the prefetch pool has always done. Both of
+  these opened their own per dispatch instead, and on a large repo that is ~150ms of
+  first-touch EVERY time: measured on a 67k-commit checkout, five successive diffs
+  cost 182/129/128/127/125ms through fresh handles against 127/17/16/19/15ms through
+  one reused handle. It showed up as a 657ms foreground diff in a log where the
+  prefetch pool was building comparable diffs in ~20ms.
+  Each worker opens its handle on its **first job**, not at spawn: `GitkApp::new`
+  starts them and blocks window creation until it returns, so discovering four
+  handles there would put repo IO back on the one path this module keeps clear.
+  Four workers, not one: foreground loads are already superseded by epoch, but a
+  single worker would queue a fresh click behind a heavy row that takes seconds to
+  build — the exact wait this path exists to avoid. Each job is caught individually
+  (`run_foreground_job`), because a persistent worker that dies takes every later
+  load with it, and **a job that does not complete still reports**: a silent exit
+  strands the UI's loading state, which is the same invariant the per-dispatch
+  version kept. A worker whose `Repository::discover` failed keeps serving jobs for
+  the same reason — but it must not keep FAILING them forever, and it used to: the
+  failure was latched, so a transient open (the repo directory replaced mid-write,
+  an ENFILE while the prefetch pool and heavy lane open their own handles, an EIO on
+  a network home) killed that worker's usefulness for the session. The queue is
+  shared and pulled from by whichever worker is free, so a worker that fails
+  instantly takes *more* than its quarter: diff clicks blank the pane back to the
+  previous diff and history extensions silently stop loading, all behind one warn
+  line. So it retries, rate-limited by `FOREGROUND_REPO_RETRY` (1s) — a held arrow
+  key dispatches diff loads faster than a failing `discover` costs, which is what
+  rules out retrying per job. `None` from the spawn leaves every caller on
+  the synchronous fallback it already had.
+- **Speculative work stands down until the first diff is on screen**
+  (`awaiting_first_diff`, gating both `dispatch_commit_stats` and
+  `dispatch_prefetch`). Both pools are sized to fill the machine and neither has any
+  thread priority, so at startup they race the one diff the reader is looking at —
+  measured on a 67k-commit repo: eight stats jobs at 1.2–1.4s each (with
+  `line_count` on, each is a full diff of every changed blob) plus a 63-row prefetch
+  band, against a foreground diff that took 997ms. Waiting costs the band nothing,
+  since it is warm long before anyone can scroll to it. The gate only ever applies at
+  startup: `current_diff_key` is `Some` from the first install onward. It also
+  releases on failure rather than sticking, because a load that fails clears
+  `diff_load_started_at` — which is why the predicate asks about a load being *in
+  flight* rather than about the diff being absent.
+  **It must ask `StartupDiff` too**, and that half is easy to omit: the first frame
+  deliberately paints the commit list BEFORE dispatching any diff
+  (`StartupDiff::NeedsPaint`), so on that frame nothing is in flight and a check on
+  `diff_load_started_at` alone opens the gate. Measured with only that half: the
+  prefetch band waited correctly — it dispatches from the render path, later — while
+  eight stats jobs went out on the first frame and finished at 631–700ms, straddling
+  the 692ms diff they were meant to yield to. Two dispatch sites, two different
+  frames, one predicate that has to cover both.
 - **Persistent diff store** (`DiffStore`, `src/diff_store.rs`) — the layer *below*
   the in-memory `DiffCache`:
   `~/.cache/gitkay/diffs`, one file per entry, so a diff an earlier launch already paid
@@ -1492,11 +1764,22 @@ with that suite green.
 repo-local config, not just user.name/email. The write-layer suite asserts on on-disk bytes,
 file modes and symlinks, so without that the developer's own `~/.gitconfig` decides whether
 `cargo test` passes — a global `autocrlf = true` alone turns the suite red.
+It does NOT pin `init.defaultBranch`, so **never name the initial branch in a test**:
+`Repository::init` honours the developer's own setting, and `set_head("refs/heads/master")`
+on a machine defaulting to `main` succeeds (attached-unborn HEAD) only for the following
+`checkout_head` to panic on `GIT_EUNBORNBRANCH` — `cargo test` red for that developer with
+no code change. Read it back with `repo.head().unwrap().name()`, as
+`default_scope_is_current_branch_only` and the shared `merged_history` fixture do.
 
 `src/test_repo.rs` (`#[cfg(test)]`, so nothing lands in the binary) holds the temp-repo
 helpers the `apply`, `diff_store` and `main` suites share — `temp_repo`,
 `write_file`/`stage`/
 `commit_index`/`commit_file`/`commit_bytes`/`commit_rename` to build history,
+`commit_at`/`commit_file_at` to state a commit's TIME and parents explicitly — the
+other helpers inherit `now()`, which stamps every commit in a test with the same
+second, so an ordering derived from time (the provisional heap walk sorts on exactly
+that field, and the shapes that break it are a parent dated newer than its child, or
+a merge base newer than the side branch below it) is unreachable without them —
 `remove_loose_object`/`corrupt_head` to break a repo the way a pruned odb or a bad HEAD
 does (the failure-to-read guards need them), `write_attributes` to change a fixed
 commit's diff without touching the commit (libgit2 reads `.gitattributes` from the
