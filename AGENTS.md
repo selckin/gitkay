@@ -903,8 +903,28 @@ parts run off the window-creation critical path:
   column disagreeing with the pane is the exact drift the shared pipeline exists to
   prevent. `SubmitStats` replaces the `stats` tier rather than extending it — a measured
   row reads as "unknown" to `stats_targets` until its line counts land, so every scroll
-  re-offers it and an extend would stack a duplicate each time. `busy_stats` is what
-  stops the same row being handed to two workers meanwhile.
+  re-offers it and an extend would stack a duplicate each time.
+  **`SubmitStats` filters an IN-FLIGHT row out too, and `busy_stats` alone does not
+  cover that.** `next_pool_job` checks `busy_stats` at hand-out, which suppresses a
+  queued copy only *while* the row is busy — so a copy left in the queue becomes
+  eligible the instant the oid is released, and the release (`Outcome::Stats`) runs
+  `dispatch` in the same call, long before the UI can drain the result and stop
+  offering the row. Since `dispatch_commit_stats` deliberately resubmits every frame
+  the target list changes, that window is hit constantly: measured on a 1300-ref repo,
+  **11 of the 26 rows in the startup band computed twice**, the first pass ~500ms each.
+  Dropping the copy loses nothing — a row still unsatisfied when its job lands is
+  re-offered on the next frame. An earlier version of this file (and of
+  `stats_targets`' own doc) said `busy_stats` made the re-offer harmless; it makes it
+  harmless only until the row finishes.
+  **A residual duplicate survives this, deliberately.** The UI's "known" map lags the
+  coordinator's release by up to a frame, so a `SubmitStats` sent before the drain but
+  processed after the `Done` still lists the row and still finds it free. Measured on
+  the same repo: 11 duplicates of 37 jobs became **2 of 40**, and the survivors cost
+  ~20ms against the ~500ms first passes that are gone. Closing it needs the
+  coordinator to remember every completion — a second copy of `commit_stats`, with its
+  own invalidation path, growing with the session — to save a few tens of ms of
+  speculative background work. Not worth it; if a log shows the occasional pair, that
+  is this, not a regression.
   `diff::source_diff` is the single `DiffSource` → `git2::Diff` dispatch shared by
   `commit_stats` and the probe, so a new row kind cannot reach one and miss the other.
   Concurrency is safe because the coordinator hands each key out once, and `InflightKeys`
