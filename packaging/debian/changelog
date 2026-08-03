@@ -1,3 +1,18 @@
+gitkay (0.0.6-1) unstable; urgency=low
+
+  * commit-list stats: stop computing a third of the band twice
+  * history: add --first-parent, showing the mainline only
+  * graph: clip the lanes to the column the layout reserved
+  * highlight: quieten the missing-grammar report, and skip binary files
+  * startup/history: stop making the reader wait for work they did not ask for
+  * docs: document every config option, and drop claims that were not true
+  * packaging: fix the install path end to end, and make the version enforceable
+  * commit list: optional relative dates, using git's own algorithm
+  * commit list: give the right-hand fields real columns
+  * commit list: draw +0/-0 in both panes
+
+ -- Thomas Matthijs <github@selckin.be>  Mon, 03 Aug 2026 02:26:43 +0200
+
 gitkay (0.0.5-1) unstable; urgency=low
 
   * This fork numbers its own releases from 0.0.1, below the original

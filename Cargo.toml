@@ -1,6 +1,6 @@
 [package]
 name = "gitkay"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 # Edition 2024 needs 1.85, let-chains need 1.88, and `Duration::from_hours`
 # in a const (diff_store.rs) needs 1.91. clippy::incompatible_msrv checks this.
