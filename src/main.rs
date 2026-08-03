@@ -1064,8 +1064,9 @@ const fn stats_relevant(s: DiffSettings) -> (bool, bool, bool) {
 /// counts fill in.
 ///
 /// No in-flight parameter: a row being computed is not yet in `known`, so it reads as
-/// unknown and is re-offered. `Coordinator::busy_stats` is what makes that harmless —
-/// the coordinator drops a re-offered row it has already handed out.
+/// unknown and is re-offered. The coordinator drops it, in `SubmitStats` — not in
+/// `next_pool_job`, whose `busy_stats` check suppresses a queued copy only while the
+/// row is still busy and so lets it run the moment the oid is released.
 ///
 /// Deduped by oid (first appearance wins, order otherwise preserved) — a `--reflog`
 /// view routinely shows the same oid at several visible indices (reset-and-back,
@@ -3697,9 +3698,23 @@ impl Coordinator {
                 // probe recorded the oid, the next dispatch re-offered the row (its
                 // line counts still unknown), and the stats job was ten seconds into
                 // recomputing them when the diff arrived with the answer.
+                //
+                // A row already IN FLIGHT is dropped for the same reason, and the
+                // reason it has to happen here is that `next_pool_job`'s `busy_stats`
+                // check cannot cover it: that only suppresses a queued copy *while*
+                // the row is busy, so a copy sitting in the queue becomes eligible the
+                // instant the oid is released — and the release runs `dispatch` in the
+                // same call, well before the UI can drain the result and stop offering
+                // the row. Measured on a 1300-ref repo: 11 of the 26 rows in the
+                // startup band computed twice, ~500ms each. Dropping it loses nothing,
+                // because a row that is still unsatisfied when the job lands is
+                // re-offered on the very next frame.
                 self.stats = jobs
                     .into_iter()
-                    .filter(|j| !self.measured.contains_key(&j.scope.source.oid()))
+                    .filter(|j| {
+                        let oid = j.scope.source.oid();
+                        !self.measured.contains_key(&oid) && !self.busy_stats.contains(&oid)
+                    })
                     .collect();
             }
             CoordMsg::ClearStats => self.stats.clear(),
@@ -12603,6 +12618,44 @@ mod tests {
         );
     }
 
+    /// ...and it must still be one worker once that first job REPORTS. `busy_stats`
+    /// only suppresses a queued copy while the row is in flight, so a copy left in the
+    /// queue becomes eligible the instant the oid is released — and the release runs
+    /// `dispatch` immediately, before the UI can possibly have drained the result and
+    /// stopped offering the row. Measured on a 1300-ref repo: 11 of 26 rows in the
+    /// startup band computed twice.
+    #[test]
+    fn a_stats_row_in_flight_is_not_queued_again_behind_its_own_result() {
+        let (mut coord, rxs) = test_coord(1);
+        coord.run_msg(CoordMsg::SubmitStats(
+            std::iter::once(stats_job(1)).collect(),
+        ));
+        assert!(
+            matches!(rxs[0].try_recv(), Ok(Job::Stats(_))),
+            "handed out once"
+        );
+
+        // The UI re-offers the row: it reads as unknown until `StatsResult` is drained,
+        // and `dispatch_commit_stats` deliberately resubmits every frame the target
+        // list changes.
+        coord.run_msg(CoordMsg::SubmitStats(
+            std::iter::once(stats_job(1)).collect(),
+        ));
+
+        // The worker reports, which frees the oid and dispatches in the same call.
+        coord.run_msg(CoordMsg::Done(
+            0,
+            Outcome::Stats {
+                oid: oid(1),
+                costly: None,
+            },
+        ));
+        assert!(
+            rxs[0].try_recv().is_err(),
+            "the re-offered copy must not run a second time"
+        );
+    }
+
     /// A warm job carries the stats epoch, so a row whose diff is dropped uncached can
     /// still report the column's numbers. Without it that cell keeps its file count and
     /// a permanently blank `+`/`-`: the row is blob-heavy, so its stats job sent a file
@@ -13223,7 +13276,7 @@ mod tests {
     /// (reset-and-back, amends). `stats_targets` must yield exactly one
     /// target per distinct oid, in first-appearance order — not one per row —
     /// because a duplicated target would put N jobs for one commit in the pool's
-    /// queue, where `Coordinator::busy_stats` makes all but one a wasted dequeue —
+    /// queue, where all but one are a wasted dequeue at best —
     /// and because the returned list is what `dispatch_commit_stats` compares
     /// against `stats_submitted`, so a list varying with row *positions* rather
     /// than content would resubmit on every scroll.
