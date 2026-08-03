@@ -1,5 +1,5 @@
 Name:           gitkay
-Version:        0.0.5
+Version:        0.0.6
 Release:        1%{?dist}
 Summary:        A fast, native Wayland git history viewer
 License:        MIT
@@ -68,6 +68,18 @@ install -Dm755 target/release/gitkay %{buildroot}%{_bindir}/gitkay
 %{_bindir}/gitkay
 
 %changelog
+* Mon Aug 03 2026 Thomas Matthijs <github@selckin.be> - 0.0.6-1
+- commit-list stats: stop computing a third of the band twice
+- history: add --first-parent, showing the mainline only
+- graph: clip the lanes to the column the layout reserved
+- highlight: quieten the missing-grammar report, and skip binary files
+- startup/history: stop making the reader wait for work they did not ask for
+- docs: document every config option, and drop claims that were not true
+- packaging: fix the install path end to end, and make the version enforceable
+- commit list: optional relative dates, using git's own algorithm
+- commit list: give the right-hand fields real columns
+- commit list: draw +0/-0 in both panes
+
 * Sun Aug 02 2026 Thomas Matthijs <github@selckin.be> - 0.0.5-1
 - This fork numbers its own releases from 0.0.1, below the original project's
   1.x line; the versions below are the original project's.

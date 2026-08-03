@@ -1,7 +1,7 @@
 # Maintainer: Thomas Matthijs <github@selckin.be>
 # Original project by Marenz <marenz@supradigital.org>
 pkgname=gitkay
-pkgver=0.0.5
+pkgver=0.0.6
 pkgrel=1
 pkgdesc="A fast, native Wayland git history viewer — gitk, but okay"
 arch=(x86_64 aarch64)
