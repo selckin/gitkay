@@ -1909,6 +1909,18 @@ ones that actually fail when the write is removed.
 ## Common Pitfalls
 
 - Both scrolled lists (commit list + diff pane) virtualize with egui `show_rows`. An early-egui bottom-gap bug once forced manual pre/post spacers on the commit list; that's fixed as of 0.34 (verified — no gap at end-of-list / few commits / on resize), so `show_rows` is used throughout. Don't reintroduce manual spacers.
+- **Every `ScrollArea` passes `SCROLL_SOURCE`, and none takes the default.** egui
+  0.36 changed `ScrollSource::default()`'s `drag` from `true` to
+  `DragScroll::OnTouch`, which asks `InputState::has_touch_screen` and answers
+  false on an ordinary desktop — so all three lists silently stopped scrolling on
+  a press-and-drag. Nothing catches that class of change: no deprecation, no
+  compile error, and no test either, since it is decided from live input state at
+  paint time. `SCROLL_SOURCE` is `ScrollSource::ALL`, which is exactly 0.34's
+  default, so it restores prior behaviour rather than choosing new behaviour —
+  upstream's `OnTouch` is aimed at apps where a drag competes with selecting text
+  or dragging an item, and nothing here binds a primary drag. The lesson beyond
+  this one field: an egui upgrade's real cost is in defaults that moved, not in
+  the renames the compiler points at.
 - `layout_no_wrap` + `with_clip_rect` for text truncation (egui `layout()` wraps)
 - egui tooltips (`show_tooltip_text` / `on_hover_*`) live on an **interactable** layer: if one lands over the pointer (likely at the right window edge, where a wide tooltip flips across the cursor), it wins the hit-test and the ScrollArea underneath silently drops wheel input until the mouse moves. The file-list path tooltip is therefore a hand-rolled `Area` with `.interactable(false)` (plus an `is_scrolling` guard so it doesn't churn mid-wheel) — don't swap it back to the convenience API
 - A bare `Area` reports a tiny `available_width`, so a default-wrapped label inside one shreds into a one-word-per-line column. Use `Label::new(..).extend()` — the file-list path tooltip and the apply status line both do
