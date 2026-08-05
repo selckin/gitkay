@@ -177,7 +177,8 @@ and the UI; the rest is split by concern:
 
 Built on:
 
-- **egui** + **eframe** — native Wayland window with OpenGL (glow) rendering
+- **egui** + **eframe** — native Wayland window, rendered with wgpu (eframe's
+  default backend; Vulkan, with a GLES fallback — the `glow` feature is off)
 - **git2** (libgit2) — repository access, revwalk, diff
 - **syntect** + **two-face** — language-aware highlighting (pure-Rust fancy-regex backend, no C deps)
 - **chrono** — date formatting
@@ -454,7 +455,7 @@ sudo dpkg -i gitkay_*_amd64.deb
 
 ### Build dependencies
 
-A Rust toolchain of **1.91 or newer**, a C compiler, and `pkg-config`. If your
+A Rust toolchain of **1.95 or newer**, a C compiler, and `pkg-config`. If your
 distro's `rustc` is older, use [rustup](https://rustup.rs). Nothing else is
 needed: libgit2 and zlib are compiled in unless `pkg-config` finds system
 copies to link against.
@@ -509,7 +510,7 @@ dpkg-buildpackage -us -uc -b
 sudo dpkg -i ../gitkay_*.deb
 ```
 
-`dpkg-buildpackage` resolves `rustc (>= 1.91)` against dpkg's package database,
+`dpkg-buildpackage` resolves `rustc (>= 1.95)` against dpkg's package database,
 not your `PATH`, so it cannot see a rustup toolchain and no current Debian or
 Ubuntu ships a new enough `rustc`. On a rustup toolchain, add `-d` to skip the
 build-dependency check:

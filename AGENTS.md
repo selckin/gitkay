@@ -145,12 +145,28 @@ cp target/release/gitkay ~/.local/bin/   # install
   `git2` is built with `default-features = []` (so no `openssl-sys`), and
   `libgit2-sys` compiles the bundled libgit2 with `cc`, never cmake. libgit2
   and zlib are compiled in unless `pkg-config` finds system copies. The MSRV is
-  **1.91** — edition 2024 needs 1.85, the let-chains in `diff.rs`/`apply.rs`/
-  `main.rs` need 1.88, and `diff_store.rs`'s const `Duration::from_hours` needs
-  1.91. Stating it in `Cargo.toml`'s `rust-version` is what makes it *checked*:
-  `clippy::incompatible_msrv` is what found the 1.91 item under a hand-guessed
-  1.88, so raise it there and let clippy confirm rather than reasoning it out.
-  Mirrored by the spec's `BuildRequires` and debian's `Build-Depends`.
+  **1.95**, and it is the first one gitkay does not set itself. gitkay's own
+  floor is **1.91** — edition 2024 needs 1.85, the let-chains in
+  `diff.rs`/`apply.rs`/`main.rs` need 1.88, and `diff_store.rs`'s const
+  `Duration::from_hours` needs 1.91 — and eframe/egui 0.36 declares 1.95.
+  **Read the dependency's floor, do not guess it**: every 0.34.x *and* 0.35.0
+  declare **1.92**, not 1.91, so the `rust-version = "1.91"` this repo carried
+  while on egui 0.34 was already a minor version short, and dropping back to
+  0.34 would make **1.92** correct rather than 1.91. `grep rust-version
+  ~/.cargo/registry/src/*/egui-*/Cargo.toml` answers it in one line.
+  Keep the two numbers distinct when raising either: the language floor is
+  what `clippy::incompatible_msrv` can check for you, and it is what found the
+  1.91 item under a hand-guessed 1.88 — raise it in `Cargo.toml` and let clippy
+  confirm rather than reasoning it out. A dependency's floor is not checkable
+  that way and is only ever as current as the last upgrade. **Note the cost of
+  a dependency-driven bump**: `rust-version` is the only input
+  `clippy::incompatible_msrv` has, so with it at 1.95 nothing checks gitkay's
+  own 1.91 floor any more — code needing 1.92–1.95 now lands silently, and the
+  "dropping back to egui 0.34" escape hatch stops being free without someone
+  re-deriving it by hand.
+  Mirrored by the spec's `BuildRequires`, debian's `Build-Depends`, the
+  README's build-dependencies and `dpkg-buildpackage` notes, and `install.sh`'s
+  header comment — six sites, all of which move together.
 - Design specs for larger features live in `docs/superpowers/specs/`.
 
 ## Architecture
@@ -1840,6 +1856,15 @@ OIDs via `oid(n)` — no real repo needed — and pins the layout invariants (la
 stability, merge diagonals, convergence, out-of-scope-parent continuation
 lines; `grep 'fn test_' src/main.rs` for the list). Change `layout_graph` only
 with that suite green.
+
+**A test that needs a real `egui::Ui` goes through `run_headless`, never a bare
+`ctx.run_ui`.** epaint `debug_assert!`s in `TexturesDelta::drop` that a frame's
+deltas were handled, and the first pass always produces one — the font atlas — so
+dropping the `FullOutput` panics. It is a *debug* assertion, which lands on exactly
+the wrong side of the profile split: CI's gating suite runs dev and fails, while
+`--release` (release.yml, `%check`, `check()`, `debian/rules`) is silent, so the
+same test passes for the packagers. `run_headless` calls egui's own
+`FullOutput::drop_without_applying_deltas`.
 
 `temp_repo` pins `core.autocrlf=false`, `core.fileMode=true` and `core.symlinks=true` on the
 repo-local config, not just user.name/email. The write-layer suite asserts on on-disk bytes,
