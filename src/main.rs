@@ -10328,6 +10328,32 @@ impl eframe::App for GitkApp {
 /// reports its own failures. Muted to `error` rather than `off` so a real clipboard
 /// error still surfaces — only the routine warning goes.
 ///
+/// **`calloop::loop_logic` is muted to `error`.** winit's Wayland event loop logs, at
+/// irregular intervals while keys are held and released:
+///
+/// > [calloop] Received an event for non-existence source: TokenInner { id: 3, … }
+///
+/// Nothing is wrong. `Poll::poll` builds one batch holding both epoll events and every
+/// expired timer, then walks it looking each token up as it goes — so a callback that
+/// removes another source strands that source's already-drained event later in the same
+/// batch, and the lookup finds an empty slot. winit hits it on **key repeat**: it
+/// inserts a repeat timer per repeating key press and removes it on release or focus
+/// change, so releasing a held key just as a repeat tick came due (arrowing through the
+/// commit list does it) leaves the Wayland socket's callback cancelling a timer whose
+/// event is already in the batch. The `version` field in the token counts how often that
+/// slot has been recycled, which is why it climbs through a session.
+///
+/// Not gitkay's to fix — this crate never touches calloop, and calloop 0.14 kept the
+/// same code path, so upstream treats it as a diagnostic rather than an error. `error`
+/// rather than `off` for the usual reason.
+///
+/// `loop_logic` and not the whole crate, deliberately: the ping sources warn when winit
+/// cannot wake its own event loop, which is a window that stops repainting on demand and
+/// is exactly the kind of thing worth hearing about. The cost of the module-wide scope is
+/// its sibling "Failed to unregister source from the polling system", which goes too —
+/// acceptable, being the same event-loop bookkeeping, equally out of the reader's hands,
+/// and reached only after the failure it reports has already been survived.
+///
 /// **How `RUST_LOG` interacts with it, which is not what insertion order suggests.**
 /// `env_logger` sorts its directives by module-name LENGTH and takes the longest one
 /// that prefixes the target, so specificity decides, not the order they went in.
@@ -10346,9 +10372,10 @@ impl eframe::App for GitkApp {
 /// **The baseline level is `parse_env`'s job, not a directive here.** See `log_defaults`
 /// for why that distinction is load-bearing rather than stylistic.
 ///
-/// Every one of these is pinned by a test. They are all easy to assume backwards, and
-/// two of them were: that a broader `RUST_LOG` prefix would lift the mute, and that
-/// setting the baseline as a directive was the same as letting `parse_env` supply it.
+/// Every one of these `RUST_LOG` rules is pinned by a test. They are all easy to assume
+/// backwards, and two of them were: that a broader `RUST_LOG` prefix would lift the mute,
+/// and that setting the baseline as a directive was the same as letting `parse_env`
+/// supply it.
 fn log_builder() -> env_logger::Builder {
     let mut builder = log_defaults();
     builder.parse_env(env_logger::Env::default().default_filter_or("warn"));
@@ -10359,7 +10386,7 @@ fn log_builder() -> env_logger::Builder {
 /// can supply a filter string in place of the environment and still exercise the real
 /// mute rather than a copy of it.
 ///
-/// It holds ONLY the mute. The baseline level is deliberately left to `parse_env`'s
+/// It holds ONLY the mutes. The baseline level is deliberately left to `parse_env`'s
 /// `default_filter_or("warn")` and is NOT set here as a `filter_level` directive: a
 /// `None`-named directive would survive `RUST_LOG` instead of being replaced by it, so
 /// `RUST_LOG=gitkay=debug` would newly print warnings from wgpu, winit and every other
@@ -10369,6 +10396,7 @@ fn log_builder() -> env_logger::Builder {
 fn log_defaults() -> env_logger::Builder {
     let mut builder = env_logger::Builder::new();
     builder.filter_module("egui_winit::clipboard", log::LevelFilter::Error);
+    builder.filter_module("calloop::loop_logic", log::LevelFilter::Error);
     builder
 }
 
