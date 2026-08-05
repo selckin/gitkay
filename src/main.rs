@@ -2396,6 +2396,24 @@ struct DiffView {
 /// the last line/file never sits flush against the bottom edge.
 const BOTTOM_PAD_ROWS: usize = 2;
 
+/// What scrolls a scroll area: bar, wheel, and **press-and-drag with a mouse**.
+///
+/// Every `ScrollArea` here passes this rather than taking the default, because egui
+/// 0.36 changed that default out from under them: `drag` went from `true` to
+/// `DragScroll::OnTouch`, which asks `InputState::has_touch_screen` and so answers
+/// false on an ordinary desktop. The three lists silently stopped scrolling on a
+/// drag, with nothing to notice — no deprecation, no compile error, and no test can
+/// see it, since it is decided from live input state at paint time.
+///
+/// `ScrollSource::ALL` is exactly egui 0.34's default (`drag: DragScroll::Always`),
+/// so this restores prior behaviour rather than choosing new behaviour. Upstream
+/// calls `OnTouch` "the recommended default" — reasonable for apps where a drag
+/// competes with selecting text or dragging an item, and not the case here: the diff
+/// pane and both row lists are custom-painted, act on click and on secondary-click,
+/// and have nothing else bound to a primary drag.
+const SCROLL_SOURCE: egui::containers::scroll_area::ScrollSource =
+    egui::containers::scroll_area::ScrollSource::ALL;
+
 /// Minimum height of one file-list row, in points — the floor `GitkApp::file_row_h`
 /// grows from when the configured file-list font is larger than the default.
 const FILE_ROW_H: f32 = 18.0;
@@ -2729,6 +2747,7 @@ fn show_virtualized_diff(
     let mut scroll = egui::ScrollArea::both()
         .id_salt("diff_scroll")
         .auto_shrink([false, false])
+        .scroll_source(SCROLL_SOURCE)
         .animated(false);
     // Jump-to-target works even when the row is off-screen (it isn't laid out)
     // by forcing the scroll offset.
@@ -8839,6 +8858,7 @@ impl GitkApp {
                 // of 0.34, so there's no manual spacing to keep in sync anymore.
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
+                    .scroll_source(SCROLL_SOURCE)
                     .show_rows(ui, row_height, num_commits, |ui, row_range| {
                         let first_row = row_range.start;
                         let last_row = row_range.end;
@@ -9152,7 +9172,9 @@ impl GitkApp {
                         .font(self.fonts.font_id(Role::Ui)),
                 );
                 ui.add_space(4.0);
-                let mut file_scroll = egui::ScrollArea::vertical().id_salt("file_list");
+                let mut file_scroll = egui::ScrollArea::vertical()
+                    .id_salt("file_list")
+                    .scroll_source(SCROLL_SOURCE);
                 // Apply a queued per-commit restore (see
                 // load_selected_diff) only once the sidebar shows the
                 // diff it was queued for — never mid-load, when the
