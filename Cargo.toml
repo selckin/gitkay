@@ -2,9 +2,13 @@
 name = "gitkay"
 version = "0.0.6"
 edition = "2024"
-# Edition 2024 needs 1.85, let-chains need 1.88, and `Duration::from_hours`
-# in a const (diff_store.rs) needs 1.91. clippy::incompatible_msrv checks this.
-rust-version = "1.91"
+# gitkay's own floor is 1.91: edition 2024 needs 1.85, let-chains need 1.88,
+# and `Duration::from_hours` in a const (diff_store.rs) needs 1.91.
+# What this field states is eframe/egui 0.36's floor, which is higher — so
+# clippy::incompatible_msrv no longer checks the 1.91 above, and code needing
+# 1.92-1.95 now lands unremarked. Dropping back to egui 0.34 lands on 1.92,
+# NOT 1.91: every 0.34.x and 0.35.0 declare 1.92. Read it, don't reason it out.
+rust-version = "1.95"
 description = "A fast, native Wayland git history viewer — gitk, but okay"
 license = "MIT"
 repository = "https://github.com/selckin/gitkay"
@@ -12,8 +16,8 @@ keywords = ["git", "history", "viewer", "wayland", "egui"]
 categories = ["development-tools", "visualization"]
 
 [dependencies]
-eframe = { version = "0.34", features = ["persistence"] }
-egui = "0.34"
+eframe = { version = "0.36", features = ["persistence"] }
+egui = "0.36"
 git2 = "0.21"
 chrono = "0.4"
 arboard = "3"

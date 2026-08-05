@@ -3,7 +3,7 @@
 #
 # Usage: ./install.sh [extra cargo args]
 #
-# Requires the build dependencies listed in the README: Rust >= 1.91, a C
+# Requires the build dependencies listed in the README: Rust >= 1.95, a C
 # compiler and pkg-config.
 
 die() { echo "$*" >&2; exit 1; }

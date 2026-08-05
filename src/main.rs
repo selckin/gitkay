@@ -8817,7 +8817,7 @@ impl GitkApp {
             .resizable(true)
             .min_size(120.0)
             .default_size(saved_commit_h)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 let num_commits = self.commits.len();
                 // Reflog rows are parentless, so the graph is just a column of
                 // disconnected dots — drop it and reclaim the width for the text.
@@ -9145,7 +9145,7 @@ impl GitkApp {
             .min_size(FILE_LIST_MIN_W)
             .max_size(max_w)
             .frame(egui::Frame::NONE)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new(format!("{} files", self.diff_files.len()))
                         .color(SUBTEXT)
@@ -9996,7 +9996,7 @@ impl eframe::App for GitkApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // 0.34 split App::update into ui/logic; we keep one body and take a cheap
         // (Arc) clone of the Context so the existing ctx-based logic is unchanged,
-        // while the top-level panels attach to `ui` via show_inside.
+        // while the top-level panels attach to `ui` via `Panel::show`.
         let ctx = ui.ctx().clone();
         // Frame-time attribution for the slow-frame log at the end of this fn: any
         // UI stutter (scroll hitches, input lag) shows up here as which section ate
@@ -10047,7 +10047,7 @@ impl eframe::App for GitkApp {
         // ── Top panel: search bar ──
         egui::Panel::top("search_panel")
             .exact_size(28.0)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.label(egui::RichText::new("🔍").size(14.0));
                     let avail = ui.available_width() - 120.0; // leave space for match count
@@ -10117,7 +10117,7 @@ impl eframe::App for GitkApp {
                 egui::Frame::side_top_panel(&ctx.global_style())
                     .inner_margin(egui::Margin::symmetric(4, 0)),
             )
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 // A divider line below the commit list, plus a small strip so the
                 // commit-panel splitter handle and the hover toolbar don't overlap.
                 ui.add_space(3.0);
@@ -10166,122 +10166,120 @@ impl eframe::App for GitkApp {
                 // light theme gets a light pane too (not dark text on a dark pane).
                 frame = frame.fill(self.diff_palette.background);
                 // Filled by the row-menu closure below (it only holds an immutable
-                // `self` borrow); declared out here so it outlives `show_inside`'s
+                // `self` borrow); declared out here so it outlives the panel's
                 // closure and the dispatch can take `&mut self`.
                 let mut pending_apply: Option<apply::ApplyRequest> = None;
-                egui::CentralPanel::default()
-                    .frame(frame)
-                    .show_inside(ui, |ui| {
-                        ui.style_mut().override_font_id = Some(self.fonts.font_id(Role::Diff));
-                        // A diff-load worker is in flight. On a commit switch, once it
-                        // has outlived DIFF_PLACEHOLDER_DELAY, blank to the "Loading
-                        // diff…" text instead of the (now stale, and wrong-commit)
-                        // previous diff; before then, keep rendering it and wake at
-                        // the threshold to flip. Returning here leaves diff_scroll_to
-                        // untouched, so the diff still opens where the caller asked
-                        // once the real content lands.
-                        //
-                        // A same-oid rebuild never reaches the blank at all — see
-                        // `can_blank` where it is decided — so it also has no
-                        // threshold to wake for.
-                        if let Some(elapsed) = diff_load_elapsed {
-                            if showing_placeholder {
-                                ui.centered_and_justified(|ui| {
-                                    ui.label(egui::RichText::new("Loading diff…").color(SUBTEXT));
-                                });
-                                return;
-                            }
-                            if can_blank {
-                                ui.ctx().request_repaint_after(
-                                    DIFF_PLACEHOLDER_DELAY.saturating_sub(elapsed),
-                                );
-                            }
-                            // fall through: keep rendering the previous diff below
+                egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+                    ui.style_mut().override_font_id = Some(self.fonts.font_id(Role::Diff));
+                    // A diff-load worker is in flight. On a commit switch, once it
+                    // has outlived DIFF_PLACEHOLDER_DELAY, blank to the "Loading
+                    // diff…" text instead of the (now stale, and wrong-commit)
+                    // previous diff; before then, keep rendering it and wake at
+                    // the threshold to flip. Returning here leaves diff_scroll_to
+                    // untouched, so the diff still opens where the caller asked
+                    // once the real content lands.
+                    //
+                    // A same-oid rebuild never reaches the blank at all — see
+                    // `can_blank` where it is decided — so it also has no
+                    // threshold to wake for.
+                    if let Some(elapsed) = diff_load_elapsed {
+                        if showing_placeholder {
+                            ui.centered_and_justified(|ui| {
+                                ui.label(egui::RichText::new("Loading diff…").color(SUBTEXT));
+                            });
+                            return;
                         }
-                        // Layout inputs are identical for both render branches (only the
-                        // closures differ), so build the DiffView once. last_top_anchor
-                        // is the deepest file start, which the bottom padding lets reach
-                        // the top (None ⇒ no files). While a load is in flight the
-                        // previous diff on screen is transient, so don't consume
-                        // diff_scroll_to (leave it for the incoming diff) or jump the old
-                        // diff to a pending target.
-                        let diff_view = DiffView {
-                            n_lines: self.diff_lines.len(),
-                            content_chars: self.diff_max_chars,
-                            scroll_target: if diff_load_elapsed.is_some() {
-                                None
-                            } else {
-                                self.diff_scroll_to.take()
-                            },
-                            last_top_anchor: self.diff_last_top_anchor,
-                            menu_salt: diff_menu_salt(self.current_diff_key.as_ref()),
-                        };
-                        // One render path for both modes. Syntax-on takes row colours from
-                        // the theme's token spans plus an add/del tint; syntax-off uses one
-                        // flat colour per LineKind with no spans and no row tint (diff_row_job
-                        // returns row_bg = None when syntax is off, so passing it through
-                        // matches the old explicit `None`). The palette is always derived
-                        // from the active theme: with syntax on prefer the highlighter's
-                        // copy once built, falling back to the theme palette until then;
-                        // with syntax off use the theme palette directly.
-                        let syntax = self.syntax_enabled;
-                        let render_palette = if syntax {
-                            self.highlighter
-                                .as_ref()
-                                .map_or(&self.diff_palette, |h| h.palette())
+                        if can_blank {
+                            ui.ctx().request_repaint_after(
+                                DIFF_PLACEHOLDER_DELAY.saturating_sub(elapsed),
+                            );
+                        }
+                        // fall through: keep rendering the previous diff below
+                    }
+                    // Layout inputs are identical for both render branches (only the
+                    // closures differ), so build the DiffView once. last_top_anchor
+                    // is the deepest file start, which the bottom padding lets reach
+                    // the top (None ⇒ no files). While a load is in flight the
+                    // previous diff on screen is transient, so don't consume
+                    // diff_scroll_to (leave it for the incoming diff) or jump the old
+                    // diff to a pending target.
+                    let diff_view = DiffView {
+                        n_lines: self.diff_lines.len(),
+                        content_chars: self.diff_max_chars,
+                        scroll_target: if diff_load_elapsed.is_some() {
+                            None
                         } else {
-                            &self.diff_palette
-                        };
-                        let font_id = self.fonts.font_id(Role::Diff);
-                        let lines = &self.diff_lines;
-                        let starts = &self.file_line_starts;
-                        let priority = self.highlight_priority.as_ref();
-                        let word_diff = self.word_diff;
-                        let diff_top = Arc::clone(&self.diff_top_line);
-                        let diff_visible = Arc::clone(&self.diff_visible_rows);
-                        show_virtualized_diff(
-                            ui,
-                            &font_id,
-                            diff_view,
-                            |rows, viewport_rows| {
-                                diff_top.store(rows.start, Ordering::Relaxed);
-                                diff_visible.store(viewport_rows, Ordering::Relaxed);
-                                // Tell the background worker which files are on screen so it
-                                // tokenizes those first, plus one viewport (in rows)
-                                // above/below for read-ahead. No-op with syntax off — there
-                                // is no worker, so priority is None.
-                                if let Some(p) = priority
-                                    && rows.start < rows.end
-                                {
-                                    p.store(VisibleRange::window(starts, rows));
-                                }
-                            },
-                            |i| {
-                                let (job, row_bg) = diff_row_job(
-                                    &lines[i],
-                                    render_palette,
-                                    &font_id,
-                                    word_diff,
-                                    syntax,
-                                );
-                                (job, row_bg, render_palette.foreground)
-                            },
-                            // A row above the first file (commit meta, diffstat) belongs to
-                            // no file — `None` means no menu is attached for it at all, so
-                            // egui never opens a (necessarily empty) popup there.
-                            |i| file_index_at_line_opt(starts, i),
-                            |ui, i, file_idx| {
-                                if let Some(req) = self.apply_menu_items(
-                                    ui,
-                                    file_idx,
-                                    diff::hunk_at_line(lines, i),
-                                    true,
-                                ) {
-                                    pending_apply = Some(req);
-                                }
-                            },
-                        );
-                    });
+                            self.diff_scroll_to.take()
+                        },
+                        last_top_anchor: self.diff_last_top_anchor,
+                        menu_salt: diff_menu_salt(self.current_diff_key.as_ref()),
+                    };
+                    // One render path for both modes. Syntax-on takes row colours from
+                    // the theme's token spans plus an add/del tint; syntax-off uses one
+                    // flat colour per LineKind with no spans and no row tint (diff_row_job
+                    // returns row_bg = None when syntax is off, so passing it through
+                    // matches the old explicit `None`). The palette is always derived
+                    // from the active theme: with syntax on prefer the highlighter's
+                    // copy once built, falling back to the theme palette until then;
+                    // with syntax off use the theme palette directly.
+                    let syntax = self.syntax_enabled;
+                    let render_palette = if syntax {
+                        self.highlighter
+                            .as_ref()
+                            .map_or(&self.diff_palette, |h| h.palette())
+                    } else {
+                        &self.diff_palette
+                    };
+                    let font_id = self.fonts.font_id(Role::Diff);
+                    let lines = &self.diff_lines;
+                    let starts = &self.file_line_starts;
+                    let priority = self.highlight_priority.as_ref();
+                    let word_diff = self.word_diff;
+                    let diff_top = Arc::clone(&self.diff_top_line);
+                    let diff_visible = Arc::clone(&self.diff_visible_rows);
+                    show_virtualized_diff(
+                        ui,
+                        &font_id,
+                        diff_view,
+                        |rows, viewport_rows| {
+                            diff_top.store(rows.start, Ordering::Relaxed);
+                            diff_visible.store(viewport_rows, Ordering::Relaxed);
+                            // Tell the background worker which files are on screen so it
+                            // tokenizes those first, plus one viewport (in rows)
+                            // above/below for read-ahead. No-op with syntax off — there
+                            // is no worker, so priority is None.
+                            if let Some(p) = priority
+                                && rows.start < rows.end
+                            {
+                                p.store(VisibleRange::window(starts, rows));
+                            }
+                        },
+                        |i| {
+                            let (job, row_bg) = diff_row_job(
+                                &lines[i],
+                                render_palette,
+                                &font_id,
+                                word_diff,
+                                syntax,
+                            );
+                            (job, row_bg, render_palette.foreground)
+                        },
+                        // A row above the first file (commit meta, diffstat) belongs to
+                        // no file — `None` means no menu is attached for it at all, so
+                        // egui never opens a (necessarily empty) popup there.
+                        |i| file_index_at_line_opt(starts, i),
+                        |ui, i, file_idx| {
+                            if let Some(req) = self.apply_menu_items(
+                                ui,
+                                file_idx,
+                                diff::hunk_at_line(lines, i),
+                                true,
+                            ) {
+                                pending_apply = Some(req);
+                            }
+                        },
+                    );
+                });
                 if let Some(req) = pending_apply {
                     self.request_apply(req);
                 }
@@ -13834,6 +13832,26 @@ mod tests {
         assert!(load_commits_tail(&repo, &reflog, 1, anchor, 10).is_none());
     }
 
+    /// One headless egui pass, with the frame's texture deltas consumed.
+    ///
+    /// The `FullOutput` must NOT simply be dropped. epaint 0.36 asserts in
+    /// `TexturesDelta::drop` that the deltas were handled, and a first pass always
+    /// produces one — the font atlas. It is a `debug_assert!`, so it fires in the
+    /// dev profile and is silent under `--release`: exactly the split CI relies on,
+    /// where the gating suite runs dev and only the release-time ones run `--release`.
+    /// A test dropping the output therefore fails the gate and passes the packagers'
+    /// `%check`, which is the confusing half of the failure.
+    ///
+    /// Consumed through egui's own `FullOutput::drop_without_applying_deltas` — the
+    /// helper the assertion's own message points at — rather than by reaching into
+    /// `textures_delta` here, so a future `FullOutput` field with the same drop rule
+    /// is covered without this function knowing about it.
+    fn run_headless(f: impl FnMut(&mut egui::Ui)) {
+        let ctx = egui::Context::default();
+        ctx.run_ui(egui::RawInput::default(), f)
+            .drop_without_applying_deltas();
+    }
+
     #[test]
     fn default_fonts_fit_the_row_height_floors() {
         // The commit list floors its row height at 20px and the file list at
@@ -13843,8 +13861,7 @@ mod tests {
         // the font-derived heights — and that a large size actually grows.
         // Headless egui context; the runtime fonts start from the same
         // FontDefinitions::default() (build_fonts only adds user fonts on top).
-        let ctx = egui::Context::default();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        run_headless(|ui| {
             let h = |size: f32| ui.fonts_mut(|f| f.row_height(&egui::FontId::monospace(size)));
             assert!(
                 h(13.0).max(h(12.0)) + 4.0 <= 20.0,
@@ -14426,8 +14443,7 @@ mod tests {
 
     #[test]
     fn sidebar_cache_ensure_scopes_invalidation() {
-        let ctx = egui::Context::default();
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        run_headless(|ui| {
             let galley = || {
                 ui.painter().layout_no_wrap(
                     "x".to_string(),

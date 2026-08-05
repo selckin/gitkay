@@ -7,8 +7,8 @@ URL:            https://github.com/selckin/gitkay
 Source0:        %{name}-%{version}.tar.gz
 
 # Edition 2024 needs rust >= 1.85, let-chains >= 1.88, and a const
-# Duration::from_hours >= 1.91.
-BuildRequires:  rust >= 1.91
+# Duration::from_hours >= 1.91. 1.95 is eframe/egui 0.36's floor, not gitkay's.
+BuildRequires:  rust >= 1.95
 BuildRequires:  cargo
 BuildRequires:  gcc
 BuildRequires:  pkg-config
