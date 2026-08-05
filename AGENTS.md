@@ -1211,13 +1211,31 @@ parts run off the window-creation critical path:
   endpoints are immutable so an entry would be sound, but its key moves with `HEAD`.
 - **Perf timing** — key startup phases log at `debug` (`perf: startup: …` / `perf:
   load_commits: …`). Run with `RUST_LOG=gitkay=debug` to see the per-phase breakdown.
-- **Logger setup** (`log_builder`) — warnings by default, and one module muted:
-  `egui_winit::clipboard` to `error`. egui initializes its own clipboard at startup, and
+- **Logger setup** (`log_builder`) — warnings by default, and two modules muted to
+  `error`, both of them dependencies warning about their own routine operation.
+  `egui_winit::clipboard`: egui initializes its own clipboard at startup, and
   on a Wayland session with no reachable X11 server arboard's fallback takes the timeout
   and warns every run. Noise, not news — nothing gitkay does depends on egui's
   clipboard; its own SHA copy runs through `GitkApp::clipboard` and reports its own
   failures. Muted to `error`, not `off`, so a real one still surfaces.
-  **`RUST_LOG` does not interact with this the way insertion order suggests.**
+  `calloop::loop_logic`: winit's Wayland event loop logs "Received an event for
+  non-existence source" at irregular intervals while keys are held and released. Nothing
+  is wrong. `Poll::poll` builds ONE batch holding both epoll events and every expired
+  timer, then walks it looking each token up as it goes — so a callback that removes
+  another source strands that source's already-drained event later in the same batch,
+  and the lookup finds an empty slot. winit hits it on **key repeat**: it inserts a
+  repeat timer per repeating key press and removes it on release or focus change, so
+  releasing a held key just as a repeat tick came due (arrowing through the commit list
+  does it) leaves the Wayland socket's callback cancelling a timer whose event is already
+  in the batch. The token's `version` field counts how often that slot has been recycled,
+  which is why it climbs through a session. Not gitkay's to fix — this crate never
+  touches calloop — and calloop 0.14 kept the same code path, so upstream treats it as a
+  diagnostic rather than an error. Scoped to `loop_logic` and NOT the whole crate,
+  deliberately: the ping sources warn when winit cannot wake its own event loop, which is
+  a window that stops repainting on demand. The cost of a module-wide scope is the
+  sibling "Failed to unregister source from the polling system", which goes too —
+  acceptable, being the same event-loop bookkeeping and equally out of the reader's hands.
+  **`RUST_LOG` does not interact with these the way insertion order suggests.**
   `env_logger` sorts directives by module-name LENGTH and takes the longest one
   prefixing the target, so specificity decides: `RUST_LOG=egui_winit=warn` does NOT lift
   the mute, and only `RUST_LOG=egui_winit::clipboard=warn` does. That works solely
@@ -1225,14 +1243,15 @@ parts run off the window-creation critical path:
   stable, so between equal-length names the later one is checked first. Built the other
   way round (`from_env` then `filter_module`) the mute is unconditional and no spelling
   can lift it.
-  `log_defaults` holds **only the mute**; the baseline level is left to `parse_env`'s
+  `log_defaults` holds **only the mutes**; the baseline level is left to `parse_env`'s
   `default_filter_or("warn")` and must NOT be a `filter_level` directive. That looks
   equivalent and is not: a `None`-named directive survives `RUST_LOG` instead of being
   replaced by it, so `RUST_LOG=gitkay=debug` would newly print warnings from wgpu, winit
   and every other dependency, where env_logger's semantics are that an explicit
-  `RUST_LOG` replaces the default outright. Every one of these has a test — they are all
-  easy to assume backwards, and two of them were: that a broader `RUST_LOG` prefix would
-  lift the mute, and that setting the baseline as a directive was the same thing.
+  `RUST_LOG` replaces the default outright. Every one of these `RUST_LOG` rules has a
+  test — they are all easy to assume backwards, and two of them were: that a broader
+  `RUST_LOG` prefix would lift the mute, and that setting the baseline as a directive was
+  the same thing.
 
 ### Graph Layout (`layout_graph()`)
 - **Pipes**: `Vec<Option<(Oid, color_index)>>` — fixed column slots, `None` = empty
