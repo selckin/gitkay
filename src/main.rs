@@ -10756,10 +10756,8 @@ mod tests {
     #[test]
     fn the_provisional_walk_covers_both_sides_of_a_merge() {
         let (_d, repo) = temp_repo();
-        // Through the shared fixture, which reads the initial branch back off HEAD.
-        // Naming it is a bug: `Repository::init` honours the developer's own
-        // `init.defaultBranch`, so `set_head("refs/heads/master")` on a machine
-        // defaulting to `main` leaves HEAD attached-unborn and the checkout panics.
+        // Through the shared fixture, which reads the initial branch back off HEAD
+        // rather than naming it — see `merged_history`.
         let (root, main_c, side_c, merge) = merged_history(&repo);
 
         let rows = provisional_commits(&repo, 100, false);
@@ -14720,8 +14718,11 @@ mod tests {
     ///   root
     /// ```
     ///
-    /// The branch name is read back rather than hardcoded: `Repository::init`
-    /// honours the developer's `init.defaultBranch`, so "master" is not a given.
+    /// The branch name is read back rather than hardcoded. `temp_repo` now states
+    /// it in the init options, so it is knowable — but naming it here would tie
+    /// this fixture to that choice, and `set_head` on a branch the repo does not
+    /// have leaves HEAD attached-unborn for the following `checkout_head` to
+    /// panic on, which is a confusing way to learn the two disagree.
     fn merged_history(repo: &git2::Repository) -> (git2::Oid, git2::Oid, git2::Oid, git2::Oid) {
         use crate::test_repo::{commit_file, commit_merge, stage, write_file};
         let root = commit_file(repo, "f.txt", "0", "root");

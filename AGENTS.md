@@ -1096,8 +1096,8 @@ parts run off the window-creation critical path:
   sees it — and the one out-of-tree file `global_attr_file` resolves: `core.attributesFile`
   if set, **otherwise** `$XDG_CONFIG_HOME/git/attributes`, which is a default rather than
   an addition, so exactly one of the two is ever read. That rule is a pure function and
-  tested as one: which branch applies depends on the developer's own global config, so an
-  integration test cannot reliably reach the fallback. Known gap: nested `.gitattributes`
+  tested as one: `temp_repo` pins `core.attributesFile` (see **Tests**), so an integration
+  test always takes the first branch and can never reach the fallback. Known gap: nested `.gitattributes`
   in subdirectories, and the system-wide file, are not fingerprinted; the escape hatch is
   deleting the directory.
   Hashing is `git2::Oid::hash_object`, not `DefaultHasher`, whose instability across
@@ -1866,19 +1866,75 @@ the wrong side of the profile split: CI's gating suite runs dev and fails, while
 same test passes for the packagers. `run_headless` calls egui's own
 `FullOutput::drop_without_applying_deltas`.
 
-`temp_repo` pins `core.autocrlf=false`, `core.fileMode=true` and `core.symlinks=true` on the
-repo-local config, not just user.name/email. The write-layer suite asserts on on-disk bytes,
-file modes and symlinks, so without that the developer's own `~/.gitconfig` decides whether
-`cargo test` passes — a global `autocrlf = true` alone turns the suite red.
-It does NOT pin `init.defaultBranch`, so **never name the initial branch in a test**:
-`Repository::init` honours the developer's own setting, and `set_head("refs/heads/master")`
-on a machine defaulting to `main` succeeds (attached-unborn HEAD) only for the following
-`checkout_head` to panic on `GIT_EUNBORNBRANCH` — `cargo test` red for that developer with
-no code change. Read it back with `repo.head().unwrap().name()`, as
-`default_scope_is_current_branch_only` and the shared `merged_history` fixture do.
+**No test may depend on the developer's own git config or attributes, and that is
+enforced by construction rather than by convention.** `temp_repo` builds a repo the
+machine cannot reach into, in three moves:
+
+- **`confine_config_to_the_repo`** replaces the repo's config object with one holding
+  only its own `.git/config` (`git_repository_set_config`), so the system, XDG and
+  global levels are not merged in at all. The app must read all four — git does, and
+  honouring the reader's `[diff "archive"]` is the point of the textconv feature — but
+  a test that reads them asserts against dotfiles. Shadowing key by key is **not** an
+  alternative: `[diff "<name>"]` sections have unbounded names, so there is no key to
+  shadow and no list that stays complete. The local file is read off `commondir()`, not
+  `path()`, so a linked worktree (whose gitdir holds only the optional
+  `config.worktree`, added at its own level) is covered too.
+- **`core.attributesFile` and `core.excludesFile`** are pinned to an empty file inside
+  `.git`. Config confinement alone does not close these: left unset, libgit2 falls back
+  to `$XDG_CONFIG_HOME/git/{attributes,ignore}` through the **sysdirs**, which no config
+  level controls. Without the pin a `~/.gitattributes` line as ordinary as
+  `*.zip diff=archive` decides which fixtures are driven, and a `~/.gitignore` decides
+  which untracked fixtures a worktree diff can see at all.
+- **`init.defaultBranch`** is stated in the init options (`initial_head("master")`),
+  being the one key that is read before the config can be replaced — and
+  **`external_template(false)`** is stated beside it, closing the other half of that
+  same window. `RepositoryInitOptions::new` turns the flag ON, and libgit2's
+  `repo_init_structure` then reads `init.templatedir` out of the DEFAULT config (system
+  + XDG + global) and copies that directory into the new `.git`. A template holding an
+  `info/attributes` therefore lands one inside `$GIT_DIR` — which libgit2 reads at
+  HIGHER priority than `core.attributesFile`, so nothing below can shadow it, and a
+  line as ordinary as `*.zip diff=archive` would decide which fixtures are driven.
+
+`core.autocrlf=false` / `core.fileMode=true` / `core.symlinks=true` are still written
+explicitly — not to un-inherit them, but because libgit2's own defaults are
+platform-derived and these three decide test outcomes (with `autocrlf` on, reverted
+patches land through the CRLF filter and the on-disk assertions compare `"x\r\n"`
+against `"x\n"`).
+
+Three tests in `test_repo.rs` pin the isolation itself, `a.zip` being the probe a real
+global driver is most likely to claim. Verified end to end: under a `HOME` holding
+`autocrlf=true`, `fileMode=false`, `symlinks=false`, `defaultBranch=trunk`,
+`renameLimit=1`, `noprefix`, `mnemonicprefix`, a `* diff=archive` attributes file and a
+`[diff "gktest"]` of its own, the suite goes from **57 failures to 0**.
+
+Two consequences. **Reopening a repo goes through `open_repo`, never
+`git2::Repository::open`** — a fresh handle builds a fresh config from the machine's
+files and silently undoes all of the above, and reopening is routine here (it is how the
+write layer reads `.git/index` back). And a test may now assert on driver identity, but
+**still not on the driver COUNT** and still under a name nobody has (`gktest`): the
+count is a property of the fixture, and asserting it invites a reader to "fix" it by
+re-admitting the global config. The residue this does not cover is the system-wide
+`/etc/gitattributes`, which is reached through the sysdirs alone; nothing short of
+libgit2's `GIT_OPT_SET_SEARCH_PATH` (an `unsafe fn` in git2, mutating process-global
+state) removes it, which is not worth `unsafe` in a crate that has none.
+
+Read the initial branch back with `repo.head().unwrap().name()` all the same, as
+`default_scope_is_current_branch_only` and the shared `merged_history` fixture do:
+naming it ties the fixture to `temp_repo`'s choice, and `set_head` on a branch the repo
+does not have succeeds (attached-unborn HEAD) only for the following `checkout_head` to
+panic on `GIT_EUNBORNBRANCH`.
+
+For the history: a developer's own `[diff "archive"]` used to be enough to turn a
+symlink fixture binary and a whitespace-only fixture into one with a patch body (a
+repo-local `diff.<name>.textconv` does not shadow a global `diff.<name>.binary`), and
+their `*.zip diff=archive` was enough to fail
+`a_repo_with_no_drivers_still_resolves_to_an_empty_map` outright. The same machine's
+`diff.noprefix` is why `header_prefixes` exists rather than a hardcoded `a/` — that one
+is a real-world case the app must handle, not merely a test hazard.
 
 `src/test_repo.rs` (`#[cfg(test)]`, so nothing lands in the binary) holds the temp-repo
-helpers the `apply`, `diff_store` and `main` suites share — `temp_repo`,
+helpers the `apply`, `diff_store` and `main` suites share — `temp_repo` and
+`open_repo`/`confine_config_to_the_repo` (the isolation above),
 `write_file`/`stage`/
 `commit_index`/`commit_file`/`commit_bytes`/`commit_rename` to build history,
 `commit_at`/`commit_file_at` to state a commit's TIME and parents explicitly — the

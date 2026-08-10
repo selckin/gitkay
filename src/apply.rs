@@ -1378,7 +1378,7 @@ mod tests {
     };
     use crate::test_repo::{
         commit_bytes, commit_file, commit_index, commit_rename, corrupt_head, index_blob,
-        read_file, remove_loose_object, stage, temp_repo, write_file,
+        open_repo, read_file, remove_loose_object, stage, temp_repo, write_file,
     };
 
     fn hr(old_start: u32, old_lines: u32, new_start: u32, new_lines: u32) -> HunkRange {
@@ -1754,7 +1754,7 @@ mod tests {
         drop(repo);
         remove_loose_object(&path, base_tree);
 
-        let repo = git2::Repository::open(&path).unwrap();
+        let repo = open_repo(&path);
         let err = apply_request(
             &repo,
             &range_req(RangeEnds { base, head }, "f.txt", None),
@@ -1832,7 +1832,7 @@ mod tests {
         )
         .unwrap();
 
-        let reopened = git2::Repository::open(dir.path()).unwrap();
+        let reopened = open_repo(dir.path());
         assert!(!index_blob(&reopened, "f.txt").contains("EDITED 17"));
     }
 
@@ -2405,7 +2405,7 @@ mod tests {
         drop(repo);
         remove_loose_object(dir.path(), blob);
 
-        let repo = git2::Repository::open(dir.path()).unwrap();
+        let repo = open_repo(dir.path());
         let commit = repo.head().unwrap().peel_to_commit().unwrap();
         // The revert diff's shape: the same two trees `RevertTrees::of_request`
         // resolves for this commit (a root commit, so `None` for the parent tree),
@@ -2807,7 +2807,7 @@ mod tests {
         assert!(matches!(err, ApplyError::Stale), "{err:?}");
         // Reopened, because git_apply commits its own index writer: an in-memory
         // handle could still show the pre-apply state.
-        let reopened = git2::Repository::open(dir.path()).unwrap();
+        let reopened = open_repo(dir.path());
         assert_eq!(
             index_blob(&reopened, "f.txt"),
             body(&[]),
@@ -3160,7 +3160,7 @@ mod tests {
         )
         .unwrap();
 
-        let reopened = git2::Repository::open(dir.path()).unwrap();
+        let reopened = open_repo(dir.path());
         assert!(
             index_blob(&reopened, "f.txt").contains("EDITED 3"),
             "the staged content must survive reopening the repository"
@@ -3177,7 +3177,7 @@ mod tests {
 
         apply_request(&repo, &req(DiffSource::Staged, "f.txt", None), settings()).unwrap();
 
-        let reopened = git2::Repository::open(dir.path()).unwrap();
+        let reopened = open_repo(dir.path());
         assert!(
             !index_blob(&reopened, "f.txt").contains("EDITED 3"),
             "the unstage must survive reopening the repository"
@@ -3465,7 +3465,7 @@ mod tests {
 
         // A corrupt HEAD — distinct from unborn, which reports `UnbornBranch`.
         corrupt_head(dir.path());
-        let repo = git2::Repository::open(dir.path()).unwrap();
+        let repo = open_repo(dir.path());
 
         let err = apply_request(&repo, &req(DiffSource::Staged, "f.txt", None), settings())
             .expect_err("an unreadable HEAD must not read as 'HEAD has no such file'");
@@ -3507,7 +3507,7 @@ mod tests {
 
         // A corrupt HEAD — distinct from unborn, which reports `UnbornBranch`.
         corrupt_head(dir.path());
-        let repo = git2::Repository::open(dir.path()).unwrap();
+        let repo = open_repo(dir.path());
 
         let err = apply_request(
             &repo,
@@ -3554,7 +3554,7 @@ mod tests {
             .id();
         drop(repo);
         remove_loose_object(dir.path(), sub);
-        let repo = git2::Repository::open(dir.path()).unwrap();
+        let repo = open_repo(dir.path());
 
         let err = apply_request(
             &repo,
@@ -3589,7 +3589,7 @@ mod tests {
         drop(repo);
 
         remove_loose_object(dir.path(), first);
-        let repo = git2::Repository::open(dir.path()).unwrap();
+        let repo = open_repo(dir.path());
 
         let err = apply_request(
             &repo,
