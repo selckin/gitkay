@@ -155,6 +155,7 @@ pub fn file_entry(path: &str, diff_line_idx: Option<usize>) -> crate::diff::File
         old_path_bytes: None,
         status: git2::Delta::Modified,
         is_binary: false,
+        is_converted: false,
         additions: 0,
         deletions: 0,
         diff_line_idx,
@@ -272,6 +273,41 @@ pub fn read_file(repo: &git2::Repository, path: &str) -> String {
 /// the commit.
 pub fn write_attributes(repo: &git2::Repository, content: &str) {
     write_file(repo, ".gitattributes", content);
+}
+
+/// Set one repo-local git config key. The textconv suite's whole fixture is a
+/// `[diff "<name>"]` section plus a `.gitattributes`, and going through libgit2
+/// rather than writing `.git/config` by hand is what keeps `temp_repo`'s pinned
+/// `core.*` settings in place — and what preserves a SUBSECTION's case, which
+/// `diff "Archive"` vs `diff "archive"` depends on.
+pub fn set_config(repo: &git2::Repository, key: &str, value: &str) {
+    repo.config().unwrap().set_str(key, value).unwrap();
+}
+
+/// Configure `diff.<name>.textconv` (and its `cachetextconv`) plus the
+/// `.gitattributes` line that selects it — the whole of a textconv fixture, in the
+/// order a user would set it up.
+pub fn write_driver(repo: &git2::Repository, name: &str, cmd: &str, cache: bool, pattern: &str) {
+    set_config(repo, &format!("diff.{name}.textconv"), cmd);
+    if cache {
+        set_config(repo, &format!("diff.{name}.cachetextconv"), "true");
+    }
+    write_attributes(repo, &format!("{pattern} diff={name}\n"));
+}
+
+/// Write an executable shell script into `dir` and return its path — the test
+/// suite's own textconv driver.
+///
+/// A script rather than a real converter, so the suite depends on `/bin/sh` and
+/// nothing else: no test may depend on the developer having `bsdtar`, and none may
+/// pick up the developer's own drivers (`temp_repo` pins its config for exactly
+/// that reason).
+pub fn driver_script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
 }
 
 /// The *staged* content of `path` — what a commit made right now would record.

@@ -156,6 +156,12 @@ pub struct DiffSection {
     /// Detect copied files (git -C): a new file copied from another modified file
     /// renders as `source → copy`. Off by default — more expensive than renames.
     pub(crate) detect_copies: bool,
+    /// Run `diff.<driver>.textconv` when `.gitattributes` names a driver for a
+    /// path, as git does — which is what turns a zip or a PDF into a readable
+    /// diff. On by default, and an off switch precisely because it runs an
+    /// external command: git runs one when a human asked for that diff, while
+    /// gitkay's prefetch pool runs them speculatively for commits nobody opened.
+    pub(crate) textconv: bool,
     /// `[diff.languages]` — extension → syntax, for suffixes syntect has no grammar
     /// for. See `highlight::LanguageMap`; empty by default, which is exactly the
     /// pre-existing extension-only behaviour.
@@ -172,6 +178,7 @@ impl Default for DiffSection {
             bands: BandsSection::default(),
             detect_renames: true,
             detect_copies: false,
+            textconv: true,
             languages: crate::highlight::LanguageMap::new(),
         }
     }
@@ -443,6 +450,13 @@ fn default_template() -> String {
          # \"source → copy\". Only files modified in the same commit are copy sources.\n\
          # More expensive than renames; off by default.\n\
          # detect_copies = false\n\
+         # Run diff.<driver>.textconv when .gitattributes names a driver for a\n\
+         # path, as git does — the setting that makes an archive or a PDF diff as\n\
+         # readable text instead of \"Binary files ... differ\". The command comes\n\
+         # from git config, never from a file in the repo, but gitkay runs it for\n\
+         # commits you have not opened yet (it prefetches diffs around the view),\n\
+         # so set this to false to keep it from running external commands at all.\n\
+         # textconv = true\n\
          # File-list sidebar layout. \"grouped\" (default) groups files under\n\
          # directory headers with basenames indented; \"full\" shows each file's\n\
          # full repo-relative path; \"name\" shows just basenames.\n\
@@ -941,6 +955,7 @@ mod tests {
         assert_eq!(cfg.diff.bands.added, None);
         assert!(cfg.diff.detect_renames); // default on (matches git -M)
         assert!(!cfg.diff.detect_copies); // default off (git -C, expensive)
+        assert!(cfg.diff.textconv); // default on, matching git
     }
 
     #[test]
@@ -953,6 +968,15 @@ mod tests {
         assert!(!cfg.diff.show_stats);
         assert_eq!(cfg.diff.bands.source, BandSource::Theme);
         assert_eq!(cfg.diff.bands.added.as_deref(), Some("#0a300a"));
+    }
+
+    /// The one setting that decides whether gitkay may run an external command, so
+    /// it must be reachable AND default to what git does.
+    #[test]
+    fn textconv_parses_and_defaults_on() {
+        let cfg: Config = toml::from_str("[diff]\ntextconv = false\n").unwrap();
+        assert!(!cfg.diff.textconv);
+        assert!(Config::default().diff.textconv);
     }
 
     #[test]
@@ -984,6 +1008,7 @@ mod tests {
         assert!(t.contains("show_stats ="));
         assert!(t.contains("detect_renames ="));
         assert!(t.contains("detect_copies ="));
+        assert!(t.contains("textconv ="));
     }
 
     #[test]

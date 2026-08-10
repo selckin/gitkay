@@ -26,6 +26,7 @@ mod highlight;
 mod mem;
 #[cfg(test)]
 mod test_repo;
+mod textconv;
 mod word_diff;
 use config::{FileListLayout, Fonts, Role};
 use diff::{
@@ -38,6 +39,7 @@ use diff::{
 use diff_cache::DiffCache;
 use diff_store::DiffStore;
 use highlight::{DiffBg, HighlightLines, Highlighter};
+use textconv::Textconv;
 
 /// A monotonic supersession token shared between the UI thread and a background worker.
 /// The UI calls `bump()` on each dispatch to get a fresh token that supersedes every
@@ -490,6 +492,18 @@ struct DiffCacheKey {
     theme: highlight::EmbeddedThemeName,
     enabled: bool,
     content: u64,
+    /// The repo's textconv drivers, as `Textconv` fingerprints them — `0` until one
+    /// has been re-resolved and found to have MOVED (`GitkApp::diff_drivers`).
+    ///
+    /// A driver decides a driven file's whole body, so an edited `diff.<name>.textconv`
+    /// changes the diff without touching the oid or any setting here — the same shape
+    /// as the attributes and config inputs `diff_store::StoreContext` folds in, and for
+    /// the same reason: an entry built under the old command must MISS rather than be
+    /// swept up by an eviction that has to be remembered everywhere. It is what stops a
+    /// warm still running under the pre-edit map from landing back in the cache the
+    /// edit just cleared, and what lets `load_selected_diff` rebuild the pane the reader
+    /// is looking at instead of early-returning on an identical key.
+    drivers: u64,
 }
 
 impl DiffCacheKey {
@@ -503,11 +517,13 @@ impl DiffCacheKey {
             theme,
             enabled,
             content: _,
+            drivers,
         } = other;
         self.oid == *oid
             && self.settings == *settings
             && self.theme == *theme
             && self.enabled == *enabled
+            && self.drivers == *drivers
     }
 }
 
@@ -1038,8 +1054,11 @@ fn prefetch_targets(
 /// every time the toolbar's `+`/`-` buttons are clicked — visible flicker
 /// bought with real work. A field added to `DiffSettings` later gets classified
 /// here, in one place.
-const fn stats_relevant(s: DiffSettings) -> (bool, bool, bool) {
-    (s.ignore_ws, s.detect_renames, s.detect_copies)
+///
+/// `textconv` IS in: the `+`/`-` on a driven row are counted off the CONVERTED
+/// lines, so turning it off changes them.
+const fn stats_relevant(s: DiffSettings) -> (bool, bool, bool, bool) {
+    (s.ignore_ws, s.detect_renames, s.detect_copies, s.textconv)
 }
 
 /// Which visible rows still need their stats computed, for the `want` the
@@ -1052,12 +1071,13 @@ const fn stats_relevant(s: DiffSettings) -> (bool, bool, bool) {
 ///
 /// A row is skipped only when what is already cached **satisfies `want`** —
 /// "known" is not a property of the map alone. A `FilesOnly` entry carries
-/// `lines: None` (see `CommitStats::lines`: that `Option` encodes "not asked
-/// for", and nothing else reads it), so it answers a `FilesOnly` want and not a
+/// `LineStats::NotAsked`, so it answers a `FilesOnly` want and not a
 /// `FilesAndLines` one; without this the row would keep its file count and
-/// never grow line counts. A failed row (`Some(None)`) is skipped whatever the
-/// want, which is what stops a broken object being re-queued every frame
-/// forever.
+/// never grow line counts. `LineStats::Withheld` is the third state and the
+/// reason that enum is not an `Option`: the row was asked and has nothing more
+/// to give, so it must stop being offered — see `LineStats`. A failed row
+/// (`Some(None)`) is skipped whatever the want, which is what stops a broken
+/// object being re-queued every frame forever.
 ///
 /// Keeping the want here rather than blanking the map when `line_count` is
 /// switched on is what lets the file counts stay on screen while the line
@@ -1088,7 +1108,7 @@ fn stats_targets(
         // record exists to prevent. `handle_git_reload` is what retries it.
         Some(None) => true,
         // Computed: enough only if it holds what is being asked for.
-        Some(Some(s)) => want == StatsWant::FilesOnly || s.lines.is_some(),
+        Some(Some(s)) => want == StatsWant::FilesOnly || s.lines.answered(),
     };
     let mut seen = HashSet::new();
     commits
@@ -1133,8 +1153,24 @@ fn install_stats_result(
     stats: Option<CommitStats>,
 ) {
     match stats {
-        Some(_) => {
-            known.insert(oid, stats);
+        // A result that answered the `+`/`-` question always installs. One that did
+        // NOT must never overwrite one that did, and that is not defensive: the
+        // costly/driven deferral in `run_stats_job` sends a `FilesOnly` count — i.e.
+        // `LineStats::NotAsked` — and its whole premise is that the row's own diff
+        // supplies the numbers instead, so it can land AFTER `cache_diff` has
+        // harvested them. Downgrading is terminal: the deferral puts the oid in the
+        // coordinator's `measured`, so `SubmitStats` filters that row out of every
+        // later submission, while `stats_targets` reads `NotAsked` under a
+        // `FilesAndLines` want as "still owed" and re-lists it every frame — a cell
+        // blank for the session, and a band never warmed while the row is on screen.
+        Some(fresh) => {
+            let downgrade = !fresh.lines.answered()
+                && known
+                    .get(&oid)
+                    .is_some_and(|had| had.is_some_and(|had| had.lines.answered()));
+            if !downgrade {
+                known.insert(oid, Some(fresh));
+            }
         }
         None => {
             known.entry(oid).or_insert(None);
@@ -1154,11 +1190,21 @@ fn install_stats_result(
 /// oid with the pre-toggle numbers, `stats_targets` reads it as known, and the column
 /// disagrees with the pane beside it permanently.
 ///
+/// The drivers are the same comparison for the same reason, and by the same route:
+/// `apply_driver_change` clears the map and calls `load_selected_diff`, whose
+/// `stash_current_diff` hands `cache_diff` the OUTGOING diff — built under the driver
+/// the reader has just edited away. Without this the column is repopulated with the
+/// pre-edit numbers (`+0 -0` for a zip the broken command could not convert) beside a
+/// sidebar showing the converted patch's, and `stats_targets` reads the entry as
+/// answered so nothing re-asks.
+///
 /// Free rather than inline in `cache_diff` so the regression test drives the real
 /// decision rather than a model of it (`GitkApp` needs a real
 /// `eframe::CreationContext`).
-fn stats_harvestable(key: &DiffCacheKey, current: DiffSettings) -> bool {
-    is_real_commit(key.oid) && stats_relevant(key.settings) == stats_relevant(current)
+fn stats_harvestable(key: &DiffCacheKey, current: DiffSettings, drivers: u64) -> bool {
+    is_real_commit(key.oid)
+        && key.drivers == drivers
+        && stats_relevant(key.settings) == stats_relevant(current)
 }
 
 /// Drop every failed stats entry, keeping successes untouched, so a reload
@@ -2689,11 +2735,15 @@ fn diff_menu_salt(key: Option<&DiffCacheKey>) -> u64 {
             oid,
             settings,
             content,
+            drivers,
             theme: _,
             enabled: _,
         }) => {
             h.write_u8(1);
-            (oid, settings, content).hash(&mut h);
+            // The drivers ARE row identity: an edited one replaces a driven file's
+            // whole body, so a menu opened over the old rendering must not act on
+            // the new one.
+            (oid, settings, content, drivers).hash(&mut h);
         }
     }
     h.finish()
@@ -3502,6 +3552,9 @@ enum Outcome {
     Warmed { lines: usize },
     /// Built, over `Limits::max_entry_lines`, dropped uncached.
     Oversized { key: DiffCacheKey, lines: usize },
+    /// Built, a textconv driver failed, dropped uncached. See
+    /// `Coordinator::unconverted`.
+    Unconverted { key: DiffCacheKey, lines: usize },
     /// A stats row finished — result already sent. `costly` carries the probe's
     /// measurement when the row was too expensive for its line counts, in which case
     /// only the file count was sent.
@@ -3527,6 +3580,16 @@ enum CoordMsg {
     SubmitStats(VecDeque<StatsJob>),
     /// Drop every queued stats row: they answer a question that has changed.
     ClearStats,
+    /// The repo's textconv drivers changed, so both `unconverted` AND `measured`
+    /// describe a repo that no longer exists — the second because `driven` is part of
+    /// the costly verdict and an oid key cannot carry it.
+    DriversChanged,
+    /// A `.git` reload re-armed `Textconv`'s hung-driver latch, so every row dropped
+    /// for a conversion that FAILED deserves another go. Distinct from
+    /// `DriversChanged`, which is rare and additionally invalidates the cost memo:
+    /// a reload fires on every commit, fetch and index write, and re-probing the whole
+    /// band each time would cost far more than the retry is worth.
+    RetryUnconverted,
     /// A worker is free again, having produced `Outcome`.
     Done(usize, Outcome),
 }
@@ -3580,6 +3643,19 @@ impl PoolHandle {
     fn clear_stats(&self) {
         let _dropped = self.tx.send(CoordMsg::ClearStats);
     }
+
+    /// The repo's textconv drivers have changed, so every row remembered as
+    /// unconvertible — or as costly for being driven — deserves another go. See
+    /// `Coordinator::unconverted` and `Coordinator::measured`.
+    fn drivers_changed(&self) {
+        let _dropped = self.tx.send(CoordMsg::DriversChanged);
+    }
+
+    /// A reload re-armed the hung-driver latch: retry the rows a conversion failure
+    /// took out of the band. See `CoordMsg::RetryUnconverted`.
+    fn retry_unconverted(&self) {
+        let _dropped = self.tx.send(CoordMsg::RetryUnconverted);
+    }
 }
 
 /// The single owner of every scheduling decision.
@@ -3619,6 +3695,17 @@ struct Coordinator {
     /// Without it a re-dispatch re-probed every deferred row — measured, 18 of them on
     /// the second dispatch alone, and a dispatch fires every half-window while scrolling.
     measured: HashMap<git2::Oid, u64>,
+    /// The `[diff] textconv` setting `measured` was built under.
+    ///
+    /// The costly verdict is `total_blob_bytes > max_blob_bytes || driven`, and
+    /// `driven` is a fact about the SETTINGS as much as about the commit — an oid key
+    /// cannot carry it, and a live config reload can flip it. Turning textconv off
+    /// otherwise left every row a driver had matched classified costly for the
+    /// session: still routed to the heavy lane it no longer needs, and still filtered
+    /// out of every stats submission, so its `+`/`-` cells stayed blank until that
+    /// lane happened to reach it. Read off the jobs themselves rather than announced
+    /// by a caller, so a new dispatch site cannot forget to say so.
+    measured_textconv: Option<bool>,
     /// Diffs whose BUILT line count exceeded the cap and were dropped.
     ///
     /// A separate store from `measured`, and `DiffCacheKey`-keyed rather than by oid,
@@ -3629,6 +3716,22 @@ struct Coordinator {
     /// over-cap row was rebuilt in full on every dispatch purely to be discarded again
     /// (measured: a 292,503-line row built twice in two seconds, 629ms each).
     oversized: HashSet<DiffCacheKey>,
+    /// Rows built whose textconv driver FAILED, so the diff was dropped uncached.
+    ///
+    /// The same shape as `oversized` and for the same reason: a row nothing will keep
+    /// is a row the band rebuilds on every dispatch, and `dispatch_prefetch` fires on
+    /// every settled diff and every half-window of scroll. What makes this one worse
+    /// than a wasted rebuild is WHY the row is uncacheable — the rebuild re-runs the
+    /// failing driver, one `/bin/sh` per side per delta, and the ordinary cause (a
+    /// driver command this machine does not have) never stops failing. Twenty such
+    /// rows of five files each is ~400 spawns per dispatch, continuously while
+    /// scrolling.
+    ///
+    /// Cleared when `[diff] textconv` moves (`note_settings`) and when the repo's
+    /// drivers change (`CoordMsg::DriversChanged`) — the two events after which the
+    /// verdict may differ. A transient failure costs one dropped warm until then, which
+    /// is what it cost before this existed.
+    unconverted: HashSet<DiffCacheKey>,
     /// Pool workers with no job right now.
     idle: Vec<usize>,
     /// Heavy-lane workers with no row right now.
@@ -3700,11 +3803,15 @@ impl Coordinator {
                 self.hl = hl;
                 self.span_gen = span_gen;
                 self.warmed = 0;
+                if let Some(target) = targets.front() {
+                    self.note_settings(target.key.settings);
+                }
                 self.take_band(targets);
             }
             CoordMsg::SubmitStats(jobs) => {
                 if let Some(job) = jobs.front() {
                     self.stats_epoch = job.epoch;
+                    self.note_settings(job.settings);
                 }
                 // Replaced, not extended: a costly row reads as "unknown" to
                 // `stats_targets` until its line counts land, so every scroll
@@ -3737,9 +3844,41 @@ impl Coordinator {
                     .collect();
             }
             CoordMsg::ClearStats => self.stats.clear(),
+            CoordMsg::DriversChanged => {
+                self.unconverted.clear();
+                // `measured` too, and for exactly the reason `note_settings` clears it
+                // when `[diff] textconv` moves: the costly verdict is
+                // `total_blob_bytes > max_blob_bytes || driven`, and `driven` is a fact
+                // about the DRIVERS as much as about the commit, which an oid key
+                // cannot carry. Left standing, every row a since-removed driver had
+                // matched stays pinned to the heavy lane and filtered out of every
+                // stats submission — its `+`/`-` cells blank — for the session.
+                self.measured.clear();
+            }
+            CoordMsg::RetryUnconverted => self.unconverted.clear(),
             CoordMsg::Done(id, outcome) => self.finish(id, outcome),
         }
         self.dispatch();
+    }
+
+    /// Notice a settings change the oid-keyed cost memo cannot express. See
+    /// `Coordinator::measured_textconv`; `oversized` needs no equivalent, its key
+    /// embedding the whole `DiffSettings`.
+    fn note_settings(&mut self, settings: DiffSettings) {
+        if self.measured_textconv.replace(settings.textconv) == Some(settings.textconv) {
+            return;
+        }
+        if !self.measured.is_empty() {
+            log::debug!(
+                "prefetch: textconv is now {} — re-measuring {} rows",
+                settings.textconv,
+                self.measured.len()
+            );
+            self.measured.clear();
+        }
+        // Same event, other memo: with textconv off nothing can fail to convert, and
+        // with it back on the reader is asking for the conversion again.
+        self.unconverted.clear();
     }
 
     /// Split a new band into the cheap and expensive lanes, dropping what is already
@@ -3747,7 +3886,7 @@ impl Coordinator {
     fn take_band(&mut self, targets: VecDeque<PrefetchTarget>) {
         let (mut ready, mut deferred) = (VecDeque::new(), VecDeque::new());
         for mut target in targets {
-            if self.oversized.contains(&target.key) {
+            if self.oversized.contains(&target.key) || self.unconverted.contains(&target.key) {
                 continue; // built once, dropped once; rebuilding it proves nothing
             }
             // A row whose cost is known skips re-learning it: it goes straight to the
@@ -3783,6 +3922,10 @@ impl Coordinator {
                 // this dispatch a worker's time, which is what the budget rations.
                 self.warmed += lines;
                 self.oversized.insert(key);
+            }
+            Outcome::Unconverted { key, lines } => {
+                self.warmed += lines;
+                self.unconverted.insert(key);
             }
             Outcome::Stats { oid, costly } => {
                 self.busy_stats.remove(&oid);
@@ -4005,7 +4148,7 @@ fn spawn_prefetch_pool(
     tx: &mpsc::Sender<WarmResult>,
     stats_tx: &mpsc::Sender<StatsResult>,
     ctx: &egui::Context,
-    store: &StoreSlot,
+    deps: &DiffDeps,
 ) -> PoolHandle {
     let (coord_tx, coord_rx) = mpsc::channel();
     let limits = budget.limits;
@@ -4021,7 +4164,7 @@ fn spawn_prefetch_pool(
             tx: tx.clone(),
             stats_tx: stats_tx.clone(),
             ctx: ctx.clone(),
-            store: Arc::clone(store),
+            deps: deps.clone(),
         };
         let repo_path = repo_path.to_owned();
         spawn_guarded(
@@ -4073,7 +4216,9 @@ fn spawn_prefetch_pool(
         ready: VecDeque::new(),
         deferred: VecDeque::new(),
         measured: HashMap::new(),
+        measured_textconv: None,
         oversized: HashSet::new(),
+        unconverted: HashSet::new(),
         idle: (0..mailboxes.len()).collect(),
         heavy_idle: (mailboxes.len()..mailboxes.len() + heavy.len()).collect(),
         heavy_outstanding: HashMap::new(),
@@ -4229,9 +4374,8 @@ struct WorkerCtx {
     tx: mpsc::Sender<WarmResult>,
     stats_tx: mpsc::Sender<StatsResult>,
     ctx: egui::Context,
-    /// The shared store slot — one store per process, published once the repo has
-    /// been fingerprinted. A worker that starts before that simply builds.
-    store: StoreSlot,
+    /// The persistent store and the textconv drivers; see `DiffDeps`.
+    deps: DiffDeps,
 }
 
 /// One worker: take a job, do it, report what happened. Forever.
@@ -4298,27 +4442,36 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
     // correct and free. Measuring separately meant building the row's diff twice for
     // every row, on every repo, to fire a guard that most repos never trip.
     //
-    // Real commits only, because deferring is a promise the diff will pay instead — and
-    // only a real commit's diff does. A prefetch never warms a virtual row (its key is
-    // content-hashed only after the diff exists) and both harvest sites, `cache_diff`
-    // and `warm_row`, guard on `is_real_commit`. Deferring one would record its SENTINEL
-    // oid in the coordinator's `measured` map, which then filters that row out of every
-    // future stats submission — so the uncommitted/staged/range row would show a file
-    // count and a permanently blank `+`/`-`, and stay that way after the working-tree
-    // change that triggered it was reverted, since a sentinel oid never expires.
     let t = std::time::Instant::now();
+    let tc = textconv_for(&ctx.deps.textconv, job.settings);
     if job.want == StatsWant::FilesAndLines
-        && is_real_commit(oid)
-        && let Ok(measured) = diff::measured_row_diff(repo, &job.scope, job.settings)
+        && let Ok(measured) = diff::measured_row_diff(repo, &job.scope, job.settings, tc)
     {
         let cost = measured.cost;
-        if cost.total_blob_bytes > ctx.limits.max_blob_bytes {
+        // `driven` joins the byte threshold rather than replacing it, and it is what
+        // keeps a SUBPROCESS off this path: a three-file zip behind `bsdtar` is a few
+        // KB and several hundred milliseconds, which no byte cap can see coming. The
+        // row's diff pays for the conversion once, on the heavy lane, and
+        // `cache_diff` takes the column off it — so the numbers still arrive, and the
+        // column still cannot disagree with the sidebar.
+        // Real commits only, because deferring is a promise the diff will pay instead —
+        // and only a real commit's diff does. A prefetch never warms a virtual row (its
+        // key is content-hashed only after the diff exists) and both harvest sites,
+        // `cache_diff` and `warm_row`, guard on `is_real_commit`. Deferring one would
+        // record its SENTINEL oid in the coordinator's `measured` map, which then filters
+        // that row out of every future stats submission — so the uncommitted/staged/range
+        // row would show a file count and a permanently blank `+`/`-`, and stay that way
+        // after the working-tree change that triggered it was reverted, since a sentinel
+        // oid never expires.
+        if is_real_commit(oid) && (cost.total_blob_bytes > ctx.limits.max_blob_bytes || cost.driven)
+        {
             log::debug!(
-                "stats: defer {oid} — {} blob bytes over {} (largest {}, {} files)",
+                "stats: defer {oid} — {} blob bytes over {} (largest {}, {} files{})",
                 cost.total_blob_bytes,
                 ctx.limits.max_blob_bytes,
                 cost.max_blob_bytes,
-                cost.deltas
+                cost.deltas,
+                if cost.driven { ", textconv" } else { "" }
             );
             // Send the file count NOW, so the row shows something rather than staying
             // blank. Deliberately counted off the pipeline's own diff and not from
@@ -4339,20 +4492,54 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
                 costly: Some(cost.total_blob_bytes),
             };
         }
+        // A DRIVEN virtual row answers its file count and nothing else. It cannot take
+        // the deferral above, and the line counts here would be libgit2's RAW ones —
+        // `Bin 13 -> 20 bytes` counts as `+0 -0` where the pane, built with the driver,
+        // shows the converted patch's numbers. Nothing ever corrects that: the harvest
+        // that fills a real commit's numbers in refuses a virtual oid, because
+        // `sync_virtual_stats` evicts these rows by content hash and would race it. So
+        // the column shows the one number no conversion can change rather than a
+        // `+`/`-` pair that contradicts the sidebar beside it, permanently.
+        //
+        // It is reported as `Withheld`, not as the `NotAsked` a `FilesOnly` job would
+        // produce, and the difference is the whole reason `LineStats` has three states:
+        // under a `FilesAndLines` want, `NotAsked` reads as "still owed", so this row
+        // stayed on `stats_targets`' visible list forever — `dispatch_commit_stats`
+        // never reached its band-warm phase while it was on screen, and re-submitted
+        // its full index→workdir diff every time another row's numbers landed.
+        let withheld = cost.driven && job.want == StatsWant::FilesAndLines;
+        let want = if withheld {
+            StatsWant::FilesOnly
+        } else {
+            job.want
+        };
         // Under the cap: finish off the diff already in hand rather than building a
         // second one. This is the ordinary path on an ordinary repo, where the guard
         // never fires — so before, measuring cost anything at all.
         let stats = measured
-            .stats(job.want)
+            .stats(want)
             .inspect_err(|e| log::debug!("stats: {oid} failed: {e}"))
-            .ok();
+            .ok()
+            .map(|stats| {
+                if withheld {
+                    CommitStats {
+                        lines: diff::LineStats::Withheld,
+                        ..stats
+                    }
+                } else {
+                    stats
+                }
+            });
         log::debug!("stats: done {oid} ({:?}) in {:?}", job.want, t.elapsed());
         send_stats(ctx, job, stats);
         return Outcome::Stats { oid, costly: None };
     }
     // Either nothing to measure (`FilesOnly` needs no blob content, so it is never worth
-    // probing; a virtual row must not be deferred at all) or the measured build failed,
-    // in which case this surfaces the same error properly.
+    // probing) or the measured build failed, in which case this surfaces the same error
+    // properly.
+    // No `tc`: this arm is `FilesOnly` (a delta count, which no conversion changes)
+    // or a build that already failed. Passing one would spawn a driver per side on
+    // the commit-list column's path, which is exactly what `driven` exists to avoid.
     let stats = commit_stats(repo, &job.scope, job.settings, job.want)
         .inspect_err(|e| log::debug!("stats: {oid} failed: {e}"))
         .ok();
@@ -4464,6 +4651,21 @@ fn store_of(slot: &StoreSlot) -> Option<&DiffStore> {
     slot.get()
 }
 
+/// The two process-wide values a diff build needs and no worker may own: the
+/// persistent store (published once the repo has been fingerprinted, off the
+/// window-creation path) and the textconv drivers (whose warn-once set and
+/// notes-cache lock are only meaningful shared).
+///
+/// One value rather than two parameters because they travel together everywhere —
+/// `WorkerCtx`, `DiffLoadJob`, `GitkApp`, the pool spawn — and a new one of the
+/// same shape then reaches every builder by construction, as `PrefetchBudget`'s
+/// two bounds do.
+#[derive(Clone, Default)]
+struct DiffDeps {
+    store: StoreSlot,
+    textconv: Arc<Textconv>,
+}
+
 /// Build a row's diff, or load it from the persistent store if an earlier run
 /// already paid for it — and record it if it was slow.
 ///
@@ -4484,6 +4686,7 @@ fn build_or_load(
     repo: &Repository,
     scope: &RowScope,
     settings: DiffSettings,
+    tc: Option<&Textconv>,
     store_cap: Option<usize>,
 ) -> DiffData {
     if let Some(store) = store
@@ -4496,11 +4699,19 @@ fn build_or_load(
         );
         return data;
     }
+    // The driver fingerprint as it stood before the build, so a driver edit noticed
+    // WHILE this one ran can be seen below. A build takes its driver map once, at the
+    // start (`Textconv::resolved`), while the store's fingerprint is live — so without
+    // this a row still building when the reader fixed a command was written under the
+    // NEW key carrying the OLD command's output, which is the stale hit the fingerprint
+    // joined the key to prevent, arriving by the one route the key cannot see.
+    let drivers_before = store.map(DiffStore::drivers);
     let t = std::time::Instant::now();
-    let data = get_diff_data(repo, scope, settings);
+    let data = get_diff_data(repo, scope, settings, tc);
     let built = t.elapsed();
     if let Some(store) = store
         && built >= store.min_build()
+        && drivers_before == Some(store.drivers())
         && store_cap.is_none_or(|cap| data.lines.len() <= cap)
         && worth_persisting(repo, scope, &data)
     {
@@ -4537,6 +4748,18 @@ fn build_or_load(
 /// Asked only on the write path, which a slow build has already gated, so the
 /// extra `find_commit`/`parent` costs nothing measurable.
 fn worth_persisting(repo: &Repository, scope: &RowScope, data: &DiffData) -> bool {
+    // A textconv that could not be run is the third transient failure this guard
+    // covers, and the one that most looks like a result: the delta simply shows its
+    // raw body. Writing that to disk would serve "Binary files … differ" for weeks
+    // after the driver is installed.
+    if data.textconv_failed {
+        log::debug!(
+            "diff store: not storing {} — a textconv driver failed, so this diff \
+             fell back to raw content",
+            scope.source.oid()
+        );
+        return false;
+    }
     if data.lines.is_empty() {
         log::debug!(
             "diff store: not storing {} — the build failed",
@@ -4576,20 +4799,25 @@ fn warm_row(
     // like, and must not hold up the rest of the band. An already-measured row skips it
     // — re-probing would postpone it forever. A probe that errors falls through to the
     // build, which surfaces the same error properly.
+    let tc = textconv_for(&ctx.deps.textconv, target.key.settings);
     if target.probed.is_none()
-        && let Ok(cost) = diff::probe_row_cost(repo, &target.scope, target.key.settings)
-        && cost.total_blob_bytes > ctx.limits.max_blob_bytes
+        && let Ok(cost) = diff::probe_row_cost(repo, &target.scope, target.key.settings, tc)
+        && (cost.total_blob_bytes > ctx.limits.max_blob_bytes || cost.driven)
     {
         // All three dimensions, not just the one that tripped: which of them is large
         // is what tells a 265MB single file apart from a wide shallow commit, and this
-        // guard has already had to move from one to another once.
+        // guard has already had to move from one to another once. `driven` is the
+        // fourth and is not a size at all — a driven row is expensive for a reason
+        // byte-thresholding cannot see (a few-KB zip behind a several-hundred-ms
+        // `bsdtar`), which is exactly what the heavy lane is for.
         log::debug!(
-            "prefetch: defer {} — {} blob bytes over {} (largest {}, {} files)",
+            "prefetch: defer {} — {} blob bytes over {} (largest {}, {} files{})",
             target.key.oid,
             cost.total_blob_bytes,
             ctx.limits.max_blob_bytes,
             cost.max_blob_bytes,
-            cost.deltas
+            cost.deltas,
+            if cost.driven { ", textconv" } else { "" }
         );
         return Outcome::TooBig {
             bytes: cost.total_blob_bytes,
@@ -4617,10 +4845,11 @@ fn warm_row(
     // function runs. Surgery on a delicate function for a millisecond, buying
     // none of the thing it looks like it buys.
     let mut data = build_or_load(
-        store_of(&ctx.store),
+        store_of(&ctx.deps.store),
         repo,
         &target.scope,
         target.key.settings,
+        tc,
         // Speculative: capped, because the drop below would throw this away.
         Some(ctx.limits.max_entry_lines),
     );
@@ -4646,6 +4875,28 @@ fn warm_row(
             send_stats_result(ctx, stats_epoch, oid, Some(diff::stats_from_data(&data)));
         }
         return Outcome::Oversized {
+            key: target.key,
+            lines,
+        };
+    }
+    // A driver that failed makes this diff uncacheable — `cache_diff` refuses it for
+    // the reason `worth_persisting` does — and an uncacheable row is one the band
+    // rebuilds on every dispatch. That is merely wasteful for an oversized row and
+    // actively harmful here, because the rebuild re-runs the driver: with a command
+    // this machine does not have, nothing ever stops failing and nothing rate-limits
+    // the retry. So it is dropped and REMEMBERED, exactly as an oversized row is.
+    if data.textconv_failed {
+        log::debug!(
+            "prefetch: drop {oid} ({lines} lines) — a textconv driver failed, so this \
+             diff fell back to raw content; built in {built:?}"
+        );
+        // As at the oversized drop: this row's stats job sent a file count and stopped,
+        // trusting the diff to supply the line counts — and this diff is about to be
+        // dropped, so `cache_diff` will never harvest it.
+        if is_real_commit(oid) {
+            send_stats_result(ctx, stats_epoch, oid, Some(diff::stats_from_data(&data)));
+        }
+        return Outcome::Unconverted {
             key: target.key,
             lines,
         };
@@ -4767,8 +5018,8 @@ struct DiffLoadJob {
     tx: mpsc::Sender<DiffLoadResult>,
     ctx: egui::Context,
     prehighlight: Option<PreHighlight>,
-    /// The shared store slot; see `StoreSlot`.
-    store: StoreSlot,
+    /// The persistent store and the textconv drivers; see `DiffDeps`.
+    deps: DiffDeps,
 }
 
 /// Deliver a `data: None` result for a diff-load worker exiting without a diff
@@ -4813,7 +5064,7 @@ fn diff_load_job(repo: &Repository, job: DiffLoadJob) {
         tx,
         ctx,
         prehighlight,
-        store,
+        deps,
     } = job;
     // Superseded before we even ran.
     if !current_epoch.is_current(epoch) {
@@ -4821,8 +5072,17 @@ fn diff_load_job(repo: &Repository, job: DiffLoadJob) {
         return;
     }
     let t = std::time::Instant::now();
-    // The user is waiting on this one, so it is stored uncapped.
-    let mut data = build_or_load(store_of(&store), repo, &scope, key.settings, None);
+    // The user is waiting on this one, so it is stored uncapped — and it is the one
+    // path a driver is deliberately unguarded on: a row the reader opened is theirs
+    // to pay for, bounded by `TEXTCONV_TIMEOUT` and cheap on the second visit.
+    let mut data = build_or_load(
+        store_of(&deps.store),
+        repo,
+        &scope,
+        key.settings,
+        textconv_for(&deps.textconv, key.settings),
+        None,
+    );
     // Content-key a working-tree row off-thread here so an unchanged working tree hits
     // the cache and reuses its highlighting.
     let key = finalize_diff_key(key, scope.source.kind(), &data);
@@ -4986,6 +5246,11 @@ const FOREGROUND_WORKERS: usize = 4;
 enum ForegroundJob {
     Diff(DiffLoadJob, Option<InflightClaim>),
     History(HistoryJob),
+    /// Re-read the repo's textconv drivers after a `.git` reload dropped them, so a
+    /// changed one is REPORTED even on a view where nothing else would build a diff.
+    /// Carries the repaint handle: the change is picked up by `apply_driver_change` on
+    /// the next frame, and on a settled window there would not be one.
+    ResolveDrivers(Arc<Textconv>, egui::Context),
 }
 
 /// Start the foreground workers. `None` if not one could be spawned, which leaves
@@ -5085,6 +5350,26 @@ fn run_foreground_job(repo: Option<&Repository>, job: ForegroundJob) {
             if !ran {
                 log::warn!("history-load did not complete; reporting it as failed");
                 let _ = tx.send(HistoryResult { epoch, load: None });
+                ctx.request_repaint();
+            }
+        }
+        // Nothing to report back: `Textconv` records the verdict itself, and the UI
+        // reads it off `drivers_changed`. A repo that could not be opened simply leaves
+        // the map to the next build, exactly as before this job existed.
+        ForegroundJob::ResolveDrivers(textconv, ctx) => {
+            // Caught like the other two, and for the same reason: these workers are
+            // persistent, `handle_git_reload` dispatches one of these per `.git`
+            // write, and an escaping panic would retire the workers one at a time
+            // until every diff click fell back to a synchronous `Repository::discover`
+            // + `build_or_load` on the UI thread.
+            if let Some(repo) = repo {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    drop(textconv.resolved(repo));
+                }))
+                .is_err()
+                {
+                    log::warn!("textconv: resolving the drivers did not complete");
+                }
                 ctx.request_repaint();
             }
         }
@@ -5292,7 +5577,23 @@ const fn config_diff_settings(
         show_stats: diff.show_stats,
         detect_renames: diff.detect_renames,
         detect_copies: diff.detect_copies,
+        textconv: diff.textconv,
     }
+}
+
+/// The textconv to run under `settings`, or `None` for "build the diff the way we
+/// always did".
+///
+/// The single place `[diff] textconv` becomes a decision. `None` covers both halves
+/// of "do not convert" — the reader turned it off, and the repo configures no
+/// drivers (which `Textconv::driver_for` answers for free) — so no builder below
+/// has to ask twice.
+///
+/// No toolbar checkbox to go with it: `ignore_ws`/`context` are toolbar-owned
+/// because they are read while reading a diff, and whether this machine may run
+/// external commands is not that kind of decision.
+fn textconv_for(tc: &Arc<Textconv>, settings: DiffSettings) -> Option<&Textconv> {
+    settings.textconv.then(|| tc.as_ref())
 }
 
 /// Word-diff highlight colour for a changed run on a `kind` line: `backdrop` pushed
@@ -6046,6 +6347,10 @@ struct GitkApp {
     highlight_rx: mpsc::Receiver<HighlightBatch>,
     highlight_priority: Option<Arc<VisibleRange>>, // visible file range (lo, hi) the worker prioritises
     diff_max_chars: usize, // widest diff line (chars); sizes the virtualized h-scroll for off-screen lines
+    /// Did the displayed diff fall back to a raw body because a textconv driver
+    /// failed? Carried across the display so `stash_current_diff` can hand it back to
+    /// `cache_diff`, which is the one caller that reassembles a `DiffData` from parts.
+    diff_textconv_failed: bool,
     /// Deepest file-start line of the current diff (None ⇒ no files) — the render's
     /// `last_top_anchor`. Fixed per diff, so computed at install, not per frame.
     diff_last_top_anchor: Option<usize>,
@@ -6061,7 +6366,25 @@ struct GitkApp {
     /// The persistent diff store, once the `gitkay-cache-prune` thread has
     /// fingerprinted the repo. Empty until then, and forever if there is no cache
     /// directory or the repo could not be identified.
-    diff_store: StoreSlot,
+    /// The persistent diff store, once the `gitkay-cache-prune` thread has
+    /// fingerprinted the repo, and the repo's `diff.<driver>.textconv` drivers —
+    /// see `DiffDeps`. The drivers are handed to each worker by `Arc` rather than
+    /// published through a global, so `get_diff_data` depends on nothing a caller
+    /// cannot see, and so the test suite can give each case its own drivers over
+    /// its own temp repo. Cheap to build: the driver map resolves lazily on the
+    /// first worker to need it, which keeps a config parse off this path.
+    diff_deps: DiffDeps,
+    /// The fingerprint of the repo's textconv drivers, as of the last CHANGE one of
+    /// the workers reported (`Textconv::drivers_changed`). `0` until then — matching
+    /// `DiffStore::drivers`, so the two halves of the key agree from the first launch.
+    /// Read by `diff_cache_key`; see `DiffCacheKey::drivers`.
+    diff_drivers: u64,
+    /// A driver fingerprint that has not reached the persistent store yet, because the
+    /// store had not been published when the change was noticed (it is opened on the
+    /// prune thread). `drivers_changed` is one-shot and nothing re-arms it, so dropping
+    /// the value here would leave `~/.cache/gitkay/diffs` keyed under the OLD command
+    /// for the rest of the session.
+    pending_store_drivers: Option<u64>,
     /// The speculative bounds, resolved once so the prefetch pool and the
     /// diff-load worker cannot disagree about what is too big to keep.
     prefetch_budget: PrefetchBudget,
@@ -6678,6 +7001,7 @@ impl GitkApp {
             _config_watcher: config_watcher,
             config_error_toast: startup_issue.then(std::time::Instant::now),
             diff_max_chars,
+            diff_textconv_failed: false,
             diff_last_top_anchor: None,
             sidebar_cache: SidebarCache::default(),
             file_line_starts: Vec::new(),
@@ -6694,7 +7018,12 @@ impl GitkApp {
             highlight_rx,
             highlight_priority: None,
             diff_cache: DiffCache::new(cache_line_budget),
-            diff_store,
+            diff_deps: DiffDeps {
+                store: diff_store,
+                textconv: Arc::new(Textconv::new()),
+            },
+            diff_drivers: 0,
+            pending_store_drivers: None,
             prefetch_budget,
             current_diff_key,
             prewarm_rx,
@@ -6873,6 +7202,7 @@ impl GitkApp {
                 .row_source(oid)
                 .range()
                 .map_or(0, diff::hash_range_ends),
+            drivers: self.diff_drivers,
         }
     }
 
@@ -7031,11 +7361,18 @@ impl GitkApp {
             );
             // The displayed diff's width is already known — reassemble without
             // rescanning every line (DiffData::new would).
-            let data = DiffData::with_max_chars(
+            let mut data = DiffData::with_max_chars(
                 std::mem::take(&mut self.diff_lines),
                 std::mem::take(&mut self.diff_files),
                 self.diff_max_chars,
             );
+            // Carried on `GitkApp` across the display, because this is where the flag
+            // has to survive to. `with_max_chars` states it `false` — right for the
+            // store's decoder, which never holds a failed entry — and reassembling the
+            // DISPLAYED diff through it laundered a transient failure straight past
+            // `cache_diff`'s guard and back into the LRU, for the one diff most likely
+            // to be revisited.
+            data.textconv_failed = self.diff_textconv_failed;
             // A virtual entry is content-keyed, so each working-tree edit — or, for the
             // range row, each move of its endpoints — produces a fresh hash and the
             // previous content would linger under the same sentinel oid as unreachable
@@ -7101,13 +7438,42 @@ impl GitkApp {
     /// Which diffs may hand their numbers over is `stats_harvestable` — real commits
     /// only, and only under settings whose counts match the current ones (the outgoing
     /// diff `stash_current_diff` brings here need not).
+    ///
+    /// A diff whose **textconv failed** is not kept at all, for the reason
+    /// `worth_persisting` already refuses to store one: the delta shows its raw body,
+    /// which is `Binary files … differ` on a repo whose driver works perfectly. A
+    /// transient failure — an `EAGAIN` while the pool, the heavy lane and four
+    /// foreground workers all have children, or one conversion overrunning
+    /// `TEXTCONV_TIMEOUT` under that contention — happens on a speculative warm the
+    /// reader never asked for, and `DiffCacheKey` does not record that it happened, so
+    /// keeping it serves that fallback on every later click, scroll-back and watcher
+    /// reload for the rest of the session. Dropping it costs one rebuild, which is the
+    /// retry.
     fn cache_diff(&mut self, key: DiffCacheKey, data: DiffData) {
-        if stats_harvestable(&key, self.diff_settings) {
+        // The harvest runs FIRST, and the order is load-bearing. `run_stats_job` sends a
+        // driven row's file count and stops, on the promise that the row's own diff
+        // supplies the line counts — and a driven row is exactly the one whose driver
+        // can fail. Returning above this left those cells blank for the session AND
+        // left `stats_targets` reading the row as still owed (its `LineStats` never
+        // moving off `NotAsked`), so `dispatch_commit_stats` never reached its
+        // band-warm phase while the row was on screen: the failure `LineStats::Withheld`
+        // was introduced to fix for virtual rows, arriving for real commits by another
+        // route. The numbers are a sum over the `FileEntry` list, which is what the
+        // sidebar beside them shows whether or not a conversion happened.
+        if stats_harvestable(&key, self.diff_settings, self.diff_drivers) {
             install_stats_result(
                 &mut self.commit_stats,
                 key.oid,
                 Some(diff::stats_from_data(&data)),
             );
+        }
+        if data.textconv_failed {
+            log::debug!(
+                "diff cache: not keeping {} — a textconv driver failed, so this diff \
+                 fell back to raw content",
+                key.oid
+            );
+            return;
         }
         let weight = data.lines.len();
         self.diff_cache.insert(key, data, weight);
@@ -7147,6 +7513,7 @@ impl GitkApp {
         }
         // Precomputed at build time (on the worker) — no per-line rescan here.
         self.diff_max_chars = data.max_chars;
+        self.diff_textconv_failed = data.textconv_failed;
         self.diff_lines = data.lines;
         self.diff_files = data.files;
         self.current_diff_key = key;
@@ -7322,7 +7689,7 @@ impl GitkApp {
             tx: self.diff_load_tx.clone(),
             ctx: self.egui_ctx.clone(),
             prehighlight,
-            store: Arc::clone(&self.diff_store),
+            deps: self.diff_deps.clone(),
         };
         // Hand it to a worker that already owns a repo handle. The claim rides
         // along and is released when the job ends, panic included.
@@ -7350,10 +7717,11 @@ impl GitkApp {
                 Ok(repo) => {
                     let scope = self.row_scope(oid);
                     let data = build_or_load(
-                        store_of(&self.diff_store),
+                        store_of(&self.diff_deps.store),
                         &repo,
                         &scope,
                         self.diff_settings,
+                        textconv_for(&self.diff_deps.textconv, self.diff_settings),
                         None,
                     );
                     let key =
@@ -7905,7 +8273,7 @@ impl GitkApp {
                 &self.prefetch_tx,
                 &self.stats_tx,
                 ctx,
-                &self.diff_store,
+                &self.diff_deps,
             )
         })
     }
@@ -7953,6 +8321,22 @@ impl GitkApp {
                 Repository::discover(&self.repo_path).ok().as_ref(),
                 ForegroundJob::History(make_job(kind)),
             );
+        }
+    }
+
+    /// Ask a foreground worker to re-read the repo's textconv drivers.
+    ///
+    /// Dispatched by the `.git` reload, right after `Textconv::invalidate` drops the
+    /// map: the change that matters — the reader having edited a `diff.<name>.textconv`
+    /// to fix a file stuck on `Binary files … differ` — is only ever REPORTED by a
+    /// re-resolution, and on a settled view of a clean worktree nothing else performs
+    /// one. Silently skipped when there is no worker: the fallback is the old
+    /// behaviour, where the next build to need the map resolves it.
+    fn dispatch_driver_resolve(&self, ctx: &egui::Context) {
+        if let Some(tx) = &self.foreground {
+            let job =
+                ForegroundJob::ResolveDrivers(Arc::clone(&self.diff_deps.textconv), ctx.clone());
+            let _dropped = tx.send(job);
         }
     }
 
@@ -8683,7 +9067,7 @@ impl GitkApp {
             );
         }
         if self.commit_list_cfg.line_count {
-            let lines = stats.and_then(|s| s.lines);
+            let lines = stats.and_then(|s| s.lines.counted());
             let signed = |sign: char, n: usize| {
                 let mut t = String::with_capacity(STATS_CELL_CHARS.len());
                 t.push(sign);
@@ -9410,6 +9794,84 @@ impl GitkApp {
         ctx.request_repaint();
     }
 
+    /// Drop everything a CHANGED set of textconv drivers has made stale.
+    ///
+    /// `Textconv::invalidate` — which the `.git` reload calls — makes the next diff
+    /// re-read git config, and on its own that changed nothing the reader could see.
+    /// Two caches sit in front of it, and neither records which command produced an
+    /// entry: the in-memory LRU (whose `DiffCacheKey` has no driver field) and
+    /// `~/.cache/gitkay/diffs` (whose `StoreContext` is fingerprinted once, at startup,
+    /// on the prune thread). So editing `diff.<name>.textconv` to fix a file stuck on
+    /// `Binary files … differ` kept serving the old command's output until a restart —
+    /// and a driven row is the slow kind that clears `min_build_ms`, so the store hit
+    /// was the likely case.
+    ///
+    /// The detection comes from the worker that re-resolved the map rather than from
+    /// here, because resolving needs a `Repository` and opening one on the frame loop is
+    /// the IO this app keeps off it. See `Textconv::drivers_changed`.
+    ///
+    /// **The displayed diff is re-loaded from here**, and that is not belt-and-braces:
+    /// it is the very row the reader edited the driver to fix, and nothing else would
+    /// rebuild it. A reload does end in `load_selected_diff` — but the fingerprint
+    /// arrives from a worker, so it can (and on a settled view usually does) land after
+    /// that call has already run. The rebuild is possible at all because the fingerprint
+    /// is part of `DiffCacheKey`: without it `load_selected_diff` early-returns on an
+    /// identical key and `install_preferring_cache` would drop the result on arrival.
+    fn apply_driver_change(&mut self) {
+        if let Some(fingerprint) = self.diff_deps.textconv.drivers_changed() {
+            log::debug!("textconv: drivers changed — dropping diffs built under the old ones");
+            self.diff_drivers = fingerprint;
+            self.pending_store_drivers = Some(fingerprint);
+            // Entries under the old fingerprint can no longer be reached, so this frees
+            // memory rather than deciding anything — including for a warm still running
+            // under the pre-edit map, whose result now fails `key_is_current` and is
+            // dropped instead of landing back in the cache this just emptied.
+            self.diff_cache.retain_keys(|_| false);
+            // The commit-list column is the third cache holding the old driver's
+            // answers, and `CommitStats` records nothing about which driver produced
+            // them: `cache_diff` harvests a driven row's `+`/`-` off its diff, so
+            // every row the band reached under the broken command sits in
+            // `commit_stats` as `+0 -0`. `stats_targets` skips an entry that has
+            // already `answered()`, so nothing re-queues them and they disagree with
+            // the sidebar for the session. Bumping the epoch and clearing
+            // `stats_submitted` (which `invalidate_commit_stats` does) is what makes
+            // the next dispatch re-ask.
+            self.invalidate_commit_stats();
+            if let Some(pool) = &self.prefetch_pool {
+                pool.drivers_changed();
+            }
+            // The store's half of the key is published BEFORE the rebuild is
+            // dispatched, not after. `DiffStore::key` reads `drivers` at load time, so
+            // a build that starts first computes the key the pre-edit entries were
+            // written under and is served one of them — deterministically on the
+            // synchronous fallback path, where `dispatch_diff_load` runs
+            // `build_or_load` inline. The reader's fix would then reload the pane to
+            // the identical broken output, out of `~/.cache/gitkay/diffs`.
+            self.publish_store_drivers();
+            self.load_selected_diff();
+        }
+        // The store keeps its entries; they simply stop being reachable, since the
+        // fingerprint joins their key. Retried each frame because the store is opened
+        // on the prune thread and may not have been published above — see
+        // `pending_store_drivers`.
+        self.publish_store_drivers();
+    }
+
+    /// Hand the pending driver fingerprint to the persistent store, if it is open.
+    ///
+    /// Separate so `apply_driver_change` can do it before dispatching the rebuild and
+    /// still retry on later frames: `drivers_changed` is one-shot and nothing re-arms
+    /// it, so a fingerprint dropped because the store was not open yet would leave
+    /// `~/.cache/gitkay/diffs` keyed under the OLD command for the rest of the session.
+    fn publish_store_drivers(&mut self) {
+        if let Some(fingerprint) = self.pending_store_drivers
+            && let Some(store) = store_of(&self.diff_deps.store)
+        {
+            store.set_drivers(fingerprint);
+            self.pending_store_drivers = None;
+        }
+    }
+
     /// Apply deferred fonts once an off-thread build finishes — the startup
     /// cold fontdb scan that outlived window init, or a config-reload rebuild.
     /// Until they land, keep waking at a modest cadence so the swap happens
@@ -9448,6 +9910,35 @@ impl GitkApp {
             let elapsed = armed.elapsed();
             if elapsed >= RELOAD_DEBOUNCE {
                 self.reload_armed_at = None;
+                // `.git/config` is under the watcher, so this is where a
+                // `diff.<name>.textconv` edit takes effect — and editing one is how a
+                // reader FIXES a file stuck on `Binary files … differ`. The driver map
+                // is resolved once by the first worker to build a diff, so without this
+                // the fix needs a restart. It also re-arms every command that hung, and
+                // gives a config read that failed once (an EMFILE while eight workers
+                // open handles) a second chance instead of leaving textconv off for the
+                // session.
+                //
+                // Dropping the map is necessary and NOT sufficient: the two caches in
+                // front of it record no command, so the fix would re-resolve and change
+                // nothing on screen. `apply_driver_change` is the other half, and it
+                // runs when the next build reports that the map really moved.
+                self.diff_deps.textconv.invalidate();
+                // Which needs something to re-resolve it, and on a settled view of a
+                // clean worktree nothing does: the closing `load_selected_diff` hits its
+                // identical-key early return, the prefetch band is already warm so every
+                // target is filtered out by `diff_cache.contains`, and no virtual row
+                // means no stats job either. So the edit was re-resolved by nobody and
+                // the fix appeared to need a restart. This asks explicitly, on a worker
+                // that owns a repo handle — resolving needs one, and opening it here is
+                // the IO this app keeps off the frame loop.
+                self.dispatch_driver_resolve(ctx);
+                // The latch `invalidate` just re-armed has a counterpart in the band:
+                // rows dropped for a conversion that failed are remembered by the
+                // coordinator, and nothing else would ever let them back in.
+                if let Some(pool) = &self.prefetch_pool {
+                    pool.retry_unconverted();
+                }
                 // The virtual rows' content moved; every real commit's stats
                 // stay valid, so drop exactly those rather than the map. Asked
                 // through `CommitKind::of`, the single oid → kind mapping —
@@ -9614,7 +10105,7 @@ impl GitkApp {
                 // template promises it, and the store is shared as an `Arc`, so
                 // the threshold moves in place rather than needing a reopen (which
                 // would re-fingerprint the repo on the UI thread).
-                if let Some(store) = store_of(&self.diff_store) {
+                if let Some(store) = store_of(&self.diff_deps.store) {
                     store.set_min_build(std::time::Duration::from_millis(cfg.cache.min_build_ms));
                 }
                 let before_settings = self.diff_settings;
@@ -10044,6 +10535,12 @@ impl eframe::App for GitkApp {
             }
             StartupDiff::Done => {}
         }
+
+        // Ahead of the drains, so the frame that notices a driver edit is the frame
+        // that re-dispatches the diff on screen. (Order is no longer load-bearing for
+        // correctness: the fingerprint is in `DiffCacheKey`, so a warm built under the
+        // old map misses on its own.)
+        self.apply_driver_change();
 
         // Before the fonts: this is the one that puts rows on an empty window, and
         // it must run ahead of the drains and the render so the frame that installs
@@ -10665,7 +11162,7 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::oid_uncommitted;
+    use crate::diff::{LineStats, oid_uncommitted};
     use crate::test_repo::{
         commit_file, commit_index, commit_rename, stage, temp_repo, write_file,
     };
@@ -10691,6 +11188,7 @@ mod tests {
             &repo,
             &diff::RowScope::new(diff::DiffSource::Commit(oid)),
             probe_settings(),
+            None,
         );
         let entry = data
             .files
@@ -11116,10 +11614,12 @@ mod tests {
                 show_stats: true,
                 detect_renames: true,
                 detect_copies: false,
+                textconv: false,
             },
             theme: highlight::DEFAULT_THEME,
             enabled: true,
             content: 0,
+            drivers: 0,
         };
         let set: InflightKeys = Arc::default();
 
@@ -11741,6 +12241,7 @@ mod tests {
             theme: highlight::EmbeddedThemeName::CatppuccinMocha,
             enabled: true,
             content,
+            drivers: 0,
         };
         let a = key(diff::oid_uncommitted(), 1);
         let same = key(diff::oid_uncommitted(), 1);
@@ -11794,6 +12295,7 @@ mod tests {
             show_stats: false,
             detect_renames: false,
             detect_copies: false,
+            textconv: false,
         }
     }
 
@@ -12259,6 +12761,7 @@ mod tests {
             theme,
             enabled,
             content,
+            drivers: 0,
         };
         let dark = T::CatppuccinMocha;
         let mut c: DiffCache<DiffCacheKey, u32> = DiffCache::new(100);
@@ -12291,6 +12794,35 @@ mod tests {
         );
     }
 
+    /// An edited `diff.<name>.textconv` replaces a driven file's whole body without
+    /// moving the oid or any setting, so the driver fingerprint has to be in the key.
+    ///
+    /// Three things rest on it, and none of them is an eviction sweep: a warm still
+    /// running under the pre-edit map now MISSES instead of landing back in the cache
+    /// the edit just cleared, `load_selected_diff` rebuilds the pane the reader is
+    /// looking at instead of early-returning on an identical key, and
+    /// `install_preferring_cache` installs that rebuild instead of dropping it.
+    #[test]
+    fn diff_cache_key_includes_the_driver_fingerprint() {
+        let key = |drivers: u64| DiffCacheKey {
+            oid: git2::Oid::ZERO_SHA1,
+            settings: ds(),
+            theme: highlight::DEFAULT_THEME,
+            enabled: true,
+            content: 0,
+            drivers,
+        };
+        let mut c: DiffCache<DiffCacheKey, u32> = DiffCache::new(100);
+        c.insert(key(0), 1, 1);
+        assert_eq!(c.remove(&key(7)), None, "different drivers ⇒ miss");
+        assert_eq!(c.remove(&key(0)), Some(1), "same key ⇒ hit");
+        assert!(
+            !key(0).same_modulo_content(&key(7)),
+            "and it is row identity, not a content hash: the virtual rows' eviction \
+             sweep must not treat two driver maps as one row"
+        );
+    }
+
     /// The invariant the range row's synchronous cache hit rests on: the key its worker
     /// caches a result under is the key the UI already built before dispatching. Taking
     /// its `content` from the computed diff would break that — the UI cannot know that
@@ -12308,6 +12840,7 @@ mod tests {
             theme: T::CatppuccinMocha,
             enabled: true,
             content,
+            drivers: 0,
         };
 
         let ends = diff::RangeEnds {
@@ -12362,6 +12895,7 @@ mod tests {
             theme: highlight::DEFAULT_THEME,
             enabled: true,
             content: 0,
+            drivers: 0,
         };
         let mut c: DiffCache<DiffCacheKey, u32> = DiffCache::new(100);
         c.insert(key(false, false), 1, 1);
@@ -12498,7 +13032,9 @@ mod tests {
                 ready: VecDeque::new(),
                 deferred: VecDeque::new(),
                 measured: HashMap::new(),
+                measured_textconv: None,
                 oversized: HashSet::new(),
+                unconverted: HashSet::new(),
                 idle: (0..workers).collect(),
                 heavy_idle: (workers..workers + heavy.len()).collect(),
                 heavy_outstanding: HashMap::new(),
@@ -12530,10 +13066,12 @@ mod tests {
                     show_stats: true,
                     detect_renames: true,
                     detect_copies: false,
+                    textconv: false,
                 },
                 theme: highlight::DEFAULT_THEME,
                 enabled: true,
                 content: 0,
+                drivers: 0,
             },
             scope: RowScope::new(DiffSource::Commit(oid(n))),
             depth: WarmDepth::DiffOnly,
@@ -12564,6 +13102,7 @@ mod tests {
                 show_stats: true,
                 detect_renames: true,
                 detect_copies: false,
+                textconv: false,
             },
             want: StatsWant::FilesAndLines,
             epoch: 0,
@@ -12632,6 +13171,124 @@ mod tests {
         );
         assert_eq!(coord.ready.len(), 1, "the unknown row");
         assert!(coord.ready[0].probed.is_none(), "still to be probed");
+    }
+
+    /// A row whose textconv driver failed is dropped uncached, so — like an oversized
+    /// one — it must not be offered again, or the band rebuilds it on every dispatch
+    /// and re-runs the failing driver, one `/bin/sh` per side per delta, forever.
+    ///
+    /// The two events that can change the verdict clear the memo: `[diff] textconv`
+    /// moving, and the repo's drivers changing.
+    #[test]
+    fn a_row_whose_driver_failed_is_not_offered_again_until_something_changes() {
+        let (mut coord, _rxs) = test_coord(2);
+        let target = heavy_target(1);
+        coord.finish(
+            0,
+            Outcome::Unconverted {
+                key: target.key,
+                lines: 10,
+            },
+        );
+        coord.take_band(std::iter::once(heavy_target(1)).collect());
+        assert!(
+            coord.ready.is_empty() && coord.deferred.is_empty(),
+            "a row built once and dropped must not be rebuilt"
+        );
+
+        coord.run_msg(CoordMsg::DriversChanged);
+        coord.take_band(std::iter::once(heavy_target(1)).collect());
+        assert_eq!(
+            coord.ready.len() + coord.deferred.len(),
+            1,
+            "an edited driver is exactly when the verdict may differ"
+        );
+    }
+
+    /// The hung-driver latch is re-armed by every `.git` reload, and the band's memo of
+    /// rows a conversion failed for has to follow — it is only ever cleared by a
+    /// settings flip or a driver edit, neither of which a plain reload is, so after one
+    /// transient overrun those rows were skipped by every dispatch for the session.
+    ///
+    /// It must NOT drag the cost memo with it: a reload fires on every commit, fetch
+    /// and index write, and re-probing the whole band each time costs far more than the
+    /// retry is worth. That is `DriversChanged`'s job, and only its.
+    #[test]
+    fn a_reload_retries_unconverted_rows_without_re_probing_the_band() {
+        let (mut coord, _rxs) = test_coord(2);
+        let target = heavy_target(1);
+        coord.unconverted.insert(target.key);
+        coord.measured.insert(oid(2), 999);
+
+        coord.run_msg(CoordMsg::RetryUnconverted);
+        coord.take_band(std::iter::once(heavy_target(1)).collect());
+        assert_eq!(
+            coord.ready.len() + coord.deferred.len(),
+            1,
+            "a re-armed driver deserves another go at the rows it failed"
+        );
+        assert!(
+            coord.measured.contains_key(&oid(2)),
+            "a reload says nothing about what a row COSTS"
+        );
+    }
+
+    /// `measured` is keyed by oid, and half the costly verdict — `RowCostProbe::driven`
+    /// — is a fact about the repo's DRIVERS, which an oid cannot carry. So the memo has
+    /// to go when they move, exactly as `note_settings` drops it when `[diff] textconv`
+    /// does. Left standing, removing a driver leaves every row it had matched pinned to
+    /// the heavy lane and filtered out of every stats submission — its `+`/`-` cells
+    /// blank — for the session.
+    #[test]
+    fn an_edited_driver_re_measures_the_rows_it_classified() {
+        let (mut coord, _rxs) = test_coord(2);
+        coord.measured.insert(oid(1), 999);
+        coord.run_msg(CoordMsg::DriversChanged);
+        assert!(
+            coord.measured.is_empty(),
+            "a row was costly because it was DRIVEN; that is no longer known"
+        );
+        coord.take_band(std::iter::once(heavy_target(1)).collect());
+        assert_eq!(coord.ready.len(), 1, "and it is probed afresh");
+        assert!(coord.ready[0].probed.is_none());
+    }
+
+    /// The cost memo is keyed by oid, and half the costly verdict is not a fact about
+    /// the oid: `RowCostProbe::driven` follows `[diff] textconv`, which a live config
+    /// reload can flip.
+    ///
+    /// Left standing, every row a driver had matched stayed classified costly for the
+    /// session after textconv was turned off — routed to a heavy lane it no longer
+    /// needed, and filtered out of every stats submission by the test above, so its
+    /// `+`/`-` cells stayed blank until that lane happened to reach it.
+    #[test]
+    fn turning_textconv_off_re_measures_the_rows_it_classified() {
+        let (mut coord, _rxs) = test_coord(2);
+        let driven = |textconv: bool| StatsJob {
+            settings: DiffSettings {
+                textconv,
+                ..stats_job(1).settings
+            },
+            ..stats_job(1)
+        };
+        coord.run_msg(CoordMsg::SubmitStats(
+            std::iter::once(driven(true)).collect(),
+        ));
+        coord.measured.insert(oid(1), 999);
+        // Same settings: the verdict still holds, and re-probing 18 rows on every
+        // dispatch is what the memo exists to avoid.
+        coord.run_msg(CoordMsg::SubmitStats(
+            std::iter::once(driven(true)).collect(),
+        ));
+        assert!(coord.measured.contains_key(&oid(1)), "nothing changed");
+
+        coord.run_msg(CoordMsg::SubmitStats(
+            std::iter::once(driven(false)).collect(),
+        ));
+        assert!(
+            coord.measured.is_empty(),
+            "a settings change the oid key cannot carry has to drop the memo"
+        );
     }
 
     /// Stats for a row already known expensive are never queued: its line counts cost
@@ -13188,6 +13845,14 @@ mod tests {
                 ..base
             })
         );
+        assert_ne!(
+            stats_relevant(base),
+            stats_relevant(DiffSettings {
+                textconv: true,
+                ..base
+            }),
+            "a driven row's counts are its CONVERTED lines, so this changes them"
+        );
     }
 
     /// A failed commit is recorded as `None` and must NOT be asked again: the
@@ -13206,7 +13871,7 @@ mod tests {
             oid(2),
             Some(CommitStats {
                 files: 1,
-                lines: Some((1, 0)),
+                lines: LineStats::Counted(1, 0),
             }),
         );
         known.insert(oid(3), None); // tried, failed
@@ -13236,14 +13901,14 @@ mod tests {
             oid(1),
             Some(CommitStats {
                 files: 3,
-                lines: None, // computed under StatsWant::FilesOnly
+                lines: LineStats::NotAsked, // computed under StatsWant::FilesOnly
             }),
         );
         known.insert(
             oid(2),
             Some(CommitStats {
                 files: 3,
-                lines: Some((7, 2)),
+                lines: LineStats::Counted(7, 2),
             }),
         );
 
@@ -13307,7 +13972,7 @@ mod tests {
                 oid(n),
                 Some(CommitStats {
                     files: 1,
-                    lines: Some((1, 1)),
+                    lines: LineStats::Counted(1, 1),
                 }),
             );
         }
@@ -13498,7 +14163,7 @@ mod tests {
     fn a_none_result_does_not_clobber_an_already_succeeded_row() {
         let stats = CommitStats {
             files: 2,
-            lines: Some((3, 1)),
+            lines: LineStats::Counted(3, 1),
         };
         let mut known: HashMap<git2::Oid, Option<CommitStats>> = HashMap::new();
         known.insert(oid(1), Some(stats));
@@ -13510,6 +14175,63 @@ mod tests {
             Some(&Some(stats)),
             "a failure must not overwrite an already-succeeded row"
         );
+    }
+
+    /// A `FilesOnly` answer landing on a row whose numbers are already in must not
+    /// take them back out — and unlike the `None` guard above, this one IS reachable.
+    ///
+    /// `run_stats_job`'s costly/driven branch sends the file count and stops, on the
+    /// premise that the row's own diff supplies the line counts instead; `cache_diff`
+    /// harvests them the moment that diff lands, which can be while the stats job is
+    /// still running. The downgrade is terminal, not merely a lost frame: that branch
+    /// puts the oid in the coordinator's `measured`, so `SubmitStats` filters the row
+    /// out of every later submission, while `stats_targets` reads `NotAsked` under a
+    /// `FilesAndLines` want as still owed and re-lists it every frame — a cell blank
+    /// for the session, and `dispatch_commit_stats` never reaching its band-warm phase
+    /// while the row is on screen.
+    #[test]
+    fn a_files_only_answer_does_not_take_back_line_counts_already_harvested() {
+        let counted = CommitStats {
+            files: 2,
+            lines: LineStats::Counted(3, 1),
+        };
+        let mut known: HashMap<git2::Oid, Option<CommitStats>> = HashMap::new();
+        known.insert(oid(1), Some(counted));
+
+        install_stats_result(
+            &mut known,
+            oid(1),
+            Some(CommitStats {
+                files: 2,
+                lines: LineStats::NotAsked,
+            }),
+        );
+        assert_eq!(
+            known.get(&oid(1)),
+            Some(&Some(counted)),
+            "the deferral's file count must not replace numbers the diff already gave"
+        );
+
+        // `Withheld` is an ANSWER — the row saying it has none to give — so it
+        // installs, and so does a later `Counted`. Only the still-owed state is refused.
+        let withheld = CommitStats {
+            files: 2,
+            lines: LineStats::Withheld,
+        };
+        install_stats_result(&mut known, oid(1), Some(withheld));
+        assert_eq!(known.get(&oid(1)), Some(&Some(withheld)));
+        install_stats_result(&mut known, oid(1), Some(counted));
+        assert_eq!(known.get(&oid(1)), Some(&Some(counted)));
+
+        // And a row that has said nothing yet takes the file count, which is the
+        // whole point of sending it early.
+        let mut fresh: HashMap<git2::Oid, Option<CommitStats>> = HashMap::new();
+        let files_only = CommitStats {
+            files: 7,
+            lines: LineStats::NotAsked,
+        };
+        install_stats_result(&mut fresh, oid(2), Some(files_only));
+        assert_eq!(fresh.get(&oid(2)), Some(&Some(files_only)));
     }
 
     /// `cache_diff` harvests the column off a built diff, and the settings half of that
@@ -13529,16 +14251,25 @@ mod tests {
             theme: highlight::EmbeddedThemeName::CatppuccinMocha,
             enabled: true,
             content: 0,
+            drivers: 7,
         };
         let now = ds();
         assert!(
-            stats_harvestable(&k(oid(1), now), now),
-            "the ordinary path: same settings, real commit"
+            stats_harvestable(&k(oid(1), now), now, 7),
+            "the ordinary path: same settings, same drivers, real commit"
+        );
+        // The drivers travel the same route as the settings — `apply_driver_change`
+        // clears the map and reloads, and `stash_current_diff` hands the outgoing diff
+        // to `cache_diff` — and a driven file's counts move with the command, so a diff
+        // built under the edited-away driver may not repopulate the column either.
+        assert!(
+            !stats_harvestable(&k(oid(1), now), now, 8),
+            "a diff built under other textconv drivers counts differently"
         );
         // `context` reshapes the patch but cannot move a COUNT, so widening it must not
         // cost the column an otherwise free harvest.
         assert!(
-            stats_harvestable(&k(oid(1), DiffSettings { context: 9, ..now }), now),
+            stats_harvestable(&k(oid(1), DiffSettings { context: 9, ..now }), now, 7),
             "context is not a count-relevant setting"
         );
         for (what, stale) in [
@@ -13557,6 +14288,13 @@ mod tests {
                 },
             ),
             (
+                "textconv",
+                DiffSettings {
+                    textconv: !now.textconv,
+                    ..now
+                },
+            ),
+            (
                 "ignore_ws",
                 DiffSettings {
                     ignore_ws: !now.ignore_ws,
@@ -13565,15 +14303,15 @@ mod tests {
             ),
         ] {
             assert!(
-                !stats_harvestable(&k(oid(1), stale), now),
+                !stats_harvestable(&k(oid(1), stale), now, 7),
                 "a diff built under a different {what} counts differently than the \
                  column now does"
             );
         }
         // Virtual rows are content-keyed and evicted by `sync_virtual_stats`; harvesting
         // one here would race that.
-        assert!(!stats_harvestable(&k(oid_uncommitted(), now), now));
-        assert!(!stats_harvestable(&k(oid_staged(), now), now));
+        assert!(!stats_harvestable(&k(oid_uncommitted(), now), now, 7));
+        assert!(!stats_harvestable(&k(oid_staged(), now), now, 7));
     }
 
     /// A worktree-only edit never touches `.git`, so the watcher's debounced
@@ -13590,11 +14328,12 @@ mod tests {
             theme: highlight::EmbeddedThemeName::CatppuccinMocha,
             enabled: true,
             content,
+            drivers: 0,
         };
         let st = |files| {
             Some(CommitStats {
                 files,
-                lines: Some((1, 0)),
+                lines: LineStats::Counted(1, 0),
             })
         };
         let mut seen: HashMap<git2::Oid, u64> = HashMap::new();
@@ -13709,7 +14448,7 @@ mod tests {
             oid(1),
             Some(CommitStats {
                 files: 1,
-                lines: Some((2, 0)),
+                lines: LineStats::Counted(2, 0),
             }),
         );
         known.insert(oid(2), None); // previously failed
@@ -14089,6 +14828,7 @@ mod tests {
                 show_stats: true,
                 ..ds()
             },
+            None,
         );
         let files: Vec<&str> = data.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(files, vec!["a.txt"]);
@@ -14111,13 +14851,14 @@ mod tests {
                 show_stats: true,
                 ..ds()
             },
+            None,
         );
         assert!(
             on.lines.iter().any(|l| l.kind == LineKind::Stat),
             "show_stats=true must include the diffstat block"
         );
 
-        let off = get_diff_data(&repo, &RowScope::new(DiffSource::Commit(c2)), ds());
+        let off = get_diff_data(&repo, &RowScope::new(DiffSource::Commit(c2)), ds(), None);
         assert!(
             !off.lines.iter().any(|l| l.kind == LineKind::Stat),
             "show_stats=false must omit the diffstat block"
@@ -14145,11 +14886,12 @@ mod tests {
             detect_renames: true,
             ..ds()
         };
-        let files: Vec<String> = get_diff_data(&repo, &RowScope::new(DiffSource::Commit(oid)), on)
-            .files
-            .iter()
-            .map(|f| f.path.clone())
-            .collect();
+        let files: Vec<String> =
+            get_diff_data(&repo, &RowScope::new(DiffSource::Commit(oid)), on, None)
+                .files
+                .iter()
+                .map(|f| f.path.clone())
+                .collect();
         assert_eq!(
             files,
             vec!["new.txt".to_string()],
@@ -14157,7 +14899,7 @@ mod tests {
         );
 
         let mut files: Vec<String> =
-            get_diff_data(&repo, &RowScope::new(DiffSource::Commit(oid)), ds())
+            get_diff_data(&repo, &RowScope::new(DiffSource::Commit(oid)), ds(), None)
                 .files
                 .iter()
                 .map(|f| f.path.clone())
@@ -14185,7 +14927,7 @@ mod tests {
             detect_renames: true,
             ..ds()
         };
-        let data = get_diff_data(&repo, &RowScope::new(DiffSource::Commit(oid)), s);
+        let data = get_diff_data(&repo, &RowScope::new(DiffSource::Commit(oid)), s, None);
         assert_eq!(data.files.len(), 1);
         assert_eq!(data.files[0].path, "new.txt");
         assert_eq!(data.files[0].old_path.as_deref(), Some("old.txt"));
@@ -14225,7 +14967,7 @@ mod tests {
             detect_copies: true,
             ..ds()
         };
-        let data = get_diff_data(&repo, &RowScope::new(DiffSource::Commit(oid)), s);
+        let data = get_diff_data(&repo, &RowScope::new(DiffSource::Commit(oid)), s, None);
         let b = data
             .files
             .iter()
@@ -15282,6 +16024,7 @@ mod tests {
             show_stats: true,
             detect_renames: true,
             detect_copies: false,
+            textconv: false,
         }
     }
 
@@ -15303,6 +16046,7 @@ mod tests {
             show_stats: true,
             detect_renames: true,
             detect_copies: false,
+            textconv: false,
         };
         let dir = tempfile::tempdir().unwrap();
 
@@ -15312,7 +16056,7 @@ mod tests {
             StoreContext::of(&repo).expect("hashable"),
             std::time::Duration::from_hours(1),
         );
-        let built = build_or_load(Some(&never), &repo, &scope, s, None);
+        let built = build_or_load(Some(&never), &repo, &scope, s, None, None);
         assert!(!built.lines.is_empty(), "control: the diff is real");
         assert_eq!(
             std::fs::read_dir(dir.path()).map_or(0, Iterator::count),
@@ -15326,11 +16070,234 @@ mod tests {
             StoreContext::of(&repo).expect("hashable"),
             std::time::Duration::ZERO,
         );
-        let a = build_or_load(Some(&always), &repo, &scope, s, None);
+        let a = build_or_load(Some(&always), &repo, &scope, s, None, None);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "written");
-        let b = build_or_load(Some(&always), &repo, &scope, s, None);
+        let b = build_or_load(Some(&always), &repo, &scope, s, None, None);
         assert_eq!(a.lines.len(), b.lines.len());
         assert_eq!(a.max_chars, b.max_chars);
+    }
+
+    /// LOAD-BEARING. A driven row must never spawn a driver on the commit-list
+    /// column's path: it sends its file count immediately and STOPS, exactly as a
+    /// blob-heavy row does, leaving the line counts to the diff (which `cache_diff`
+    /// harvests for free). Without `driven` on the probe the row is handed to a pool
+    /// worker and the column runs the conversion — a performance failure, so the
+    /// assertion is on the CLASSIFICATION and on `lines` being `None`, never on a
+    /// timing.
+    ///
+    /// `max_blob_bytes` is `u64::MAX` here so nothing but `driven` can trip the
+    /// guard.
+    #[test]
+    fn a_driven_stats_row_answers_files_only_and_defers() {
+        use crate::test_repo::{commit_bytes, driver_script, write_driver};
+        let (dir, repo) = temp_repo();
+        let cmd = driver_script(dir.path(), "conv.sh", "echo CONVERTED\n")
+            .display()
+            .to_string();
+        write_driver(&repo, "gktest", &cmd, false, "*.zip");
+        commit_bytes(&repo, "a.zip", &[0, 1, b'A', 0], "one");
+        let oid = commit_bytes(&repo, "a.zip", &[0, 1, b'A', b'B', 0], "two");
+        let scope = RowScope::new(DiffSource::Commit(oid));
+
+        let (stats_tx, stats_rx) = mpsc::channel();
+        let worker = WorkerCtx {
+            id: 0,
+            limits: Limits {
+                max_blob_bytes: u64::MAX,
+                max_entry_lines: usize::MAX,
+            },
+            coord: mpsc::channel().0,
+            tx: mpsc::channel().0,
+            stats_tx,
+            ctx: egui::Context::default(),
+            deps: DiffDeps::default(),
+        };
+        let job = |textconv: bool| StatsJob {
+            scope: scope.clone(),
+            settings: DiffSettings {
+                textconv,
+                ..probe_settings()
+            },
+            want: StatsWant::FilesAndLines,
+            epoch: 1,
+        };
+
+        let outcome = run_stats_job(&worker, &repo, &job(true));
+        assert!(
+            matches!(
+                outcome,
+                Outcome::Stats {
+                    costly: Some(_),
+                    ..
+                }
+            ),
+            "the row must be recorded as costly, or every dispatch re-probes it"
+        );
+        let sent = stats_rx.recv().expect("exactly one result").stats.unwrap();
+        assert_eq!(sent.files, 1, "the file count arrives immediately");
+        assert_eq!(
+            sent.lines,
+            LineStats::NotAsked,
+            "and the line counts are left to the diff, which pays for the conversion once"
+        );
+
+        // Control: with textconv off the same row is ordinary and is finished inline.
+        let outcome = run_stats_job(&worker, &repo, &job(false));
+        assert!(matches!(outcome, Outcome::Stats { costly: None, .. }));
+        assert_eq!(
+            stats_rx.recv().unwrap().stats.unwrap().lines,
+            LineStats::Counted(0, 0),
+            "a binary change has no lines, but they were computed rather than deferred"
+        );
+    }
+
+    /// LOAD-BEARING. The uncommitted row is DRIVEN too, and its column may not
+    /// contradict the sidebar. It cannot take the deferral a real commit takes — a
+    /// sentinel oid in `measured` would filter the row out of every later submission —
+    /// and the harvest that fills a real commit's numbers in refuses a virtual oid, so
+    /// a wrong `+`/`-` here is wrong forever. It answers the file count alone.
+    ///
+    /// Without the rule the column shows libgit2's RAW numbers (`+0 -0` for a binary
+    /// change) beside a pane showing the converted patch's.
+    ///
+    /// **It answers `Withheld`, and the difference from `NotAsked` is the second half
+    /// of the rule.** Under a `FilesAndLines` want, `NotAsked` reads as "still owed":
+    /// `stats_targets` kept listing this row, so `dispatch_commit_stats` never reached
+    /// its band-warm phase while it was on screen and re-submitted the row — a full
+    /// index→workdir diff — every time any other row's numbers landed. The last
+    /// assertion here is what fails if the two states are collapsed again.
+    #[test]
+    fn a_driven_uncommitted_row_answers_files_only() {
+        use crate::test_repo::{commit_bytes, driver_script, write_driver};
+        let (dir, repo) = temp_repo();
+        let cmd = driver_script(
+            dir.path(),
+            "conv.sh",
+            "printf 'size %s\\n' \"$(wc -c < \"$1\")\"\n",
+        )
+        .display()
+        .to_string();
+        write_driver(&repo, "gktest", &cmd, false, "*.zip");
+        commit_bytes(&repo, "a.zip", &[0, 1, b'A', 0], "one");
+        std::fs::write(repo.workdir().unwrap().join("a.zip"), [0, 1, b'A', b'B', 0]).unwrap();
+        let scope = RowScope::new(DiffSource::Uncommitted);
+
+        let (stats_tx, stats_rx) = mpsc::channel();
+        let worker = WorkerCtx {
+            id: 0,
+            limits: Limits {
+                max_blob_bytes: u64::MAX,
+                max_entry_lines: usize::MAX,
+            },
+            coord: mpsc::channel().0,
+            tx: mpsc::channel().0,
+            stats_tx,
+            ctx: egui::Context::default(),
+            deps: DiffDeps::default(),
+        };
+        let job = |textconv: bool| StatsJob {
+            scope: scope.clone(),
+            settings: DiffSettings {
+                textconv,
+                ..probe_settings()
+            },
+            want: StatsWant::FilesAndLines,
+            epoch: 1,
+        };
+
+        let outcome = run_stats_job(&worker, &repo, &job(true));
+        assert!(
+            matches!(outcome, Outcome::Stats { costly: None, .. }),
+            "a virtual row is never recorded as costly — that would blank it forever"
+        );
+        let sent = stats_rx.recv().expect("exactly one result").stats.unwrap();
+        assert_eq!(sent.files, 1);
+        assert_eq!(
+            sent.lines,
+            LineStats::Withheld,
+            "no `+`/`-` rather than the raw ones the pane disagrees with"
+        );
+        // …and the dispatcher must read that as an ANSWER. `stats_targets` re-offering
+        // it is what pinned `dispatch_commit_stats` in its visible-rows phase and
+        // re-ran this row's whole worktree diff on every landing result.
+        let known = HashMap::from([(scope.source.oid(), Some(sent))]);
+        let commits = vec![CommitInfo::new(
+            DiffSource::Uncommitted,
+            "Uncommitted changes".to_owned(),
+            String::new(),
+            0,
+            0,
+            Vec::new(),
+            Vec::new(),
+            None,
+        )];
+        assert!(
+            stats_targets(&commits, 0..1, &known, StatsWant::FilesAndLines).is_empty(),
+            "a withheld row must stop being offered, or the band phase is never reached"
+        );
+        // And the pane's own numbers for that row really are the converted ones, which
+        // is what the column would have contradicted.
+        let tc = Textconv::new();
+        let data = diff::get_diff_data(&repo, &scope, job(true).settings, Some(&tc));
+        assert_eq!(
+            diff::stats_from_data(&data).lines,
+            LineStats::Counted(1, 1),
+            "the sidebar counts the converted patch"
+        );
+
+        // Control: with textconv off the same row is ordinary and is finished inline.
+        let outcome = run_stats_job(&worker, &repo, &job(false));
+        assert!(matches!(outcome, Outcome::Stats { costly: None, .. }));
+        assert_eq!(
+            stats_rx.recv().unwrap().stats.unwrap().lines,
+            LineStats::Counted(0, 0),
+            "a binary change has no lines, but they were computed rather than skipped"
+        );
+    }
+
+    /// A textconv that could not be run is the third transient failure
+    /// `worth_persisting` covers, and the one that most looks like a result: the
+    /// delta simply shows its raw body. Persisting it would serve "Binary files …
+    /// differ" from disk for weeks after the driver is installed.
+    ///
+    /// Two assertions, because the second is what stops the failure being cached.
+    #[test]
+    fn build_or_load_never_stores_a_diff_whose_textconv_failed() {
+        use crate::diff_store::{DiffStore, StoreContext};
+        use crate::test_repo::{commit_bytes, write_driver};
+        let (_d, repo) = temp_repo();
+        write_driver(&repo, "gktest", "/bin/false", false, "*.zip");
+        commit_bytes(&repo, "a.zip", &[0, 1, b'A', 0], "one");
+        let oid = commit_bytes(&repo, "a.zip", &[0, 1, b'A', b'B', 0], "two");
+        let scope = RowScope::new(DiffSource::Commit(oid));
+        let s = DiffSettings {
+            textconv: true,
+            ..probe_settings()
+        };
+        let tc = Textconv::new();
+
+        let data = get_diff_data(&repo, &scope, s, Some(&tc));
+        assert!(
+            !data.lines.is_empty(),
+            "control: the pane still shows the raw diff rather than blanking"
+        );
+        assert!(
+            !worth_persisting(&repo, &scope, &data),
+            "a fallen-back diff is not a faithful answer"
+        );
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = DiffStore::at(
+            store_dir.path().to_path_buf(),
+            StoreContext::of(&repo).expect("hashable"),
+            std::time::Duration::ZERO,
+        );
+        build_or_load(Some(&store), &repo, &scope, s, Some(&tc), None);
+        assert_eq!(
+            std::fs::read_dir(store_dir.path()).unwrap().count(),
+            0,
+            "and nothing reaches the disk"
+        );
     }
 
     /// A diff built from a read that FAILED must not be persisted.
@@ -15355,7 +16322,7 @@ mod tests {
         let repo = Repository::open(dir.path()).unwrap();
         let store = DiffStore::at(root, ctx, std::time::Duration::ZERO);
 
-        let data = build_or_load(Some(&store), &repo, &scope, s, None);
+        let data = build_or_load(Some(&store), &repo, &scope, s, None, None);
         assert!(data.lines.is_empty(), "control: the build did fail");
         assert_eq!(
             std::fs::read_dir(store_dir.path()).map_or(0, Iterator::count),
@@ -15384,7 +16351,7 @@ mod tests {
         );
         // And the same commit's real diff IS worth persisting, so the guard is
         // rejecting the failure rather than the commit.
-        let real = get_diff_data(&repo, &scope, probe_settings());
+        let real = get_diff_data(&repo, &scope, probe_settings(), None);
         assert!(worth_persisting(&repo, &scope, &real));
     }
 
@@ -15416,6 +16383,7 @@ mod tests {
             &RowScope::new(DiffSource::Commit(root_oid)),
             s,
             None,
+            None,
         );
         assert_eq!(
             std::fs::read_dir(store_dir.path()).unwrap().count(),
@@ -15439,6 +16407,7 @@ mod tests {
             &repo,
             &RowScope::new(DiffSource::Commit(child)),
             s,
+            None,
             None,
         );
         assert_eq!(
@@ -15472,7 +16441,7 @@ mod tests {
 
         // Speculative, cap of 1: any real diff exceeds it, nothing is written.
         let spec = tempfile::tempdir().unwrap();
-        build_or_load(Some(&mk(spec.path())), &repo, &scope, s, Some(1));
+        build_or_load(Some(&mk(spec.path())), &repo, &scope, s, None, Some(1));
         assert_eq!(
             std::fs::read_dir(spec.path()).map_or(0, Iterator::count),
             0,
@@ -15481,7 +16450,7 @@ mod tests {
 
         // Displayed: no cap, so the same diff IS worth keeping.
         let shown = tempfile::tempdir().unwrap();
-        build_or_load(Some(&mk(shown.path())), &repo, &scope, s, None);
+        build_or_load(Some(&mk(shown.path())), &repo, &scope, s, None, None);
         assert_eq!(
             std::fs::read_dir(shown.path()).unwrap().count(),
             1,
@@ -15508,14 +16477,14 @@ mod tests {
             std::time::Duration::from_hours(1),
         );
 
-        build_or_load(Some(&store), &repo, &scope, s, None);
+        build_or_load(Some(&store), &repo, &scope, s, None, None);
         assert_eq!(
             std::fs::read_dir(dir.path()).map_or(0, Iterator::count),
             0,
             "control: nothing is worth an hour"
         );
         store.set_min_build(std::time::Duration::ZERO);
-        build_or_load(Some(&store), &repo, &scope, s, None);
+        build_or_load(Some(&store), &repo, &scope, s, None, None);
         assert_eq!(
             std::fs::read_dir(dir.path()).unwrap().count(),
             1,
@@ -15539,7 +16508,9 @@ mod tests {
                 show_stats: true,
                 detect_renames: true,
                 detect_copies: false,
+                textconv: false,
             },
+            None,
             None,
         );
         assert!(!data.lines.is_empty());

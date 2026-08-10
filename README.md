@@ -295,10 +295,22 @@ or `500` cannot make the window unusable.
 | `file_list` | `"grouped"` | Sidebar layout: `"grouped"` puts files under directory headers, `"full"` shows full repo-relative paths, `"name"` shows basenames only |
 | `detect_renames` | `true` | Show a rename as one `old → new` entry instead of a delete + add (git `-M`) |
 | `detect_copies` | `false` | Show a file copied from another *modified* file as `source → copy` (git `-C`). More expensive than renames |
+| `textconv` | `true` | Run `diff.<driver>.textconv` when `.gitattributes` names a driver for a path, as git does — what turns an archive or a PDF into a readable diff instead of "Binary files … differ" |
 
 `detect_renames` and `detect_copies` are also on the diff's hover toolbar. The
 config is authoritative: the toolbar is a session override, and a config reload
 re-asserts the configured value over it.
+
+`textconv` is the one setting that lets gitkay run an external program. The command
+comes from git **config**, never from a file in the repository, so cloning a hostile
+repository executes nothing new — the same boundary git has. What differs is *when*:
+git runs a driver when you ask for that diff, while gitkay warms diffs around the view
+and so runs them for commits you have not opened. Set it to `false` to keep it from
+running anything. `diff.<driver>.cachetextconv` is honoured for **reading**: a repo git
+has already converted costs gitkay nothing, out of git's own
+`refs/notes/textconv/<driver>`. gitkay never writes that cache — populating it is a
+once-per-run job git does at exit, and a viewer doing it per conversion would grow the
+repository without bound. Browsing a repository never writes to it.
 
 <details>
 <summary><strong>All 29 themes</strong></summary>
