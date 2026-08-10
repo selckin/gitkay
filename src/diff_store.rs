@@ -1229,6 +1229,10 @@ mod tests {
         let wt_path = dir.path().join("linked");
         let wt = repo.worktree("linked", &wt_path, None).expect("worktree");
         let linked = git2::Repository::open_from_worktree(&wt).expect("open worktree");
+        // A fresh handle rebuilds its config from the machine's own files; this
+        // one has to inherit what `temp_repo` set up, `attrs_id` being a function
+        // of `core.attributesFile` among other things.
+        crate::test_repo::confine_config_to_the_repo(&linked);
         assert_ne!(
             linked.commondir(),
             linked.path(),

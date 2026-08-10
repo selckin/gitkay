@@ -4,21 +4,98 @@
 
 use std::path::Path;
 
+/// Confine `repo` to its OWN config file, dropping the system, XDG and global
+/// levels libgit2 merges in by default.
+///
+/// The app must read all four — git does, and honouring the reader's own
+/// `[diff "archive"]` is the entire point of the textconv feature — but a test
+/// that reads them is asserting against whatever the developer happens to have
+/// configured. That is not hypothetical: a `~/.gitconfig` holding
+/// `diff.renameLimit`, `diff.noprefix`, `diff.mnemonicprefix` and three real
+/// textconv drivers is an ordinary one, and it is enough to turn this suite red
+/// on that machine alone.
+///
+/// A repo-local `set_str` cannot express this. A level can be SHADOWED key by
+/// key, and `[diff "<name>"]` sections have unbounded names — there is no key to
+/// shadow, and no list of keys that stays complete. Replacing the config object
+/// removes the levels themselves, which is the only form of this that cannot
+/// drift. `git_repository_set_config` refcounts the config it is given and
+/// clears the repo's configmap cache, so nothing keeps reading the old one.
+///
+/// The local file comes off `commondir()`, not `path()`: a linked worktree's
+/// gitdir holds no `config` of its own, only the optional `config.worktree`
+/// beside it, which is added at its own level when it exists.
+pub fn confine_config_to_the_repo(repo: &git2::Repository) {
+    let mut cfg = git2::Config::new().unwrap();
+    cfg.add_file(
+        &repo.commondir().join("config"),
+        git2::ConfigLevel::Local,
+        false,
+    )
+    .unwrap();
+    let per_worktree = repo.path().join("config.worktree");
+    if per_worktree.exists() {
+        cfg.add_file(&per_worktree, git2::ConfigLevel::Worktree, false)
+            .unwrap();
+    }
+    repo.set_config(&cfg).unwrap();
+}
+
+/// Reopen a repository a test already built — always through here, never
+/// `git2::Repository::open`, which builds a fresh config from the machine's own
+/// files and so undoes everything `temp_repo` set up. Reopening is how the write
+/// layer's suite reads `.git/index` back (`repo.index()` hands out the cached
+/// in-memory one), so it is a common step, not a rare one.
+pub fn open_repo(path: &Path) -> git2::Repository {
+    let repo = git2::Repository::open(path).unwrap();
+    confine_config_to_the_repo(&repo);
+    repo
+}
+
 pub fn temp_repo() -> (tempfile::TempDir, git2::Repository) {
     let dir = tempfile::tempdir().unwrap();
-    let repo = git2::Repository::init(dir.path()).unwrap();
+    // The initial branch is stated rather than inherited: `init.defaultBranch` is
+    // the developer's to set, and `Repository::init` is the one step that runs
+    // before the global config can be taken away.
+    //
+    // `external_template(false)` closes the other half of that same window.
+    // `RepositoryInitOptions::new` turns the flag ON, and libgit2's
+    // `repo_init_structure` then reads `init.templatedir` out of the DEFAULT config
+    // — system + XDG + global — and copies that directory into the new `.git`. A
+    // template holding an `info/attributes` would therefore land one inside
+    // `$GIT_DIR`, which libgit2 reads at higher priority than `core.attributesFile`
+    // and which nothing below can shadow: a line as ordinary as `*.zip diff=archive`
+    // would decide which fixtures are driven.
+    let mut init = git2::RepositoryInitOptions::new();
+    init.initial_head("master");
+    init.external_template(false);
+    let repo = git2::Repository::init_opts(dir.path(), &init).unwrap();
+    confine_config_to_the_repo(&repo);
     let mut cfg = repo.config().unwrap();
     cfg.set_str("user.name", "t").unwrap();
     cfg.set_str("user.email", "t@example.com").unwrap();
-    // Pin every core setting the write-layer suite asserts on, so the developer's
-    // own ~/.gitconfig cannot decide whether the tests pass. These are not
-    // hypothetical: with `core.autocrlf = true` set globally, the reverted
-    // patches land through the CRLF filter and the on-disk assertions compare
-    // "x\r\n" against "x\n". `fileMode`/`symlinks` are the same story for the
-    // mode and symlink tests. Repo-local, so it wins over global and system.
+    // Pin every core setting the write-layer suite asserts on. These are not
+    // hypothetical: with `core.autocrlf = true`, the reverted patches land
+    // through the CRLF filter and the on-disk assertions compare "x\r\n" against
+    // "x\n". `fileMode`/`symlinks` are the same story for the mode and symlink
+    // tests. Stated rather than merely un-inherited, because libgit2's own
+    // defaults are platform-derived and these three decide test outcomes.
     cfg.set_bool("core.autocrlf", false).unwrap();
     cfg.set_bool("core.fileMode", true).unwrap();
     cfg.set_bool("core.symlinks", true).unwrap();
+    // The two out-of-tree files config alone does not remove. Left unset, libgit2
+    // falls back to `$XDG_CONFIG_HOME/git/{attributes,ignore}` — the fallback is
+    // reached through the sysdirs, not through any config level — so both are
+    // pointed at an empty file instead. Without it a developer's
+    // `~/.gitattributes` decides which fixtures are driven (`*.zip diff=archive`
+    // is an ordinary line to have) and their `~/.gitignore` decides which
+    // untracked fixtures a worktree diff can see at all. The file lives inside
+    // `.git`, so it is never itself an untracked worktree entry.
+    let empty = repo.path().join("gitkay-test-empty");
+    std::fs::write(&empty, b"").unwrap();
+    let empty = empty.to_str().unwrap();
+    cfg.set_str("core.attributesFile", empty).unwrap();
+    cfg.set_str("core.excludesFile", empty).unwrap();
     (dir, repo)
 }
 
@@ -203,4 +280,53 @@ pub fn index_blob(repo: &git2::Repository, path: &str) -> String {
     let entry = index.get_path(Path::new(path), 0).unwrap();
     let blob = repo.find_blob(entry.id).unwrap();
     String::from_utf8_lossy(blob.content()).into_owned()
+}
+
+/// Every other suite in the crate rests on the isolation above, so it is
+/// asserted here rather than assumed. Both of these fail on this author's own
+/// machine without `confine_config_to_the_repo` and the `core.attributesFile`
+/// pin respectively — the second is the one that already turned `cargo test`
+/// red once, through `~/.gitattributes`'s `*.zip diff=archive`.
+///
+/// `a.zip` is deliberately the probe: it is the path a real global driver is
+/// most likely to claim, which is exactly what makes it worth asserting on.
+#[test]
+fn a_temp_repo_sees_no_textconv_driver_the_developer_configured() {
+    let (_t, repo) = temp_repo();
+    let cfg = repo.config().unwrap().snapshot().unwrap();
+    let mut entries = cfg.entries(Some(r"^diff\..*\.textconv$")).unwrap();
+    let mut names = Vec::new();
+    while let Some(Ok(entry)) = entries.next() {
+        names.push(entry.name().unwrap_or("<non-utf8>").to_owned());
+    }
+    assert!(
+        names.is_empty(),
+        "a temp repo must configure no drivers of its own, found {names:?}"
+    );
+}
+
+#[test]
+fn a_temp_repo_sees_no_attributes_from_outside_its_own_worktree() {
+    let (_t, repo) = temp_repo();
+    let attr = repo
+        .get_attr(
+            Path::new("a.zip"),
+            "diff",
+            git2::AttrCheckFlags::FILE_THEN_INDEX,
+        )
+        .unwrap();
+    assert_eq!(
+        attr, None,
+        "a path must take its attributes from the fixture alone, not from ~/.gitattributes"
+    );
+}
+
+/// `init.defaultBranch` is a `~/.gitconfig` key like any other, and the one that
+/// runs before the config can be replaced — so it is stated in the init options.
+#[test]
+fn a_temp_repo_starts_on_a_branch_the_test_chose() {
+    let (_t, repo) = temp_repo();
+    commit_file(&repo, "a.txt", "x\n", "c");
+    let head = repo.head().unwrap();
+    assert_eq!(head.name().unwrap(), "refs/heads/master");
 }
