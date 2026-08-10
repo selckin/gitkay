@@ -21,10 +21,13 @@ const MAGIC: &[u8; 8] = b"gitkayD\x00";
 ///
 /// 2: `diff_line_idx` went from a tagged native-width run to a plain `u64` with
 /// 0 as `None`, so the format no longer differs between a 32- and a 64-bit
-/// build. Note this guards the LAYOUT only — a change to what the diff BUILDER
-/// emits is invisible here, which is why `StoreContext` mixes in the crate
-/// version.
-const VERSION: u16 = 3;
+/// build. 4: `FileEntry::is_converted` joined the file record — a textconv-driven
+/// file's patch names coordinates in text that exists in no blob, and the write
+/// layer refuses a hunk click on it, so an entry that lost the flag on the way to
+/// disk would come back applicable-by-hunk and fail as `Stale`. Note this guards
+/// the LAYOUT only — a change to what the diff BUILDER emits is invisible here,
+/// which is why `StoreContext` mixes in the crate version.
+const VERSION: u16 = 4;
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
@@ -144,8 +147,8 @@ impl<'a> Reader<'a> {
 /// encoder rather than restating by hand.
 const LINE_MIN_BYTES: usize = 1 + 8 + 4 + 4;
 /// The same for a file: two empty length-prefixed paths, the two optional-path
-/// tags, the status tag, the binary flag, and three `u64`s.
-const FILE_MIN_BYTES: usize = 8 + 1 + 8 + 1 + 1 + 1 + 8 + 8 + 8;
+/// tags, the status tag, the binary and converted flags, and three `u64`s.
+const FILE_MIN_BYTES: usize = 8 + 1 + 8 + 1 + 1 + 1 + 1 + 8 + 8 + 8;
 
 /// Exhaustive both ways: a new `LineKind` variant fails to compile here rather
 /// than silently decoding as something else.
@@ -242,6 +245,7 @@ fn encode(data: &DiffData) -> Vec<u8> {
         put_opt_bytes(&mut out, f.old_path_bytes.as_deref());
         out.push(delta_tag(f.status));
         out.push(u8::from(f.is_binary));
+        out.push(u8::from(f.is_converted));
         put_u64(&mut out, f.additions as u64);
         put_u64(&mut out, f.deletions as u64);
         // `usize + 1`, so 0 is `None` — the same sentinel trick the line numbers
@@ -294,6 +298,7 @@ fn decode(bytes: &[u8]) -> Option<DiffData> {
         let old_path_bytes = r.opt_bytes()?;
         let status = delta_from_tag(r.u8()?)?;
         let is_binary = r.u8()? != 0;
+        let is_converted = r.u8()? != 0;
         let additions = usize::try_from(r.u64()?).ok()?;
         let deletions = usize::try_from(r.u64()?).ok()?;
         let diff_line_idx = match r.u64()? {
@@ -307,6 +312,7 @@ fn decode(bytes: &[u8]) -> Option<DiffData> {
             old_path_bytes,
             status,
             is_binary,
+            is_converted,
             additions,
             deletions,
             diff_line_idx,
@@ -477,6 +483,13 @@ fn config_id(repo: &git2::Repository) -> Vec<u8> {
         "diff.indentheuristic",
         "diff.ignoresubmodules",
         "core.ignorecase",
+        // The path prefixes every file header carries (`diff_generate.c:571`).
+        // Load-bearing beyond the headers libgit2 prints: `diff::header_prefixes`
+        // reads them back off one and `swept_header_lines` builds a whole
+        // `diff --git` line from them, so flipping either would leave stored diffs
+        // stating prefixes the repo no longer uses.
+        "diff.noprefix",
+        "diff.mnemonicprefix",
         // Content filters change the bytes xdiff is handed.
         "core.autocrlf",
         "core.eol",
@@ -494,6 +507,76 @@ fn config_id(repo: &git2::Repository) -> Vec<u8> {
         // Absent and empty must differ, hence the option tag rather than "".
         put_opt_str(&mut buf, cfg.get_str(key).ok());
     }
+    put_bytes(&mut buf, &driver_id(&cfg, repo.workdir()));
+    buf
+}
+
+/// The second half of `config_id`: every per-driver key that changes a diff.
+///
+/// The explicit list above cannot express these — the driver names are unbounded —
+/// so this is one glob instead, folded in sorted order so two configs that set the
+/// same things fingerprint the same however they were written.
+///
+/// `textconv`/`cachetextconv` are here because gitkay now runs them, and without
+/// this an edited driver command serves entries built under the OLD command
+/// forever: the exact stale-hit failure `attrs_id` was added to close on the
+/// attributes side. The other three are here because **libgit2 reads them**, so they
+/// have always changed a diff while `config_id` missed them — `binary` decides
+/// whether a delta gets a patch body at all, and `xfuncname`/`funcname` are the
+/// regexes whose match libgit2 prints as the function context after `@@`
+/// (`diff_driver.c` reads `diff.%s.xfuncname` then `diff.%s.funcname`). Editing
+/// either of those last two changes every hunk header of every file the driver
+/// applies to, with no commit, no file and no gitkay setting involved. Same pass,
+/// same cost.
+///
+/// An unreadable iterator folds in nothing, which is the same "unreadable config"
+/// case the caller already handles by marker.
+///
+/// Shared with `textconv`, which fingerprints the LIVE driver map off this same
+/// pass. One key list, so the in-session verdict ("the reader edited a driver, drop
+/// what the old one produced") and the on-disk one cannot cover different keys —
+/// they did, and the live half was the smaller: adding a `diff.<name>.xfuncname`
+/// moved the store's key while leaving every in-memory diff of the session alone.
+pub fn driver_id(cfg: &git2::Config, worktree: Option<&Path>) -> Vec<u8> {
+    let mut entries = Vec::new();
+    // libgit2 matches an entry name with a POSIX regex, so `.` is escaped.
+    let keys = r"^diff\..*\.(textconv|cachetextconv|binary|xfuncname|funcname)$";
+    if let Ok(mut it) = cfg.entries(Some(keys)) {
+        // An entry libgit2 could not hand over is SKIPPED, not the end of the scan:
+        // `GIT_ITEROVER` arrives as `None`, so a `Some(Err(_))` is one bad entry.
+        // Stopping there truncated the key silently — every driver declared after it
+        // left out, so entries built while it was invisible keep being served once the
+        // config problem is fixed.
+        while let Some(e) = it.next() {
+            let Ok(e) = e else { continue };
+            // `ConfigEntry::value` PANICS on a valueless key, which for `binary` is
+            // the ordinary spelling of "true" — so it is read as bytes, not skipped.
+            let value = e.has_value().then(|| e.value_bytes().to_vec());
+            entries.push((e.name_bytes().to_vec(), value));
+        }
+    }
+    entries.sort();
+    let mut buf = Vec::new();
+    for (name, value) in entries {
+        put_bytes(&mut buf, &name);
+        put_opt_bytes(&mut buf, value.as_deref());
+        // The command names a converter; the converter is what decides the output. A
+        // `textconv = ~/bin/zipdiff.sh` keeps the same string when the script behind it
+        // is FIXED, so folding in only the string served the broken script's patches on
+        // every later launch with nothing short of deleting the cache directory to
+        // clear them — where git, which re-runs the driver every time without
+        // `cachetextconv`, has no such state to be stale. See `textconv::script_stamp`
+        // for what it can and cannot see.
+        if let Some(stamp) = value
+            .as_deref()
+            .filter(|_| name.ends_with(b".textconv"))
+            .and_then(|v| std::str::from_utf8(v).ok())
+            .and_then(|cmd| crate::textconv::script_stamp(cmd, worktree))
+        {
+            put_u64(&mut buf, stamp.0);
+            put_u64(&mut buf, stamp.1);
+        }
+    }
     buf
 }
 
@@ -510,12 +593,16 @@ fn config_id(repo: &git2::Repository) -> Vec<u8> {
 /// setting are then served under the new one.
 fn entry_key(
     ctx: &StoreContext,
+    drivers: u64,
     source: DiffSource,
     paths: &[String],
     settings: DiffSettings,
 ) -> Option<git2::Oid> {
     let mut b = Vec::new();
     b.extend_from_slice(&ctx.0);
+    // Zero while the drivers are still the ones `ctx` was built from, which is every
+    // launch until the reader edits one. See `DiffStore::drivers`.
+    put_u64(&mut b, drivers);
 
     // Real commits only. A match, not an oid comparison, so a new row kind has
     // to be classified rather than silently inheriting persistence.
@@ -535,9 +622,16 @@ fn entry_key(
         show_stats,
         detect_renames,
         detect_copies,
+        textconv,
     } = settings;
     put_u32(&mut b, context);
-    for flag in [ignore_ws, show_stats, detect_renames, detect_copies] {
+    for flag in [
+        ignore_ws,
+        show_stats,
+        detect_renames,
+        detect_copies,
+        textconv,
+    ] {
         b.push(u8::from(flag));
     }
 
@@ -555,6 +649,23 @@ pub struct DiffStore {
     /// other config key, and the store is shared as an `Arc` by the pool and the
     /// diff-load worker, so the threshold has to move in place.
     min_build: AtomicU64,
+    /// A fingerprint of the textconv drivers as they are NOW, `0` while they are still
+    /// the ones `context` was built from.
+    ///
+    /// Live for a reason `min_build` is not. `StoreContext` folds in `driver_id`, but
+    /// it is resolved exactly once — on the prune thread, at startup — so an edited
+    /// `diff.<name>.textconv` could not move any key in the running process, and
+    /// `~/.cache/gitkay/diffs` went on serving the old command's output until a
+    /// restart. Editing that command is precisely how a reader fixes a file stuck on
+    /// `Binary files … differ`, and a driven row is exactly the slow kind that clears
+    /// `min_build_ms`, so the store hit was the likely case rather than the corner one.
+    ///
+    /// `0` at open keeps every entry an earlier launch wrote reachable, since a fresh
+    /// launch's `context` already describes the current command. Entries written after
+    /// an in-session edit are keyed under the new fingerprint and are unreachable next
+    /// launch (which keys them under the new `context` and `0`) — a cache miss, and the
+    /// pruner's budget collects them.
+    drivers: AtomicU64,
     /// "Already complained about this store". A plain flag, not an `Arc`: the
     /// store is only ever shared AS an `Arc<DiffStore>` (`GitkApp` and every
     /// `WorkerCtx` hold clones of one), so the field is already shared and an
@@ -578,6 +689,7 @@ impl DiffStore {
             root,
             context,
             min_build: AtomicU64::new(min_build.as_millis() as u64),
+            drivers: AtomicU64::new(0),
             warned: AtomicBool::new(false),
         }
     }
@@ -597,8 +709,27 @@ impl DiffStore {
             .store(d.as_millis() as u64, Ordering::Relaxed);
     }
 
+    /// Apply a driver map that has CHANGED since this store was opened, so every entry
+    /// built under the old one misses. See the `drivers` field.
+    pub fn set_drivers(&self, fingerprint: u64) {
+        self.drivers.store(fingerprint, Ordering::Relaxed);
+    }
+
+    /// The driver fingerprint entry keys currently carry. Read by `build_or_load` on
+    /// both sides of a build: this value can move WHILE one runs, and a build that
+    /// snapshotted the old driver map must not be written under the new key.
+    pub fn drivers(&self) -> u64 {
+        self.drivers.load(Ordering::Relaxed)
+    }
+
     fn key(&self, scope: &RowScope, settings: DiffSettings) -> Option<git2::Oid> {
-        entry_key(&self.context, scope.source, &scope.paths, settings)
+        entry_key(
+            &self.context,
+            self.drivers.load(Ordering::Relaxed),
+            scope.source,
+            &scope.paths,
+            settings,
+        )
     }
 
     fn entry_path(&self, key: git2::Oid) -> PathBuf {
@@ -806,6 +937,7 @@ mod tests {
                 old_path_bytes: Some(b"y.rs".to_vec()),
                 status: git2::Delta::Renamed,
                 is_binary: false,
+                is_converted: false,
                 additions: 1,
                 deletions: 1,
                 diff_line_idx: Some(0),
@@ -851,6 +983,7 @@ mod tests {
                 old_path_bytes: None,
                 status: git2::Delta::Added,
                 is_binary: false,
+                is_converted: false,
                 additions: 0,
                 deletions: 0,
                 diff_line_idx: None,
@@ -1007,6 +1140,7 @@ mod tests {
             show_stats: true,
             detect_renames: true,
             detect_copies: false,
+            textconv: false,
         }
     }
 
@@ -1019,6 +1153,7 @@ mod tests {
         let owned: Vec<String> = paths.iter().map(|p| (*p).to_string()).collect();
         entry_key(
             &StoreContext::of(repo).expect("hashable"),
+            0,
             DiffSource::Commit(oid),
             &owned,
             s,
@@ -1056,6 +1191,67 @@ mod tests {
         assert_ne!(before, after, "a changed .gitattributes must miss");
     }
 
+    /// LOAD-BEARING. The driver command is not a key `config_id`'s explicit list
+    /// can name — driver names are unbounded — so it takes a second pass over the
+    /// config. Without it, editing `diff.<name>.textconv` serves entries built
+    /// under the OLD command forever: the same stale-hit failure `attrs_id` closes
+    /// on the attributes side, arriving through config instead.
+    #[test]
+    fn a_changed_driver_command_is_part_of_the_key() {
+        use crate::test_repo::set_config;
+        let (_d, repo) = temp_repo();
+        let oid = commit_file(&repo, "a.zip", "one\n", "c");
+        write_attributes(&repo, "*.zip diff=gktest\n");
+        set_config(&repo, "diff.gktest.textconv", "old-command");
+        let before = key_for(&repo, oid, &[], settings());
+        set_config(&repo, "diff.gktest.textconv", "new-command");
+        assert_ne!(
+            before,
+            key_for(&repo, oid, &[], settings()),
+            "a changed driver command must miss"
+        );
+        // `cachetextconv` decides whether the conversion is even read from a cache,
+        // and `binary` has always changed a diff (libgit2 honours it) while
+        // `config_id` missed it — both ride the same pass.
+        let before = key_for(&repo, oid, &[], settings());
+        set_config(&repo, "diff.gktest.cachetextconv", "true");
+        let after = key_for(&repo, oid, &[], settings());
+        assert_ne!(before, after, "cachetextconv is part of the key");
+        set_config(&repo, "diff.gktest.binary", "true");
+        let after = key_for(&repo, oid, &[], settings());
+        assert_ne!(before, after, "so is binary");
+        // And so are the two keys libgit2 reads in the same function as `binary`:
+        // `diff.<driver>.xfuncname` / `.funcname` are the regexes whose match it
+        // prints as the function context after `@@`, so editing either rewrites every
+        // hunk header of every file the driver applies to.
+        for key in ["xfuncname", "funcname"] {
+            let before = key_for(&repo, oid, &[], settings());
+            set_config(&repo, &format!("diff.gktest.{key}"), "^\\s*def\\s");
+            assert_ne!(
+                before,
+                key_for(&repo, oid, &[], settings()),
+                "{key} changes the hunk headers, so it must move the key"
+            );
+        }
+    }
+
+    /// A `DiffSettings` field left out of `entry_key` is a stale hit; the
+    /// exhaustive destructure is what makes forgetting one a compile error, and
+    /// this pins the one added most recently.
+    #[test]
+    fn the_textconv_setting_is_part_of_the_key() {
+        let (_d, repo) = temp_repo();
+        let oid = commit_file(&repo, "a.zip", "one\n", "c");
+        let on = DiffSettings {
+            textconv: true,
+            ..settings()
+        };
+        assert_ne!(
+            key_for(&repo, oid, &[], settings()),
+            key_for(&repo, oid, &[], on)
+        );
+    }
+
     /// LOAD-BEARING. Two repos, same commit oid, different attributes. Beyond
     /// attributes the diff also depends on repo config (`diff.renameLimit` was
     /// measured changing a fixed oid's file count from 4 to 6), and that
@@ -1068,12 +1264,14 @@ mod tests {
         assert_ne!(
             entry_key(
                 &StoreContext::of(&a).expect("hashable"),
+                0,
                 DiffSource::Commit(oid),
                 &[],
                 settings()
             ),
             entry_key(
                 &StoreContext::of(&b).expect("hashable"),
+                0,
                 DiffSource::Commit(oid),
                 &[],
                 settings()
@@ -1269,10 +1467,10 @@ mod tests {
     fn only_a_real_commit_gets_a_key() {
         let (_d, repo) = temp_repo();
         let ctx = StoreContext::of(&repo).expect("hashable");
-        assert!(entry_key(&ctx, DiffSource::Uncommitted, &[], settings()).is_none());
-        assert!(entry_key(&ctx, DiffSource::Staged, &[], settings()).is_none());
+        assert!(entry_key(&ctx, 0, DiffSource::Uncommitted, &[], settings()).is_none());
+        assert!(entry_key(&ctx, 0, DiffSource::Staged, &[], settings()).is_none());
         let oid = commit_file(&repo, "a.txt", "one\n", "c");
-        assert!(entry_key(&ctx, DiffSource::Commit(oid), &[], settings()).is_some());
+        assert!(entry_key(&ctx, 0, DiffSource::Commit(oid), &[], settings()).is_some());
     }
 
     fn temp_store(repo: &git2::Repository) -> (tempfile::TempDir, DiffStore) {
@@ -1309,7 +1507,7 @@ mod tests {
         let oid = commit_file(&repo, "a.rs", "fn main() {\n    todo!()\n}\n", "two");
         let (_t, store) = temp_store(&repo);
 
-        let built = crate::diff::get_diff_data(&repo, &scope_of(oid), settings());
+        let built = crate::diff::get_diff_data(&repo, &scope_of(oid), settings(), None);
         assert!(!built.lines.is_empty(), "control: the diff is not empty");
 
         store.save(&scope_of(oid), settings(), &built);
@@ -1350,7 +1548,7 @@ mod tests {
         let oid = commit_rename(&repo, "old.txt", "new.txt", "rename");
         let (_t, store) = temp_store(&repo);
 
-        let built = crate::diff::get_diff_data(&repo, &scope_of(oid), settings());
+        let built = crate::diff::get_diff_data(&repo, &scope_of(oid), settings(), None);
         store.save(&scope_of(oid), settings(), &built);
         let back = store.load(&scope_of(oid), settings()).expect("hit");
 
@@ -1376,7 +1574,7 @@ mod tests {
         let (_d, repo) = temp_repo();
         let oid = commit_file(&repo, "a.txt", "one\n", "c");
         let (_t, store) = temp_store(&repo);
-        let built = crate::diff::get_diff_data(&repo, &scope_of(oid), settings());
+        let built = crate::diff::get_diff_data(&repo, &scope_of(oid), settings(), None);
         store.save(&scope_of(oid), settings(), &built);
 
         let entry = only_entry(&store);
@@ -1412,7 +1610,7 @@ mod tests {
         let (_d, repo) = temp_repo();
         let oid = commit_file(&repo, "a.txt", "one\n", "c");
         let (_t, store) = temp_store(&repo);
-        let built = crate::diff::get_diff_data(&repo, &scope_of(oid), settings());
+        let built = crate::diff::get_diff_data(&repo, &scope_of(oid), settings(), None);
         store.save(&scope_of(oid), settings(), &built);
 
         let entry = only_entry(&store);

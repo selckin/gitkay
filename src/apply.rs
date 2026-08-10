@@ -66,6 +66,11 @@ pub struct ApplyRequest {
     /// booleans at the call site would mean a new flag — and a sweep of every
     /// construction site — for the next status this layer has to tell apart.
     pub status: git2::Delta,
+    /// Was the displayed patch produced by a `diff.<driver>.textconv`? See
+    /// `ApplyError::TextconvNotApplicable`. Copied from the displayed
+    /// `FileEntry::is_converted` rather than re-derived from the driver config
+    /// here: a driven path whose delta was left unconverted still applies by hunk.
+    pub converted: bool,
     pub hunk: Option<HunkRange>,
 }
 
@@ -83,6 +88,7 @@ impl ApplyRequest {
             path: file.path_bytes.clone(),
             old_path: file.old_path_bytes.clone(),
             status: file.status,
+            converted: file.is_converted,
             hunk,
         }
     }
@@ -139,7 +145,10 @@ impl ApplyRequest {
 /// no portable fallback is offered: a lossy one would silently reintroduce the
 /// "matches nothing, reports success" bug this exists to prevent. gitkay is
 /// unix-only anyway (see the `compile_error!` in main.rs).
-fn path_from_bytes(bytes: &[u8]) -> &std::path::Path {
+///
+/// Shared with `textconv`, which hands the same raw bytes to `get_attr_bytes` and
+/// to the driver: an attribute lookup on a laundered name matches the wrong rules.
+pub fn path_from_bytes(bytes: &[u8]) -> &std::path::Path {
     use std::os::unix::ffi::OsStrExt;
     std::path::Path::new(std::ffi::OsStr::from_bytes(bytes))
 }
@@ -175,6 +184,21 @@ pub enum ApplyError {
     /// `Stale`, blaming a change that never happened, forever. Actionable rather
     /// than fatal, like `RenameNeedsWholeFile`: the whole-file action works.
     CopyNeedsWholeFile,
+    /// A hunk was clicked on a file whose patch came from a
+    /// `diff.<driver>.textconv`. Its coordinates name lines in CONVERTED text —
+    /// the readable rendering of an archive or a PDF — which exists in no file and
+    /// no blob, while `action_diff` regenerates the RAW diff. So `hunk_fit` matches
+    /// nothing and the click used to come back `Stale`, "the file has changed since
+    /// this diff was shown", about a file nothing had touched and with no retry that
+    /// could ever work. Same defect `CopyNeedsWholeFile` was added for, so it is
+    /// decided the same way: from the displayed entry, before any diff is generated.
+    ///
+    /// The three whole-file routes are unaffected and all exact — stage and unstage
+    /// are index operations that never build a patch, and a whole-file revert routes
+    /// on `delta_is_binary`, which sniffs the ACTION diff's blobs rather than
+    /// trusting `FileEntry::is_binary` (false for a converted file, which is on
+    /// disk still binary).
+    TextconvNotApplicable,
     /// The clicked hunk cannot be written on its own: with whitespace ignored the
     /// pane split it out of a wider real hunk, and a hunk is indivisible, so
     /// applying it would carry along edits the display never showed as changes.
@@ -213,6 +237,10 @@ impl ApplyError {
             ),
             Self::CopyNeedsWholeFile => format!(
                 "{verb} failed — {path} was copied from another file, which has no hunks of its own; {} the file instead of a hunk",
+                verb.to_lowercase()
+            ),
+            Self::TextconvNotApplicable => format!(
+                "{verb} failed — {path} is shown through a textconv driver, so its hunks are converted text rather than the file's own; {} the file instead of a hunk",
                 verb.to_lowercase()
             ),
             // Says what to do about it: the click is fine, the whitespace toggle
@@ -1251,6 +1279,13 @@ pub fn apply_request(
     if req.shown_copied() {
         return Err(ApplyError::CopyNeedsWholeFile);
     }
+    // A converted file's hunks are coordinates in text no file holds, so nothing the
+    // action diff regenerates can ever match them. Decided from the DISPLAYED entry,
+    // like the copy above, and for the same reason: the alternative is a `Stale` that
+    // blames a change nothing made, forever.
+    if req.converted {
+        return Err(ApplyError::TextconvNotApplicable);
+    }
     let (diff, location, reversed) = action_diff(repo, req, settings, false)?;
 
     // Decide BEFORE mutating. The hunk callback cannot be the gate: libgit2 skips
@@ -1513,6 +1548,7 @@ mod tests {
             show_stats: false,
             detect_renames: true,
             detect_copies: false,
+            textconv: false,
         }
     }
 
@@ -2145,7 +2181,12 @@ mod tests {
         commit_file(&repo, "f.txt", &body(&[]), "base");
         write_file(&repo, "f.txt", &body(&[3, 17]));
 
-        let data = crate::diff::get_working_tree_diff(&repo, settings(), &[]);
+        let data = crate::diff::get_working_tree_diff(
+            &repo,
+            settings(),
+            &RowScope::new(DiffSource::Uncommitted),
+            None,
+        );
         // Row of the "+EDITED 17" line.
         let row = data
             .lines
@@ -2290,6 +2331,7 @@ mod tests {
             &repo,
             &RowScope::new(DiffSource::Commit(target)),
             settings(),
+            None,
         );
         let row = data
             .lines
@@ -2759,6 +2801,7 @@ mod tests {
             &repo,
             &RowScope::new(DiffSource::Commit(target)),
             settings(),
+            None,
         );
         let row = data
             .lines
@@ -2865,7 +2908,12 @@ mod tests {
         commit_file(&repo, "f.txt", &body(&[]), "base");
         std::fs::remove_file(repo.workdir().unwrap().join("f.txt")).unwrap();
 
-        let data = crate::diff::get_working_tree_diff(&repo, settings(), &[]);
+        let data = crate::diff::get_working_tree_diff(
+            &repo,
+            settings(),
+            &RowScope::new(DiffSource::Uncommitted),
+            None,
+        );
         let row = data
             .lines
             .iter()
@@ -2916,7 +2964,12 @@ mod tests {
         write_file(&repo, "f.txt", &numbered(5, &[(3, "EDITED")]));
 
         // The request as the menu built it, from a diff showing a MODIFIED file.
-        let data = crate::diff::get_working_tree_diff(&repo, settings(), &[]);
+        let data = crate::diff::get_working_tree_diff(
+            &repo,
+            settings(),
+            &RowScope::new(DiffSource::Uncommitted),
+            None,
+        );
         let f = &data.files[0];
         assert_eq!(f.status, git2::Delta::Modified);
         let row = data
@@ -2952,7 +3005,12 @@ mod tests {
         write_file(&repo, "new.txt", &body(&[]));
         stage(&repo, "new.txt");
 
-        let data = crate::diff::get_staged_diff(&repo, settings(), &[]);
+        let data = crate::diff::get_staged_diff(
+            &repo,
+            settings(),
+            &RowScope::new(DiffSource::Staged),
+            None,
+        );
         let row = data
             .lines
             .iter()
@@ -2996,6 +3054,7 @@ mod tests {
             &repo,
             &RowScope::new(DiffSource::Commit(target)),
             settings(),
+            None,
         );
         let row = data
             .lines
@@ -3110,7 +3169,12 @@ mod tests {
         // Now a tracked, modified file — what the uncommitted row would list.
         std::fs::write(&full, "after\n").unwrap();
 
-        let data = crate::diff::get_working_tree_diff(&repo, settings(), &[]);
+        let data = crate::diff::get_working_tree_diff(
+            &repo,
+            settings(),
+            &RowScope::new(DiffSource::Uncommitted),
+            None,
+        );
         let f = data
             .files
             .iter()
@@ -3198,7 +3262,12 @@ mod tests {
         write_file(&repo, "f.txt", &body(&[3]));
 
         // The request as the menu built it, from a diff showing a MODIFIED file.
-        let data = crate::diff::get_working_tree_diff(&repo, settings(), &[]);
+        let data = crate::diff::get_working_tree_diff(
+            &repo,
+            settings(),
+            &RowScope::new(DiffSource::Uncommitted),
+            None,
+        );
         let f = &data.files[0];
         assert_eq!(f.status, git2::Delta::Modified);
         let request = ApplyRequest::for_entry(DiffSource::Uncommitted, f, None);
@@ -3226,7 +3295,12 @@ mod tests {
         commit_file(&repo, "f.txt", &body(&[]), "base");
         std::fs::remove_file(repo.workdir().unwrap().join("f.txt")).unwrap();
 
-        let data = crate::diff::get_working_tree_diff(&repo, settings(), &[]);
+        let data = crate::diff::get_working_tree_diff(
+            &repo,
+            settings(),
+            &RowScope::new(DiffSource::Uncommitted),
+            None,
+        );
         let f = &data.files[0];
         assert_eq!(f.status, git2::Delta::Deleted);
 
@@ -3304,7 +3378,12 @@ mod tests {
             ignore_ws: true,
             ..settings()
         };
-        let data = crate::diff::get_working_tree_diff(&repo, ws, &[]);
+        let data = crate::diff::get_working_tree_diff(
+            &repo,
+            ws,
+            &RowScope::new(DiffSource::Uncommitted),
+            None,
+        );
         let row = data
             .lines
             .iter()
@@ -3429,7 +3508,12 @@ mod tests {
         std::fs::remove_file(repo.workdir().unwrap().join("generated.rs")).unwrap();
 
         // The request as the menu built it, from a diff showing a DELETED file.
-        let data = crate::diff::get_working_tree_diff(&repo, settings(), &[]);
+        let data = crate::diff::get_working_tree_diff(
+            &repo,
+            settings(),
+            &RowScope::new(DiffSource::Uncommitted),
+            None,
+        );
         let f = &data.files[0];
         assert_eq!(f.status, git2::Delta::Deleted);
         let request = ApplyRequest::for_entry(DiffSource::Uncommitted, f, None);
@@ -3496,7 +3580,12 @@ mod tests {
         stage(&repo, "f.txt");
 
         // The clicked hunk, as the pane shows it while HEAD is still fine.
-        let data = crate::diff::get_staged_diff(&repo, settings(), &[]);
+        let data = crate::diff::get_staged_diff(
+            &repo,
+            settings(),
+            &RowScope::new(DiffSource::Staged),
+            None,
+        );
         let row = data
             .lines
             .iter()
@@ -3818,7 +3907,12 @@ mod tests {
             ignore_ws: true,
             ..settings()
         };
-        let data = crate::diff::get_working_tree_diff(&repo, ws, &[]);
+        let data = crate::diff::get_working_tree_diff(
+            &repo,
+            ws,
+            &RowScope::new(DiffSource::Uncommitted),
+            None,
+        );
         // The row the user right-clicks: the "+EDITED 10" line itself.
         let row = data
             .lines
@@ -3877,7 +3971,12 @@ mod tests {
     #[test]
     fn unstaging_a_copy_leaves_the_copy_source_staged() {
         let (_d, repo) = staged_copy_repo();
-        let data = crate::diff::get_staged_diff(&repo, copy_settings(), &[]);
+        let data = crate::diff::get_staged_diff(
+            &repo,
+            copy_settings(),
+            &RowScope::new(DiffSource::Staged),
+            None,
+        );
         let b = data
             .files
             .iter()
@@ -3915,7 +4014,12 @@ mod tests {
     #[test]
     fn a_hunk_clicked_on_a_copy_names_the_action_that_works() {
         let (_d, repo) = staged_copy_repo();
-        let data = crate::diff::get_staged_diff(&repo, copy_settings(), &[]);
+        let data = crate::diff::get_staged_diff(
+            &repo,
+            copy_settings(),
+            &RowScope::new(DiffSource::Staged),
+            None,
+        );
         let b = data.files.iter().find(|f| f.path == "b.rs").unwrap();
         assert_eq!(b.status, git2::Delta::Copied);
         let row = data
@@ -3944,12 +4048,97 @@ mod tests {
         );
     }
 
+    /// A hunk clicked on a file the pane rendered through a `diff.<driver>.textconv`
+    /// is refused for the real reason.
+    ///
+    /// Its hunk coordinates are line numbers in CONVERTED text — an archive read as
+    /// a listing — which exists in no file and no blob, while `action_diff`
+    /// regenerates the RAW diff. So nothing can ever match, and before this the
+    /// click came back `Stale`: "has changed since this diff was shown" about a file
+    /// nothing had touched, permanently, with no toggle that could fix it. Same
+    /// permanently-false-reason defect as the copy above.
+    ///
+    /// The whole-file route is deliberately NOT refused, and the second half of this
+    /// test is what pins that: it is an index operation that never builds a patch.
+    #[test]
+    fn a_hunk_clicked_on_a_converted_file_names_the_action_that_works() {
+        use crate::test_repo::{driver_script, write_driver};
+        let (dir, repo) = temp_repo();
+        let cmd = driver_script(
+            dir.path(),
+            "conv.sh",
+            "printf 'size %s\\n' \"$(wc -c < \"$1\" | tr -d ' ')\"\n",
+        )
+        .display()
+        .to_string();
+        write_driver(&repo, "gktest", &cmd, false, "*.zip");
+        commit_bytes(&repo, "a.zip", &[0, 1, 2, 0], "one");
+        std::fs::write(repo.workdir().unwrap().join("a.zip"), [0u8, 1, 2, 3, 4, 0]).unwrap();
+        stage(&repo, "a.zip");
+
+        let tc = crate::textconv::Textconv::new();
+        let settings = DiffSettings {
+            textconv: true,
+            ..settings()
+        };
+        let data = crate::diff::get_staged_diff(
+            &repo,
+            settings,
+            &RowScope::new(DiffSource::Staged),
+            Some(&tc),
+        );
+        let file = data.files.iter().find(|f| f.path == "a.zip").unwrap();
+        assert!(
+            file.is_converted,
+            "the fixture must actually convert, or this proves nothing"
+        );
+        let start = file.diff_line_idx.expect("the converted patch has a body");
+        let row = data
+            .lines
+            .iter()
+            .skip(start)
+            .position(|l| l.kind == crate::diff::LineKind::Add)
+            .map(|r| r + start)
+            .expect("the conversion differs, so there is an added line");
+        let hunk = hunk_at_line(&data.lines, row).expect("that row is inside a hunk");
+
+        let err = apply_request(
+            &repo,
+            &ApplyRequest::for_entry(DiffSource::Staged, file, Some(hunk)),
+            settings,
+        )
+        .expect_err("a hunk on converted content cannot be applied");
+        assert!(matches!(err, ApplyError::TextconvNotApplicable), "{err:?}");
+        let msg = err.user_message(ApplyAction::Unstage, "a.zip");
+        assert!(msg.contains("textconv"), "{msg}");
+        assert!(msg.contains("unstage the file instead of a hunk"), "{msg}");
+
+        // The whole-file route is exact and stays open: unstaging restores HEAD's
+        // blob, converted display or not.
+        apply_request(
+            &repo,
+            &ApplyRequest::for_entry(DiffSource::Staged, file, None),
+            settings,
+        )
+        .expect("the whole-file action still works");
+        assert_eq!(
+            index_blob(&repo, "a.zip").len(),
+            4,
+            "unstaging put HEAD's four bytes back"
+        );
+    }
+
     #[test]
     fn staging_a_copy_leaves_the_copy_source_alone() {
         let (_d, repo) = staged_copy_repo();
         // Same shape, but now the copy is only in the worktree: unstage a.rs's
         // edit so staging b.rs would visibly drag it back in.
-        let data = crate::diff::get_staged_diff(&repo, copy_settings(), &[]);
+        let data = crate::diff::get_staged_diff(
+            &repo,
+            copy_settings(),
+            &RowScope::new(DiffSource::Staged),
+            None,
+        );
         let b = data
             .files
             .iter()
@@ -3992,6 +4181,7 @@ mod tests {
             &repo,
             &RowScope::new(DiffSource::Commit(oid)),
             copy_settings(),
+            None,
         );
         let b = data
             .files
