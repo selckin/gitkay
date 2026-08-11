@@ -707,24 +707,31 @@ impl DiffStore {
         drivers: Arc<AtomicU64>,
     ) -> Option<Self> {
         let root = dirs::cache_dir()?.join("gitkay").join("diffs");
-        Some(Self::at(root, StoreContext::of(repo)?, min_build, drivers))
+        Some(Self::at(root, StoreContext::of(repo)?, min_build).sharing(drivers))
     }
 
-    /// Construct over an explicit root. Public for the tests, which supply a
-    /// temp directory and a context built from a repo of their own.
-    pub const fn at(
-        root: PathBuf,
-        context: StoreContext,
-        min_build: Duration,
-        drivers: Arc<AtomicU64>,
-    ) -> Self {
+    /// Construct over an explicit root, keying entries under its own fingerprint cell.
+    /// Public for the tests, which supply a temp directory and a context built from a
+    /// repo of their own.
+    pub fn at(root: PathBuf, context: StoreContext, min_build: Duration) -> Self {
         Self {
             root,
             context,
             min_build: AtomicU64::new(min_build.as_millis() as u64),
-            drivers,
+            drivers: Arc::default(),
             warned: AtomicBool::new(false),
         }
+    }
+
+    /// Key entries from the app's cell instead of this store's own.
+    ///
+    /// Only `open` needs it, and separating it is what keeps the fingerprint out of the
+    /// signature every test call site has to satisfy: a store nobody shares the cell
+    /// with keys under `0` forever, which is exactly what a test wants and what the app
+    /// has anyway until the reader edits a driver.
+    fn sharing(mut self, drivers: Arc<AtomicU64>) -> Self {
+        self.drivers = drivers;
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -1506,7 +1513,6 @@ mod tests {
             dir.path().to_path_buf(),
             StoreContext::of(repo).expect("hashable"),
             std::time::Duration::ZERO,
-            Arc::default(),
         );
         (dir, store)
     }
