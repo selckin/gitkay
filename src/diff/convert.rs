@@ -20,8 +20,6 @@
 //!
 //! See **Textconv** in AGENTS.md; each of the four traps above is pinned by a test.
 
-use std::sync::Arc;
-
 use git2::Repository;
 
 use super::{DiffLine, DiffSettings, DiffSource, FileEntry, LineKind, diff_opts, push_patch_line};
@@ -44,8 +42,8 @@ pub(super) fn side_path_bytes<'a>(delta: &git2::DiffDelta<'a>, new: bool) -> &'a
 /// The `(old, new)` drivers of one delta. See `ConvertCtx::drivers`.
 #[derive(Default)]
 pub(super) struct DeltaDrivers {
-    pub(super) old: Option<Arc<textconv::Driver>>,
-    pub(super) new: Option<Arc<textconv::Driver>>,
+    pub(super) old: Option<textconv::DriverRun>,
+    pub(super) new: Option<textconv::DriverRun>,
 }
 
 impl DeltaDrivers {
@@ -55,8 +53,10 @@ impl DeltaDrivers {
         self.old.is_some() || self.new.is_some()
     }
 
-    pub(super) fn pair(&self) -> (Option<&textconv::Driver>, Option<&textconv::Driver>) {
-        (self.old.as_deref(), self.new.as_deref())
+    pub(super) const fn pair(
+        &self,
+    ) -> (Option<&textconv::DriverRun>, Option<&textconv::DriverRun>) {
+        (self.old.as_ref(), self.new.as_ref())
     }
 }
 
@@ -76,7 +76,10 @@ pub(super) struct ConvertCtx<'a> {
     /// was re-forked on every later click, scroll-back and prefetch of that row. git
     /// calls `diff_filespec_check_attr` per side and converts only the side whose own
     /// path names a driver, leaving the other's bytes as they are; so does this now.
-    pub(super) drivers: (Option<&'a textconv::Driver>, Option<&'a textconv::Driver>),
+    pub(super) drivers: (
+        Option<&'a textconv::DriverRun>,
+        Option<&'a textconv::DriverRun>,
+    ),
     /// This delta's `(old, new)` file modes. Anything but `Known` refuses the
     /// conversion — the modes are the only thing keeping a driver off a symlink or a
     /// gitlink — and the two ways of not knowing are told apart because only one of
@@ -496,15 +499,15 @@ pub(super) fn emit_converted(
     // two arms: a driver that could not be RUN is transient and must keep the diff off
     // disk, while a side simply too large to hold is a permanent property of the delta
     // — the raw body is the honest rendering and there is nothing to retry.
-    let side_bytes = |driver: Option<&textconv::Driver>, side| {
-        driver.map_or_else(
+    let side_bytes = |run: Option<&textconv::DriverRun>, side| {
+        run.map_or_else(
             // No driver for THIS side: its own bytes, as git uses them.
             || match Textconv::side_bytes(ctx.repo, side) {
                 textconv::RawSide::Bytes(bytes) => Ok(bytes),
                 textconv::RawSide::TooLarge => Err(Substitution::Unconvertible),
                 textconv::RawSide::Unreadable => Err(Substitution::Failed),
             },
-            |driver| match ctx.tc.convert(ctx.repo, driver, side) {
+            |run| match ctx.tc.convert(ctx.repo, run, side) {
                 textconv::Converted::Bytes(bytes) => Ok(bytes),
                 // The same split the undriven arm makes, for the same reason: a blob
                 // over the ceiling is permanent, so the raw body is the honest

@@ -63,6 +63,7 @@ const TEXTCONV_TIMEOUT: Duration = Duration::from_secs(10);
 const TEXTCONV_MEMO_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// One `[diff "<name>"]` section that has a `textconv`.
+#[derive(Clone)]
 pub struct Driver {
     /// The subsection name, exactly as written. Git folds a config section and
     /// variable to lower case but leaves the subsection alone, and the `diff=`
@@ -84,6 +85,55 @@ pub struct Driver {
 
 /// Every `diff.<name>.textconv` a repo configures, by subsection name.
 type Drivers = HashMap<String, Arc<Driver>>;
+
+/// The per-driver facts one diff BUILD needs, taken once for that build.
+///
+/// Both are properties of the driver rather than of any delta, and both used to be
+/// re-derived per side of every driven delta — a commit touching fifty archives paid
+/// them a hundred times over for one answer that cannot change while the build runs.
+///
+/// Deliberately NOT cached on `Driver`, which lives in the `Drivers` map across
+/// builds: the whole point of the stamp is that a script edited mid-session is caught
+/// at the NEXT build, and a value resolved once per `resolve_drivers` would only be
+/// re-taken on a `.git` reload — which a `~/bin/zipdiff.sh` edit does not trip.
+/// Per build is the granularity that makes it correct; per delta was only ever cost.
+pub struct DriverFacts {
+    /// See `script_stamp`. Read before every memo lookup, so hoisting it takes a
+    /// `stat(2)` off the fast path of a cache that exists to avoid work.
+    stamp: Option<(u64, u64)>,
+    /// The validated `refs/notes/textconv/<name>`, when the repo enables the cache and
+    /// the ref's tip still describes this command. `None` covers all three of "no
+    /// cache", "no such ref" and "the command moved" — the caller does the same thing
+    /// for each, which is to run the driver.
+    notes: Option<String>,
+}
+
+impl DriverFacts {
+    /// Take both facts for `driver`, once.
+    pub fn of(repo: &Repository, driver: &Driver) -> Self {
+        let notes = driver.cache.then(|| notes_ref(&driver.name)).filter(|r| {
+            // git's own validity rule; see `cache_is_valid`. Asked here rather than per
+            // blob, where it cost a refdb hit and a commit-object load apiece.
+            cache_is_valid(repo, r, &driver.cmd)
+        });
+        Self {
+            stamp: script_stamp(&driver.cmd, repo.workdir()),
+            notes,
+        }
+    }
+}
+
+/// A driver together with the facts this build took for it — what a delta actually
+/// needs to run a conversion.
+///
+/// One type rather than two parallel parameters, so a conversion cannot be handed a
+/// driver with another driver's stamp: the pairing is made once, where the facts are
+/// computed, and travels as a unit from there.
+#[derive(Clone)]
+pub struct DriverRun {
+    pub driver: Arc<Driver>,
+    pub facts: Arc<DriverFacts>,
+}
 
 /// One diff build's view of the driver map: taken once, then asked about every path.
 ///
@@ -487,7 +537,8 @@ impl Textconv {
     /// `InputTooLarge` is the third answer for the reason `RawSide` has three: a blob
     /// over the ceiling is a permanent, reproducible property of the delta, so the raw
     /// body is the honest rendering and the diff stays cacheable.
-    pub fn convert(&self, repo: &Repository, driver: &Driver, side: Side<'_>) -> Converted {
+    pub fn convert(&self, repo: &Repository, run: &DriverRun, side: Side<'_>) -> Converted {
+        let driver = &*run.driver;
         match side {
             Side::Absent => Converted::Bytes(Vec::new()),
             Side::Worktree { path } => {
@@ -506,11 +557,11 @@ impl Textconv {
                     .map_or(Converted::Failed, Converted::Bytes)
             }
             Side::Blob { oid, path } => {
-                let under = MemoKey::of(driver, path, repo.workdir());
+                let under = MemoKey::of(driver, &run.facts, path);
                 if let Some(hit) = self.remembered(&under, oid) {
                     return Converted::Bytes(hit);
                 }
-                let out = match Self::cached(repo, driver, oid) {
+                let out = match Self::cached(repo, &run.facts, oid) {
                     Some(hit) => hit,
                     None => match self.convert_blob(repo, driver, oid, path) {
                         Converted::Bytes(out) => out,
@@ -794,15 +845,14 @@ impl Textconv {
     /// worth less than those three: gitkay's own diff store already persists the
     /// CONVERTED patch under a key that includes the driver command, so the repeat
     /// visit that matters costs nothing either way.
-    fn cached(repo: &Repository, driver: &Driver, blob: git2::Oid) -> Option<Vec<u8>> {
-        if !driver.cache {
-            return None;
-        }
-        let notes_ref = notes_ref(&driver.name);
-        if !cache_is_valid(repo, &notes_ref, &driver.cmd) {
-            return None;
-        }
-        let note = repo.find_note(Some(&notes_ref), blob).ok()?;
+    ///
+    /// Which ref to read, and whether it is still valid for this command, is
+    /// `DriverFacts::notes` — decided once for the build. Asked per blob, as it was, it
+    /// cost a refdb hit plus a commit-object load for every side of every driven delta,
+    /// to re-answer a question that cannot change while the build runs.
+    fn cached(repo: &Repository, facts: &DriverFacts, blob: git2::Oid) -> Option<Vec<u8>> {
+        let notes_ref = facts.notes.as_deref()?;
+        let note = repo.find_note(Some(notes_ref), blob).ok()?;
         // `TEXTCONV_MAX_OUTPUT` bounds this cache exactly as it bounds a live run, and
         // the size is asked for BEFORE the bytes are materialised — git applies no
         // ceiling when it WRITES these notes, so an entry can be arbitrarily large, and
@@ -968,11 +1018,14 @@ struct MemoKey {
 }
 
 impl MemoKey {
-    fn of(driver: &Driver, path: &[u8], worktree: Option<&Path>) -> Self {
+    /// The stamp is taken from `facts` rather than read here: this runs before every
+    /// memo lookup, so computing it would put a `stat(2)` and three allocations on the
+    /// fast path of the cache that exists to avoid exactly that kind of work.
+    fn of(driver: &Driver, facts: &DriverFacts, path: &[u8]) -> Self {
         Self {
             cmd: driver.cmd.clone(),
             base: basename(path).to_vec(),
-            stamp: script_stamp(&driver.cmd, worktree),
+            stamp: facts.stamp,
         }
     }
 }
@@ -1363,6 +1416,19 @@ mod tests {
         }
     }
 
+    /// Pair a driver with the facts a diff build would take for it — the same pairing
+    /// `build_diff_data` makes, so the suite exercises the real one instead of a copy.
+    ///
+    /// Call it once per conversion a test means to be a separate BUILD: the facts hold
+    /// the script stamp and the notes-cache verdict, both of which are re-taken per
+    /// build precisely so a mid-session edit is picked up at the next one.
+    fn run_of(repo: &Repository, d: &Driver) -> DriverRun {
+        DriverRun {
+            driver: Arc::new(d.clone()),
+            facts: Arc::new(DriverFacts::of(repo, d)),
+        }
+    }
+
     /// The blob oid `path` has in `commit`.
     fn blob_of(repo: &Repository, commit: git2::Oid, path: &str) -> git2::Oid {
         repo.find_commit(commit)
@@ -1598,7 +1664,7 @@ mod tests {
         let tc = Textconv::new();
         let under = |path| {
             let out = tc
-                .convert(&repo, &d, Side::Blob { oid, path })
+                .convert(&repo, &run_of(&repo, &d), Side::Blob { oid, path })
                 .bytes()
                 .expect("the driver ran");
             String::from_utf8_lossy(&out).trim().to_owned()
@@ -1623,7 +1689,10 @@ mod tests {
         };
         let tc = Textconv::new();
         let run = || {
-            let out = tc.convert(&repo, &d, side).bytes().expect("the driver ran");
+            let out = tc
+                .convert(&repo, &run_of(&repo, &d), side)
+                .bytes()
+                .expect("the driver ran");
             String::from_utf8_lossy(&out).trim().to_owned()
         };
         assert_eq!(run(), "ONE");
@@ -1712,7 +1781,7 @@ mod tests {
         let out = tc
             .convert(
                 &repo,
-                &d,
+                &run_of(&repo, &d),
                 Side::Blob {
                     oid: blob_of(&repo, c, "deep/dir/a.zip"),
                     path: b"deep/dir/a.zip",
@@ -1751,7 +1820,11 @@ mod tests {
         );
         let tc = Textconv::new();
         let out = tc
-            .convert(&repo, &driver(&script.display().to_string()), Side::Absent)
+            .convert(
+                &repo,
+                &run_of(&repo, &driver(&script.display().to_string())),
+                Side::Absent,
+            )
             .bytes()
             .expect("an absent side converts to nothing");
         assert!(out.is_empty());
@@ -1772,7 +1845,9 @@ mod tests {
         let tc = Textconv::new();
         for cmd in ["/bin/false", "/nonexistent/nope"] {
             assert!(
-                tc.convert(&repo, &driver(cmd), side).bytes().is_none(),
+                tc.convert(&repo, &run_of(&repo, &driver(cmd)), side)
+                    .bytes()
+                    .is_none(),
                 "{cmd} must be reported as a failure, not as an empty conversion"
             );
         }
@@ -1838,7 +1913,9 @@ mod tests {
 
         let started = std::time::Instant::now();
         assert!(
-            tc.convert(&repo, &d, side).bytes().is_none(),
+            tc.convert(&repo, &run_of(&repo, &d), side)
+                .bytes()
+                .is_none(),
             "the first hangs"
         );
         let one = started.elapsed();
@@ -1846,7 +1923,11 @@ mod tests {
 
         let again = std::time::Instant::now();
         for _ in 0..3 {
-            assert!(tc.convert(&repo, &d, side).bytes().is_none());
+            assert!(
+                tc.convert(&repo, &run_of(&repo, &d), side)
+                    .bytes()
+                    .is_none()
+            );
         }
         assert!(
             again.elapsed() < TEXTCONV_TIMEOUT / 4,
@@ -1960,7 +2041,10 @@ mod tests {
         let side = zip_side(blob_of(&repo, c, "a.zip"));
         let tc = Textconv::new();
         for _ in 0..4 {
-            assert_eq!(tc.convert(&repo, &d, side).bytes().unwrap(), b"CONVERTED\n");
+            assert_eq!(
+                tc.convert(&repo, &run_of(&repo, &d), side).bytes().unwrap(),
+                b"CONVERTED\n"
+            );
         }
         assert_eq!(
             std::fs::read(&counter).unwrap().len(),
@@ -1972,7 +2056,12 @@ mod tests {
         // the command beside the bytes rather than trusting the oid alone.
         let other = driver_script(t.path(), "other.sh", "echo OTHER\n");
         let d2 = driver(&other.display().to_string());
-        assert_eq!(tc.convert(&repo, &d2, side).bytes().unwrap(), b"OTHER\n");
+        assert_eq!(
+            tc.convert(&repo, &run_of(&repo, &d2), side)
+                .bytes()
+                .unwrap(),
+            b"OTHER\n"
+        );
     }
 
     /// The child's stdout is its OWN open file description, not a `dup` of ours.
@@ -2127,7 +2216,7 @@ mod tests {
             ..driver(&cmd)
         };
         let hit = Textconv::new()
-            .convert(&repo, &d, zip_side(blob))
+            .convert(&repo, &run_of(&repo, &d), zip_side(blob))
             .bytes()
             .expect("served from the cache");
         assert_eq!(hit, stored, "the note's bytes, NUL and all");
@@ -2162,7 +2251,7 @@ mod tests {
             ..driver(&cmd)
         };
         let hit = Textconv::new()
-            .convert(&repo, &d, zip_side(blob))
+            .convert(&repo, &run_of(&repo, &d), zip_side(blob))
             .bytes()
             .expect("served from the fanned-out cache");
         assert_eq!(hit, b"FANNED\n");
@@ -2190,10 +2279,61 @@ mod tests {
             ..driver(&script.display().to_string())
         };
         let out = Textconv::new()
-            .convert(&repo, &d, zip_side(blob))
+            .convert(&repo, &run_of(&repo, &d), zip_side(blob))
             .bytes()
             .expect("the driver ran");
         assert_eq!(String::from_utf8_lossy(&out).trim(), "FRESH");
+    }
+
+    /// The notes-cache verdict is a per-DRIVER answer, taken once for a build.
+    ///
+    /// It used to be re-derived inside `cached`, i.e. per blob — a refdb hit plus a
+    /// commit-object load for every side of every driven delta, all re-answering a
+    /// question that cannot change while the build runs. This pins the moved decision
+    /// directly: `None` means "run the driver", and all three ways of getting there
+    /// must still produce it.
+    #[test]
+    fn the_notes_ref_is_resolved_once_per_driver_and_only_when_valid() {
+        let (t, repo) = temp_repo();
+        let cmd = driver_script(t.path(), "conv.sh", "echo FRESH\n")
+            .display()
+            .to_string();
+        let c = commit_file(&repo, "a.zip", "payload\n", "c");
+        let blob = blob_of(&repo, c, "a.zip");
+        let cached = |cache: bool| Driver {
+            cache,
+            ..driver(&cmd)
+        };
+
+        // No ref at all yet.
+        assert!(
+            DriverFacts::of(&repo, &cached(true)).notes.is_none(),
+            "a cache the repo enables but git never wrote is still nothing to read"
+        );
+
+        write_cache(&repo, "gktest", &cmd, &[(blob, b"CACHED\n")], false);
+        assert_eq!(
+            DriverFacts::of(&repo, &cached(true)).notes.as_deref(),
+            Some("refs/notes/textconv/gktest"),
+            "a valid cache resolves to the ref the reader will be served from"
+        );
+        assert!(
+            DriverFacts::of(&repo, &cached(false)).notes.is_none(),
+            "`cachetextconv = false` is the repo declining those objects; do not read them"
+        );
+
+        // Same ref, a tip describing a different command — git's own validity rule.
+        write_cache(
+            &repo,
+            "gktest",
+            "some other command",
+            &[(blob, b"X\n")],
+            false,
+        );
+        assert!(
+            DriverFacts::of(&repo, &cached(true)).notes.is_none(),
+            "an edited command must re-convert rather than serve the old command's cache"
+        );
     }
 
     /// `cachetextconv = false` is the repo saying it does not want those objects, so
@@ -2208,7 +2348,7 @@ mod tests {
         write_cache(&repo, "gktest", &cmd, &[(blob, b"CACHED\n")], false);
 
         let out = Textconv::new()
-            .convert(&repo, &driver(&cmd), zip_side(blob)) // cache: false
+            .convert(&repo, &run_of(&repo, &driver(&cmd)), zip_side(blob)) // cache: false
             .bytes()
             .expect("the driver ran");
         assert_eq!(String::from_utf8_lossy(&out).trim(), "FRESH");
@@ -2245,7 +2385,10 @@ mod tests {
 
         let tc = Textconv::new();
         for side in [zip_side(blob), Side::Worktree { path: b"a.zip" }] {
-            let out = tc.convert(&repo, &d, side).bytes().expect("the driver ran");
+            let out = tc
+                .convert(&repo, &run_of(&repo, &d), side)
+                .bytes()
+                .expect("the driver ran");
             assert_eq!(String::from_utf8_lossy(&out).trim(), "CONVERTED");
         }
 
