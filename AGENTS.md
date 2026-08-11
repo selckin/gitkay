@@ -184,9 +184,9 @@ commit-list column cannot drift from the pane; and every "commit vs its first
 parent" diff — the pane, the path filter, the `--follow` tracer — goes through
 `commit_parent_diff`), the diff-shaping `DiffOptions` helpers, the word-diff
 emphasis driver, the content hash,
-the diff pane's scroll anchor (`DiffAnchor` / `capture_anchor` /
-`resolve_anchor` — pure, so all five resolution rungs are unit-testable), and
-the pure line/file lookups — git2-facing and egui-free; cache keying
+the scroll anchor (its own child module,
+`src/diff/anchor.rs`: `DiffAnchor` / `capture_anchor` / `resolve_anchor` — pure,
+so all five resolution rungs are unit-testable), and the pure line/file lookups — git2-facing and egui-free; cache keying
 and rendering stay in `main.rs`, highlight orchestration in
 `src/diff_highlight.rs`), `src/apply.rs` (the
 write layer: `ApplyAction`/`ApplyRequest`/`ApplyError`, the
@@ -231,6 +231,10 @@ repository; see **Graph Layout**),
 `/proc/meminfo` plus the cgroup limit, Linux only, no `unsafe` and no dependency;
 advisory, `None` ⇒ the caller uses its static default. One consumer:
 `diff_cache_line_budget`),
+`src/datefmt.rs` (a commit timestamp rendered absolutely or as an age — pure, and
+its own module rather than `diff.rs`'s, where it had ended up by accident: it is the
+commit LIST's concern, and the relative form is a port of git's `show_date_relative`
+whose rounding is the whole of it),
 `src/cli.rs` (pure argv parser, rev-vs-path classification, pathspec
 resolution, window-title suffix, help/version text), and
 `src/word_diff.rs` (pure intra-line word diff: tokenizer + LCS alignment; the

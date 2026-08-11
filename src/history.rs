@@ -15,9 +15,10 @@ use std::collections::{HashMap, HashSet};
 use git2::{Repository, Sort};
 
 use crate::cli;
+use crate::datefmt::{local_tz_offset_min, now_unix_secs};
 use crate::diff::{
-    self, commit_parent_diff, is_real_commit, local_tz_offset_min, oid_staged, pathspec_opts,
-    staged_git_diff, worktree_git_diff,
+    self, commit_parent_diff, is_real_commit, oid_staged, pathspec_opts, staged_git_diff,
+    worktree_git_diff,
 };
 
 #[derive(Clone)]
@@ -473,7 +474,7 @@ pub fn load_commits_inner(
                 source,
                 title.to_string(),
                 String::new(),
-                diff::now_unix_secs(),
+                now_unix_secs(),
                 local_tz_offset_min(),
                 parents,
                 vec![(chip.0.to_string(), chip.1)],

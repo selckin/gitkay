@@ -19,6 +19,7 @@ use std::sync::mpsc;
 mod apply;
 mod cli;
 mod config;
+mod datefmt;
 mod diff;
 mod diff_cache;
 mod diff_highlight;
@@ -34,11 +35,12 @@ mod textconv;
 mod word_diff;
 mod workers;
 use config::{FileListLayout, Fonts, Role};
+use datefmt::{RELATIVE_DATE_SAMPLE, format_commit_time, format_relative_time};
 use diff::{
     CommitKind, CommitStats, DiffAnchor, DiffData, DiffLine, DiffSettings, DiffSource, FileEntry,
     LineKind, RowScope, StatsWant, capture_anchor, emphasize_rows, file_index_at_line,
-    file_index_at_line_opt, file_line_starts, format_commit_time, get_diff_data, hash_diff_content,
-    is_real_commit, next_file_line, resolve_anchor,
+    file_index_at_line_opt, file_line_starts, get_diff_data, hash_diff_content, is_real_commit,
+    next_file_line, resolve_anchor,
 };
 use diff_cache::DiffCache;
 use diff_highlight::{
@@ -1216,7 +1218,7 @@ impl DateCol {
         match style {
             config::DateStyle::Absolute => Self::Absolute,
             config::DateStyle::Relative => Self::Relative {
-                now: diff::now_unix_secs(),
+                now: datefmt::now_unix_secs(),
             },
         }
     }
@@ -1228,7 +1230,7 @@ impl DateCol {
             // drift from the format the rows use. Every absolute date is the same
             // width, so which instant it is does not matter.
             Self::Absolute => format_commit_time(0, 0, false),
-            Self::Relative { .. } => diff::RELATIVE_DATE_SAMPLE.to_string(),
+            Self::Relative { .. } => RELATIVE_DATE_SAMPLE.to_string(),
         }
     }
 
@@ -1260,7 +1262,7 @@ impl DateCol {
         }
         match self {
             Self::Absolute => format_commit_time(commit.time, commit.tz_offset_min, false),
-            Self::Relative { now } => diff::format_relative_time(commit.time, now),
+            Self::Relative { now } => format_relative_time(commit.time, now),
         }
     }
 }
