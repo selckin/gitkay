@@ -320,6 +320,28 @@ impl DiffPalette {
 /// it away: a diff holds hunks, and the `<?xml` line of a large file is not in them.
 pub type LanguageMap = std::collections::BTreeMap<String, String>;
 
+/// A fingerprint of the map, for `DiffCacheKey`.
+///
+/// The map decides which GRAMMAR a file is tokenized with, so editing it changes a
+/// cached diff's spans without moving its oid or any `DiffSettings` field — the same
+/// shape as the textconv driver fingerprint beside it in that key, and in the key for
+/// the same reason: an entry tokenized under the old map must MISS, rather than be
+/// swept up by an eviction that every dispatch site has to remember.
+///
+/// `DefaultHasher` deliberately, where `diff_store` goes out of its way to use
+/// `git2::Oid::hash_object` instead. The difference is where the value goes: the
+/// store's key is written to disk and read back by a later process, so a hash that
+/// changed with the toolchain would silently invalidate every entry on a rustc bump.
+/// This one never leaves the process — it is compared only against another value
+/// computed by the same binary in the same run — so instability across builds costs
+/// nothing, and a `BTreeMap` is ordered, so within a run the hash is deterministic.
+pub fn languages_fingerprint(map: &LanguageMap) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    map.hash(&mut h);
+    h.finish()
+}
+
 /// Owns the highlighting assets + active theme. Built lazily on the first diff.
 /// `Send + Sync` so it can be shared with a background highlighting worker via
 /// `Arc`; the multi-MB syntax set lives behind its own `Arc` so a theme swap
