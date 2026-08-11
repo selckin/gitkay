@@ -543,10 +543,7 @@ pub fn spawn_prewarm(repo_path: String) -> Option<mpsc::Receiver<Arc<Highlighter
         "gitkay-prewarm",
         "prewarm thread panicked; highlighting falls back to the installed or synchronous highlighter",
         move || {
-            let cfg = config::config_path()
-                .as_ref()
-                .and_then(|p| config::read_config(p).ok())
-                .unwrap_or_default();
+            let cfg = config::read_or_default();
             if !cfg.diff.syntax {
                 return; // syntax off: nothing to build (new() drops the rx too)
             }

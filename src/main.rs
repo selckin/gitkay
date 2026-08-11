@@ -380,6 +380,11 @@ const PREHIGHLIGHT_CEILING: std::time::Duration = std::time::Duration::from_mill
 // instead of one suite nobody may run.
 const _: () = {
     assert!(
+        SHA_SAMPLE.len() == history::SHORT_SHA_LEN,
+        "the SHA column is measured from this sample and filled by `CommitInfo::new`, \
+         so a sample of the wrong width mismeasures every column to its right"
+    );
+    assert!(
         PREHIGHLIGHT_CHUNK < HIGHLIGHT_CHUNK,
         "a ceiling is honoured only to within one chunk, so the bounded pass must step finer"
     );
@@ -457,6 +462,32 @@ impl DiffCacheKey {
             && self.enabled == *enabled
             && self.drivers == *drivers
     }
+}
+
+/// The four settings that decide a diff's SPANS: whether to tokenize at all, and
+/// with which theme, row backgrounds and extension→grammar map.
+///
+/// One struct so the config reload can compare and assign it whole. As four loose
+/// `GitkApp` fields the comparison was a four-term `||` chain that a fifth setting
+/// could silently miss — and missing it is not a lost frame: every cached diff keeps
+/// yesterday's colours, sticky via `diff_cache.contains`, for the rest of the session
+/// with nothing logged. `DiffSettings` is compared whole for exactly this reason.
+///
+/// Note only `enabled` and `theme` are in `DiffCacheKey`; `diff_bg` and `languages`
+/// are not, which is why the reload CLEARS the cache and bumps `span_gen` rather than
+/// relying on stale entries missing. See the reload block.
+#[derive(Clone, PartialEq)]
+struct SpanSettings {
+    /// false ⇒ original flat per-line colouring, no tokenizing at all.
+    enabled: bool,
+    /// Configured syntax theme (validated at the config boundary).
+    theme: highlight::EmbeddedThemeName,
+    /// Add/del row background mode + colours.
+    diff_bg: DiffBg,
+    /// `[diff.languages]`: extensions syntect has no grammar for, and what to
+    /// highlight them as. Held so the highlighter can be rebuilt with it — on the
+    /// prewarm install, the synchronous fallback, and a config reload.
+    languages: highlight::LanguageMap,
 }
 
 /// Whether `oid`'s lowercase hex starts with `prefix`, without allocating the full hex
@@ -801,8 +832,24 @@ fn build_file_rows(files: &[(&str, Option<&str>)], layout: FileListLayout) -> Ve
 ///
 /// `textconv` IS in: the `+`/`-` on a driven row are counted off the CONVERTED
 /// lines, so turning it off changes them.
+///
+/// Destructured rather than field-picked, which is load-bearing rather than
+/// stylistic — the same discipline as `diff_store::entry_key` and
+/// `diff_menu_salt`. Naming the four fields compiles unchanged when a fifth is
+/// added, so a count-affecting setting would silently stay out:
+/// `invalidate_stats_if_counts_changed` would never fire and `stats_harvestable`
+/// would wave the pre-toggle numbers through, leaving the column permanently
+/// disagreeing with the sidebar beside it.
 const fn stats_relevant(s: DiffSettings) -> (bool, bool, bool, bool) {
-    (s.ignore_ws, s.detect_renames, s.detect_copies, s.textconv)
+    let DiffSettings {
+        ignore_ws,
+        detect_renames,
+        detect_copies,
+        textconv,
+        context: _,
+        show_stats: _,
+    } = s;
+    (ignore_ws, detect_renames, detect_copies, textconv)
 }
 
 /// Which visible rows still need their stats computed, for the `want` the
@@ -1014,9 +1061,6 @@ fn sync_virtual_stats(
     }
 }
 
-/// Number of real (non-virtual) commits in a loaded list. `max`/`count` budgets
-/// these, so the 0-2 virtual uncommitted/staged rows never shrink the window or
-/// skew the `all_loaded` check.
 /// Whether a commit matches the (already lowercased) search query — the one
 /// predicate shared by the full rescan (`refresh_search_matches`) and the
 /// append-only extension in `append_commits`.
@@ -1027,6 +1071,9 @@ fn commit_matches(c: &CommitInfo, q: &str) -> bool {
         || c.refs_lc.iter().any(|r| r.contains(q))
 }
 
+/// Number of real (non-virtual) commits in a loaded list. `max`/`count` budgets
+/// these, so the 0-2 virtual uncommitted/staged rows never shrink the window or
+/// skew the `all_loaded` check.
 fn real_commit_count(commits: &[CommitInfo]) -> usize {
     commits.iter().filter(|c| is_real_commit(c.oid)).count()
 }
@@ -1041,6 +1088,30 @@ fn stored<T: serde::de::DeserializeOwned>(
     storage
         .and_then(|s| eframe::get_value(s, key))
         .unwrap_or(default)
+}
+
+/// Has an armed debounce timer expired? Clears it and answers `true` if so;
+/// otherwise schedules the repaint that will run it.
+///
+/// The `else` branch is the load-bearing half, and the reason this is one function
+/// rather than a shape copied per timer: egui only wakes on input, so a timer with no
+/// `request_repaint_after` behind it simply never fires on a settled window — the
+/// reload or the search load waits for some unrelated repaint to come along. Free and
+/// taking the field rather than `&mut self`, so it is one rule for every debounce
+/// gitkay arms.
+fn debounce_expired(
+    armed: &mut Option<std::time::Instant>,
+    window: std::time::Duration,
+    ctx: &egui::Context,
+) -> bool {
+    let Some(at) = *armed else { return false };
+    let elapsed = at.elapsed();
+    if elapsed >= window {
+        *armed = None;
+        return true;
+    }
+    ctx.request_repaint_after(window.saturating_sub(elapsed));
+    false
 }
 
 /// Consume a directional key pair, returning +1 for `down`, -1 for `up`, or 0 if
@@ -1175,8 +1246,9 @@ const STATS_CELL_CHARS: &str = "-99999";
 /// Gap between adjacent stats cells, in points.
 const STATS_CELL_GAP: f32 = 6.0;
 
-/// A short SHA is always this many characters (`CommitInfo::new`), so one sample
-/// measures the column. Virtual rows carry an empty one and leave the slot blank.
+/// A short SHA is always `history::SHORT_SHA_LEN` characters (`CommitInfo::new`), so
+/// one sample measures the column. Virtual rows carry an empty one and leave the slot
+/// blank. Its length is asserted against that constant below, so the two cannot drift.
 const SHA_SAMPLE: &str = "0000000";
 /// The character the author column's width is counted in. A digit, not `M` or
 /// `i`: in the default monospace `[text] commit_meta` font every glyph is the
@@ -1640,12 +1712,7 @@ fn spawn_font_build(
         "gitkay-fonts",
         "font build thread panicked; keeping current fonts",
         move || {
-            let cfg = cfg.unwrap_or_else(|| {
-                config::config_path()
-                    .as_ref()
-                    .and_then(|p| config::read_config(p).ok())
-                    .unwrap_or_default()
-            });
+            let cfg = cfg.unwrap_or_else(config::read_or_default);
             let _ = tx.send(config::build_fonts(&cfg));
         },
     )
@@ -2054,9 +2121,6 @@ fn diff_row_job(
     (job, row_bg)
 }
 
-/// Compute the set of commit indices to emphasize for `start_idx`.
-/// Walks upward through first-parent children to stay on the selected lane,
-/// and downward through all parents so merged ancestry stays highlighted.
 /// The two commit-derived lookup maps `compute_branch_highlight` needs: oid → index, and
 /// first-parent oid → its (topologically latest) child index. Built once when `commits`
 /// changes and cached on `GitkApp`, so per-selection highlighting doesn't rescan every
@@ -2130,6 +2194,9 @@ fn derive_from_commits(commits: &[CommitInfo]) -> DerivedHistory {
     }
 }
 
+/// Compute the set of commit indices to emphasize for `start_idx`.
+/// Walks upward through first-parent children to stay on the selected lane,
+/// and downward through all parents so merged ancestry stays highlighted.
 fn compute_branch_highlight(
     commits: &[CommitInfo],
     start_idx: usize,
@@ -2410,15 +2477,11 @@ struct GitkApp {
     _config_watcher: Option<RecommendedWatcher>, // watches the config's parent dir so atomic-rename saves are caught
     config_error_toast: Option<std::time::Instant>, // transient parse-error notice
     highlighter: Option<Arc<Highlighter>>,       // built lazily on the first diff (when syntax on)
-    syntax_enabled: bool,                        // false ⇒ original flat per-line coloring
-    theme: highlight::EmbeddedThemeName, // configured syntax theme (validated at the config boundary)
-    diff_bg: DiffBg,                     // add/del row background mode + colors
+    /// Everything that decides a diff's spans, held whole so the config reload
+    /// compares and assigns it in one move. See `SpanSettings`.
+    span_settings: SpanSettings,
     diff_palette: highlight::DiffPalette, // theme-derived diff colours (both modes)
-    /// `[diff.languages]`: extensions syntect has no grammar for, and what to
-    /// highlight them as. Held so the highlighter can be rebuilt with it — on the
-    /// prewarm install, the synchronous fallback, and a config reload.
-    diff_languages: highlight::LanguageMap,
-    diff_needs_highlight: bool, // diff_lines changed; re-run highlight_diff
+    diff_needs_highlight: bool,           // diff_lines changed; re-run highlight_diff
     diff_generation: Epoch, // bumped each highlight pass; lets stale workers bail + results drop
     highlight_tx: mpsc::Sender<HighlightBatch>, // worker → UI: per-file span updates
     highlight_rx: mpsc::Receiver<HighlightBatch>,
@@ -2428,9 +2491,6 @@ struct GitkApp {
     /// failed? Carried across the display so `stash_current_diff` can hand it back to
     /// `cache_diff`, which is the one caller that reassembles a `DiffData` from parts.
     diff_textconv_failed: bool,
-    /// Deepest file-start line of the current diff (None ⇒ no files) — the render's
-    /// `last_top_anchor`. Fixed per diff, so computed at install, not per frame.
-    diff_last_top_anchor: Option<usize>,
     /// Cached per-row galleys for the (un-virtualized) file-list sidebar.
     sidebar_cache: SidebarCache,
     /// Sorted `(patch start line, file index)` for the current diff — the
@@ -3109,15 +3169,16 @@ impl GitkApp {
             config_error_toast: startup_issue.then(std::time::Instant::now),
             diff_max_chars,
             diff_textconv_failed: false,
-            diff_last_top_anchor: None,
             sidebar_cache: SidebarCache::default(),
             file_line_starts: Vec::new(),
             clipboard: None,
             highlighter: None,
-            syntax_enabled,
-            theme,
-            diff_bg,
-            diff_languages: cfg.diff.languages.clone(),
+            span_settings: SpanSettings {
+                enabled: syntax_enabled,
+                theme,
+                diff_bg,
+                languages: cfg.diff.languages.clone(),
+            },
             diff_palette,
             diff_needs_highlight: false, // no diff yet — the deferred startup load arms highlighting
             diff_generation: Epoch::default(),
@@ -3303,8 +3364,8 @@ impl GitkApp {
         DiffCacheKey {
             oid,
             settings: self.diff_settings,
-            theme: self.theme,
-            enabled: self.syntax_enabled,
+            theme: self.span_settings.theme,
+            enabled: self.span_settings.enabled,
             content: self
                 .row_source(oid)
                 .range()
@@ -3667,8 +3728,6 @@ impl GitkApp {
         self.diff_top_line.store(0, Ordering::Relaxed);
         self.rebuild_file_rows();
         self.file_line_starts = file_line_starts(&self.diff_files);
-        // Sorted by start, so the last entry is the largest file start.
-        self.diff_last_top_anchor = self.file_line_starts.last().map(|&(s, _)| s);
         self.invalidate_diff_highlight();
     }
 
@@ -3827,7 +3886,7 @@ impl GitkApp {
         // A `None` highlighter is the startup window before the prewarm thread
         // lands, not an error: skip and behave exactly as before.
         //
-        // Also gated on `self.syntax_enabled`: `self.highlighter` outlives a
+        // Also gated on `self.span_settings.enabled`: `self.highlighter` outlives a
         // syntax-off toggle (the config-reload branch rebuilds and keeps it
         // whenever the theme changes too, regardless of the new `enabled`
         // value), so `same_oid_rebuild` alone is not sufficient — without this,
@@ -3836,9 +3895,9 @@ impl GitkApp {
         // bool, never reads. That would break the "syntax off is cost-free"
         // promise every other highlight-dispatch site in this file keeps
         // (`ensure_diff_highlighted`'s early return, `dispatch_prefetch`'s own
-        // `if self.syntax_enabled` guard at its call site) and delay the swap
+        // `if self.span_settings.enabled` guard at its call site) and delay the swap
         // for nothing.
-        let prehighlight = (same_oid_rebuild && self.syntax_enabled)
+        let prehighlight = (same_oid_rebuild && self.span_settings.enabled)
             .then(|| self.highlighter.clone())
             .flatten()
             .map(|hl| PreHighlight {
@@ -3965,48 +4024,37 @@ impl GitkApp {
             let action = apply::ApplyAction::of(req.source.oid());
             let scope = if req.hunk.is_some() { "hunk" } else { "file" };
             match outcome {
-                Ok(()) => {
-                    self.set_apply_status(
-                        format!("{} {scope}: {}", action.verb(), req.display_path()),
-                        false,
-                    );
-                    self.reload_armed_at = Some(std::time::Instant::now());
-                    // `handle_git_reload` — which schedules the wake-up that runs
-                    // an armed reload — already ran earlier this frame, so arming
-                    // it here would otherwise wait for some other repaint to come
-                    // along. Usually one does (the `.git` watcher fires, because
-                    // every action rewrites `.git/index`), but not for the binary
-                    // blob restore: `restore_binary` only touches the worktree, so
-                    // nothing under `.git` changes and the watcher stays silent.
-                    // Without this the pane would sit on pre-revert content until
-                    // the status message's own fade timer happened to repaint.
-                    self.egui_ctx.request_repaint_after(RELOAD_DEBOUNCE);
-                    // No `load_selected_diff()` here: the armed reload dispatches
-                    // a Rebuild, and `drain_history_results` already ends with one
-                    // — so calling it now would compute the same diff twice, and
-                    // for a virtual row (content-keyed, so the immediate call
-                    // always misses the cache) that means two full `get_diff_data`
-                    // runs plus a visible re-flash of the pane per click.
-                }
+                Ok(()) => self.set_apply_status(
+                    format!("{} {scope}: {}", action.verb(), req.display_path()),
+                    false,
+                ),
                 Err(e) => {
                     if let Some(raw) = e.detail() {
                         log::warn!("gitkay: {} {scope} failed: {raw}", action.verb());
                     }
                     self.set_apply_status(e.user_message(action, &req.display_path()), true);
-                    // Refresh on this branch too. Most failures are refusals
-                    // decided before anything was written, where the reload is a
-                    // cheap no-op — but not all of them are: `restore_binary`
-                    // writes the parent-side file before it removes the
-                    // commit-side one, so an IO error in between fails with the
-                    // worktree already changed. Left unarmed, the pane would keep
-                    // rendering pre-write content until something else happened
-                    // to reload — and for the blob restore nothing does, since it
-                    // never touches `.git` and the watcher stays silent (same
-                    // reason the success branch needs the explicit repaint).
-                    self.reload_armed_at = Some(std::time::Instant::now());
-                    self.egui_ctx.request_repaint_after(RELOAD_DEBOUNCE);
                 }
             }
+            // EVERY outcome re-arms the reload, success and failure alike. Most
+            // failures are refusals decided before anything was written, where the
+            // reload is a cheap no-op — but not all of them are: `restore_binary`
+            // writes the parent-side file before it removes the commit-side one, so
+            // an IO error in between fails with the worktree already changed, and
+            // left unarmed the pane would keep rendering pre-write content.
+            //
+            // The repaint is ours to schedule because `handle_git_reload` — which
+            // wakes an armed reload — already ran earlier this frame. Usually the
+            // `.git` watcher would cover it (every action rewrites `.git/index`),
+            // but not for the binary blob restore: that only touches the worktree,
+            // so nothing under `.git` changes and the watcher stays silent.
+            //
+            // No `load_selected_diff()` here: the armed reload dispatches a Rebuild
+            // and `drain_history_results` already ends with one, so calling it now
+            // would compute the same diff twice — and for a virtual row
+            // (content-keyed, so the immediate call always misses the cache) that
+            // means two full `get_diff_data` runs plus a re-flash of the pane.
+            self.reload_armed_at = Some(std::time::Instant::now());
+            self.egui_ctx.request_repaint_after(RELOAD_DEBOUNCE);
         }
     }
 
@@ -4093,7 +4141,7 @@ impl GitkApp {
         }
         // Syntax off ⇒ the original flat render path is used; never build the
         // highlighter or tokenize (keeps the disabled mode cost-free).
-        if !self.syntax_enabled {
+        if !self.span_settings.enabled {
             self.diff_needs_highlight = false;
             return;
         }
@@ -4108,9 +4156,9 @@ impl GitkApp {
                 // reuses the warm SyntaxSet.
                 Some(Ok(prewarmed)) => {
                     self.highlighter = Some(Arc::new(prewarmed.reconfigured(
-                        self.theme,
-                        self.diff_bg,
-                        &self.diff_languages,
+                        self.span_settings.theme,
+                        self.span_settings.diff_bg,
+                        &self.span_settings.languages,
                     )));
                     self.prewarm_rx = None;
                 }
@@ -4128,7 +4176,11 @@ impl GitkApp {
                 Some(Err(mpsc::TryRecvError::Disconnected)) | None => {
                     self.prewarm_rx = None;
                     let t = std::time::Instant::now();
-                    let hl = Highlighter::new(self.theme, self.diff_bg, &self.diff_languages);
+                    let hl = Highlighter::new(
+                        self.span_settings.theme,
+                        self.span_settings.diff_bg,
+                        &self.span_settings.languages,
+                    );
                     log::debug!("perf: built highlighter (sync fallback) {:?}", t.elapsed());
                     self.highlighter = Some(Arc::new(hl));
                 }
@@ -4208,6 +4260,35 @@ impl GitkApp {
         }
     }
 
+    /// Is the pane still waiting for its FIRST diff?
+    ///
+    /// While it is, speculative work stands down. Both pools are sized to fill the
+    /// machine — eight stats workers, eight prefetch — and neither has any thread
+    /// priority, so at startup they race the one diff the reader is actually looking
+    /// at: measured on a 67k-commit repo, eight stats jobs at 1.2–1.4s each and a
+    /// 63-row prefetch band, alongside a foreground diff that took 997ms. Waiting
+    /// costs the band nothing, since it is warm long before anyone can scroll to it.
+    ///
+    /// Only ever true at startup: `current_diff_key` is `Some` from the first
+    /// install onward, so this stops gating anything the moment a diff exists.
+    ///
+    /// `startup_diff` is half the answer and is easy to leave out — the first frame
+    /// deliberately paints the commit list BEFORE dispatching any diff
+    /// (`StartupDiff::NeedsPaint`), so on that frame no load has started and a check
+    /// on `diff_load_started_at` alone reads as "nothing is loading". Measured with
+    /// only that half: the prefetch band waited correctly while eight stats jobs went
+    /// out on the first frame and finished at 631–700ms, straddling the 692ms diff
+    /// they were supposed to yield to.
+    ///
+    /// Both halves release on failure rather than sticking: a failed load clears
+    /// `diff_load_started_at`, and `StartupDiff` reaches `Done` whether or not a diff
+    /// arrived — including when there are no commits to load one for.
+    const fn awaiting_first_diff(&self) -> bool {
+        self.current_diff_key.is_none()
+            && (self.diff_load_started_at.is_some()
+                || !matches!(self.startup_diff, StartupDiff::Done))
+    }
+
     /// Queue the commit-list rows still needing numbers onto the shared pool.
     ///
     /// No longer a batch on a dedicated thread. That shape put every row of a screenful
@@ -4240,35 +4321,6 @@ impl GitkApp {
     /// across an invalidation), which is why the comparison against a freshly built list
     /// is the gate: it cannot be stale, because it is recomputed from the state it gates
     /// on.
-    /// Is the pane still waiting for its FIRST diff?
-    ///
-    /// While it is, speculative work stands down. Both pools are sized to fill the
-    /// machine — eight stats workers, eight prefetch — and neither has any thread
-    /// priority, so at startup they race the one diff the reader is actually looking
-    /// at: measured on a 67k-commit repo, eight stats jobs at 1.2–1.4s each and a
-    /// 63-row prefetch band, alongside a foreground diff that took 997ms. Waiting
-    /// costs the band nothing, since it is warm long before anyone can scroll to it.
-    ///
-    /// Only ever true at startup: `current_diff_key` is `Some` from the first
-    /// install onward, so this stops gating anything the moment a diff exists.
-    ///
-    /// `startup_diff` is half the answer and is easy to leave out — the first frame
-    /// deliberately paints the commit list BEFORE dispatching any diff
-    /// (`StartupDiff::NeedsPaint`), so on that frame no load has started and a check
-    /// on `diff_load_started_at` alone reads as "nothing is loading". Measured with
-    /// only that half: the prefetch band waited correctly while eight stats jobs went
-    /// out on the first frame and finished at 631–700ms, straddling the 692ms diff
-    /// they were supposed to yield to.
-    ///
-    /// Both halves release on failure rather than sticking: a failed load clears
-    /// `diff_load_started_at`, and `StartupDiff` reaches `Done` whether or not a diff
-    /// arrived — including when there are no commits to load one for.
-    const fn awaiting_first_diff(&self) -> bool {
-        self.current_diff_key.is_none()
-            && (self.diff_load_started_at.is_some()
-                || !matches!(self.startup_diff, StartupDiff::Done))
-    }
-
     fn dispatch_commit_stats(&mut self, ctx: &egui::Context) {
         if !self.commit_list_cfg.any() {
             return;
@@ -5355,6 +5407,55 @@ impl GitkApp {
         meta.galley(egui::pos2(at.date, meta_y), date_galley, SUBTEXT);
     }
 
+    /// A click in the commit list: select the row it landed on, and copy a real
+    /// commit's SHA to both clipboards.
+    ///
+    /// Beside the `draw_*` row helpers rather than inline in `show_rows`' closure,
+    /// because it is the one `&mut self` mutation tangled in the row-drawing borrow
+    /// region — and the only part of that closure to reach five levels of nesting.
+    fn handle_commit_click(
+        &mut self,
+        response: &egui::Response,
+        top_y: f32,
+        row_height: f32,
+        first_row: usize,
+        ctx: &egui::Context,
+    ) {
+        if !response.clicked() {
+            return;
+        }
+        let Some(pos) = response.interact_pointer_pos() else {
+            return;
+        };
+        let clicked_idx = first_row + ((pos.y - top_y) / row_height) as usize;
+        let Some(commit) = self.commits.get(clicked_idx) else {
+            return;
+        };
+        let clicked_oid = commit.oid;
+        // Copy SHA to both clipboards — but only for real commits: the virtual
+        // Uncommitted/Staged rows carry sentinel oids (ffff…/fefe…) that would
+        // clobber the clipboard with a fake SHA.
+        if is_real_commit(clicked_oid) {
+            let sha = clicked_oid.to_string();
+            ctx.copy_text(sha.clone());
+            // Also set primary selection (middle-click paste), over a display-server
+            // connection made once and kept for the session.
+            if self.clipboard.is_none() {
+                self.clipboard = arboard::Clipboard::new().ok();
+            }
+            if let Some(clip) = self.clipboard.as_mut() {
+                let _ = clip
+                    .set()
+                    .clipboard(arboard::LinuxClipboardKind::Primary)
+                    .text(&sha);
+            }
+            self.copied_toast = Some(std::time::Instant::now());
+        }
+        // The clicked commit is already loaded at clicked_idx — select it and load
+        // its diff, exactly like arrow-key nav.
+        self.select_loaded(clicked_idx);
+    }
+
     fn show_commit_list(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         // Row height follows the largest configured row font (summary/meta) so
         // `[text]` sizes beyond the default don't overlap or clip; today's 20px
@@ -5422,41 +5523,13 @@ impl GitkApp {
                         );
                         let top_left = response.rect.min;
 
-                        // Check click — select commit and copy SHA
-                        if response.clicked()
-                            && let Some(pos) = response.interact_pointer_pos()
-                        {
-                            let row_offset = ((pos.y - top_left.y) / row_height) as usize;
-                            let clicked_idx = row_range.start + row_offset;
-                            if clicked_idx < num_commits {
-                                let commit = &self.commits[clicked_idx];
-                                let clicked_oid = commit.oid;
-                                // Copy SHA to both clipboards — but only for real
-                                // commits: the virtual Uncommitted/Staged rows carry
-                                // sentinel oids (ffff…/fefe…) that would clobber the
-                                // clipboard with a fake SHA.
-                                if is_real_commit(clicked_oid) {
-                                    let sha = clicked_oid.to_string();
-                                    ctx.copy_text(sha.clone());
-                                    // Also set primary selection (middle-click paste),
-                                    // over a display-server connection made once and
-                                    // kept for the session.
-                                    if self.clipboard.is_none() {
-                                        self.clipboard = arboard::Clipboard::new().ok();
-                                    }
-                                    if let Some(clip) = self.clipboard.as_mut() {
-                                        let _ = clip
-                                            .set()
-                                            .clipboard(arboard::LinuxClipboardKind::Primary)
-                                            .text(&sha);
-                                    }
-                                    self.copied_toast = Some(std::time::Instant::now());
-                                }
-                                // The clicked commit is already loaded at clicked_idx —
-                                // select it and load its diff, exactly like arrow-key nav.
-                                self.select_loaded(clicked_idx);
-                            }
-                        }
+                        self.handle_commit_click(
+                            &response,
+                            top_left.y,
+                            row_height,
+                            row_range.start,
+                            ctx,
+                        );
 
                         for idx in row_range.clone() {
                             let commit = &self.commits[idx];
@@ -5631,7 +5704,15 @@ impl GitkApp {
                     .diff_toolbar_rect
                     .is_some_and(|r| r.expand(2.0).contains(p))
         });
-        let mut diff_opts_changed = false;
+        // The whole struct, compared after the widgets have run — not a flag each
+        // widget sets by hand. A fifth `DiffSettings` control that forgot the flag
+        // would mutate the settings and skip both the stats invalidation and the
+        // reload, leaving the pane on the old shape and the column on counts from
+        // settings that no longer apply — and the omission would read as deliberate,
+        // since `word_diff` beside them legitimately does not trigger a reload. It is
+        // also more precise: `-` at context 0 and `+` at 99 set the flag while
+        // changing nothing. `word_diff` is not a `DiffSettings` field, so it stays
+        // excluded for free.
         let before = self.diff_settings;
         if show_toolbar {
             let area = egui::Area::new(egui::Id::new("diff_opts_toolbar"))
@@ -5644,7 +5725,6 @@ impl GitkApp {
                             if ui.small_button("-").clicked() {
                                 self.diff_settings.context =
                                     self.diff_settings.context.saturating_sub(1);
-                                diff_opts_changed = true;
                             }
                             ui.label(
                                 egui::RichText::new(self.diff_settings.context.to_string())
@@ -5653,18 +5733,11 @@ impl GitkApp {
                             if ui.small_button("+").clicked() {
                                 self.diff_settings.context =
                                     self.diff_settings.context.saturating_add(1).min(99);
-                                diff_opts_changed = true;
                             }
                             ui.add_space(12.0);
-                            diff_opts_changed |= ui
-                                .checkbox(&mut self.diff_settings.ignore_ws, "Ignore whitespace")
-                                .changed();
-                            diff_opts_changed |= ui
-                                .checkbox(&mut self.diff_settings.detect_renames, "Detect renames")
-                                .changed();
-                            diff_opts_changed |= ui
-                                .checkbox(&mut self.diff_settings.detect_copies, "Detect copies")
-                                .changed();
+                            ui.checkbox(&mut self.diff_settings.ignore_ws, "Ignore whitespace");
+                            ui.checkbox(&mut self.diff_settings.detect_renames, "Detect renames");
+                            ui.checkbox(&mut self.diff_settings.detect_copies, "Detect copies");
                             // Word-diff only changes the render, so no diff
                             // reload. Emphasis fills lazily per viewport
                             // (ensure_visible_word_emphasis) at the top of
@@ -5682,7 +5755,7 @@ impl GitkApp {
         } else {
             self.diff_toolbar_rect = None;
         }
-        if diff_opts_changed {
+        if self.diff_settings != before {
             self.invalidate_stats_if_counts_changed(before);
             self.load_selected_diff();
         }
@@ -6052,73 +6125,66 @@ impl GitkApp {
         if self.needs_reload.swap(false, Ordering::Relaxed) {
             self.reload_armed_at = Some(std::time::Instant::now());
         }
-        if let Some(armed) = self.reload_armed_at {
-            let elapsed = armed.elapsed();
-            if elapsed >= RELOAD_DEBOUNCE {
-                self.reload_armed_at = None;
-                // `.git/config` is under the watcher, so this is where a
-                // `diff.<name>.textconv` edit takes effect — and editing one is how a
-                // reader FIXES a file stuck on `Binary files … differ`. The driver map
-                // is resolved once by the first worker to build a diff, so without this
-                // the fix needs a restart. It also re-arms every command that hung, and
-                // gives a config read that failed once (an EMFILE while eight workers
-                // open handles) a second chance instead of leaving textconv off for the
-                // session.
-                //
-                // Dropping the map is necessary and NOT sufficient: the two caches in
-                // front of it record no command, so the fix would re-resolve and change
-                // nothing on screen. `apply_driver_change` is the other half, and it
-                // runs when the next build reports that the map really moved.
-                self.diff_deps.textconv.invalidate();
-                // Which needs something to re-resolve it, and on a settled view of a
-                // clean worktree nothing does: the closing `load_selected_diff` hits its
-                // identical-key early return, the prefetch band is already warm so every
-                // target is filtered out by `diff_cache.contains`, and no virtual row
-                // means no stats job either. So the edit was re-resolved by nobody and
-                // the fix appeared to need a restart. This asks explicitly, on a worker
-                // that owns a repo handle — resolving needs one, and opening it here is
-                // the IO this app keeps off the frame loop.
-                self.dispatch_driver_resolve(ctx);
-                // The latch `invalidate` just re-armed has a counterpart in the band:
-                // rows dropped for a conversion that failed are remembered by the
-                // coordinator, and nothing else would ever let them back in.
-                if let Some(pool) = &self.prefetch_pool {
-                    pool.retry_unconverted();
-                }
-                // And the same latch has a counterpart on SCREEN, which nothing else
-                // reaches. The displayed diff may be the raw fallback one overrun of
-                // `TEXTCONV_TIMEOUT` produced, and `textconv_failed` is not part of
-                // `DiffCacheKey` — so the closing `load_selected_diff` takes its
-                // identical-key early return, and `install_preferring_cache` would drop
-                // the result even if it did not. Meanwhile the band re-warms that row
-                // successfully, so the cache ends up holding the converted patch while
-                // the pane keeps `Binary files … differ` until the reader navigates
-                // away and back. Dropping the displayed key states what is true — the
-                // content on screen is not a valid answer for it — which is what
-                // `apply_driver_change` gets for free from the fingerprint moving.
-                if self.diff_textconv_failed {
-                    self.diff_content_stale = true;
-                    self.load_selected_diff();
-                }
-                // The virtual rows' content moved; every real commit's stats
-                // stay valid, so drop exactly those rather than the map. Asked
-                // through `CommitKind::of`, the single oid → kind mapping —
-                // never by comparing the sentinel oids here.
-                self.commit_stats
-                    .retain(|oid, _| !CommitKind::of(*oid).is_virtual());
-                // Retry failed rows: a reload is exactly when a previously
-                // unreadable object may have become readable again. See
-                // `retry_failed_stats`.
-                retry_failed_stats(&mut self.commit_stats);
-                // Rebuild on a worker (the walk stalls the frame loop on a
-                // long-loaded history); the result lands in drain_history_results,
-                // which re-anchors the selection and refreshes the diff.
-                let count = real_commit_count(&self.commits).max(INITIAL_COMMITS);
-                self.dispatch_history_load(HistoryJobKind::Rebuild { count });
-            } else {
-                // Wake up when the debounce window closes to run the reload.
-                ctx.request_repaint_after(RELOAD_DEBOUNCE.saturating_sub(elapsed));
+        if debounce_expired(&mut self.reload_armed_at, RELOAD_DEBOUNCE, ctx) {
+            // `.git/config` is under the watcher, so this is where a
+            // `diff.<name>.textconv` edit takes effect — and editing one is how a
+            // reader FIXES a file stuck on `Binary files … differ`. The driver map
+            // is resolved once by the first worker to build a diff, so without this
+            // the fix needs a restart. It also re-arms every command that hung, and
+            // gives a config read that failed once (an EMFILE while eight workers
+            // open handles) a second chance instead of leaving textconv off for the
+            // session.
+            //
+            // Dropping the map is necessary and NOT sufficient: the two caches in
+            // front of it record no command, so the fix would re-resolve and change
+            // nothing on screen. `apply_driver_change` is the other half, and it
+            // runs when the next build reports that the map really moved.
+            self.diff_deps.textconv.invalidate();
+            // Which needs something to re-resolve it, and on a settled view of a
+            // clean worktree nothing does: the closing `load_selected_diff` hits its
+            // identical-key early return, the prefetch band is already warm so every
+            // target is filtered out by `diff_cache.contains`, and no virtual row
+            // means no stats job either. So the edit was re-resolved by nobody and
+            // the fix appeared to need a restart. This asks explicitly, on a worker
+            // that owns a repo handle — resolving needs one, and opening it here is
+            // the IO this app keeps off the frame loop.
+            self.dispatch_driver_resolve(ctx);
+            // The latch `invalidate` just re-armed has a counterpart in the band:
+            // rows dropped for a conversion that failed are remembered by the
+            // coordinator, and nothing else would ever let them back in.
+            if let Some(pool) = &self.prefetch_pool {
+                pool.retry_unconverted();
             }
+            // And the same latch has a counterpart on SCREEN, which nothing else
+            // reaches. The displayed diff may be the raw fallback one overrun of
+            // `TEXTCONV_TIMEOUT` produced, and `textconv_failed` is not part of
+            // `DiffCacheKey` — so the closing `load_selected_diff` takes its
+            // identical-key early return, and `install_preferring_cache` would drop
+            // the result even if it did not. Meanwhile the band re-warms that row
+            // successfully, so the cache ends up holding the converted patch while
+            // the pane keeps `Binary files … differ` until the reader navigates
+            // away and back. Dropping the displayed key states what is true — the
+            // content on screen is not a valid answer for it — which is what
+            // `apply_driver_change` gets for free from the fingerprint moving.
+            if self.diff_textconv_failed {
+                self.diff_content_stale = true;
+                self.load_selected_diff();
+            }
+            // The virtual rows' content moved; every real commit's stats
+            // stay valid, so drop exactly those rather than the map. Asked
+            // through `CommitKind::of`, the single oid → kind mapping —
+            // never by comparing the sentinel oids here.
+            self.commit_stats
+                .retain(|oid, _| !CommitKind::of(*oid).is_virtual());
+            // Retry failed rows: a reload is exactly when a previously
+            // unreadable object may have become readable again. See
+            // `retry_failed_stats`.
+            retry_failed_stats(&mut self.commit_stats);
+            // Rebuild on a worker (the walk stalls the frame loop on a
+            // long-loaded history); the result lands in drain_history_results,
+            // which re-anchors the selection and refreshes the diff.
+            let count = real_commit_count(&self.commits).max(INITIAL_COMMITS);
+            self.dispatch_history_load(HistoryJobKind::Rebuild { count });
         }
     }
 
@@ -6126,15 +6192,8 @@ impl GitkApp {
     /// `jump_to_current_match_deferred`) — the same arm/expire shape as
     /// `handle_git_reload`.
     fn handle_search_debounce(&mut self, ctx: &egui::Context) {
-        if let Some(armed) = self.search_diff_armed_at {
-            let elapsed = armed.elapsed();
-            if elapsed >= SEARCH_DIFF_DEBOUNCE {
-                self.search_diff_armed_at = None;
-                self.load_selected_diff();
-            } else {
-                // Wake up when the debounce window closes to run the load.
-                ctx.request_repaint_after(SEARCH_DIFF_DEBOUNCE.saturating_sub(elapsed));
-            }
+        if debounce_expired(&mut self.search_diff_armed_at, SEARCH_DIFF_DEBOUNCE, ctx) {
+            self.load_selected_diff();
         }
     }
 
@@ -6172,20 +6231,22 @@ impl GitkApp {
                     ctx.set_fonts(defs);
                     warned |= !warns.is_empty();
                 }
-                let new_enabled = cfg.diff.syntax;
                 // Same resolve-and-warn path as startup (stderr now, toast below),
                 // so config typos aren't silent on a headless desktop.
                 let (new_theme, new_diff_bg, visuals_warned) = resolve_config_visuals(&cfg);
                 warned |= visuals_warned;
-                if new_enabled != self.syntax_enabled
-                    || new_theme != self.theme
-                    || new_diff_bg != self.diff_bg
-                    || cfg.diff.languages != self.diff_languages
-                {
-                    self.syntax_enabled = new_enabled;
-                    self.theme = new_theme;
-                    self.diff_bg = new_diff_bg;
-                    self.diff_languages = cfg.diff.languages.clone();
+                // Compared and assigned WHOLE, the way `DiffSettings` is below and for
+                // the same reason: a fifth span setting joins both for free, where the
+                // four-term chain this replaced would have compiled unchanged without
+                // it and left every cached diff on yesterday's colours for the session.
+                let new_spans = SpanSettings {
+                    enabled: cfg.diff.syntax,
+                    theme: new_theme,
+                    diff_bg: new_diff_bg,
+                    languages: cfg.diff.languages.clone(),
+                };
+                if new_spans != self.span_settings {
+                    self.span_settings = new_spans;
                     // Every cached diff's spans were tokenized under the OLD settings,
                     // and only two of the four are in `DiffCacheKey` — `theme` and
                     // `enabled` make a stale entry miss on their own, `diff_bg` and
@@ -6210,7 +6271,7 @@ impl GitkApp {
                     // plain (the Empty branch returns and the thread's single
                     // request_repaint already fired). Re-enabling then takes the
                     // synchronous build path.
-                    if !self.syntax_enabled {
+                    if !self.span_settings.enabled {
                         self.prewarm_rx = None;
                     }
                     // Refresh the theme-derived palette (used by the syntax-off
@@ -6220,12 +6281,18 @@ impl GitkApp {
                     // blob is loaded once, not twice; a new Arc leaves any
                     // in-flight worker holding the old one valid.
                     if let Some(old_hl) = self.highlighter.take() {
-                        let new_hl =
-                            old_hl.reconfigured(self.theme, self.diff_bg, &self.diff_languages);
+                        let new_hl = old_hl.reconfigured(
+                            self.span_settings.theme,
+                            self.span_settings.diff_bg,
+                            &self.span_settings.languages,
+                        );
                         self.diff_palette = new_hl.palette().clone();
                         self.highlighter = Some(Arc::new(new_hl));
                     } else {
-                        self.diff_palette = highlight::palette_for(self.theme, self.diff_bg);
+                        self.diff_palette = highlight::palette_for(
+                            self.span_settings.theme,
+                            self.span_settings.diff_bg,
+                        );
                     }
                     // Re-highlight the visible diff under the new settings.
                     // Reset live spans to None so the worker re-colours every
@@ -6498,7 +6565,7 @@ impl GitkApp {
             // the O(lines) scan off the frame loop: the scroll trigger stays true for
             // every frame until a dispatch actually succeeds, so an un-memoized question
             // would be re-asked on all of them.
-            let syntax = self.syntax_enabled;
+            let syntax = self.span_settings.enabled;
             let have_highlighter = self.highlighter.is_some();
             if !self.awaiting_first_diff()
                 && band_warmable(syntax, have_highlighter, || {
@@ -6891,7 +6958,11 @@ impl eframe::App for GitkApp {
                         } else {
                             self.diff_scroll_to.take()
                         },
-                        last_top_anchor: self.diff_last_top_anchor,
+                        // Deepest file-start line (None ⇒ no files). `file_line_starts`
+                        // is sorted by start, so the last entry is the largest — an
+                        // O(1) read, derived here rather than mirrored in a field
+                        // that a future write to `file_line_starts` could forget.
+                        last_top_anchor: self.file_line_starts.last().map(|&(s, _)| s),
                         menu_salt: diff_menu_salt(self.current_diff_key.as_ref()),
                     };
                     // One render path for both modes. Syntax-on takes row colours from
@@ -6902,7 +6973,7 @@ impl eframe::App for GitkApp {
                     // from the active theme: with syntax on prefer the highlighter's
                     // copy once built, falling back to the theme palette until then;
                     // with syntax off use the theme palette directly.
-                    let syntax = self.syntax_enabled;
+                    let syntax = self.span_settings.enabled;
                     let render_palette = if syntax {
                         self.highlighter
                             .as_ref()
@@ -7326,7 +7397,7 @@ mod tests {
     use crate::diff::{LineStats, oid_staged, oid_uncommitted};
     use crate::diff_highlight::{file_fully_highlighted, pending_files, pick_file};
     use crate::history::load_commits;
-    use crate::test_repo::{commit_file, commit_index, commit_rename, temp_repo};
+    use crate::test_repo::{commit_file, commit_index, commit_rename, rename_file, temp_repo};
 
     /// A row's `node_col` is not bounded by the width the layout reserved, so the
     /// lane mapping must saturate into it: without that, the caller's right-edge
@@ -7555,16 +7626,7 @@ mod tests {
 
     /// Baseline `DiffSettings` (default context, every toggle off); tests flip the
     /// flag under test via struct-update syntax: `DiffSettings { show_stats: true, ..ds() }`.
-    pub fn ds() -> DiffSettings {
-        DiffSettings {
-            context: 3,
-            ignore_ws: false,
-            show_stats: false,
-            detect_renames: false,
-            detect_copies: false,
-            textconv: false,
-        }
-    }
+    pub use crate::diff::tests::base_settings as ds;
 
     #[test]
     fn diff_pad_rows_sizes_to_the_last_file() {
@@ -8939,11 +9001,7 @@ mod tests {
     fn detect_renames_coalesces_add_delete() {
         let (_d, repo) = temp_repo();
         commit_file(&repo, "old.txt", "same content\n", "base");
-        std::fs::rename(
-            repo.workdir().unwrap().join("old.txt"),
-            repo.workdir().unwrap().join("new.txt"),
-        )
-        .unwrap();
+        rename_file(&repo, "old.txt", "new.txt");
         let oid = commit_rename(&repo, "old.txt", "new.txt", "rename");
 
         let on = DiffSettings {
@@ -8980,11 +9038,7 @@ mod tests {
     fn renamed_file_has_old_path_and_header() {
         let (_d, repo) = temp_repo();
         commit_file(&repo, "old.txt", "same content\n", "base");
-        std::fs::rename(
-            repo.workdir().unwrap().join("old.txt"),
-            repo.workdir().unwrap().join("new.txt"),
-        )
-        .unwrap();
+        rename_file(&repo, "old.txt", "new.txt");
         let oid = commit_rename(&repo, "old.txt", "new.txt", "rename");
 
         let s = DiffSettings {
@@ -9526,14 +9580,7 @@ mod tests {
         commit_file(&repo, "a.rs", "fn main() {}\n", "one");
         let oid = commit_file(&repo, "a.rs", "fn main() {\n    todo!()\n}\n", "two");
         let scope = RowScope::new(DiffSource::Commit(oid));
-        let s = DiffSettings {
-            context: 3,
-            ignore_ws: false,
-            show_stats: true,
-            detect_renames: true,
-            detect_copies: false,
-            textconv: false,
-        };
+        let s = probe_settings();
         let dir = tempfile::tempdir().unwrap();
 
         // A threshold no real build can reach: nothing is written.

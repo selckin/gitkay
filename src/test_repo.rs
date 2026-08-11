@@ -120,6 +120,21 @@ pub fn write_file(repo: &git2::Repository, path: &str, content: &str) {
     std::fs::write(&full, content).unwrap();
 }
 
+/// Move a worktree file, the way a rename is staged from — `commit_rename` takes
+/// the file as already moved, so every one of its callers needs this first.
+///
+/// Its own helper rather than folded into `commit_rename`, because several tests
+/// edit the file *between* the move and the commit ("rename and edit"): doing the
+/// move inside the commit would clobber that write.
+pub fn rename_file(repo: &git2::Repository, old: &str, new: &str) {
+    let wd = repo.workdir().unwrap();
+    let to = wd.join(new);
+    if let Some(p) = to.parent() {
+        std::fs::create_dir_all(p).unwrap();
+    }
+    std::fs::rename(wd.join(old), to).unwrap();
+}
+
 /// Stage the current worktree content of `path`.
 pub fn stage(repo: &git2::Repository, path: &str) {
     let mut index = repo.index().unwrap();
@@ -316,6 +331,61 @@ pub fn index_blob(repo: &git2::Repository, path: &str) -> String {
     let entry = index.get_path(Path::new(path), 0).unwrap();
     let blob = repo.find_blob(entry.id).unwrap();
     String::from_utf8_lossy(blob.content()).into_owned()
+}
+
+/// An index entry at `path` naming `id` with `mode` and `flags`, every field libgit2
+/// does not read left zero.
+///
+/// One twelve-field literal instead of six. Nothing in these fixtures cares about
+/// `ctime`/`mtime`/`dev`/`ino`/`uid`/`gid`/`file_size` — libgit2 reads them back for
+/// staleness checks the tests never make — so spelling them out per call site was
+/// twelve lines
+/// of noise hiding the two fields that matter.
+fn index_entry(path: &str, id: git2::Oid, mode: u32, flags: u16) -> git2::IndexEntry {
+    git2::IndexEntry {
+        ctime: git2::IndexTime::new(0, 0),
+        mtime: git2::IndexTime::new(0, 0),
+        dev: 0,
+        ino: 0,
+        mode,
+        uid: 0,
+        gid: 0,
+        file_size: 0,
+        id,
+        flags,
+        flags_extended: 0,
+        path: path.as_bytes().to_vec(),
+    }
+}
+
+/// Stage a gitlink (submodule) entry at `path` pointing at commit `id`.
+///
+/// What `git submodule add` records, and the only way to build one here: git2 has no
+/// submodule-add that stops at the index.
+pub fn stage_gitlink(repo: &git2::Repository, path: &str, id: git2::Oid) {
+    let mut index = repo.index().unwrap();
+    index.add(&index_entry(path, id, 0o160_000, 0)).unwrap();
+    index.write().unwrap();
+}
+
+/// Leave `path` unmerged, with the three stages a merge conflict writes: base (1),
+/// ours (2), theirs (3), holding `contents` in that order.
+///
+/// The stage rides in the entry's `flags` at `GIT_INDEX_ENTRY_STAGESHIFT` (12), which
+/// is the whole trick and was reproduced — comment and all — at each site that needed
+/// a conflicted index.
+pub fn write_conflict_stages(repo: &git2::Repository, path: &str, contents: [&str; 3]) {
+    let mut index = repo.index().unwrap();
+    index.remove_path(Path::new(path)).unwrap();
+    for (i, content) in contents.iter().enumerate() {
+        let stage = u16::try_from(i + 1).unwrap();
+        let id = repo.blob(content.as_bytes()).unwrap();
+        index
+            .add(&index_entry(path, id, 0o100_644, stage << 12))
+            .unwrap();
+    }
+    index.write().unwrap();
+    assert!(index.has_conflicts(), "fixture must actually be conflicted");
 }
 
 /// Every other suite in the crate rests on the isolation above, so it is

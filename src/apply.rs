@@ -1413,7 +1413,8 @@ mod tests {
     };
     use crate::test_repo::{
         commit_bytes, commit_file, commit_index, commit_rename, corrupt_head, index_blob,
-        open_repo, read_file, remove_loose_object, stage, temp_repo, write_file,
+        open_repo, read_file, remove_loose_object, rename_file, stage, stage_gitlink, temp_repo,
+        write_conflict_stages, write_file,
     };
 
     fn hr(old_start: u32, old_lines: u32, new_start: u32, new_lines: u32) -> HunkRange {
@@ -1758,11 +1759,7 @@ mod tests {
     fn revert_hunk_over_a_range_refuses_a_rename() {
         let (_d, repo) = temp_repo();
         let base = commit_file(&repo, "old.txt", "a\nb\nc\n", "base");
-        std::fs::rename(
-            repo.workdir().unwrap().join("old.txt"),
-            repo.workdir().unwrap().join("new.txt"),
-        )
-        .unwrap();
+        rename_file(&repo, "old.txt", "new.txt");
         let head = commit_rename(&repo, "old.txt", "new.txt", "rename");
 
         let request = ApplyRequest::for_entry(
@@ -2319,11 +2316,7 @@ mod tests {
     fn a_hunk_click_refuses_a_rename_instead_of_moving_the_whole_file() {
         let (_d, repo) = temp_repo();
         commit_file(&repo, "a.txt", &body(&[]), "base");
-        std::fs::rename(
-            repo.workdir().unwrap().join("a.txt"),
-            repo.workdir().unwrap().join("b.txt"),
-        )
-        .unwrap();
+        rename_file(&repo, "a.txt", "b.txt");
         write_file(&repo, "b.txt", &body(&[3]));
         let target = commit_rename(&repo, "a.txt", "b.txt", "rename a->b and edit");
 
@@ -2362,11 +2355,7 @@ mod tests {
     fn revert_file_undoes_a_rename() {
         let (_d, repo) = temp_repo();
         commit_file(&repo, "a.txt", &body(&[]), "base");
-        std::fs::rename(
-            repo.workdir().unwrap().join("a.txt"),
-            repo.workdir().unwrap().join("b.txt"),
-        )
-        .unwrap();
+        rename_file(&repo, "a.txt", "b.txt");
         let target = commit_rename(&repo, "a.txt", "b.txt", "rename a->b");
 
         let request = renamed_req(DiffSource::Commit(target), "a.txt", "b.txt");
@@ -2391,11 +2380,7 @@ mod tests {
         // duplicates the file instead of moving it back.
         let (_d, repo) = temp_repo();
         commit_bytes(&repo, "a.bin", &[0u8, 1, 2, 3], "add binary");
-        std::fs::rename(
-            repo.workdir().unwrap().join("a.bin"),
-            repo.workdir().unwrap().join("b.bin"),
-        )
-        .unwrap();
+        rename_file(&repo, "a.bin", "b.bin");
         let target = commit_rename(&repo, "a.bin", "b.bin", "rename binary a->b");
 
         let request = renamed_req(DiffSource::Commit(target), "a.bin", "b.bin");
@@ -2546,7 +2531,7 @@ mod tests {
             let mut index = repo.index().unwrap();
             commit_index(&repo, &mut index, "add binary");
         }
-        std::fs::rename(workdir.join("a/x.bin"), workdir.join("b/y.bin")).unwrap();
+        rename_file(&repo, "a/x.bin", "b/y.bin");
         let target = commit_rename(&repo, "a/x.bin", "b/y.bin", "rename binary");
 
         // Unlinking from a read-only directory fails with EACCES — unless we are
@@ -2592,11 +2577,7 @@ mod tests {
         // that guard block leaves all other tests green; only this one catches it.
         let (_d, repo) = temp_repo();
         commit_bytes(&repo, "a.bin", &[0u8, 1, 2, 3], "add binary");
-        std::fs::rename(
-            repo.workdir().unwrap().join("a.bin"),
-            repo.workdir().unwrap().join("b.bin"),
-        )
-        .unwrap();
+        rename_file(&repo, "a.bin", "b.bin");
         let target = commit_rename(&repo, "a.bin", "b.bin", "rename binary a->b");
 
         // Someone/something put different content at the pre-rename path since.
@@ -3084,29 +3065,11 @@ mod tests {
         let (_d, repo) = temp_repo();
         let first = commit_file(&repo, "unrelated.txt", "x\n", "base");
         let second = commit_file(&repo, "unrelated.txt", "y\n", "second");
-        let gitlink = |id: git2::Oid| git2::IndexEntry {
-            ctime: git2::IndexTime::new(0, 0),
-            mtime: git2::IndexTime::new(0, 0),
-            dev: 0,
-            ino: 0,
-            mode: 0o160_000,
-            uid: 0,
-            gid: 0,
-            file_size: 0,
-            id,
-            flags: 0,
-            flags_extended: 0,
-            path: b"sub".to_vec(),
-        };
         // HEAD records the submodule at `first`; the index has it moved to
         // `second` — a staged submodule bump, the thing being unstaged.
-        {
-            let mut index = repo.index().unwrap();
-            index.add(&gitlink(first)).unwrap();
-            commit_index(&repo, &mut index, "add submodule");
-            index.add(&gitlink(second)).unwrap();
-            index.write().unwrap();
-        }
+        stage_gitlink(&repo, "sub", first);
+        commit_index(&repo, &mut repo.index().unwrap(), "add submodule");
+        stage_gitlink(&repo, "sub", second);
 
         let err =
             apply_request(&repo, &req(DiffSource::Staged, "sub", None), settings()).unwrap_err();
@@ -3335,7 +3298,7 @@ mod tests {
         let workdir = repo.workdir().unwrap().to_path_buf();
         // The content survives under a different name; only the tracked path
         // becomes unresolvable, so this is emphatically not a deletion.
-        std::fs::rename(workdir.join("d"), workdir.join("real")).unwrap();
+        rename_file(&repo, "d", "real");
         std::os::unix::fs::symlink("d", workdir.join("d")).unwrap();
         let kind = workdir
             .join("d/f.txt")
@@ -3463,26 +3426,8 @@ mod tests {
         let sub = git2::Oid::from_bytes(&[3u8; 20]).unwrap();
 
         // A gitlink entry, committed: what adding a submodule records.
-        {
-            let mut index = repo.index().unwrap();
-            index
-                .add(&git2::IndexEntry {
-                    ctime: git2::IndexTime::new(0, 0),
-                    mtime: git2::IndexTime::new(0, 0),
-                    dev: 0,
-                    ino: 0,
-                    mode: 0o160_000,
-                    uid: 0,
-                    gid: 0,
-                    file_size: 0,
-                    id: sub,
-                    flags: 0,
-                    flags_extended: 0,
-                    path: b"vendor/lib".to_vec(),
-                })
-                .unwrap();
-            commit_index(&repo, &mut index, "add submodule");
-        }
+        stage_gitlink(&repo, "vendor/lib", sub);
+        commit_index(&repo, &mut repo.index().unwrap(), "add submodule");
         let target = repo.head().unwrap().peel_to_commit().unwrap().id();
         // Checked out, as a real submodule would be.
         std::fs::create_dir_all(repo.workdir().unwrap().join("vendor/lib")).unwrap();
@@ -3850,29 +3795,7 @@ mod tests {
             .id;
 
         // The three stages a merge conflict leaves behind: base, ours, theirs.
-        let conflicted = |stage: u16, content: &str| git2::IndexEntry {
-            ctime: git2::IndexTime::new(0, 0),
-            mtime: git2::IndexTime::new(0, 0),
-            dev: 0,
-            ino: 0,
-            mode: 0o100_644,
-            uid: 0,
-            gid: 0,
-            file_size: 0,
-            id: repo.blob(content.as_bytes()).unwrap(),
-            flags: stage << 12, // GIT_INDEX_ENTRY_STAGESHIFT
-            flags_extended: 0,
-            path: b"f.txt".to_vec(),
-        };
-        {
-            let mut index = repo.index().unwrap();
-            index.remove_path(std::path::Path::new("f.txt")).unwrap();
-            index.add(&conflicted(1, "base\n")).unwrap();
-            index.add(&conflicted(2, "ours\n")).unwrap();
-            index.add(&conflicted(3, "theirs\n")).unwrap();
-            index.write().unwrap();
-            assert!(index.has_conflicts(), "fixture must actually be conflicted");
-        }
+        write_conflict_stages(&repo, "f.txt", ["base\n", "ours\n", "theirs\n"]);
 
         apply_request(&repo, &req(DiffSource::Staged, "f.txt", None), settings()).unwrap();
 

@@ -236,7 +236,7 @@ mod tests {
     use super::*;
     use git2::Repository;
 
-    use crate::diff::tests::base_settings;
+    use crate::diff::tests::{base_settings, diff_of};
     use crate::diff::{DiffData, DiffSettings, DiffSource, LineKind, RowScope, get_diff_data};
 
     /// The capture skips every row that carries no line number — the commit
@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn capture_anchor_takes_its_bearing_from_the_viewport_centre() {
         let (_d, repo, oid) = two_hunk_repo();
-        let data = diff_at(&repo, oid, base_settings());
+        let data = diff_of(&repo, oid, base_settings(), None);
         // Park the viewport top on the second hunk's header — the case that
         // motivated this: a structural row, carrying no line number of its own.
         let hdr = (0..data.lines.len())
@@ -429,7 +429,7 @@ mod tests {
     #[test]
     fn capture_anchor_without_a_viewport_height_anchors_at_the_top() {
         let (_d, repo, oid) = two_hunk_repo();
-        let data = diff_at(&repo, oid, base_settings());
+        let data = diff_of(&repo, oid, base_settings(), None);
         let hdr = (0..data.lines.len())
             .filter(|&r| data.lines[r].kind == LineKind::Hunk)
             .nth(1)
@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn capture_anchor_clamps_a_centre_past_the_end_of_the_diff() {
         let (_d, repo, oid) = two_hunk_repo();
-        let data = diff_at(&repo, oid, base_settings());
+        let data = diff_of(&repo, oid, base_settings(), None);
         let got = capture_anchor(&data.lines, &data.files, 0, 100_000).expect("an anchor");
         assert_eq!(
             resolve_anchor(&got, &data.lines, &data.files),
@@ -505,15 +505,6 @@ mod tests {
         (d, repo, oid)
     }
 
-    fn diff_at(repo: &Repository, oid: git2::Oid, settings: DiffSettings) -> DiffData {
-        get_diff_data(
-            repo,
-            &RowScope::new(DiffSource::Commit(oid)),
-            settings,
-            None,
-        )
-    }
-
     /// The row index of `path`'s line numbered `n` on `side`. Always file-scoped:
     /// line numbers repeat across files, so a whole-diff search would silently
     /// answer for the wrong one.
@@ -533,21 +524,23 @@ mod tests {
     #[test]
     fn widening_context_keeps_the_anchored_line_and_moves_it_down() {
         let (_d, repo, oid) = two_hunk_repo();
-        let narrow = diff_at(
+        let narrow = diff_of(
             &repo,
             oid,
             DiffSettings {
                 context: 1,
                 ..base_settings()
             },
+            None,
         );
-        let wide = diff_at(
+        let wide = diff_of(
             &repo,
             oid,
             DiffSettings {
                 context: 6,
                 ..base_settings()
             },
+            None,
         );
 
         let row = row_of(&narrow, "f.txt", AnchorSide::New, 70);
@@ -572,21 +565,23 @@ mod tests {
     #[test]
     fn narrowing_context_lands_on_the_next_surviving_line() {
         let (_d, repo, oid) = two_hunk_repo();
-        let wide = diff_at(
+        let wide = diff_of(
             &repo,
             oid,
             DiffSettings {
                 context: 6,
                 ..base_settings()
             },
+            None,
         );
-        let narrow = diff_at(
+        let narrow = diff_of(
             &repo,
             oid,
             DiffSettings {
                 context: 1,
                 ..base_settings()
             },
+            None,
         );
 
         // Line 64 is context only at 6 columns; at 1 the second hunk starts at 69.
@@ -615,21 +610,23 @@ mod tests {
     #[test]
     fn a_shrunk_trailing_hunk_falls_to_its_own_files_header() {
         let (_d, repo, oid) = two_hunk_repo();
-        let wide = diff_at(
+        let wide = diff_of(
             &repo,
             oid,
             DiffSettings {
                 context: 6,
                 ..base_settings()
             },
+            None,
         );
-        let narrow = diff_at(
+        let narrow = diff_of(
             &repo,
             oid,
             DiffSettings {
                 context: 1,
                 ..base_settings()
             },
+            None,
         );
 
         let row = row_of(&wide, "f.txt", AnchorSide::New, 76);
@@ -658,14 +655,15 @@ mod tests {
     #[test]
     fn a_file_without_a_patch_body_falls_to_the_previous_header() {
         let (_d, repo, oid) = ws_only_repo();
-        let shown = diff_at(&repo, oid, base_settings());
-        let hidden = diff_at(
+        let shown = diff_of(&repo, oid, base_settings(), None);
+        let hidden = diff_of(
             &repo,
             oid,
             DiffSettings {
                 ignore_ws: true,
                 ..base_settings()
             },
+            None,
         );
 
         let b = hidden
@@ -731,14 +729,15 @@ mod tests {
     #[test]
     fn a_leading_file_without_a_patch_body_falls_to_the_next_header() {
         let (_d, repo, oid) = ws_only_repo_leading();
-        let shown = diff_at(&repo, oid, base_settings());
-        let hidden = diff_at(
+        let shown = diff_of(&repo, oid, base_settings(), None);
+        let hidden = diff_of(
             &repo,
             oid,
             DiffSettings {
                 ignore_ws: true,
                 ..base_settings()
             },
+            None,
         );
 
         assert_eq!(
@@ -818,14 +817,15 @@ mod tests {
         let (_d, repo) = temp_repo();
         commit_file(&repo, "b.txt", "x\ny\nz\n", "base");
         let oid = commit_file(&repo, "b.txt", "x\ny   \nz\n", "whitespace only");
-        let shown = diff_at(&repo, oid, base_settings());
-        let hidden = diff_at(
+        let shown = diff_of(&repo, oid, base_settings(), None);
+        let hidden = diff_of(
             &repo,
             oid,
             DiffSettings {
                 ignore_ws: true,
                 ..base_settings()
             },
+            None,
         );
 
         let row = row_of(&shown, "b.txt", AnchorSide::New, 2);
@@ -844,25 +844,22 @@ mod tests {
     /// the toggle survivable at all.
     #[test]
     fn a_rename_toggle_matches_the_anchor_on_either_path() {
-        use crate::test_repo::{commit_file, commit_rename, temp_repo, write_file};
+        use crate::test_repo::{commit_file, commit_rename, rename_file, temp_repo, write_file};
         let (_d, repo) = temp_repo();
         commit_file(&repo, "m.txt", "1\n2\n3\n4\n5\n6\n7\n8\n", "base");
-        std::fs::rename(
-            repo.workdir().unwrap().join("m.txt"),
-            repo.workdir().unwrap().join("z.txt"),
-        )
-        .unwrap();
+        rename_file(&repo, "m.txt", "z.txt");
         write_file(&repo, "z.txt", "1\n2\n3\nFOUR\n5\n6\n7\n8\n");
         let oid = commit_rename(&repo, "m.txt", "z.txt", "rename and edit");
 
-        let off = diff_at(&repo, oid, base_settings());
-        let on = diff_at(
+        let off = diff_of(&repo, oid, base_settings(), None);
+        let on = diff_of(
             &repo,
             oid,
             DiffSettings {
                 detect_renames: true,
                 ..base_settings()
             },
+            None,
         );
         assert_eq!(on.files.len(), 1, "detection collapses the pair");
         assert_eq!(on.files[0].old_path_bytes.as_deref(), Some(&b"m.txt"[..]));
@@ -922,13 +919,14 @@ mod tests {
             commit_index(&repo, &mut index, "copy z.txt to a.txt and edit z.txt")
         };
 
-        let data = diff_at(
+        let data = diff_of(
             &repo,
             oid,
             DiffSettings {
                 detect_copies: true,
                 ..base_settings()
             },
+            None,
         );
         assert_eq!(data.files.len(), 2, "the copy pairs off, nothing extra");
         assert_eq!(data.files[0].path, "a.txt", "the target sorts first");
@@ -982,7 +980,7 @@ mod tests {
         }
         let oid = add_all("edit both");
 
-        let data = diff_at(&repo, oid, base_settings());
+        let data = diff_of(&repo, oid, base_settings(), None);
         assert_eq!(data.files.len(), 2);
         assert_eq!(
             data.files[0].path, data.files[1].path,
@@ -1085,13 +1083,13 @@ mod tests {
         // Detection OFF: sss.txt is its own Deleted entry, so capturing an
         // anchor on one of its rows exercises the real capture path instead
         // of hand-building a DiffAnchor.
-        let off = diff_at(&repo, oid, base_settings());
+        let off = diff_of(&repo, oid, base_settings(), None);
         let off_row = row_of(&off, "sss.txt", AnchorSide::Old, 50);
         let anchor = capture_anchor(&off.lines, &off.files, off_row, 0).expect("an anchor");
         assert_eq!(anchor.path, b"sss.txt".to_vec());
         assert_eq!(anchor.side, AnchorSide::Old);
 
-        let on = diff_at(
+        let on = diff_of(
             &repo,
             oid,
             DiffSettings {
@@ -1099,6 +1097,7 @@ mod tests {
                 detect_copies: true,
                 ..base_settings()
             },
+            None,
         );
 
         // Fixture preconditions, asserted before trusting anything
@@ -1147,7 +1146,7 @@ mod tests {
     #[test]
     fn anchor_hint_names_the_file_the_view_lands_in() {
         let (_d, repo, oid) = two_hunk_repo();
-        let data = diff_at(&repo, oid, base_settings());
+        let data = diff_of(&repo, oid, base_settings(), None);
         let row = row_of(&data, "f.txt", AnchorSide::New, 70);
         let anchor = capture_anchor(&data.lines, &data.files, row, 0).expect("an anchor");
 
@@ -1159,7 +1158,7 @@ mod tests {
     #[test]
     fn anchor_hint_picks_the_anchored_file_not_the_first() {
         let (_d, repo, oid) = ws_only_repo();
-        let data = diff_at(&repo, oid, base_settings());
+        let data = diff_of(&repo, oid, base_settings(), None);
         let row = row_of(&data, "b.txt", AnchorSide::New, 2);
         let anchor = capture_anchor(&data.lines, &data.files, row, 0).expect("an anchor");
 
@@ -1178,14 +1177,15 @@ mod tests {
     #[test]
     fn anchor_hint_follows_the_ladder_when_the_file_has_no_body() {
         let (_d, repo, oid) = ws_only_repo();
-        let shown = diff_at(&repo, oid, base_settings());
-        let hidden = diff_at(
+        let shown = diff_of(&repo, oid, base_settings(), None);
+        let hidden = diff_of(
             &repo,
             oid,
             DiffSettings {
                 ignore_ws: true,
                 ..base_settings()
             },
+            None,
         );
         let row = row_of(&shown, "b.txt", AnchorSide::New, 2);
         let anchor = capture_anchor(&shown.lines, &shown.files, row, 0).expect("an anchor");
@@ -1201,7 +1201,7 @@ mod tests {
     #[test]
     fn anchor_hint_is_none_for_an_empty_diff() {
         let (_d, repo, oid) = two_hunk_repo();
-        let data = diff_at(&repo, oid, base_settings());
+        let data = diff_of(&repo, oid, base_settings(), None);
         let row = row_of(&data, "f.txt", AnchorSide::New, 70);
         let anchor = capture_anchor(&data.lines, &data.files, row, 0).expect("an anchor");
 

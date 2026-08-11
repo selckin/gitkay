@@ -686,12 +686,12 @@ pub fn get_diff_data(
 /// side (deletions/renames), or empty if neither is set. Bytes (not a lossy `&str`)
 /// so file identity survives non-UTF-8 names: `String::from_utf8_lossy` would map two
 /// distinct non-UTF-8 paths to the same display string and collide them.
+///
+/// The new side's own `side_path_bytes`, named for the question its callers ask
+/// ("which path is this delta?") rather than for the side. One rule, so the
+/// fall-back order cannot drift between the two.
 pub fn delta_path_bytes<'a>(delta: &git2::DiffDelta<'a>) -> &'a [u8] {
-    delta
-        .new_file()
-        .path_bytes()
-        .or_else(|| delta.old_file().path_bytes())
-        .unwrap_or(b"")
+    side_path_bytes(delta, true)
 }
 
 /// One patch row, pushed exactly as libgit2 handed it over.
@@ -1875,7 +1875,10 @@ pub fn next_file_line(starts: &[(usize, usize)], top: usize, down: bool) -> Opti
 }
 
 #[cfg(test)]
-mod tests {
+// Crate-visible so the fixtures below (`base_settings`, `diff_of`) are shared rather
+// than re-rolled per suite — a diverged baseline makes two suites assert about
+// different settings while looking identical.
+pub mod tests {
     use super::*;
     use crate::diff::convert::tests::{commit_two_zips, driven_repo};
 

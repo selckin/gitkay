@@ -80,17 +80,24 @@ pub fn layout_graph_rows(
         deferred_parents,
     } = state;
     let mut rows = Vec::new();
+    // Reused across commits: this is rebuilt for every row and read back within the
+    // same iteration, so one allocation covers the whole layout instead of one per
+    // commit. The layout runs over the full loaded list on every install, append and
+    // rebuild, so the per-commit malloc/free pair was the dominant allocation here.
+    let mut matching_cols: Vec<usize> = Vec::new();
 
     for commit in commits {
         // Find which column this commit is in. If multiple lanes point
         // to this commit (convergence), pick the first and mark others
         // for merge lines.
-        let matching_cols: Vec<usize> = pipes
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| p.is_some_and(|(oid, _)| oid == commit.oid))
-            .map(|(i, _)| i)
-            .collect();
+        matching_cols.clear();
+        matching_cols.extend(
+            pipes
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.is_some_and(|(oid, _)| oid == commit.oid))
+                .map(|(i, _)| i),
+        );
 
         let node_col = if matching_cols.is_empty() {
             // New commit — find an empty slot or append
@@ -133,44 +140,45 @@ pub fn layout_graph_rows(
         // still continue in the node's column — the other lane will merge at
         // the parent's own row.
         for (i, parent_oid) in commit.parents.iter().enumerate() {
-            let first_parent = i == 0;
-            let in_scope = oid_set.contains(parent_oid);
-
-            // Check if parent is already tracked in a different lane
-            let existing = if in_scope {
-                pipes
-                    .iter()
-                    .position(|p| p.is_some_and(|(oid, _)| oid == *parent_oid))
-            } else {
-                None
-            };
-
-            if first_parent {
+            if i == 0 {
                 // First parent always continues in the node's column (even if the
                 // parent is out of scope / not loaded yet, so the graph doesn't show
-                // an orphan). Claim the column's pipe unless the parent already
-                // occupies exactly this column.
-                if existing != Some(node_col) {
-                    pipes[node_col] = Some((*parent_oid, node_color));
-                }
+                // an orphan), and claims the pipe unconditionally: the node's slot was
+                // cleared just above and nothing has written it since, so the parent
+                // cannot already occupy exactly this column.
+                debug_assert!(
+                    pipes[node_col].is_none(),
+                    "node column {node_col} was not cleared before the first parent"
+                );
+                pipes[node_col] = Some((*parent_oid, node_color));
                 lines.push((node_col, node_col, node_color));
-            } else if in_scope {
-                // Second+ parent (in scope)
-                if let Some(existing_col) = existing {
-                    lines.push((node_col, existing_col, node_color));
-                } else {
-                    let color = *next_color;
-                    *next_color += 1;
-                    let col = alloc_lane(pipes, (*parent_oid, color));
-                    lines.push((node_col, col, color));
-                    new_lanes.push(col);
-                }
-            } else {
+                continue;
+            }
+
+            // Second+ parent. Out of scope is decided first: the in-scope arms below
+            // are the only readers of the lane scan, so an unloaded parent never pays
+            // for it.
+            if !oid_set.contains(parent_oid) {
                 // Second+ parent out of scope: skip (can't draw a merge to an
                 // unloaded row) — but remember it, so a later append that loads
                 // this parent knows a pure resume would miss this row's merge
                 // diagonal and falls back to a full relayout.
                 deferred_parents.insert(*parent_oid);
+                continue;
+            }
+
+            // Check if parent is already tracked in a different lane
+            let existing = pipes
+                .iter()
+                .position(|p| p.is_some_and(|(oid, _)| oid == *parent_oid));
+            if let Some(existing_col) = existing {
+                lines.push((node_col, existing_col, node_color));
+            } else {
+                let color = *next_color;
+                *next_color += 1;
+                let col = alloc_lane(pipes, (*parent_oid, color));
+                lines.push((node_col, col, color));
+                new_lanes.push(col);
             }
         }
 
