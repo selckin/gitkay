@@ -368,6 +368,21 @@ pub fn config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("gitkay").join("config.toml"))
 }
 
+/// The config as a worker with no `Config` in hand should read it: defaults when
+/// there is no file, and defaults when there is one it cannot parse.
+///
+/// The policy — not just the expression — belongs here beside `config_path` and
+/// `read_config`. Both off-thread starters (`spawn_font_build`, `spawn_prewarm`) run
+/// before the main thread has parsed anything, and neither is the place to decide
+/// what an unreadable config means; the UI's own reload reports parse errors, so a
+/// second report from a prewarm thread would only double them.
+pub fn read_or_default() -> Config {
+    config_path()
+        .as_deref()
+        .and_then(|p| read_config(p).ok())
+        .unwrap_or_default()
+}
+
 fn cache_path() -> Option<PathBuf> {
     dirs::cache_dir().map(|d| d.join("gitkay").join("fonts.toml"))
 }

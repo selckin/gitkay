@@ -722,9 +722,10 @@ parts run off the window-creation critical path:
   are plain `VecDeque`/`HashMap`/`HashSet` — no mutexes, no RAII guards, no lock
   ordering. Workers are pure: `worker()` receives a `Job`, does it, and reports an
   `Outcome`. Everything they learn travels back as that return value; the coordinator
-  decides what any of it means. `PoolHandle` is the UI's whole surface — three sends
-  (`submit`, `submit_stats`, `clear_stats`) into one `CoordMsg` channel that also
-  carries every worker's completion, which is what makes the state single-owner.
+  decides what any of it means. `PoolHandle` is the UI's whole surface — five sends
+  (`submit`, `submit_stats`, `clear_stats`, `drivers_changed`, `retry_unconverted`)
+  into one `CoordMsg` channel that also carries every worker's completion, which is
+  what makes the state single-owner.
   Dispatch is **pull-based**: the coordinator hands a job to an idle worker, so
   priority is evaluated at hand-out against the band as it is NOW, not at submit time.
   Supersession stays free — the plan lives in the coordinator's own memory and is never
@@ -1612,7 +1613,7 @@ parts run off the window-creation critical path:
   two-part `4 years, 11 months ago`. Its test expectations come from **real git output**
   (2.55.0 — a scratch repo, one empty commit per boundary age, read back with `%ar`),
   not from reading `date.c`; re-derive them that way. Width is bounded by
-  `diff::RELATIVE_DATE_SAMPLE`, which lives beside the formatter that must honour it
+  `datefmt::RELATIVE_DATE_SAMPLE`, which lives beside the formatter that must honour it
   rather than beside the column measuring from it, and holds for **every** `i64` — the
   two-part form is the widest ordinary output and ties, coincidentally, with `i64::MIN`'s
   `292471208678 years ago`. A future timestamp reads `in the future` as git has it, and
@@ -1633,6 +1634,16 @@ parts run off the window-creation critical path:
   Relative mode also asks for a repaint every `RELATIVE_DATE_TICK` (30s), since it is
   the one thing on screen that goes stale with no input to prompt one; without it an
   idle window showed ages frozen at its last paint.
+- **Diff toolbar**: the hover toolbar's `±` context buttons and its
+  rename/copy/whitespace checkboxes mutate `self.diff_settings` directly, and whether
+  anything moved is decided by comparing the **whole struct** against a snapshot taken
+  before the widgets ran — not by a flag each widget sets. A fifth control that forgot
+  such a flag would mutate the settings and skip both `invalidate_stats_if_counts_changed`
+  and `load_selected_diff`, leaving the pane on the old shape and the column on counts
+  from settings that no longer apply; and the omission would read as deliberate, since
+  `word_diff` beside them legitimately triggers no reload. The comparison is also more
+  precise than a flag — `-` at context 0 and `+` at 99 change nothing — and `word_diff`
+  stays excluded for free by not being a `DiffSettings` field.
 - **Bottom panel**: diff view (left, syntax-highlighted) + file list sidebar
   (right, dynamic width). Both remember their scroll position per commit for
   the session (`scroll_memory`, oid-keyed: saved by `stash_current_diff` when
@@ -2791,7 +2802,11 @@ helpers the `apply`, `diff_store` and `main` suites share — `temp_repo` and
 `open_repo`/`confine_config_to_the_repo` (the isolation above),
 `write_file`/`stage`/
 `commit_index`/`commit_file`/`commit_bytes`/`commit_rename` to build history,
-`commit_at`/`commit_file_at` to state a commit's TIME and parents explicitly — the
+`rename_file` to move a worktree file (its own helper rather than folded into
+`commit_rename`, because several tests edit the file *between* the move and the
+commit), `stage_gitlink`/`write_conflict_stages` to build the two index shapes that
+need a hand-rolled `git2::IndexEntry` — a submodule entry and a path left unmerged at
+stages 1/2/3 — `commit_at`/`commit_file_at` to state a commit's TIME and parents explicitly — the
 other helpers inherit `now()`, which stamps every commit in a test with the same
 second, so an ordering derived from time (the provisional heap walk sorts on exactly
 that field, and the shapes that break it are a parent dated newer than its child, or
@@ -2805,6 +2820,13 @@ working tree — the diff store's key depends on it), `set_config`/`write_driver
 `read_file`/`index_blob`
 to assert on the worktree vs. the index separately. Add fixtures there rather than
 re-rolling them per module.
+
+The same rule covers the `DiffSettings` baselines, which are **two values, not five**:
+`diff::tests::base_settings` (every toggle off) and `crate::tests::probe_settings`
+(stats and rename detection on). `diff::tests` is `pub` so the first is shared rather
+than copied — `main`'s `ds` is a re-export of it — and `diff_store`'s suite imports the
+second under its own local name. A suite that spells the literal out instead is one
+whose asserted key or diff can drift from every other suite's while looking identical.
 
 The write layer's tests are the safety net for code that can destroy uncommitted work, so
 each destructive guard is pinned by a test that was **demonstrated to fail without it**
@@ -2849,6 +2871,7 @@ ones that actually fail when the write is removed.
 - Branch highlighting walks first-parent children upward, but all parents downward, so merge commits keep merged history highlighted
 - File-list sidebar is not row-virtualized — every row draws each frame, so per-row file text goes through `SidebarCache`: elided labels (laid out in `Color32::PLACEHOLDER` so normal/hover color applies at paint time) and `+n`/`-n` stat galleys are built once per (diff, width, font) — `rebuild_file_rows` and a font reload reset the cache, `ensure` re-keys it on width change. Both stat galleys always exist, a zero count included (`+0`/`-0`, as in the commit list), so `StatGalleys` holds no `Option` and the row's stats block is a fixed distance from its right edge instead of sliding when one side is empty. `build_file_rows` (pure) turns `(new_path, Option<old_path>)` pairs into header/file rows per `[diff] file_list` (`grouped` = one header per directory, files sorted by label; renames/copies group under their `rename_brace` common directory); `left_elide` left-truncates labels, measuring the full string once and binary-searching only when it overflows (directory headers still elide per frame — they're the minority of rows). `grouped` directory headers are drawn breadcrumb-style (`draw_dir_header` + `common_dir_prefix_len`): the ancestor path a header shares with the header drawn just above it is dimmed (`SUBTEXT_DIM`) and the distinguishing tail is `SUBTEXT`, so deep trees don't repeat the same long prefix on every header
 - Any new diff-*data*-affecting setting goes in `DiffSettings` only. `GitkApp` holds one `DiffSettings` field (the diff-shaping state — `context`/`ignore_ws` are toolbar-owned + persisted, `show_stats`/`detect_renames`/`detect_copies` come from `[diff]` config), and `DiffCacheKey` *embeds* a `DiffSettings`. (It also carries a `drivers` fingerprint, which is NOT a setting — it is the repo's own `diff.<name>.textconv` config, and it is in the key for the same reason: an edited driver changes a driven file's whole body without moving the oid. See **Textconv**.) So a field added to `DiffSettings` is automatically (a) part of the cache key — cached diffs invalidate when it changes, no second edit site — and (b) covered by the config-reload's whole-struct comparison (`new_settings != self.diff_settings`), which triggers the re-diff. The prefetch mapping reads it back as `key.settings`. Settings that only change *spans* (theme, syntax on/off, `diff_bg`, `[diff.languages]`) or *render* (`word_diff`, `file_list`) are handled by their own branches in the config-reload block, not `DiffSettings`.
+  The span half is **one struct too** (`SpanSettings`, held as `GitkApp::span_settings`), compared and assigned whole for the same reason `DiffSettings` is: as four loose fields the reload's test was a four-term `||` chain that a fifth setting could silently miss, and missing it is not a lost frame — every cached diff keeps yesterday's colours, sticky via `diff_cache.contains`, for the session with nothing logged. Which of the four are in `DiffCacheKey` is unchanged and is the next paragraph's subject.
   Only two of those four span settings are in `DiffCacheKey` — `theme` and `enabled` make a stale entry miss on their own; `diff_bg` and `languages` do not. So that reload branch **clears the diff cache** rather than keying on all four: every cached entry's spans were tokenized under the old settings, the pool refills the band within a dispatch, and the alternative is a neighbour holding yesterday's colours (or none, for the extension just mapped) until something unrelated evicts it. A span setting added later joins the clear, not the key.
   **Clearing is not enough on its own**, and the reason is the same absence: warms already queued or running were dispatched under the OLD span settings, and because `diff_bg`/`languages` are not in the key, `key_is_current` waves their results through and they land back in the just-cleared cache carrying the old colours — after which every dispatch skips them via `contains`, so those rows stay flat for the session. So the reload also bumps a **`span_gen`**, stamped onto every warm at dispatch (on the job, like `hl`, so a reload cannot race a worker mid-row) and checked when it returns. Stale spans outrank `awaiting` deliberately: installing one puts plain spans on the live diff, and since `spans` would then be `Some`, `diff_fully_highlighted` reads true and nothing re-tokenizes it — dropping it costs only a wait for the diff-load worker dispatched alongside. The drain's precedence is the pure `warm_disposition`, so the case a live `GitkApp` makes hard to reach is testable.
 - **A missing grammar is invisible unless something reports it.** `Highlighter::new_file_state` resolves a syntax from the path's extension and falls back to syntect's **plain text** — which still sets a span on every line. So `diff_fully_highlighted` answers true, `ensure_diff_highlighted` skips the diff on selection, and it renders in one flat colour for the session with every log line calling it highlighted. `[diff.languages]` (`highlight::LanguageMap`) is the fix for a repo's own suffix — `oml = "xml"`, `tfvars = "hcl"` — consulted BEFORE the built-in lookup so it can also override one, and matched lower-cased and dot-insensitive; the built-in lookup still gets the extension as written, because syntect distinguishes `.C` from `.c`. First-line sniffing is not an alternative even when the content would give it away: a diff holds hunks, and the `<?xml` line of a large file is not in them. `has_grammar` is what makes the state reportable, and `warm_row` logs three outcomes rather than two — `Highlighted` / `PlainText` / `DiffOnly` — reporting a **count** where they are mixed (`Highlighted 1/501, rest PlainText`). Binary files are excluded from that denominator, since the highlighter skips them: counting them would report a commit touching only a `.png` as `PlainText`, a coverage gap that is not one. A count and not `any`: one grammar-backed file among 500 `.oml` ones otherwise logged a flat `Highlighted`, which is the exact "looks like a success" reading this label exists to remove, and an empty diff logged `PlainText` though nothing had been left uncoloured. Measured on a repo of `.oml` ontologies: a whole band logged `Highlighted` at ~3µs/line against ~60µs/line for rows that really tokenized, and that ratio was the only clue.

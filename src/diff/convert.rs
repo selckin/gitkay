@@ -349,7 +349,23 @@ pub(super) enum HeaderOf<'a> {
 /// two rules agree today. They agree by accident, on a detail of when libgit2 fills the
 /// id in, which is not something a synthesized `/dev/null` should rest on.)
 pub(super) fn filename_lines(delta: &git2::DiffDelta<'_>, prefixes: (&str, &str)) -> [String; 2] {
-    let (old, new) = (delta_path(&delta.old_file()), delta_path(&delta.new_file()));
+    filename_lines_of(
+        delta,
+        prefixes,
+        &(delta_path(&delta.old_file()), delta_path(&delta.new_file())),
+    )
+}
+
+/// `filename_lines` for a caller that has already rendered the path pair.
+///
+/// `delta_path` is a UTF-8 validation scan plus an allocation per side, and
+/// `swept_header_lines` needs both paths for its own `diff --git` line — so without
+/// this the sweep renders each of them twice per driven delta.
+fn filename_lines_of(
+    delta: &git2::DiffDelta<'_>,
+    prefixes: (&str, &str),
+    (old, new): &(String, String),
+) -> [String; 2] {
     let side = |new_side: bool, prefix: &str, path: &str| {
         if side_absent(delta, new_side) {
             "/dev/null".to_owned()
@@ -358,8 +374,8 @@ pub(super) fn filename_lines(delta: &git2::DiffDelta<'_>, prefixes: (&str, &str)
         }
     };
     [
-        format!("--- {}", side(false, prefixes.0, &old)),
-        format!("+++ {}", side(true, prefixes.1, &new)),
+        format!("--- {}", side(false, prefixes.0, old)),
+        format!("+++ {}", side(true, prefixes.1, new)),
     ]
 }
 
@@ -382,8 +398,9 @@ pub(super) fn swept_header_lines(
     delta: &git2::DiffDelta<'_>,
     prefixes: (&str, &str),
 ) -> [DiffLine; 3] {
-    let (old, new) = (delta_path(&delta.old_file()), delta_path(&delta.new_file()));
-    let [minus, plus] = filename_lines(delta, prefixes);
+    let paths = (delta_path(&delta.old_file()), delta_path(&delta.new_file()));
+    let [minus, plus] = filename_lines_of(delta, prefixes, &paths);
+    let (old, new) = (&paths.0, &paths.1);
     [
         DiffLine::new(
             format!("diff --git {}{old} {}{new}", prefixes.0, prefixes.1),
@@ -870,7 +887,7 @@ pub(super) mod tests {
 
     #[test]
     fn a_symlink_and_a_gitlink_under_a_driver_keep_their_raw_body() {
-        use crate::test_repo::commit_index;
+        use crate::test_repo::{commit_index, stage_gitlink};
         let (_t, repo, cmd) = driven_repo("echo CONVERTED\n");
         crate::test_repo::write_driver(&repo, "gktest", &cmd, false, "*");
         let wd = repo.workdir().unwrap().to_path_buf();
@@ -899,26 +916,10 @@ pub(super) mod tests {
         assert!(!data.textconv_failed, "unconvertible is not a failure");
 
         // A gitlink: a 160000 index entry pointing at a commit, changed to another.
-        let gitlink = |oid: git2::Oid| git2::IndexEntry {
-            ctime: git2::IndexTime::new(0, 0),
-            mtime: git2::IndexTime::new(0, 0),
-            dev: 0,
-            ino: 0,
-            mode: 0o160_000,
-            uid: 0,
-            gid: 0,
-            file_size: 0,
-            id: oid,
-            flags: 0,
-            flags_extended: 0,
-            path: b"sub".to_vec(),
-        };
-        let mut index = repo.index().unwrap();
-        index.add(&gitlink(base)).unwrap();
-        commit_index(&repo, &mut index, "sub at base");
-        let mut index = repo.index().unwrap();
-        index.add(&gitlink(head)).unwrap();
-        let sub = commit_index(&repo, &mut index, "sub moved");
+        stage_gitlink(&repo, "sub", base);
+        commit_index(&repo, &mut repo.index().unwrap(), "sub at base");
+        stage_gitlink(&repo, "sub", head);
+        let sub = commit_index(&repo, &mut repo.index().unwrap(), "sub moved");
         let data = diff_of(&repo, sub, conv_settings(), Some(&tc));
         assert!(
             texts(&data).iter().any(|l| l.contains("Subproject commit")),
@@ -1326,33 +1327,12 @@ pub(super) mod tests {
     /// resolved.
     #[test]
     fn a_conflicted_driven_path_keeps_its_raw_body_without_failing_the_diff() {
-        use crate::test_repo::commit_bytes;
+        use crate::test_repo::{commit_bytes, write_conflict_stages};
         let (_t, repo, _cmd) = driven_repo(CONV);
         commit_bytes(&repo, "c.zip", &[0, 1, b'A', 0], "a zip");
         // Three stages on the driven path itself, exactly as a conflicted merge
         // leaves the index.
-        let blob = repo.blob(b"whatever\n").unwrap();
-        let mut index = repo.index().unwrap();
-        index.remove_path(std::path::Path::new("c.zip")).unwrap();
-        for stage in 1..=3u16 {
-            index
-                .add(&git2::IndexEntry {
-                    ctime: git2::IndexTime::new(0, 0),
-                    mtime: git2::IndexTime::new(0, 0),
-                    dev: 0,
-                    ino: 0,
-                    mode: 0o100_644,
-                    uid: 0,
-                    gid: 0,
-                    file_size: 0,
-                    id: blob,
-                    flags: stage << 12,
-                    flags_extended: 0,
-                    path: b"c.zip".to_vec(),
-                })
-                .unwrap();
-        }
-        index.write().unwrap();
+        write_conflict_stages(&repo, "c.zip", ["whatever\n"; 3]);
 
         let scope = RowScope::new(DiffSource::Uncommitted);
         let mut opts = scoped_diff_opts(conv_settings(), &[]);
@@ -1380,7 +1360,7 @@ pub(super) mod tests {
     /// tree reverted to `Binary files … differ` for as long as the conflict stood.
     #[test]
     fn an_unmerged_path_does_not_disable_textconv_for_the_pane() {
-        use crate::test_repo::{commit_bytes, commit_file};
+        use crate::test_repo::{commit_bytes, commit_file, write_conflict_stages};
         let (t, repo, _cmd) = driven_repo(CONV);
         let _ = t;
         commit_file(&repo, "c.txt", "base\n", "base");
@@ -1389,28 +1369,7 @@ pub(super) mod tests {
         std::fs::write(repo.workdir().unwrap().join("a.zip"), [0, 1, b'A', b'B', 0]).unwrap();
         // …and an unmerged `c.txt` beside it: three stages, exactly as a conflicted
         // merge leaves the index.
-        let blob = repo.blob(b"whatever\n").unwrap();
-        let mut index = repo.index().unwrap();
-        index.remove_path(std::path::Path::new("c.txt")).unwrap();
-        for stage in 1..=3u16 {
-            index
-                .add(&git2::IndexEntry {
-                    ctime: git2::IndexTime::new(0, 0),
-                    mtime: git2::IndexTime::new(0, 0),
-                    dev: 0,
-                    ino: 0,
-                    mode: 0o100_644,
-                    uid: 0,
-                    gid: 0,
-                    file_size: 0,
-                    id: blob,
-                    flags: stage << 12,
-                    flags_extended: 0,
-                    path: b"c.txt".to_vec(),
-                })
-                .unwrap();
-        }
-        index.write().unwrap();
+        write_conflict_stages(&repo, "c.txt", ["whatever\n"; 3]);
 
         let scope = RowScope::new(DiffSource::Uncommitted);
         let data = get_diff_data(&repo, &scope, conv_settings(), Some(&Textconv::new()));

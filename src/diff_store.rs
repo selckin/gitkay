@@ -410,6 +410,17 @@ fn xdg_config_home() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
 }
 
+/// `attrs_id` over the attribute sources gitkay actually reads.
+///
+/// The single spelling of *which* files, so `StoreContext`'s on-disk key and the live
+/// driver fingerprint `textconv::resolve_drivers` builds cannot end up covering
+/// different ones. The `xdg` parameter below exists only so a test can point the
+/// fallback elsewhere, which is why the production pairing is named once here rather
+/// than repeated at both call sites.
+pub fn attrs_fingerprint(repo: &git2::Repository) -> Vec<u8> {
+    attrs_id(repo, xdg_config_home().as_deref())
+}
+
 /// A fingerprint of the attribute sources' CONTENTS.
 ///
 /// The repo path alone stops one repo serving another, but not a repo serving
@@ -425,17 +436,6 @@ fn xdg_config_home() -> Option<PathBuf> {
 /// Known gap: nested `.gitattributes` in subdirectories, and the system-wide
 /// file, are not included. A bounded tree walk is not worth its cost; the escape
 /// hatch is deleting the cache directory.
-/// `attrs_id` over the attribute sources gitkay actually reads.
-///
-/// The single spelling of *which* files, so `StoreContext`'s on-disk key and the live
-/// driver fingerprint `textconv::resolve_drivers` builds cannot end up covering
-/// different ones. The `xdg` parameter below exists only so a test can point the
-/// fallback elsewhere, which is why the production pairing is named once here rather
-/// than repeated at both call sites.
-pub fn attrs_fingerprint(repo: &git2::Repository) -> Vec<u8> {
-    attrs_id(repo, xdg_config_home().as_deref())
-}
-
 fn attrs_id(repo: &git2::Repository, xdg: Option<&Path>) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut fold = |p: Option<PathBuf>| {
@@ -1166,17 +1166,10 @@ mod tests {
     }
 
     use crate::test_repo::{commit_file, temp_repo, write_attributes};
-
-    fn settings() -> DiffSettings {
-        DiffSettings {
-            context: 3,
-            ignore_ws: false,
-            show_stats: true,
-            detect_renames: true,
-            detect_copies: false,
-            textconv: false,
-        }
-    }
+    // The shared baseline, not a copy of it: these are the key-derivation tests, so a
+    // silently diverged `show_stats`/`detect_renames` here would assert about a key no
+    // other suite builds.
+    use crate::tests::probe_settings as settings;
 
     fn key_for(
         repo: &git2::Repository,
@@ -1571,14 +1564,10 @@ mod tests {
     /// which is exactly what a codec can lose silently.
     #[test]
     fn a_rename_and_a_bodyless_file_survive() {
-        use crate::test_repo::commit_rename;
+        use crate::test_repo::{commit_rename, rename_file};
         let (_d, repo) = temp_repo();
         commit_file(&repo, "old.txt", "a\nb\nc\n", "one");
-        std::fs::rename(
-            repo.workdir().unwrap().join("old.txt"),
-            repo.workdir().unwrap().join("new.txt"),
-        )
-        .unwrap();
+        rename_file(&repo, "old.txt", "new.txt");
         let oid = commit_rename(&repo, "old.txt", "new.txt", "rename");
         let (_t, store) = temp_store(&repo);
 

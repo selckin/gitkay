@@ -366,6 +366,30 @@ impl Limits {
     pub const fn too_costly(&self, cost: &diff::RowCostProbe) -> bool {
         cost.total_blob_bytes > self.max_blob_bytes || cost.may_be_driven()
     }
+
+    /// Why a row `too_costly` answered for was deferred, as both lanes' logs word it —
+    /// everything after the row's own identifier.
+    ///
+    /// All three dimensions, not just the one that tripped: which of them is large is
+    /// what tells a 265MB single file apart from a wide shallow commit, and this guard
+    /// has already had to move from one to another once. `driven` is the fourth and is
+    /// not a size at all — a driven row is expensive for a reason byte-thresholding
+    /// cannot see (a few-KB zip behind a several-hundred-ms `bsdtar`), which is exactly
+    /// what the heavy lane is for.
+    ///
+    /// Beside the rule it explains, and stated once for the stats lane and the prefetch
+    /// lane both — so the next dimension this guard moves to is worded once rather than
+    /// in two five-argument format strings that can disagree.
+    pub fn defer_reason(&self, cost: &diff::RowCostProbe) -> String {
+        format!(
+            "{} blob bytes over {} (largest {}, {} files{})",
+            cost.total_blob_bytes,
+            self.max_blob_bytes,
+            cost.max_blob_bytes,
+            cost.deltas,
+            cost.textconv_note()
+        )
+    }
 }
 
 /// Everything the speculative machinery bounds itself by, all of it derived from
@@ -1271,14 +1295,7 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
         // after the working-tree change that triggered it was reverted, since a sentinel
         // oid never expires.
         if is_real_commit(oid) && ctx.limits.too_costly(&cost) {
-            log::debug!(
-                "stats: defer {oid} — {} blob bytes over {} (largest {}, {} files{})",
-                cost.total_blob_bytes,
-                ctx.limits.max_blob_bytes,
-                cost.max_blob_bytes,
-                cost.deltas,
-                cost.textconv_note()
-            );
+            log::debug!("stats: defer {oid} — {}", ctx.limits.defer_reason(&cost));
             // Send the file count NOW, so the row shows something rather than staying
             // blank. Deliberately counted off the pipeline's own diff and not from
             // `cost.deltas`: the measurement is taken before `detect_similar`, so it
@@ -1470,20 +1487,10 @@ fn warm_row(
         && let Ok(cost) = diff::probe_row_cost(repo, &target.scope, target.key.settings, tc)
         && ctx.limits.too_costly(&cost)
     {
-        // All three dimensions, not just the one that tripped: which of them is large
-        // is what tells a 265MB single file apart from a wide shallow commit, and this
-        // guard has already had to move from one to another once. `driven` is the
-        // fourth and is not a size at all — a driven row is expensive for a reason
-        // byte-thresholding cannot see (a few-KB zip behind a several-hundred-ms
-        // `bsdtar`), which is exactly what the heavy lane is for.
         log::debug!(
-            "prefetch: defer {} — {} blob bytes over {} (largest {}, {} files{})",
+            "prefetch: defer {} — {}",
             target.key.oid,
-            cost.total_blob_bytes,
-            ctx.limits.max_blob_bytes,
-            cost.max_blob_bytes,
-            cost.deltas,
-            cost.textconv_note()
+            ctx.limits.defer_reason(&cost)
         );
         return Outcome::TooBig {
             cost: RowCost::of(&cost),
@@ -1671,14 +1678,7 @@ mod tests {
     fn inflight_claim_excludes_duplicates_and_releases_on_drop() {
         let test_key = |n| DiffCacheKey {
             oid: oid(n),
-            settings: DiffSettings {
-                context: 3,
-                ignore_ws: false,
-                show_stats: true,
-                detect_renames: true,
-                detect_copies: false,
-                textconv: false,
-            },
+            settings: probe_settings(),
             theme: highlight::DEFAULT_THEME,
             enabled: true,
             content: 0,
@@ -1763,14 +1763,7 @@ mod tests {
             probed: None,
             key: DiffCacheKey {
                 oid: oid(n),
-                settings: DiffSettings {
-                    context: 3,
-                    ignore_ws: false,
-                    show_stats: true,
-                    detect_renames: true,
-                    detect_copies: false,
-                    textconv: false,
-                },
+                settings: probe_settings(),
                 theme: highlight::DEFAULT_THEME,
                 enabled: true,
                 content: 0,
@@ -1804,14 +1797,7 @@ mod tests {
     fn stats_job(n: u32) -> StatsJob {
         StatsJob {
             scope: RowScope::new(DiffSource::Commit(oid(n))),
-            settings: DiffSettings {
-                context: 3,
-                ignore_ws: false,
-                show_stats: true,
-                detect_renames: true,
-                detect_copies: false,
-                textconv: false,
-            },
+            settings: probe_settings(),
             want: StatsWant::FilesAndLines,
             epoch: 0,
         }

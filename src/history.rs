@@ -21,6 +21,14 @@ use crate::diff::{
     worktree_git_diff,
 };
 
+/// How many hex characters a row's abbreviated SHA carries.
+///
+/// One datum, because the commit list also RESERVES a column this wide: `main.rs`'s
+/// `SHA_SAMPLE` is asserted against it at compile time. Two copies drift silently —
+/// widening the abbreviation here alone mismeasures that column, shifting every field
+/// to its right until the SHA lands under the ref chips.
+pub const SHORT_SHA_LEN: usize = 7;
+
 #[derive(Clone)]
 pub struct CommitInfo {
     /// What this row's diff is taken over. The range row's endpoints ride in here, the
@@ -79,7 +87,7 @@ impl CommitInfo {
             time,
             tz_offset_min,
             short_sha: if is_real_commit(oid) {
-                format!("{oid:.7}")
+                format!("{oid:.SHORT_SHA_LEN$}")
             } else {
                 String::new()
             },
@@ -1800,8 +1808,7 @@ mod tests {
         let (_d, repo) = temp_repo();
         commit_file(&repo, "old.txt", "one\ntwo\nthree\n", "create old");
         // Rename old.txt -> new.txt (identical content, so rename detection sees it).
-        let wd = repo.workdir().unwrap().to_path_buf();
-        std::fs::rename(wd.join("old.txt"), wd.join("new.txt")).unwrap();
+        rename_file(&repo, "old.txt", "new.txt");
         commit_rename(&repo, "old.txt", "new.txt", "rename to new");
         commit_file(&repo, "new.txt", "one\ntwo CHANGED\nthree\n", "edit new");
 
@@ -2152,8 +2159,7 @@ mod tests {
     fn rename_source_and_file_added() {
         let (_d, repo) = temp_repo();
         commit_file(&repo, "old.txt", "x\ny\nz\n", "create");
-        let wd = repo.workdir().unwrap().to_path_buf();
-        std::fs::rename(wd.join("old.txt"), wd.join("new.txt")).unwrap();
+        rename_file(&repo, "old.txt", "new.txt");
         let renamed = commit_rename(&repo, "old.txt", "new.txt", "rename");
         let edit = commit_file(&repo, "new.txt", "x\nY\nz\n", "edit");
         let c = |o| repo.find_commit(o).unwrap();
