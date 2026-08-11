@@ -133,14 +133,16 @@ fn prefetch_worker_count() -> usize {
 /// genuinely short of memory.
 const HEAVY_ROW_NOMINAL_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// The least `heavy_fits` will charge for a row, however small its blobs measured.
+/// What `heavy_fits` charges a driven row ON TOP of its blob bytes.
 ///
 /// Two sides at `textconv::TEXTCONV_MAX_OUTPUT` — what one conversion can hold live —
 /// and nothing for the converted patch beside them, so it is an under-estimate of the
-/// worst case on purpose. It exists because rows reach this lane by two tests and only
-/// one of them is a size: see `Coordinator::heavy_need`. Small enough that a machine
-/// with the floor budget still runs a full lane, so an ordinary repo is unaffected.
-const HEAVY_ROW_FLOOR_BYTES: u64 = 2 * crate::textconv::TEXTCONV_MAX_OUTPUT as u64;
+/// worst case on purpose: small enough that an idle lane still fills on a modest
+/// machine. **Added, not `max`ed**, because the two costs are additive: a row that is
+/// both driven and blob-heavy holds its inflated blobs *and* its conversion buffers, so
+/// a floor left the conversion memory unaccounted on exactly the repo where both are
+/// true — the case the bound is least able to afford being wrong about.
+const DRIVEN_ROW_EXTRA_BYTES: u64 = 2 * crate::textconv::TEXTCONV_MAX_OUTPUT as u64;
 
 /// Threads on the heavy lane: **as many as the pool, less whatever memory says**.
 ///
@@ -279,14 +281,15 @@ impl Drop for InflightClaim {
 
 /// One row for the prefetch pool to warm.
 pub struct PrefetchTarget {
-    /// `Some(total_blob_bytes)` once the probe has measured this row.
+    /// `Some(cost)` once the probe has measured this row.
     ///
-    /// Carries the number rather than a bare "was deferred" flag so the row is measured
-    /// exactly once: `Some` is both "this belongs on the heavy lane" and "do not probe
-    /// it again". Re-probing is a tree diff plus an odb lookup per file — cheap once,
-    /// and paid on every dispatch without this (measured: 18 rows re-probed on the
-    /// second dispatch alone, and a dispatch fires every half-window while scrolling).
-    pub probed: Option<u64>,
+    /// Carries the measurement rather than a bare "was deferred" flag so the row is
+    /// measured exactly once: `Some` is both "this belongs on the heavy lane" and "do
+    /// not probe it again". Re-probing is a tree diff plus an odb lookup per file —
+    /// cheap once, and paid on every dispatch without this (measured: 18 rows re-probed
+    /// on the second dispatch alone, and a dispatch fires every half-window while
+    /// scrolling).
+    pub probed: Option<RowCost>,
     pub key: DiffCacheKey,
     /// The per-row scope to diff it under — WHAT to diff plus the pathspec, as one
     /// value, so a worker cannot pick up one and quietly forget the other.
@@ -297,9 +300,42 @@ pub struct PrefetchTarget {
 impl PrefetchTarget {
     /// The same target, carrying the probe's measurement, so the heavy lane builds it
     /// rather than measuring it again.
-    pub const fn measured(mut self, est_bytes: u64) -> Self {
-        self.probed = Some(est_bytes);
+    pub const fn measured(mut self, cost: RowCost) -> Self {
+        self.probed = Some(cost);
         self
+    }
+}
+
+/// Why a row was sent to the heavy lane, in the form `heavy_fits` can price.
+///
+/// **Both dimensions travel, because both producers have both and the lane needs
+/// both.** A row reaches this lane by two tests — blob bytes, and
+/// `RowCostProbe::may_be_driven`, which is not a size at all — and collapsing the
+/// verdict to a `u64` on the way out left `heavy_need` to guess the missing bit back
+/// from a constant. A commit touching a dozen zips is a few compressed KB probed while
+/// each conversion materialises megabytes, so priced on bytes alone every driven row
+/// looked free, which is precisely what defeats a bound whose job is stopping
+/// `dispatch`'s tight hand-out loop from committing the whole lane at once.
+///
+/// Carrying it also means a third reason to defer adds a field here rather than another
+/// constant inside a `max()`, where each new one silently inflates the charge for every
+/// row deferred for any other reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowCost {
+    /// `RowCostProbe::total_blob_bytes`.
+    pub bytes: u64,
+    /// `RowCostProbe::may_be_driven` — the loose reading, since that is what routed the
+    /// row here and what predicts a conversion running.
+    pub driven: bool,
+}
+
+impl RowCost {
+    /// The measurement, as the probe reports it.
+    pub const fn of(probe: &diff::RowCostProbe) -> Self {
+        Self {
+            bytes: probe.total_blob_bytes,
+            driven: probe.may_be_driven(),
+        }
     }
 }
 
@@ -319,6 +355,17 @@ pub struct Limits {
     /// then sits alone until the next insert evicts it too. Measured: a 133,460-line
     /// diff evicted all 51 warmed entries (98,507 lines).
     pub max_entry_lines: usize,
+}
+
+impl Limits {
+    /// Is this row too expensive for an ordinary pool worker?
+    ///
+    /// The costly rule, stated once. Both askers (`run_stats_job`'s deferral and
+    /// `warm_row`'s) used to spell it out, and this diff had to edit both copies when
+    /// the second dimension changed shape — which is the whole argument for one.
+    pub const fn too_costly(&self, cost: &diff::RowCostProbe) -> bool {
+        cost.total_blob_bytes > self.max_blob_bytes || cost.may_be_driven()
+    }
 }
 
 /// Everything the speculative machinery bounds itself by, all of it derived from
@@ -390,7 +437,7 @@ enum Outcome {
     /// measurement so it is never probed again.
     TooBig {
         target: Box<PrefetchTarget>,
-        bytes: u64,
+        cost: RowCost,
     },
     /// Built and handed to the UI. `lines` feeds the dispatch budget.
     Warmed { lines: usize },
@@ -402,7 +449,10 @@ enum Outcome {
     /// A stats row finished — result already sent. `costly` carries the probe's
     /// measurement when the row was too expensive for its line counts, in which case
     /// only the file count was sent.
-    Stats { oid: git2::Oid, costly: Option<u64> },
+    Stats {
+        oid: git2::Oid,
+        costly: Option<RowCost>,
+    },
     /// Nothing happened: the row was claimed elsewhere, the send failed, or the job
     /// panicked. The worker is free; no state changed.
     Nothing,
@@ -538,7 +588,7 @@ struct Coordinator {
     ///
     /// Without it a re-dispatch re-probed every deferred row — measured, 18 of them on
     /// the second dispatch alone, and a dispatch fires every half-window while scrolling.
-    measured: HashMap<git2::Oid, u64>,
+    measured: HashMap<git2::Oid, RowCost>,
     /// The `[diff] textconv` setting `measured` was built under.
     ///
     /// The costly verdict is `total_blob_bytes > max_blob_bytes || driven`, and
@@ -752,13 +802,13 @@ impl Coordinator {
         // Releases the shared claim for a warm job (nothing for a stats job).
         drop(self.warming.remove(&id));
         match outcome {
-            Outcome::TooBig { target, bytes } => {
+            Outcome::TooBig { target, cost } => {
                 // Postponed, not dropped: the cache is sized to hold it and revisiting
                 // it should be instant. It simply must not stand in front of fifty
                 // cheap rows. No dedup needed — the coordinator handed this row out
                 // exactly once, so it can come back exactly once.
-                self.measured.insert(target.key.oid, bytes);
-                self.deferred.push_back(target.measured(bytes));
+                self.measured.insert(target.key.oid, cost);
+                self.deferred.push_back(target.measured(cost));
             }
             Outcome::Warmed { lines } => self.warmed += lines,
             Outcome::Oversized { key, lines } => {
@@ -773,8 +823,8 @@ impl Coordinator {
             }
             Outcome::Stats { oid, costly } => {
                 self.busy_stats.remove(&oid);
-                if let Some(bytes) = costly {
-                    self.measured.insert(oid, bytes);
+                if let Some(cost) = costly {
+                    self.measured.insert(oid, cost);
                 }
             }
             Outcome::Nothing => {}
@@ -860,27 +910,23 @@ impl Coordinator {
 
     /// Transient memory a heavy row is expected to hold: both sides of every changed
     /// file, doubled for xdiff's own line records and the `DiffData` that follows, both
-    /// of which scale with the same content. `probed` is set for every row on this
-    /// lane; a row without it has not been measured and is treated as the floor below.
+    /// of which scale with the same content — plus `DRIVEN_ROW_EXTRA_BYTES` when a
+    /// driver will run, which no amount of blob measuring can predict. `probed` is set
+    /// for every row on this lane; a row without it has not been measured and is
+    /// charged nothing, as before.
     ///
-    /// **The floor is what makes this bound mean anything for a DRIVEN row**, and the
-    /// estimator has no other way to see one. Rows reach this lane by two different
-    /// tests — blob bytes, and `RowCostProbe::driven`, which is not a size at all — and
-    /// for the second the measurement bears no relation to what the build holds: a
-    /// commit touching a dozen zips is a few compressed KB probed, while each
-    /// conversion materialises up to `TEXTCONV_MAX_OUTPUT` per side plus the converted
-    /// patch. Admitted against `probed * 2`, every such row looks free, so the bound
-    /// that exists to stop `dispatch`'s tight hand-out loop from committing the whole
-    /// lane at once stopped nothing on exactly the repos this lane was widened for.
-    /// `HEAVY_ROW_FLOOR_BYTES` is deliberately an under-estimate of the worst case
-    /// rather than a guess at the average: it has to be small enough that an idle lane
-    /// still fills on a modest machine.
+    /// The two terms are ADDED because the two costs are: a row that is both driven and
+    /// blob-heavy holds its inflated blobs and its conversion buffers at once. See
+    /// `RowCost` for why the verdict travels here rather than being inferred.
     fn heavy_need(target: &PrefetchTarget) -> u64 {
-        target
-            .probed
-            .unwrap_or(0)
-            .saturating_mul(2)
-            .max(HEAVY_ROW_FLOOR_BYTES)
+        target.probed.map_or(0, |cost| {
+            let blobs = cost.bytes.saturating_mul(2);
+            if cost.driven {
+                blobs.saturating_add(DRIVEN_ROW_EXTRA_BYTES)
+            } else {
+                blobs
+            }
+        })
     }
 
     /// May another heavy row start right now?
@@ -1224,20 +1270,14 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
         // row would show a file count and a permanently blank `+`/`-`, and stay that way
         // after the working-tree change that triggered it was reverted, since a sentinel
         // oid never expires.
-        if is_real_commit(oid)
-            && (cost.total_blob_bytes > ctx.limits.max_blob_bytes || cost.driven_or_unknown())
-        {
+        if is_real_commit(oid) && ctx.limits.too_costly(&cost) {
             log::debug!(
                 "stats: defer {oid} — {} blob bytes over {} (largest {}, {} files{})",
                 cost.total_blob_bytes,
                 ctx.limits.max_blob_bytes,
                 cost.max_blob_bytes,
                 cost.deltas,
-                if cost.driven_or_unknown() {
-                    ", textconv"
-                } else {
-                    ""
-                }
+                cost.textconv_note()
             );
             // Send the file count NOW, so the row shows something rather than staying
             // blank. Deliberately counted off the pipeline's own diff and not from
@@ -1255,7 +1295,7 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
             // the drop site, which is the exact moment that becomes knowable.
             return Outcome::Stats {
                 oid,
-                costly: Some(cost.total_blob_bytes),
+                costly: Some(RowCost::of(&cost)),
             };
         }
         // A DRIVEN virtual row answers its file count and nothing else. It cannot take
@@ -1274,7 +1314,7 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
         // never reached its band-warm phase while it was on screen, and re-submitted
         // its full index→workdir diff every time another row's numbers landed.
         //
-        // `cost.driven` and NOT `driven_or_unknown()`: the deferral above can afford the
+        // `is_driven` and NOT `may_be_driven`: the deferral above can afford the
         // conservative verdict because the row's own diff corrects it, and this arm
         // cannot — `Withheld` has `answered()`, so nothing ever re-asks. Reading a
         // failed resolution as driven here let one EMFILE blank the "Uncommitted
@@ -1282,7 +1322,7 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
         // working tree changed enough to move that row's content hash. With the
         // resolution failed the pane is built all-raw too, so the raw counts this now
         // computes are the ones the sidebar shows.
-        let withheld = cost.driven && job.want == StatsWant::FilesAndLines;
+        let withheld = cost.is_driven() && job.want == StatsWant::FilesAndLines;
         let want = if withheld {
             StatsWant::FilesOnly
         } else {
@@ -1428,7 +1468,7 @@ fn warm_row(
     let tc = textconv_for(&ctx.deps.textconv, target.key.settings);
     if target.probed.is_none()
         && let Ok(cost) = diff::probe_row_cost(repo, &target.scope, target.key.settings, tc)
-        && (cost.total_blob_bytes > ctx.limits.max_blob_bytes || cost.driven_or_unknown())
+        && ctx.limits.too_costly(&cost)
     {
         // All three dimensions, not just the one that tripped: which of them is large
         // is what tells a 265MB single file apart from a wide shallow commit, and this
@@ -1443,14 +1483,10 @@ fn warm_row(
             ctx.limits.max_blob_bytes,
             cost.max_blob_bytes,
             cost.deltas,
-            if cost.driven_or_unknown() {
-                ", textconv"
-            } else {
-                ""
-            }
+            cost.textconv_note()
         );
         return Outcome::TooBig {
-            bytes: cost.total_blob_bytes,
+            cost: RowCost::of(&cost),
             target: Box::new(target),
         };
     }
@@ -1537,9 +1573,11 @@ fn warm_row(
         // is the one that cannot contradict the sidebar. `invalidate_commit_stats`
         // still re-asks it when the drivers move, which is when the verdict can change.
         if is_real_commit(oid) {
+            // Built directly rather than through `stats_from_data`, whose whole job is
+            // the two line sums this then discards — only `files` survives.
             let stats = CommitStats {
+                files: data.files.len(),
                 lines: diff::LineStats::Withheld,
-                ..diff::stats_from_data(&data)
             };
             send_stats_result(ctx, stats_epoch, oid, Some(stats));
         }
@@ -1744,8 +1782,23 @@ mod tests {
     }
 
     /// A heavy target that has been measured at `bytes`, as one off the lane always is.
+    /// An undriven measurement of `bytes`.
+    const fn cost(bytes: u64) -> RowCost {
+        RowCost {
+            bytes,
+            driven: false,
+        }
+    }
+
     fn measured_target(n: u32, bytes: u64) -> PrefetchTarget {
-        heavy_target(n).measured(bytes)
+        heavy_target(n).measured(cost(bytes))
+    }
+
+    fn driven_target(n: u32, bytes: u64) -> PrefetchTarget {
+        heavy_target(n).measured(RowCost {
+            bytes,
+            driven: true,
+        })
     }
 
     fn stats_job(n: u32) -> StatsJob {
@@ -1780,12 +1833,16 @@ mod tests {
             0,
             Outcome::TooBig {
                 target: Box::new(heavy_target(1)),
-                bytes: 999,
+                cost: cost(999),
             },
         );
         assert_eq!(coord.deferred.len(), 1, "postponed, not dropped");
-        assert_eq!(coord.deferred[0].probed, Some(999), "measured exactly once");
-        assert_eq!(coord.measured.get(&oid(1)), Some(&999));
+        assert_eq!(
+            coord.deferred[0].probed,
+            Some(cost(999)),
+            "measured exactly once"
+        );
+        assert_eq!(coord.measured.get(&oid(1)), Some(&cost(999)));
     }
 
     /// A measured row is re-offered to the heavy lane rather than re-probed, and one
@@ -1793,7 +1850,7 @@ mod tests {
     #[test]
     fn a_new_band_routes_rows_by_what_is_already_known() {
         let (mut coord, _rxs) = test_coord(2);
-        coord.measured.insert(oid(1), 999);
+        coord.measured.insert(oid(1), cost(999));
         coord.oversized.insert(heavy_target(3).key);
         coord.take_band(
             [heavy_target(1), heavy_target(2), heavy_target(3)]
@@ -1803,7 +1860,7 @@ mod tests {
         assert_eq!(coord.deferred.len(), 1, "the measured row");
         assert_eq!(
             coord.deferred[0].probed,
-            Some(999),
+            Some(cost(999)),
             "carrying its measurement"
         );
         assert_eq!(coord.ready.len(), 1, "the unknown row");
@@ -1823,7 +1880,7 @@ mod tests {
         let (mut coord, _rxs) = test_coord(2);
         let target = heavy_target(1);
         coord.unconverted.insert(target.key);
-        coord.measured.insert(oid(2), 999);
+        coord.measured.insert(oid(2), cost(999));
 
         coord.run_msg(CoordMsg::RetryUnconverted);
         coord.take_band(std::iter::once(heavy_target(1)).collect());
@@ -1845,7 +1902,7 @@ mod tests {
     #[test]
     fn stats_are_not_queued_for_a_row_the_diff_already_owes() {
         let (mut coord, _rxs) = test_coord(2);
-        coord.measured.insert(oid(1), 999);
+        coord.measured.insert(oid(1), cost(999));
         coord.stats = [stats_job(1), stats_job(2)]
             .into_iter()
             .filter(|j| !coord.measured.contains_key(&j.scope.source.oid()))
@@ -2037,45 +2094,44 @@ mod tests {
         assert!(coord.heavy_fits(100, &mem), "900 + 100 is not");
     }
 
-    /// A row reaches the heavy lane by two tests, and only one of them is a size.
+    /// A row reaches the heavy lane by two tests, and only one of them is a size — so
+    /// the charge has to have two terms, ADDED.
     ///
     /// LOAD-BEARING. A driven row is a few compressed KB of archive that converts to
-    /// megabytes per side, so charging it `probed * 2` made it free — and free is
-    /// exactly what defeats `heavy_fits`, whose whole job is stopping `dispatch`'s tight
-    /// hand-out loop from committing the entire lane at once. Without the floor a whole
-    /// band of driven rows is admitted against an accounted need of nothing.
+    /// megabytes per side, so charging it `bytes * 2` made it free — and free is exactly
+    /// what defeats `heavy_fits`, whose whole job is stopping `dispatch`'s tight
+    /// hand-out loop from committing the entire lane at once. A `max` of the two terms
+    /// fixes the small-and-driven row and re-opens the hole for the big-and-driven one,
+    /// which holds its inflated blobs and its conversion buffers at once.
     #[test]
-    fn a_row_whose_blobs_measured_small_is_still_charged_the_floor() {
+    fn a_driven_row_is_charged_for_its_conversion_as_well_as_its_blobs() {
         assert_eq!(
-            Coordinator::heavy_need(&measured_target(1, 3_000)),
-            HEAVY_ROW_FLOOR_BYTES,
+            Coordinator::heavy_need(&driven_target(1, 3_000)),
+            6_000 + DRIVEN_ROW_EXTRA_BYTES,
             "3KB of zip is not what converting it holds"
         );
         assert_eq!(
-            Coordinator::heavy_need(&heavy_target(2)),
-            HEAVY_ROW_FLOOR_BYTES,
-            "and an unmeasured row is not free either"
+            Coordinator::heavy_need(&measured_target(2, 3_000)),
+            6_000,
+            "and an undriven row is not charged for a conversion that will not happen"
         );
-        // Above the floor the measurement still decides — this is a floor, not a flat rate.
-        let big = HEAVY_ROW_FLOOR_BYTES;
+        // The two terms add. Under `max` this row would be charged its blobs alone,
+        // leaving the conversion unaccounted on the repo that can least afford it.
+        let big = DRIVEN_ROW_EXTRA_BYTES;
         assert_eq!(
-            Coordinator::heavy_need(&measured_target(3, big)),
-            2 * big,
-            "a genuinely large row is charged what it measured"
+            Coordinator::heavy_need(&driven_target(3, big)),
+            2 * big + DRIVEN_ROW_EXTRA_BYTES,
+            "big AND driven is both costs, not the larger of them"
         );
     }
 
     /// Eight rows admitted in one dispatch must not exceed the budget between them.
     ///
-    /// Sized in multiples of `HEAVY_ROW_FLOOR_BYTES` rather than in round numbers: the
-    /// floor is what a row costs when its own measurement says less, so a row measured
-    /// below it is charged the floor and toy byte counts would all collapse onto one
-    /// need.
     #[test]
     fn a_whole_dispatch_cannot_overcommit_the_lane() {
         let (mut coord, _rxs) = test_coord_n(1, 8);
-        let row = HEAVY_ROW_FLOOR_BYTES; // probed, so need = 2 × this
-        let budget = 6 * HEAVY_ROW_FLOOR_BYTES; // room for exactly three of them
+        let row = 500; // undriven, so need = 1_000 each
+        let budget = 3_000; // room for exactly three of them
         coord.heavy_budget = Some(budget);
         for n in 1..=8 {
             coord.deferred.push_back(measured_target(n, row));
@@ -2532,7 +2588,7 @@ mod tests {
     #[test]
     fn an_edited_driver_re_measures_the_rows_it_classified() {
         let (mut coord, _rxs) = test_coord(2);
-        coord.measured.insert(oid(1), 999);
+        coord.measured.insert(oid(1), cost(999));
         coord.run_msg(CoordMsg::DriversChanged);
         assert!(
             coord.measured.is_empty(),
@@ -2564,7 +2620,7 @@ mod tests {
         coord.run_msg(CoordMsg::SubmitStats(
             std::iter::once(driven(true)).collect(),
         ));
-        coord.measured.insert(oid(1), 999);
+        coord.measured.insert(oid(1), cost(999));
         // Same settings: the verdict still holds, and re-probing 18 rows on every
         // dispatch is what the memo exists to avoid.
         coord.run_msg(CoordMsg::SubmitStats(
