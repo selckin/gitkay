@@ -202,6 +202,10 @@ budget-and-temp-sweep pruner),
 the runner and its watchdog, and reading git's own `cachetextconv` notes cache — the
 one place gitkay runs an external program, and it writes nothing to the repo; see
 **Textconv**),
+`src/graph.rs` (the commit graph's lane/pipe layout: `CommitInfo`s in, per-row
+node columns and line segments out — pure and egui-free, a row's colour being an
+INDEX the renderer resolves, which is what lets its suite run on fake oids with no
+repository; see **Graph Layout**),
 `src/mem.rs` (what the system will say about memory —
 `/proc/meminfo` plus the cgroup limit, Linux only, no `unsafe` and no dependency;
 advisory, `None` ⇒ the caller uses its static default. One consumer:
@@ -218,10 +222,12 @@ anywhere, no matter the diff size; installs and the toggle just nudge a repaint)
 
 The big picture, ahead of the detail sections below:
 
-- **The commit-graph layout (`layout_graph`) is the subtle part** — lane/pipe
+- **The commit-graph layout (`src/graph.rs`) is the subtle part** — lane/pipe
   tracking with a load-bearing "first parent always continues straight"
   invariant. Its test suite uses fake OIDs (`oid(n)`), so no real repo is
-  needed; change it only with those tests green.
+  needed; change it only with those tests green. It is its own module because
+  that is exactly what it needs to be asked of it: nothing there touches
+  `GitkApp` or egui, so the boundary is the compiler's rather than a convention.
 - **Startup is latency-critical** (the window should be up before anything
   expensive finishes; the old "sub-200ms" figure is no longer claimed anywhere
   user-facing, but the budget it implied still governs this code): heavy/IO-bound
@@ -1334,7 +1340,7 @@ parts run off the window-creation critical path:
   `RUST_LOG` prefix would lift the mute, and that setting the baseline as a directive was
   the same thing.
 
-### Graph Layout (`layout_graph()`)
+### Graph Layout (`src/graph.rs`)
 - **Pipes**: `Vec<Option<(Oid, color_index)>>` — fixed column slots, `None` = empty
 - **Algorithm** per commit:
   1. Find matching pipe(s). Multiple matches = convergence → merge lines + clear extras
@@ -2492,8 +2498,12 @@ binaries, symlinks, modes, and every refusal the write layer owes the user), and
 layout, diff integration over temp repos, and UI helpers). The graph-layout suite uses fake
 OIDs via `oid(n)` — no real repo needed — and pins the layout invariants (lane
 stability, merge diagonals, convergence, out-of-scope-parent continuation
-lines; `grep 'fn test_' src/main.rs` for the list). Change `layout_graph` only
-with that suite green.
+lines; `grep 'fn test_' src/graph.rs` for the list), plus
+`layout_resume_matches_full_layout`, which pins the append contract. Change
+`layout_graph` only with that suite green. Its two fixtures — `oid(n)` and
+`commit(id, parents)` — stay in `main.rs`'s own suite, which is the larger user of
+both, and are `pub` so the graph suite can share them rather than keep a copy that
+drifts.
 
 **A test that needs a real `egui::Ui` goes through `run_headless`, never a bare
 `ctx.run_ui`.** epaint `debug_assert!`s in `TexturesDelta::drop` that a frame's
