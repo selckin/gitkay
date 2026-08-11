@@ -523,9 +523,14 @@ impl DiffData {
         Self::with_max_chars(lines, files, max_chars)
     }
 
-    /// Reassemble a diff whose widest line is already known — the stash path
-    /// returns the *displayed* diff to the cache, so rescanning it on the UI
-    /// thread would undo what build-time `max_chars` exists to avoid.
+    /// A diff whose widest line is already known, and which cannot have failed a
+    /// conversion — the persistent store's decoder, where `textconv_failed` is `false`
+    /// by construction because a failed diff is never written.
+    ///
+    /// NOT for the display round-trip, which has a flag to carry: see `into_parts`.
+    /// This constructor used to serve both, and stating `false` here laundered a
+    /// transient textconv failure straight past `cache_diff`'s guard and back into the
+    /// LRU, for the one diff most likely to be revisited.
     pub const fn with_max_chars(
         lines: Vec<DiffLine>,
         files: Vec<FileEntry>,
@@ -536,6 +541,42 @@ impl DiffData {
             files,
             max_chars,
             textconv_failed: false,
+        }
+    }
+
+    /// Split into the parts `GitkApp` holds separately while a diff is on screen.
+    ///
+    /// Paired with `from_parts`, and both destructure/construct `Self` exhaustively so
+    /// a field added to `DiffData` is a compile error in BOTH directions. That is the
+    /// point: the display boundary is where a field quietly dies. `textconv_failed`
+    /// already did — the reassembly went through `with_max_chars`, which states it
+    /// `false`, and the flag had to be patched back by hand afterwards by a caller that
+    /// remembered to. A new field would be lost the same way, silently, and for a diff
+    /// that is then cached and served.
+    pub fn into_parts(self) -> (Vec<DiffLine>, Vec<FileEntry>, usize, bool) {
+        let Self {
+            lines,
+            files,
+            max_chars,
+            textconv_failed,
+        } = self;
+        (lines, files, max_chars, textconv_failed)
+    }
+
+    /// Reassemble what `into_parts` split — the stash path returning the *displayed*
+    /// diff to the cache, so nothing is rescanned on the UI thread (which is what
+    /// build-time `max_chars` exists to avoid).
+    pub const fn from_parts(
+        lines: Vec<DiffLine>,
+        files: Vec<FileEntry>,
+        max_chars: usize,
+        textconv_failed: bool,
+    ) -> Self {
+        Self {
+            lines,
+            files,
+            max_chars,
+            textconv_failed,
         }
     }
 
