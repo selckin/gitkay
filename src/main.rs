@@ -2456,12 +2456,17 @@ struct GitkApp {
     /// `DiffStore::drivers`, so the two halves of the key agree from the first launch.
     /// Read by `diff_cache_key`; see `DiffCacheKey::drivers`.
     diff_drivers: u64,
-    /// A driver fingerprint that has not reached the persistent store yet, because the
-    /// store had not been published when the change was noticed (it is opened on the
-    /// prune thread). `drivers_changed` is one-shot and nothing re-arms it, so dropping
-    /// the value here would leave `~/.cache/gitkay/diffs` keyed under the OLD command
-    /// for the rest of the session.
-    pending_store_drivers: Option<u64>,
+    /// The same fingerprint, in the cell `DiffStore` keys its entries from.
+    ///
+    /// Held here rather than inside the store because the store does not exist for the
+    /// first frames of a session — it is opened on the `gitkay-cache-prune` thread and
+    /// published through a `OnceLock` — while a driver edit can be noticed at any time.
+    /// Handing the cell to `DiffStore::open` means a fingerprint written before the
+    /// store opens is already in force when it does, which a "publish it to the store
+    /// each frame" retry could not promise: see the field's doc in `diff_store.rs` for
+    /// the entries that came back out of `~/.cache/gitkay/diffs` under `0` because of
+    /// it. Written beside `diff_drivers` — one write, in `apply_driver_change`.
+    store_drivers: Arc<std::sync::atomic::AtomicU64>,
     /// The speculative bounds, resolved once so the prefetch pool and the
     /// diff-load worker cannot disagree about what is too big to keep.
     prefetch_budget: PrefetchBudget,
@@ -2984,9 +2989,13 @@ impl GitkApp {
         // creation, where the rule is that no IO runs inline. Nothing needs the
         // store until the first diff load, which is at least a frame away.
         let diff_store = StoreSlot::default();
+        // The app's own cell, so a driver edit noticed before the store is published
+        // is already in force when it opens. See `GitkApp::store_drivers`.
+        let store_drivers: Arc<std::sync::atomic::AtomicU64> = Arc::default();
         {
             let slot = Arc::clone(&diff_store);
             let repo_path = repo_path.clone();
+            let drivers = Arc::clone(&store_drivers);
             let min_build = std::time::Duration::from_millis(cfg.cache.min_build_ms);
             let _ = spawn_guarded(
                 "gitkay-cache-prune",
@@ -2997,7 +3006,7 @@ impl GitkApp {
                     let Ok(repo) = Repository::discover(&repo_path) else {
                         return;
                     };
-                    let Some(store) = DiffStore::open(&repo, min_build) else {
+                    let Some(store) = DiffStore::open(&repo, min_build, drivers) else {
                         return; // no cache dir, or the repo could not be fingerprinted
                     };
                     diff_store::prune(store.root(), diff_store::DEFAULT_BUDGET_BYTES);
@@ -3100,7 +3109,7 @@ impl GitkApp {
                 textconv: Arc::new(Textconv::new()),
             },
             diff_drivers: 0,
-            pending_store_drivers: None,
+            store_drivers,
             prefetch_budget,
             current_diff_key,
             prewarm_rx,
@@ -3620,6 +3629,30 @@ impl GitkApp {
         // replaced, so a later revisit restores it instantly.
         self.stash_current_diff();
         self.diff_load_started_at = None;
+        // Harvest the INCOMING diff's numbers, not only the outgoing one's.
+        // `stash_current_diff` → `cache_diff` covers the diff being replaced, which
+        // left the SELECTED row — the one commit whose diff is guaranteed to exist —
+        // as the single row nothing harvested: `prefetch_targets` excludes the selected
+        // index and `dispatch_prefetch` excludes `current_diff_key`, so the band never
+        // warms it either. `run_stats_job` defers a costly row on the promise that its
+        // own diff supplies the line counts, so those cells stayed blank for as long as
+        // the row stayed selected, filling only once the reader navigated away. Worse,
+        // the deferral leaves `LineStats::NotAsked`, which `stats_targets` reads as
+        // still owed — so `dispatch_commit_stats` never advanced past its visible-rows
+        // phase while that row was on screen and the band around it was never warmed.
+        // Rare while only `total_blob_bytes` could defer a row; ordinary once `driven`
+        // can, which is any commit touching one small archive.
+        //
+        // Same rule and same order as `cache_diff`'s harvest, refusal included: these
+        // numbers are a sum over the very `FileEntry` list the sidebar is about to
+        // draw, so they agree with the pane whether or not a conversion happened.
+        if stats_harvestable(&key, self.diff_settings, self.diff_drivers) {
+            install_stats_result(
+                &mut self.commit_stats,
+                oid,
+                Some(diff::stats_from_data(&data)),
+            );
+        }
         self.set_diff_content(Some(key), data);
         // Put the reader back on the line they were reading, for a same-oid
         // rebuild. Only when an anchor is actually pending: on a commit switch
@@ -5898,7 +5931,15 @@ impl GitkApp {
         if let Some(fingerprint) = self.diff_deps.textconv.drivers_changed() {
             log::debug!("textconv: drivers changed — dropping diffs built under the old ones");
             self.diff_drivers = fingerprint;
-            self.pending_store_drivers = Some(fingerprint);
+            // The store's half of the key moves HERE, before the rebuild is dispatched
+            // below. `DiffStore::key` reads it at load time, so a build that starts
+            // first computes the key the pre-edit entries were written under and is
+            // served one of them — deterministically on the synchronous fallback path,
+            // where `dispatch_diff_load` runs `build_or_load` inline on the UI thread.
+            // The reader's fix would then reload the pane to the identical broken
+            // output, out of `~/.cache/gitkay/diffs`. This lands whether or not the
+            // store has been opened yet, the cell being the app's own.
+            self.store_drivers.store(fingerprint, Ordering::Relaxed);
             // Entries under the old fingerprint can no longer be reached, so this frees
             // memory rather than deciding anything — including for a warm still running
             // under the pre-edit map, whose result now fails `key_is_current` and is
@@ -5917,35 +5958,9 @@ impl GitkApp {
             if let Some(pool) = &self.prefetch_pool {
                 pool.drivers_changed();
             }
-            // The store's half of the key is published BEFORE the rebuild is
-            // dispatched, not after. `DiffStore::key` reads `drivers` at load time, so
-            // a build that starts first computes the key the pre-edit entries were
-            // written under and is served one of them — deterministically on the
-            // synchronous fallback path, where `dispatch_diff_load` runs
-            // `build_or_load` inline. The reader's fix would then reload the pane to
-            // the identical broken output, out of `~/.cache/gitkay/diffs`.
-            self.publish_store_drivers();
+            // The store keeps its entries; they simply stop being reachable, since the
+            // fingerprint joins their key.
             self.load_selected_diff();
-        }
-        // The store keeps its entries; they simply stop being reachable, since the
-        // fingerprint joins their key. Retried each frame because the store is opened
-        // on the prune thread and may not have been published above — see
-        // `pending_store_drivers`.
-        self.publish_store_drivers();
-    }
-
-    /// Hand the pending driver fingerprint to the persistent store, if it is open.
-    ///
-    /// Separate so `apply_driver_change` can do it before dispatching the rebuild and
-    /// still retry on later frames: `drivers_changed` is one-shot and nothing re-arms
-    /// it, so a fingerprint dropped because the store was not open yet would leave
-    /// `~/.cache/gitkay/diffs` keyed under the OLD command for the rest of the session.
-    fn publish_store_drivers(&mut self) {
-        if let Some(fingerprint) = self.pending_store_drivers
-            && let Some(store) = store_of(&self.diff_deps.store)
-        {
-            store.set_drivers(fingerprint);
-            self.pending_store_drivers = None;
         }
     }
 
@@ -6015,6 +6030,22 @@ impl GitkApp {
                 // coordinator, and nothing else would ever let them back in.
                 if let Some(pool) = &self.prefetch_pool {
                     pool.retry_unconverted();
+                }
+                // And the same latch has a counterpart on SCREEN, which nothing else
+                // reaches. The displayed diff may be the raw fallback one overrun of
+                // `TEXTCONV_TIMEOUT` produced, and `textconv_failed` is not part of
+                // `DiffCacheKey` — so the closing `load_selected_diff` takes its
+                // identical-key early return, and `install_preferring_cache` would drop
+                // the result even if it did not. Meanwhile the band re-warms that row
+                // successfully, so the cache ends up holding the converted patch while
+                // the pane keeps `Binary files … differ` until the reader navigates
+                // away and back. Dropping the displayed key states what is true — the
+                // content on screen is not a valid answer for it — which is what
+                // `apply_driver_change` gets for free from the fingerprint moving.
+                if self.diff_textconv_failed {
+                    self.current_diff_key = None;
+                    self.diff_textconv_failed = false;
+                    self.load_selected_diff();
                 }
                 // The virtual rows' content moved; every real commit's stats
                 // stay valid, so drop exactly those rather than the map. Asked
@@ -9457,6 +9488,7 @@ mod tests {
             dir.path().to_path_buf(),
             StoreContext::of(&repo).expect("hashable"),
             std::time::Duration::from_hours(1),
+            Arc::default(),
         );
         let built = build_or_load(Some(&never), &repo, &scope, s, None, None);
         assert!(!built.lines.is_empty(), "control: the diff is real");
@@ -9471,6 +9503,7 @@ mod tests {
             dir.path().to_path_buf(),
             StoreContext::of(&repo).expect("hashable"),
             std::time::Duration::ZERO,
+            Arc::default(),
         );
         let a = build_or_load(Some(&always), &repo, &scope, s, None, None);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "written");
@@ -9515,6 +9548,7 @@ mod tests {
             store_dir.path().to_path_buf(),
             StoreContext::of(&repo).expect("hashable"),
             std::time::Duration::ZERO,
+            Arc::default(),
         );
         build_or_load(Some(&store), &repo, &scope, s, Some(&tc), None);
         assert_eq!(
@@ -9543,8 +9577,8 @@ mod tests {
         let ctx = StoreContext::of(&repo).expect("hashable");
         drop(repo);
         crate::test_repo::remove_loose_object(dir.path(), oid);
-        let repo = Repository::open(dir.path()).unwrap();
-        let store = DiffStore::at(root, ctx, std::time::Duration::ZERO);
+        let repo = crate::test_repo::open_repo(dir.path());
+        let store = DiffStore::at(root, ctx, std::time::Duration::ZERO, Arc::default());
 
         let data = build_or_load(Some(&store), &repo, &scope, s, None, None);
         assert!(data.lines.is_empty(), "control: the build did fail");
@@ -9600,6 +9634,7 @@ mod tests {
             store_dir.path().to_path_buf(),
             ctx,
             std::time::Duration::ZERO,
+            Arc::default(),
         );
         build_or_load(
             Some(&store),
@@ -9619,12 +9654,13 @@ mod tests {
         let ctx = StoreContext::of(&repo).expect("hashable");
         drop(repo);
         crate::test_repo::remove_loose_object(dir.path(), root_oid);
-        let repo = Repository::open(dir.path()).unwrap();
+        let repo = crate::test_repo::open_repo(dir.path());
         let store_dir = tempfile::tempdir().unwrap();
         let store = DiffStore::at(
             store_dir.path().to_path_buf(),
             ctx,
             std::time::Duration::ZERO,
+            Arc::default(),
         );
         build_or_load(
             Some(&store),
@@ -9660,6 +9696,7 @@ mod tests {
                 dir.to_path_buf(),
                 StoreContext::of(&repo).expect("hashable"),
                 std::time::Duration::ZERO,
+                Arc::default(),
             )
         };
 
@@ -9699,6 +9736,7 @@ mod tests {
             dir.path().to_path_buf(),
             StoreContext::of(&repo).expect("hashable"),
             std::time::Duration::from_hours(1),
+            Arc::default(),
         );
 
         build_or_load(Some(&store), &repo, &scope, s, None, None);

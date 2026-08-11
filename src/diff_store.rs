@@ -403,7 +403,7 @@ fn repo_id(repo: &git2::Repository) -> PathBuf {
 /// `$XDG_CONFIG_HOME`, or `$HOME/.config` — where libgit2 looks for
 /// `git/attributes` when `core.attributesFile` is unset. Read from the
 /// environment rather than through `dirs`, so a test can point it elsewhere.
-fn xdg_config_home() -> Option<PathBuf> {
+pub fn xdg_config_home() -> Option<PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
@@ -425,7 +425,7 @@ fn xdg_config_home() -> Option<PathBuf> {
 /// Known gap: nested `.gitattributes` in subdirectories, and the system-wide
 /// file, are not included. A bounded tree walk is not worth its cost; the escape
 /// hatch is deleting the cache directory.
-fn attrs_id(repo: &git2::Repository, xdg: Option<&Path>) -> Vec<u8> {
+pub fn attrs_id(repo: &git2::Repository, xdg: Option<&Path>) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut fold = |p: Option<PathBuf>| {
         let content = p.and_then(|p| std::fs::read(p).ok()).unwrap_or_default();
@@ -665,7 +665,19 @@ pub struct DiffStore {
     /// an in-session edit are keyed under the new fingerprint and are unreachable next
     /// launch (which keys them under the new `context` and `0`) — a cache miss, and the
     /// pruner's budget collects them.
-    drivers: AtomicU64,
+    ///
+    /// **Shared with `GitkApp`, which is the point of the `Arc`.** The value used to be
+    /// owned here and mirrored in `GitkApp::diff_drivers`, kept in step by a per-frame
+    /// `publish_store_drivers` that silently did nothing while the store was still
+    /// unopened — it is opened on the prune thread and published through a `OnceLock` no
+    /// frame observes. A driver edit noticed inside that window (a slow `StoreContext::of`
+    /// against a debounced reload — a cold cache or a network home reaches it easily) left
+    /// the app keyed under the new fingerprint and the store under `0`, which is exactly
+    /// what earlier launches wrote the PRE-EDIT entries under: every worker then loaded
+    /// the broken driver's output back, and `cache_diff` pinned it in the LRU under the
+    /// new key, where `diff_cache.contains` kept every later dispatch from rebuilding it.
+    /// One value, written wherever the store happens to be in its life, has no window.
+    drivers: Arc<AtomicU64>,
     /// "Already complained about this store". A plain flag, not an `Arc`: the
     /// store is only ever shared AS an `Arc<DiffStore>` (`GitkApp` and every
     /// `WorkerCtx` hold clones of one), so the field is already shared and an
@@ -677,19 +689,29 @@ impl DiffStore {
     /// Open the user's store, or `None` when there is no cache directory — the
     /// whole feature then degrades to a no-op and gitkay behaves as it did
     /// before it existed.
-    pub fn open(repo: &git2::Repository, min_build: Duration) -> Option<Self> {
+    /// `drivers` is the app's own live fingerprint cell — see the field.
+    pub fn open(
+        repo: &git2::Repository,
+        min_build: Duration,
+        drivers: Arc<AtomicU64>,
+    ) -> Option<Self> {
         let root = dirs::cache_dir()?.join("gitkay").join("diffs");
-        Some(Self::at(root, StoreContext::of(repo)?, min_build))
+        Some(Self::at(root, StoreContext::of(repo)?, min_build, drivers))
     }
 
     /// Construct over an explicit root. Public for the tests, which supply a
     /// temp directory and a context built from a repo of their own.
-    pub const fn at(root: PathBuf, context: StoreContext, min_build: Duration) -> Self {
+    pub const fn at(
+        root: PathBuf,
+        context: StoreContext,
+        min_build: Duration,
+        drivers: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             root,
             context,
             min_build: AtomicU64::new(min_build.as_millis() as u64),
-            drivers: AtomicU64::new(0),
+            drivers,
             warned: AtomicBool::new(false),
         }
     }
@@ -707,12 +729,6 @@ impl DiffStore {
     pub fn set_min_build(&self, d: Duration) {
         self.min_build
             .store(d.as_millis() as u64, Ordering::Relaxed);
-    }
-
-    /// Apply a driver map that has CHANGED since this store was opened, so every entry
-    /// built under the old one misses. See the `drivers` field.
-    pub fn set_drivers(&self, fingerprint: u64) {
-        self.drivers.store(fingerprint, Ordering::Relaxed);
     }
 
     /// The driver fingerprint entry keys currently carry. Read by `build_or_load` on
@@ -1479,6 +1495,7 @@ mod tests {
             dir.path().to_path_buf(),
             StoreContext::of(repo).expect("hashable"),
             std::time::Duration::ZERO,
+            Arc::default(),
         );
         (dir, store)
     }

@@ -115,7 +115,7 @@ pub fn view_moved_enough(prev: &std::ops::Range<usize>, now: &std::ops::Range<us
 /// `available_parallelism` already accounts for cgroup quotas and CPU affinity, so a
 /// two-core container sees two. Floored at 1 so a single-core machine still prefetches,
 /// and ceilinged at `PREFETCH_MAX_WORKERS` because a band is finite.
-pub fn prefetch_worker_count() -> usize {
+fn prefetch_worker_count() -> usize {
     std::thread::available_parallelism()
         .map_or(1, |n| n.get() / 2)
         .clamp(1, PREFETCH_MAX_WORKERS)
@@ -131,7 +131,16 @@ pub fn prefetch_worker_count() -> usize {
 /// pessimistic here costs a little parallelism on a small machine whose rows turn out to
 /// be small, and prevents spawning eight threads that cannot all run on one that is
 /// genuinely short of memory.
-pub const HEAVY_ROW_NOMINAL_BYTES: u64 = 1024 * 1024 * 1024;
+const HEAVY_ROW_NOMINAL_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// The least `heavy_fits` will charge for a row, however small its blobs measured.
+///
+/// Two sides at `textconv::TEXTCONV_MAX_OUTPUT` — what one conversion can hold live —
+/// and nothing for the converted patch beside them, so it is an under-estimate of the
+/// worst case on purpose. It exists because rows reach this lane by two tests and only
+/// one of them is a size: see `Coordinator::heavy_need`. Small enough that a machine
+/// with the floor budget still runs a full lane, so an ordinary repo is unaffected.
+const HEAVY_ROW_FLOOR_BYTES: u64 = 2 * crate::textconv::TEXTCONV_MAX_OUTPUT as u64;
 
 /// Threads on the heavy lane: **as many as the pool, less whatever memory says**.
 ///
@@ -166,7 +175,7 @@ pub const HEAVY_ROW_NOMINAL_BYTES: u64 = 1024 * 1024 * 1024;
 /// variance — those same commits are equally slow at eight concurrent), then that it
 /// scaled 2.2× (from one fast batch of eight, faster than every batch since, and above
 /// the 2× ceiling that doubling can even reach).
-pub fn prefetch_heavy_workers(budget: Option<u64>) -> usize {
+fn prefetch_heavy_workers(budget: Option<u64>) -> usize {
     let by_memory = budget.map_or(usize::MAX, |b| {
         usize::try_from(b / HEAVY_ROW_NOMINAL_BYTES).unwrap_or(usize::MAX)
     });
@@ -349,7 +358,7 @@ impl PrefetchBudget {
 /// speculative, priority-ordered — and because they compete for the same cores. Two
 /// pools could not express that the numbers on screen outrank a diff nobody has
 /// clicked; one coordinator does.
-pub enum Job {
+enum Job {
     /// The commit-list `+`/`-` column for one row. On screen NOW, so it outranks every
     /// speculative diff.
     Stats(StatsJob),
@@ -375,7 +384,7 @@ pub enum Job {
 /// Every job produces exactly one of these — including a panicked one — which is what
 /// lets the coordinator own all the bookkeeping: it handed the work out, so it knows
 /// what came back, and nothing has to be reconstructed from shared state.
-pub enum Outcome {
+enum Outcome {
     /// The row's blobs are too large to build inline. Carries the target back so the
     /// coordinator can queue it on the heavy lane without rebuilding it, and the
     /// measurement so it is never probed again.
@@ -404,7 +413,7 @@ pub enum Outcome {
 /// One channel with many senders — the UI's dispatches and every worker's completions
 /// arrive in the same queue, which is what makes the coordinator's state single-owner
 /// and therefore lock-free.
-pub enum CoordMsg {
+enum CoordMsg {
     /// A new band, replacing whatever the pool was working through.
     Submit {
         targets: VecDeque<PrefetchTarget>,
@@ -444,7 +453,7 @@ pub enum CoordMsg {
 /// worker already building a row still finishes it, and the result is still a valid
 /// cache entry, so nothing has to be detected or discarded.
 pub struct PoolHandle {
-    pub tx: mpsc::Sender<CoordMsg>,
+    tx: mpsc::Sender<CoordMsg>,
 }
 
 impl PoolHandle {
@@ -504,21 +513,21 @@ impl PoolHandle {
 /// is now a plain field — and the class of bug that shape produced went with it: a
 /// dedup that read "measured" as "queued" silently dropped every heavy row the stats
 /// path had already probed, i.e. every heavy row on screen.
-pub struct Coordinator {
+struct Coordinator {
     /// On-screen work: the commit-list numbers the user is looking at right now.
     /// Always handed out first — a blank cell is visible, a cold cache entry is not.
-    pub stats: VecDeque<StatsJob>,
+    stats: VecDeque<StatsJob>,
     /// The band in priority order, popped from the front so every worker takes the
     /// globally highest-priority row left. Striping the list across workers up front
     /// would leave one grinding the far band while another idled on an exhausted stripe.
-    pub ready: VecDeque<PrefetchTarget>,
+    ready: VecDeque<PrefetchTarget>,
     /// Rows the probe found expensive. Only `heavy` is ever given one of these, so a
     /// row that costs seconds can never occupy a worker the next band needs.
     ///
     /// Order matters more here than in `ready`, because one thread drains it in
     /// sequence — the order IS the schedule — so `Submit` replaces it wholesale,
     /// re-sorted by the new band's priority.
-    pub deferred: VecDeque<PrefetchTarget>,
+    deferred: VecDeque<PrefetchTarget>,
     /// Blob bytes per row, from the probe. Keyed by **oid**, not `DiffCacheKey`,
     /// because blob size is a property of the commit and its pathspec — not of the
     /// theme, the context width, or whether syntax is on. That is also what lets stats
@@ -529,7 +538,7 @@ pub struct Coordinator {
     ///
     /// Without it a re-dispatch re-probed every deferred row — measured, 18 of them on
     /// the second dispatch alone, and a dispatch fires every half-window while scrolling.
-    pub measured: HashMap<git2::Oid, u64>,
+    measured: HashMap<git2::Oid, u64>,
     /// The `[diff] textconv` setting `measured` was built under.
     ///
     /// The costly verdict is `total_blob_bytes > max_blob_bytes || driven`, and
@@ -540,7 +549,7 @@ pub struct Coordinator {
     /// out of every stats submission, so its `+`/`-` cells stayed blank until that
     /// lane happened to reach it. Read off the jobs themselves rather than announced
     /// by a caller, so a new dispatch site cannot forget to say so.
-    pub measured_textconv: Option<bool>,
+    measured_textconv: Option<bool>,
     /// Diffs whose BUILT line count exceeded the cap and were dropped.
     ///
     /// A separate store from `measured`, and `DiffCacheKey`-keyed rather than by oid,
@@ -550,7 +559,7 @@ pub struct Coordinator {
     /// built, which is exactly why the verdict has to be kept afterwards. Without it an
     /// over-cap row was rebuilt in full on every dispatch purely to be discarded again
     /// (measured: a 292,503-line row built twice in two seconds, 629ms each).
-    pub oversized: HashSet<DiffCacheKey>,
+    oversized: HashSet<DiffCacheKey>,
     /// Rows built whose textconv driver FAILED, so the diff was dropped uncached.
     ///
     /// The same shape as `oversized` and for the same reason: a row nothing will keep
@@ -566,51 +575,51 @@ pub struct Coordinator {
     /// drivers change (`CoordMsg::DriversChanged`) — the two events after which the
     /// verdict may differ. A transient failure costs one dropped warm until then, which
     /// is what it cost before this existed.
-    pub unconverted: HashSet<DiffCacheKey>,
+    unconverted: HashSet<DiffCacheKey>,
     /// Pool workers with no job right now.
-    pub idle: Vec<usize>,
+    idle: Vec<usize>,
     /// Heavy-lane workers with no row right now.
-    pub heavy_idle: Vec<usize>,
+    heavy_idle: Vec<usize>,
     /// Bytes each outstanding heavy row is expected to hold, by worker id. Summed by
     /// `heavy_fits` into what the lane has committed, and keyed by worker so a finishing
     /// row releases exactly what it reserved.
-    pub heavy_outstanding: HashMap<usize, u64>,
+    heavy_outstanding: HashMap<usize, u64>,
     /// Bytes the heavy lane may have committed at once, resolved ONCE at startup from
     /// `mem::usable_bytes`. `None` where the platform will not say, leaving the thread
     /// count as the only bound.
-    pub heavy_budget: Option<u64>,
+    heavy_budget: Option<u64>,
     /// Oids being computed for the commit-list column right now. The stats tier can
     /// legitimately be re-submitted while a row is in flight, since a row not yet in
     /// `commit_stats` still reads as unknown, so without this the same row would be
     /// handed to a second worker.
-    pub busy_stats: HashSet<git2::Oid>,
+    busy_stats: HashSet<git2::Oid>,
     /// Claims on the keys being warmed, released when the worker reports back.
     ///
     /// Held here rather than by the worker because the coordinator is what knows the
     /// job ended. The set itself is shared with the foreground diff-load path, which is
     /// the point: a prefetch skips a key that load is already computing, and that load
     /// skips one the pool has.
-    pub warming: HashMap<usize, InflightClaim>,
+    warming: HashMap<usize, InflightClaim>,
     /// Lines built since the last `Submit`, across every worker.
-    pub warmed: usize,
+    warmed: usize,
     /// Lines one dispatch may build before it stops — a fraction of the resolved cache
     /// budget, which is derived from system memory and so is not known until startup.
-    pub line_budget: usize,
+    line_budget: usize,
     /// The highlighter as of the last `Submit`, copied onto each warm job.
-    pub hl: Option<Arc<Highlighter>>,
+    hl: Option<Arc<Highlighter>>,
     /// The span generation as of the last `Submit`, copied onto each warm job so a
     /// result can say which span settings it was built under; see `WarmResult`.
-    pub span_gen: u64,
+    span_gen: u64,
     /// The epoch of the last `SubmitStats`, copied onto each warm job. Uniform across
     /// a batch — the UI stamps every job in a dispatch from one `stats_epoch.current()`
     /// — so the front job speaks for all of them. A stale one is simply dropped by the
     /// UI's own epoch check, leaving the cell exactly as blank as it was.
-    pub stats_epoch: u64,
+    stats_epoch: u64,
     /// One mailbox per pool worker, then one per heavy worker. Heavy ids continue
     /// straight on from the pool's, so `id >= mailboxes.len()` names the lane.
-    pub mailboxes: Vec<mpsc::Sender<Job>>,
-    pub heavy: Vec<mpsc::Sender<Job>>,
-    pub inflight: InflightKeys,
+    mailboxes: Vec<mpsc::Sender<Job>>,
+    heavy: Vec<mpsc::Sender<Job>>,
+    inflight: InflightKeys,
 }
 
 impl Coordinator {
@@ -619,7 +628,7 @@ impl Coordinator {
     /// The loop is the whole scheduler: every state change enters through one channel,
     /// so there is no interleaving to reason about and every decision sees a consistent
     /// picture by construction.
-    pub fn run(mut self, rx: &mpsc::Receiver<CoordMsg>) {
+    fn run(mut self, rx: &mpsc::Receiver<CoordMsg>) {
         while let Ok(msg) = rx.recv() {
             self.run_msg(msg);
         }
@@ -628,7 +637,7 @@ impl Coordinator {
     /// Apply one message and hand out whatever work that frees up. Split from `run`
     /// so the scheduler's behaviour is reachable from a test without a channel or a
     /// thread behind it.
-    pub fn run_msg(&mut self, msg: CoordMsg) {
+    fn run_msg(&mut self, msg: CoordMsg) {
         match msg {
             CoordMsg::Submit {
                 targets,
@@ -699,7 +708,7 @@ impl Coordinator {
     /// Notice a settings change the oid-keyed cost memo cannot express. See
     /// `Coordinator::measured_textconv`; `oversized` needs no equivalent, its key
     /// embedding the whole `DiffSettings`.
-    pub fn note_settings(&mut self, settings: DiffSettings) {
+    fn note_settings(&mut self, settings: DiffSettings) {
         if self.measured_textconv.replace(settings.textconv) == Some(settings.textconv) {
             return;
         }
@@ -718,7 +727,7 @@ impl Coordinator {
 
     /// Split a new band into the cheap and expensive lanes, dropping what is already
     /// known too large to cache.
-    pub fn take_band(&mut self, targets: VecDeque<PrefetchTarget>) {
+    fn take_band(&mut self, targets: VecDeque<PrefetchTarget>) {
         let (mut ready, mut deferred) = (VecDeque::new(), VecDeque::new());
         for mut target in targets {
             if self.oversized.contains(&target.key) || self.unconverted.contains(&target.key) {
@@ -739,7 +748,7 @@ impl Coordinator {
     }
 
     /// Record what a worker did and free it.
-    pub fn finish(&mut self, id: usize, outcome: Outcome) {
+    fn finish(&mut self, id: usize, outcome: Outcome) {
         // Releases the shared claim for a warm job (nothing for a stats job).
         drop(self.warming.remove(&id));
         match outcome {
@@ -782,7 +791,7 @@ impl Coordinator {
     }
 
     /// Hand out as much work as there are free workers, highest priority first.
-    pub fn dispatch(&mut self) {
+    fn dispatch(&mut self) {
         // The budget is the dispatch's, not each worker's. Crossing it empties both
         // diff lanes: warming past it would evict the band just filled, so the rows the
         // user is about to scroll into would be gone before they reached them.
@@ -823,7 +832,7 @@ impl Coordinator {
     }
 
     /// Is `id` a heavy-lane worker? Heavy ids continue on from the pool's.
-    pub const fn is_heavy(&self, id: usize) -> bool {
+    const fn is_heavy(&self, id: usize) -> bool {
         id >= self.mailboxes.len()
     }
 
@@ -835,7 +844,7 @@ impl Coordinator {
     /// whenever a worker reports, i.e. precisely when memory frees. That replaced a
     /// requeue-and-park loop with a retry interval; there is nothing to park on when
     /// the queue is the coordinator's own field.
-    pub fn next_heavy(&mut self, usable: &std::cell::OnceCell<Option<u64>>) -> Option<(Job, u64)> {
+    fn next_heavy(&mut self, usable: &std::cell::OnceCell<Option<u64>>) -> Option<(Job, u64)> {
         loop {
             let need = self.deferred.front().map(Self::heavy_need)?;
             if !self.heavy_fits(need, usable) {
@@ -852,9 +861,26 @@ impl Coordinator {
     /// Transient memory a heavy row is expected to hold: both sides of every changed
     /// file, doubled for xdiff's own line records and the `DiffData` that follows, both
     /// of which scale with the same content. `probed` is set for every row on this
-    /// lane; a row without it has not been measured and is treated as free.
-    pub fn heavy_need(target: &PrefetchTarget) -> u64 {
-        target.probed.unwrap_or(0).saturating_mul(2)
+    /// lane; a row without it has not been measured and is treated as the floor below.
+    ///
+    /// **The floor is what makes this bound mean anything for a DRIVEN row**, and the
+    /// estimator has no other way to see one. Rows reach this lane by two different
+    /// tests — blob bytes, and `RowCostProbe::driven`, which is not a size at all — and
+    /// for the second the measurement bears no relation to what the build holds: a
+    /// commit touching a dozen zips is a few compressed KB probed, while each
+    /// conversion materialises up to `TEXTCONV_MAX_OUTPUT` per side plus the converted
+    /// patch. Admitted against `probed * 2`, every such row looks free, so the bound
+    /// that exists to stop `dispatch`'s tight hand-out loop from committing the whole
+    /// lane at once stopped nothing on exactly the repos this lane was widened for.
+    /// `HEAVY_ROW_FLOOR_BYTES` is deliberately an under-estimate of the worst case
+    /// rather than a guess at the average: it has to be small enough that an idle lane
+    /// still fills on a modest machine.
+    fn heavy_need(target: &PrefetchTarget) -> u64 {
+        target
+            .probed
+            .unwrap_or(0)
+            .saturating_mul(2)
+            .max(HEAVY_ROW_FLOOR_BYTES)
     }
 
     /// May another heavy row start right now?
@@ -892,7 +918,7 @@ impl Coordinator {
     /// `usable` is the dispatch's live reading, taken at most once and only if some row
     /// gets far enough to need it — an idle lane admits before reading anything, which is
     /// the common case on an ordinary repo. See the call site in `dispatch`.
-    pub fn heavy_fits(&self, need: u64, usable: &std::cell::OnceCell<Option<u64>>) -> bool {
+    fn heavy_fits(&self, need: u64, usable: &std::cell::OnceCell<Option<u64>>) -> bool {
         if self.heavy_outstanding.is_empty() {
             return true;
         }
@@ -908,7 +934,7 @@ impl Coordinator {
     /// `deferred`, which is what makes "an expensive row never occupies a worker the
     /// next band needs" a fact about who reads what rather than an arithmetic
     /// invariant between a counter and a limit.
-    pub fn next_pool_job(&mut self) -> Option<Job> {
+    fn next_pool_job(&mut self) -> Option<Job> {
         while let Some(job) = self.stats.pop_front() {
             if self.busy_stats.insert(job.scope.source.oid()) {
                 return Some(Job::Stats(job));
@@ -926,7 +952,7 @@ impl Coordinator {
     /// Claim a row's key for `id`, or `None` when the foreground diff-load already
     /// holds it — that result will be cached when it lands, so recomputing it here
     /// would be pure duplicate work.
-    pub fn claim_warm(&mut self, id: usize, target: PrefetchTarget) -> Option<Job> {
+    fn claim_warm(&mut self, id: usize, target: PrefetchTarget) -> Option<Job> {
         let claim = InflightClaim::try_claim(&self.inflight, target.key.clone())?;
         self.warming.insert(id, claim);
         Some(Job::Warm {
@@ -948,7 +974,7 @@ impl Coordinator {
     /// coordinator would refuse to hand that row out again while `stats_targets`
     /// re-offered it forever. Reachable without any thread dying mid-run: a worker whose
     /// `Repository::discover` failed exits immediately, and every send to it fails.
-    pub fn send(&mut self, id: usize, job: Job) -> bool {
+    fn send(&mut self, id: usize, job: Job) -> bool {
         let mailbox = if self.is_heavy(id) {
             self.heavy.get(id - self.mailboxes.len())
         } else {
@@ -1096,21 +1122,21 @@ pub fn spawn_prefetch_pool(
 /// of the session — and, more importantly, the report still goes out. "Every job
 /// produces exactly one `Outcome`" is what lets the coordinator own the bookkeeping;
 /// a silent exit would strand a claim and an idle slot with nothing to release them.
-pub fn run_caught(f: impl FnOnce() -> Outcome) -> Option<Outcome> {
+fn run_caught(f: impl FnOnce() -> Outcome) -> Option<Outcome> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok()
 }
 
 /// Everything a worker holds for its whole life. All of it is either `Copy` or a
 /// channel endpoint — there is no shared mutable state left for a worker to reach.
-pub struct WorkerCtx {
-    pub id: usize,
-    pub limits: Limits,
-    pub coord: mpsc::Sender<CoordMsg>,
-    pub tx: mpsc::Sender<WarmResult>,
-    pub stats_tx: mpsc::Sender<StatsResult>,
-    pub ctx: egui::Context,
+struct WorkerCtx {
+    id: usize,
+    limits: Limits,
+    coord: mpsc::Sender<CoordMsg>,
+    tx: mpsc::Sender<WarmResult>,
+    stats_tx: mpsc::Sender<StatsResult>,
+    ctx: egui::Context,
     /// The persistent store and the textconv drivers; see `DiffDeps`.
-    pub deps: DiffDeps,
+    deps: DiffDeps,
 }
 
 /// One worker: take a job, do it, report what happened. Forever.
@@ -1120,7 +1146,7 @@ pub struct WorkerCtx {
 /// importantly, the report still goes out. "Every job produces exactly one `Outcome`"
 /// is what lets the coordinator own the bookkeeping; a silent exit would strand a
 /// claim and an idle slot with nothing to release them.
-pub fn worker(ctx: &WorkerCtx, repo: &Repository, jobs: &mpsc::Receiver<Job>) {
+fn worker(ctx: &WorkerCtx, repo: &Repository, jobs: &mpsc::Receiver<Job>) {
     while let Ok(job) = jobs.recv() {
         let caught = |what: &str| log::warn!("prefetch: worker {} panicked on {what}", ctx.id);
         let outcome = match job {
@@ -1164,7 +1190,7 @@ pub fn worker(ctx: &WorkerCtx, repo: &Repository, jobs: &mpsc::Receiver<Job>) {
 ///
 /// A row too expensive to compute inline gets its file count and nothing else; see the
 /// comment at that return for why it does not ask to be finished later.
-pub fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome {
+fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome {
     let oid = job.scope.source.oid();
     // `FilesAndLines` calls `diff.stats()`, which loads blob content — the same bytes
     // the diff reads. Unguarded, that had eight workers spend 24 seconds computing this
@@ -1198,7 +1224,8 @@ pub fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outc
         // row would show a file count and a permanently blank `+`/`-`, and stay that way
         // after the working-tree change that triggered it was reverted, since a sentinel
         // oid never expires.
-        if is_real_commit(oid) && (cost.total_blob_bytes > ctx.limits.max_blob_bytes || cost.driven)
+        if is_real_commit(oid)
+            && (cost.total_blob_bytes > ctx.limits.max_blob_bytes || cost.driven_or_unknown())
         {
             log::debug!(
                 "stats: defer {oid} — {} blob bytes over {} (largest {}, {} files{})",
@@ -1206,7 +1233,11 @@ pub fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outc
                 ctx.limits.max_blob_bytes,
                 cost.max_blob_bytes,
                 cost.deltas,
-                if cost.driven { ", textconv" } else { "" }
+                if cost.driven_or_unknown() {
+                    ", textconv"
+                } else {
+                    ""
+                }
             );
             // Send the file count NOW, so the row shows something rather than staying
             // blank. Deliberately counted off the pipeline's own diff and not from
@@ -1242,6 +1273,15 @@ pub fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outc
         // stayed on `stats_targets`' visible list forever — `dispatch_commit_stats`
         // never reached its band-warm phase while it was on screen, and re-submitted
         // its full index→workdir diff every time another row's numbers landed.
+        //
+        // `cost.driven` and NOT `driven_or_unknown()`: the deferral above can afford the
+        // conservative verdict because the row's own diff corrects it, and this arm
+        // cannot — `Withheld` has `answered()`, so nothing ever re-asks. Reading a
+        // failed resolution as driven here let one EMFILE blank the "Uncommitted
+        // changes" row's `+`/`-` on a repo with no textconv driver at all, until the
+        // working tree changed enough to move that row's content hash. With the
+        // resolution failed the pane is built all-raw too, so the raw counts this now
+        // computes are the ones the sidebar shows.
         let withheld = cost.driven && job.want == StatsWant::FilesAndLines;
         let want = if withheld {
             StatsWant::FilesOnly
@@ -1284,13 +1324,13 @@ pub fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outc
 }
 
 /// Hand one stats row's result to the UI and wake it.
-pub fn send_stats(ctx: &WorkerCtx, job: &StatsJob, stats: Option<CommitStats>) {
+fn send_stats(ctx: &WorkerCtx, job: &StatsJob, stats: Option<CommitStats>) {
     send_stats_result(ctx, job.epoch, job.scope.source.oid(), stats);
 }
 
 /// As `send_stats`, for a result that did not come from a stats job — the column's
 /// numbers harvested off a diff that is about to be dropped uncached.
-pub fn send_stats_result(ctx: &WorkerCtx, epoch: u64, oid: git2::Oid, stats: Option<CommitStats>) {
+fn send_stats_result(ctx: &WorkerCtx, epoch: u64, oid: git2::Oid, stats: Option<CommitStats>) {
     if ctx.stats_tx.send(StatsResult { epoch, oid, stats }).is_ok() {
         ctx.ctx.request_repaint();
     }
@@ -1373,7 +1413,7 @@ pub const fn warm_disposition(f: WarmFacts) -> WarmDisposition {
 ///
 /// Pure in the sense that matters: everything it learns comes back as the return value,
 /// so the coordinator — not this thread — decides what any of it means.
-pub fn warm_row(
+fn warm_row(
     ctx: &WorkerCtx,
     repo: &Repository,
     target: PrefetchTarget,
@@ -1388,7 +1428,7 @@ pub fn warm_row(
     let tc = textconv_for(&ctx.deps.textconv, target.key.settings);
     if target.probed.is_none()
         && let Ok(cost) = diff::probe_row_cost(repo, &target.scope, target.key.settings, tc)
-        && (cost.total_blob_bytes > ctx.limits.max_blob_bytes || cost.driven)
+        && (cost.total_blob_bytes > ctx.limits.max_blob_bytes || cost.driven_or_unknown())
     {
         // All three dimensions, not just the one that tripped: which of them is large
         // is what tells a 265MB single file apart from a wide shallow commit, and this
@@ -1403,7 +1443,11 @@ pub fn warm_row(
             ctx.limits.max_blob_bytes,
             cost.max_blob_bytes,
             cost.deltas,
-            if cost.driven { ", textconv" } else { "" }
+            if cost.driven_or_unknown() {
+                ", textconv"
+            } else {
+                ""
+            }
         );
         return Outcome::TooBig {
             bytes: cost.total_blob_bytes,
@@ -1479,8 +1523,25 @@ pub fn warm_row(
         // As at the oversized drop: this row's stats job sent a file count and stopped,
         // trusting the diff to supply the line counts — and this diff is about to be
         // dropped, so `cache_diff` will never harvest it.
+        //
+        // **The line counts are WITHHELD here, where the oversized drop sends them.**
+        // That drop's `FileEntry` list is the converted one, so its sum is the answer
+        // the sidebar shows; this one's is the RAW fallback the failed driver left
+        // behind — `+0 -0` on a binary change whose pane, once the conversion succeeds,
+        // shows the converted patch. And it is not a lost frame but a permanent wrong
+        // answer: `Counted` has `answered()`, so `stats_targets` never re-asks, while
+        // `unconverted` keeps the row from being re-warmed and `handle_git_reload`
+        // retains every real commit's stats — so a single transient `EAGAIN` pinned
+        // `+0 -0` beside a correct pane for the rest of the session. `Withheld` is an
+        // answer too (the row stops being re-listed, which is what it is for), but it
+        // is the one that cannot contradict the sidebar. `invalidate_commit_stats`
+        // still re-asks it when the drivers move, which is when the verdict can change.
         if is_real_commit(oid) {
-            send_stats_result(ctx, stats_epoch, oid, Some(diff::stats_from_data(&data)));
+            let stats = CommitStats {
+                lines: diff::LineStats::Withheld,
+                ..diff::stats_from_data(&data)
+            };
+            send_stats_result(ctx, stats_epoch, oid, Some(stats));
         }
         return Outcome::Unconverted {
             key: target.key,
@@ -1976,19 +2037,54 @@ mod tests {
         assert!(coord.heavy_fits(100, &mem), "900 + 100 is not");
     }
 
+    /// A row reaches the heavy lane by two tests, and only one of them is a size.
+    ///
+    /// LOAD-BEARING. A driven row is a few compressed KB of archive that converts to
+    /// megabytes per side, so charging it `probed * 2` made it free — and free is
+    /// exactly what defeats `heavy_fits`, whose whole job is stopping `dispatch`'s tight
+    /// hand-out loop from committing the entire lane at once. Without the floor a whole
+    /// band of driven rows is admitted against an accounted need of nothing.
+    #[test]
+    fn a_row_whose_blobs_measured_small_is_still_charged_the_floor() {
+        assert_eq!(
+            Coordinator::heavy_need(&measured_target(1, 3_000)),
+            HEAVY_ROW_FLOOR_BYTES,
+            "3KB of zip is not what converting it holds"
+        );
+        assert_eq!(
+            Coordinator::heavy_need(&heavy_target(2)),
+            HEAVY_ROW_FLOOR_BYTES,
+            "and an unmeasured row is not free either"
+        );
+        // Above the floor the measurement still decides — this is a floor, not a flat rate.
+        let big = HEAVY_ROW_FLOOR_BYTES;
+        assert_eq!(
+            Coordinator::heavy_need(&measured_target(3, big)),
+            2 * big,
+            "a genuinely large row is charged what it measured"
+        );
+    }
+
     /// Eight rows admitted in one dispatch must not exceed the budget between them.
+    ///
+    /// Sized in multiples of `HEAVY_ROW_FLOOR_BYTES` rather than in round numbers: the
+    /// floor is what a row costs when its own measurement says less, so a row measured
+    /// below it is charged the floor and toy byte counts would all collapse onto one
+    /// need.
     #[test]
     fn a_whole_dispatch_cannot_overcommit_the_lane() {
         let (mut coord, _rxs) = test_coord_n(1, 8);
-        coord.heavy_budget = Some(3_000); // room for three 1_000-byte rows
+        let row = HEAVY_ROW_FLOOR_BYTES; // probed, so need = 2 × this
+        let budget = 6 * HEAVY_ROW_FLOOR_BYTES; // room for exactly three of them
+        coord.heavy_budget = Some(budget);
         for n in 1..=8 {
-            coord.deferred.push_back(measured_target(n, 500)); // need = 1_000 each
+            coord.deferred.push_back(measured_target(n, row));
         }
         coord.dispatch();
         let held: u64 = coord.heavy_outstanding.values().sum();
         assert!(
-            held <= 3_000,
-            "committed {held} against a 3000 budget across one dispatch"
+            held <= budget,
+            "committed {held} against a {budget} budget across one dispatch"
         );
         assert!(
             !coord.deferred.is_empty(),

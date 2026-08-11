@@ -711,7 +711,13 @@ parts run off the window-creation critical path:
   derivation can produce, which the `const` block asserts.
   **The pool is an actor**, and since it became its own module (`src/prefetch.rs`)
   that is a rule the compiler keeps rather than a convention an edit could quietly
-  break. One `Coordinator` thread owns every scheduling decision and
+  break. **The module boundary only does that work if the internals are actually
+  PRIVATE**, which the lift did not leave them: `Coordinator`, all 20+ of its scheduling
+  fields and every one of its methods were `pub`, and in a binary crate `pub` is
+  crate-wide — so a `coord.ready.clear()` in `main.rs` would have compiled silently while
+  this file told the next reader it could not. Only the fourteen names `main.rs` imports
+  are `pub` now; keep it that way when adding one. One `Coordinator` thread owns every
+  scheduling decision and
   **nothing else touches its fields**, so the queues, the memos and the in-flight sets
   are plain `VecDeque`/`HashMap`/`HashSet` — no mutexes, no RAII guards, no lock
   ordering. Workers are pure: `worker()` receives a `Job`, does it, and reports an
@@ -802,6 +808,16 @@ parts run off the window-creation critical path:
   keep busy. `Coordinator::heavy_fits` is the bound that has to hold, deciding per row
   against each row's ACTUAL measurement, since rows range from a few MB to over a
   gigabyte.
+  **`heavy_need` carries a FLOOR (`HEAVY_ROW_FLOOR_BYTES`) because rows reach this lane
+  by two tests and only one of them is a size.** `probed * 2` is right for a blob-heavy
+  row and meaningless for a `driven` one: a commit touching a dozen zips is a few
+  compressed KB probed, while each conversion materialises up to `TEXTCONV_MAX_OUTPUT`
+  per side plus the converted patch. Charged its measurement, every such row looked
+  free — and free is exactly what defeats a bound whose job is stopping `dispatch`'s
+  tight hand-out loop from committing the whole lane at once, on precisely the repos
+  this lane was widened for. The floor is two sides at the textconv ceiling and nothing
+  for the patch beside them, i.e. deliberately an under-estimate of the worst case
+  rather than a guess at the average, so an idle lane still fills on a modest machine.
   Matching the pool is affordable because the two lanes are **complementary**: on an
   ordinary repo heavy rows are rare and this lane sleeps, while on a repo of 265MB blobs
   almost nothing is cheap and the pool sleeps — measured, eight pool workers idle for 36
@@ -887,17 +903,29 @@ parts run off the window-creation critical path:
   changed path have a `diff.<driver>.textconv`". Byte-thresholding cannot see that
   coming — a three-file zip behind `bsdtar` is a few KB and several hundred
   milliseconds of subprocess — so it joins the costly test at both sites that ask it
-  (`cost.total_blob_bytes > ctx.limits.max_blob_bytes || cost.driven`), which routes the
+  (`cost.total_blob_bytes > ctx.limits.max_blob_bytes || cost.driven_or_unknown()`),
+  which routes the
   row to the heavy lane and makes its stats job send a file count and stop. Free where
   the probe already is: an attribute lookup reads no blob either. See **Textconv**.
-  A config read that FAILED counts as driven, and must: `Textconv::drivers`
+  A resolution that FAILED counts as costly, and must: `Textconv::drivers`
   deliberately does not remember such a read (the EMFILE case), so it answers an empty
   map — indistinguishable from "this repo configures no drivers" — plus
-  `Resolved::failed`. Dropping that flag reported the row as undriven, so it took an
+  `Resolved::failed`, and `Resolved::driver_for` answers `DriverLookup::Failed` for the
+  attribute half of the same question. Dropping that reported the row as undriven, so it
+  took an
   ordinary prefetch worker and its stats job computed line counts, and the build that
   followed re-resolved successfully and spawned a driver per side across the light lane
   and the top-priority stats tier: exactly what `driven` exists to keep off both. The
   cost of the conservative answer is one heavy-lane slot.
+  **It is a FIFTH dimension, `driver_unknown`, and not a second writer of `driven`** —
+  the two are read by callers whose cost of being wrong differs by orders of magnitude.
+  `driven_or_unknown()` is what routes to the heavy lane, where the guess costs a slot
+  and the row's own diff corrects it; `run_stats_job`'s driven-virtual arm reads
+  `driven` alone, because there the verdict is a `LineStats::Withheld` that `answered()`
+  and so is never re-asked. Conflated, one EMFILE blanked the "Uncommitted changes" row's
+  `+`/`-` on a repo configuring no textconv driver at all, until the working tree changed
+  enough to move that row's content hash. With the resolution failed the pane is built
+  all-raw too, so the raw counts that arm now computes are the ones the sidebar shows.
   The probe is cheap for two reasons that must both hold: a tree-to-tree diff compares
   tree *entries* and loads no content, and `Odb::read_header` reads a size from the object
   header without inflating the payload. It deliberately does NOT run `detect_similar`,
@@ -1721,7 +1749,14 @@ and that `.git/config` write trips `make_git_watcher` like every other diff-affe
 config change, so `handle_git_reload` calls `Textconv::invalidate`. A `OnceLock` made
 the fix need a restart, and made one unlucky config read (an EMFILE while eight
 workers open handles) turn textconv off for the session, since `resolve_drivers`
-answers an empty map on failure. It now answers `None` there, which is not cached.
+answers an empty map on failure. It now answers `None` there, which is not cached — and **says so**, once per reload
+(`Textconv::warn_resolve_failed`). Not remembering the failure left it with no voice at
+all: while the read keeps failing (a syntax error in `~/.gitconfig` saved while gitkay
+runs is enough) every diff in the repo is marked `textconv_failed` and every row costly,
+so the band is rebuilt from scratch on each dispatch, the commit-list `+`/`-` column goes
+blank for every commit and nothing is written to `~/.cache/gitkay/diffs` — on a repo that
+may configure no driver at all. `warn_once`'s line cannot cover it: that one names a
+driver, and here none ever ran.
 
 It lives in **`src/diff/convert.rs`** — `textconv.rs` runs the command, and this
 decides when and against what.
@@ -1854,7 +1889,16 @@ typechange boundary above (`a_typechange_keeps_each_half_in_its_own_file_entry`)
   permanent property of the delta, so the raw body is the honest rendering and the diff
   stays cacheable, where an unreadable side is transient and must keep it off disk.
   Collapsing them made the former set `textconv_failed`, so both caches refused the row
-  and every visit re-paid a build that could never come out differently. One driver per
+  and every visit re-paid a build that could never come out differently.
+  **The DRIVEN side is bounded the same way, by the same call, and used not to be**:
+  `convert_blob` did exactly what the paragraph above forbids — `find_blob(oid).content()`
+  then a full `TempBlob::write` copy to $TMPDIR — with no header check and no ceiling, so
+  one delta could decline a 20MB `.bin` as `TooLarge` while inflating a 500MB `.zip`
+  beside it, per side, for a commit nobody opened, and `heavy_fits` had reserved only the
+  row's COMPRESSED bytes. `Textconv::convert` therefore answers three states too
+  (`Converted`), drawing the line where `RawSide` does: `InputTooLarge` is permanent and
+  becomes `Substitution::Unconvertible`, `Failed` is transient and keeps the diff off both
+  caches. One driver per
   delta,
   taken from `delta_path_bytes` (the NEW path) and handed to both sides, ran the wrong
   converter across a rename over a driver boundary: `data.bin` → `data.zip` under
@@ -1944,15 +1988,24 @@ CONVERTER and the command is only a name for it — fixing `~/bin/zipdiff.sh` le
 string alone, so without it the broken script's output was served for the rest of the
 process. The same stamp joins `diff_store::driver_id`, so a later launch misses the
 entries the broken script produced rather than serving them until the cache directory
-is deleted. A first word that is not a path (`unzip -c -a`) has no stamp, which is the
-same blind spot git's own cache has and would need a `PATH` search to close. A
-**relative** one is resolved against the WORKTREE, which is the cwd `run` gives the
+is deleted. The mtime is folded in at **nanosecond** resolution, which
+`Metadata::modified` carries on Linux: truncated to whole seconds, a script re-saved
+within one second at the same byte length — a one-character correction, or an editor
+that writes twice — kept its identity, and that is the same "served for weeks after the
+fix" outcome arriving through the clock instead of the string.
+**"Not a path" means "holds no separator"**, so `unzip -c -a` and a bare `bsdtar` have
+no stamp — the same blind spot git's own cache has, and one a `PATH` search would be
+needed to close. Resolving a bare word against the worktree instead was worse than
+useless: `fs::metadata` succeeds on a DIRECTORY as readily as a file, so a repo holding
+a top-level entry named like the command (`textconv = docs2text` beside a `docs2text/`
+fixture dir) stamped that entry, and every file added under it read as a driver edit —
+LRU dropped, commit-list `+`/`-` column blanked, every entry in `~/.cache/gitkay/diffs`
+missed — while the converter that really runs went unwatched. A
+**relative** one (`./bin/zipdiff.sh`) is resolved against the WORKTREE, which is the cwd
+`run` gives the
 driver — both call sites pass `repo.workdir()`, so the memo and the store's key stamp
-the same file. Against gitkay's own process cwd it named a different file entirely,
-and both outcomes are wrong: usually nothing is there, so there is no stamp at all and
-fixing the script invalidates nothing; occasionally something unrelated is, and its
-mtime reads as a driver change that wipes the whole diff cache while the script that
-really runs goes unwatched. With no worktree there is no stamp, rather than a guess.
+the same file. Against gitkay's own process cwd it named a different file entirely.
+With no worktree there is no stamp, rather than a guess.
 Blob sides only — a worktree file has no oid and can change between two reads. The child's **stderr
 is `null`**, also unlike git: speculative rows would otherwise spray the terminal
 with no row to attribute it to, and an inherited stderr is a handle on gitkay's own
@@ -1985,11 +2038,18 @@ cleared by the three events that can change the verdict: `[diff] textconv` movin
 reload, which re-arms the hung-driver latch (`CoordMsg::RetryUnconverted`). The
 reader's own click is unguarded, as everywhere else.
 
-**Three routes reach the flag, and two of them are not a failed conversion.** A
+**Four routes reach the flag, and three of them are not a failed conversion.** A
 `resolve_drivers` that FAILED (the EMFILE case) yields an empty map, which drives
 nothing and so used to produce an ordinary-looking all-raw diff that `worth_persisting`
 accepted — the same transient-failure-served-for-weeks outcome arriving one step
-earlier; `Resolved::failed` carries it. And a `Patch::print` that fails part-way
+earlier; `Resolved::failed` carries it. **The ATTRIBUTE half of the same lookup is the
+second**, and it was `.ok()?` for a long time: the identical transient conditions (an
+EMFILE while eight workers open handles, an EIO on `.gitattributes`, a momentarily
+unreadable index, which `FILE_THEN_INDEX` reads too) answered "this path has no driver",
+so a commit whose `.zip` files were readable-as-text a moment earlier was written to
+`~/.cache/gitkay/diffs` showing `Binary files … differ` under a key that does not move.
+`Resolved::driver_for` answers `DriverLookup::Failed` for it, which `append_diff_body`
+folds into the same flag. And a `Patch::print` that fails part-way
 through the converted body rewinds the rows it wrote and reports `Substitution::Failed`
 rather than `Done`, which was one of two exits that could not set the flag it exists
 for: a half-rendered patch was persisted and served on every later launch. The other is
@@ -2013,8 +2073,35 @@ own diff supplies the line counts, and a driven row is exactly the one whose dri
 fail. Refusing first left those cells blank for the session *and* left `stats_targets`
 reading the row as still owed, so `dispatch_commit_stats` never reached its band-warm
 phase while the row was on screen — the failure `LineStats::Withheld` was introduced to
-fix for virtual rows, arriving for real commits by another route. `warm_row` sends the
-same numbers at its own drop site, as it does for an oversized row.
+fix for virtual rows, arriving for real commits by another route. Sound here because the
+pane shows the same all-raw fallback the numbers are summed from, so the column agrees
+with the sidebar beside it.
+
+**`warm_row`'s two drop sites do NOT send the same thing, and the difference is which
+`FileEntry` list they are summing.** The oversized drop sends real counts: its list is
+the CONVERTED one, i.e. what the sidebar will show. The `Unconverted` drop sends
+`LineStats::Withheld`, because its list is the raw fallback a failed driver left behind —
+`+0 -0` on a binary change whose pane, once the conversion succeeds, shows the converted
+patch. And that is not a lost frame but a permanent wrong answer: `Counted` has
+`answered()`, so `stats_targets` never re-asks, while `unconverted` keeps the row from
+being re-warmed and `handle_git_reload` retains every real commit's stats — so a single
+transient `EAGAIN` pinned `+0 -0` beside a correct pane for the rest of the session.
+`Withheld` is an answer too (the row stops being re-listed, which is the point of the
+third state), and it is the one that cannot contradict the sidebar; a later `Counted`
+from `cache_diff` still replaces it, and `invalidate_commit_stats` re-asks it when the
+drivers move.
+
+**And the harvest runs for the INCOMING diff as well** (`apply_loaded_diff`, same rule
+and same order). `stash_current_diff` → `cache_diff` covers the diff being *replaced*,
+which left the SELECTED row — the one commit whose diff is guaranteed to exist — as the
+single row nothing harvested: `prefetch_targets` excludes the selected index and
+`dispatch_prefetch` excludes `current_diff_key`, so the band never warms it either. Its
+`+`/`-` stayed blank for as long as it stayed selected, filling only once the reader
+navigated away — and worse, the deferral leaves `LineStats::NotAsked`, which
+`stats_targets` reads as still owed, so `dispatch_commit_stats` never advanced past its
+visible-rows phase while that row was on screen and the whole band around it went
+unwarmed. Rare while only `total_blob_bytes` could defer a row; ordinary once `driven`
+can, which is any commit touching one small archive.
 
 **An edited driver command now takes effect without a restart, which needs more than
 `invalidate`.** Two caches sit in front of the driver map and neither used to record
@@ -2024,16 +2111,29 @@ thread). So the fix re-resolved the map and changed nothing on screen. `Textconv
 fingerprints each resolution and reports a *change* (`drivers_changed`, `None` for the
 first one, which has nothing to differ from); `GitkApp::apply_driver_change` polls it
 each frame, records it in `GitkApp::diff_drivers`, drops the LRU, tells the coordinator
-and hands it to `DiffStore::set_drivers`, a live `AtomicU64` folded into `entry_key`
-beside the context. Four things make that whole rather than half:
+and writes it to `GitkApp::store_drivers`, a live `Arc<AtomicU64>` folded into
+`entry_key` beside the context. Four things make that whole rather than half:
 
 - **The fingerprint is one value over one key list.** It is `fingerprint_of` over
-  `diff_store::driver_id`'s bytes — not a hash of the resolved MAP, which holds only
+  `diff_store::driver_id`'s bytes **plus `diff_store::attrs_id`'s** — not a hash of the
+  resolved MAP, which holds only
   `textconv`/`cachetextconv` while `driver_id` also covers the
   `binary`/`xfuncname`/`funcname` libgit2 itself reads. Two fingerprints over two key
   lists meant the on-disk key moved where the live one did not: adding a
   `diff.rust.xfuncname` missed the store (correct) while every diff already in the LRU
-  kept the old `@@` function context for the session. **It is published `Release` and
+  kept the old `@@` function context for the session.
+  **`attrs_id` is there because config is only half of what decides whether a delta is
+  driven**, the other half being the `diff=<name>` attribute `driver_for` looks up.
+  Over config alone, removing a `*.zip diff=archive` line — the natural way to turn a
+  driver off, and the half git's own docs pair with the config half — reported no change
+  at all: the LRU kept serving the pre-edit rendering, and `CoordMsg::DriversChanged`
+  never fired, so every row the driver had matched stayed in the coordinator's `measured`
+  map with its costly verdict, pinned to the heavy lane and filtered out of every stats
+  submission, its `+`/`-` cells blank for the session — verbatim the failure
+  `DriversChanged` exists to prevent, through the other half. Affordable only here:
+  `resolve_drivers` runs once per `Textconv` lifetime, so it is three file reads per
+  `.git` reload rather than per diff, and it is the same function `StoreContext` folds
+  in, so the live fingerprint and the on-disk key cannot cover different sources. **It is published `Release` and
   read `Acquire`**, because it travels as two atomics — the value and a one-shot
   `changed` flag — and `drivers_changed` consumes the flag with nothing to re-arm it.
   Relaxed on both sides, a reader could see the flag while still holding the PREVIOUS
@@ -2053,14 +2153,26 @@ beside the context. Four things make that whole rather than half:
   skipped it via `diff_cache.contains`, so the row the reader had just fixed kept the
   broken driver's output for the session. `build_or_load` closes the same race on the
   disk side by comparing `DiffStore::drivers` on both sides of the build.
-  **`DiffStore::set_drivers` therefore runs BEFORE the rebuild is dispatched**, not
+  **The store's copy therefore moves BEFORE the rebuild is dispatched**, not
   after it: `DiffStore::key` reads the value at load time, so a build that starts
   first computes the key the pre-edit entries were written under and is served one —
   deterministically on the synchronous fallback path, where `dispatch_diff_load` runs
   `build_or_load` inline on the UI thread. The reader's fix reloaded the pane to the
-  identical broken output, out of `~/.cache/gitkay/diffs`. It is still retried each
-  frame (`publish_store_drivers`), because the store is opened on the prune thread and
-  may not exist yet, and `drivers_changed` is one-shot.
+  identical broken output, out of `~/.cache/gitkay/diffs`.
+  **There is only ONE copy**, and that is the fix for the window the old two-copy shape
+  left open. `GitkApp` used to own a `u64` while the store owned its own `AtomicU64`,
+  kept in step by a per-frame `publish_store_drivers` that silently did nothing while
+  `store_of` answered `None` — and it answers `None` for the first frames of every
+  session, the store being opened on the prune thread and published through a `OnceLock`
+  no frame observes. An edit noticed inside that window (a slow `StoreContext::of` —
+  canonicalize, three attribute-file reads and a full config parse — against a debounced
+  reload, which a cold cache or a network home reaches easily) left the app keyed under
+  the new fingerprint and the store under `0`: exactly what earlier launches wrote the
+  PRE-EDIT entries under, so every worker loaded the broken driver's output back and
+  `cache_diff` pinned it in the LRU under the new key, where `diff_cache.contains` kept
+  every later dispatch from rebuilding it. `GitkApp::store_drivers` is now an
+  `Arc<AtomicU64>` handed to `DiffStore::open`, so a fingerprint written before the store
+  exists is already in force when it opens, and there is nothing to retry.
 - **The commit-list column is dropped too** (`invalidate_commit_stats`). `CommitStats`
   records nothing about which driver produced it, and `cache_diff` harvests a driven
   row's `+`/`-` straight off its diff — so every row the band reached under the broken
@@ -2099,6 +2211,16 @@ instead, which clears only `unconverted` — it re-arms `Textconv::hung`, so the
 transient overrun took out of the band deserve another go, but it fires on every commit,
 fetch and index write, and re-probing the whole band each time would cost far more than
 the retry is worth.
+**The same latch has a counterpart on SCREEN**, which nothing else reaches: the displayed
+diff may be the raw fallback that one overrun produced, and `textconv_failed` is not part
+of `DiffCacheKey` — so the reload's closing `load_selected_diff` takes its identical-key
+early return, and `install_preferring_cache` would drop the result even if it did not.
+The band meanwhile re-warms that row successfully, so the cache ends up holding the
+converted patch while the pane keeps `Binary files … differ` until the reader navigates
+away and back. `handle_git_reload` therefore drops `current_diff_key` when
+`diff_textconv_failed` is set, which states what is true — the content on screen is not a
+valid answer for that key — and is what `apply_driver_change` gets for free from the
+fingerprint moving.
 
 **`cachetextconv` is honoured for READ ONLY**, gated on the repo's own setting exactly
 as git is. `refs/notes/textconv/<driver>`'s tip commit subject must equal the command
@@ -2519,7 +2641,8 @@ over real temp repos, and the pruner's eviction + temp sweep), `word_diff` (LCS 
 alignment), `prefetch` (the coordinator's scheduling decisions, driven through its message
 protocol rather than by reaching into its fields: the heavy lane's two admission
 bounds and the stampede a whole dispatch would otherwise commit, the deferral round
-trip, stats claiming, and `warm_disposition`'s precedence),
+trip, the floor that keeps a driven row from being admitted as free, stats claiming,
+and `warm_disposition`'s precedence),
 `history` (the walk over real temp repos: the tail extension against a full walk,
 the provisional walk's agreement with the real one and the two orderings that break
 it, the path filter's parent rewriting, `--first-parent`, `--follow`, the reflog and
@@ -2528,10 +2651,13 @@ rather than keeping copies that drift), `textconv` (driver resolution and its re
 runner's argument shape, its two bounds and the fork that used to defeat them, the
 hung-driver latch and the reload that re-arms it, the reported driver CHANGE that lets
 the two caches be dropped — including one carried by a key only libgit2 reads, which
-the map-based fingerprint missed — the two independent file offsets that keep a late-writing
+the map-based fingerprint missed, and one carried by `.gitattributes` alone, which a
+config-only fingerprint missed — the two independent file offsets that keep a late-writing
 grandchild out of the output, the conversion memo — including the basename and the
-script stamp that keep two paths and two script versions apart, and the worktree the
-stamp of a relative command is resolved against — the temp copy's
+script stamp that keep two paths and two script versions apart (a same-length re-save
+inside one mtime second included), the worktree the
+stamp of a relative command is resolved against and the bare command word that is not
+stamped against it at all — the temp copy's
 permissions, and the notes cache
 read out of fixtures written in git's own layout, flat and fanned out — every driver
 fixture a `/bin/sh` script, so the suite depends on nothing else), `apply` (the largest suite — hunk matching and error phrasing

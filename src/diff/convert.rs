@@ -487,10 +487,13 @@ pub(super) fn emit_converted(
                 textconv::RawSide::TooLarge => Err(Substitution::Unconvertible),
                 textconv::RawSide::Unreadable => Err(Substitution::Failed),
             },
-            |driver| {
-                ctx.tc
-                    .convert(ctx.repo, driver, side)
-                    .ok_or(Substitution::Failed)
+            |driver| match ctx.tc.convert(ctx.repo, driver, side) {
+                textconv::Converted::Bytes(bytes) => Ok(bytes),
+                // The same split the undriven arm makes, for the same reason: a blob
+                // over the ceiling is permanent, so the raw body is the honest
+                // rendering and there is nothing to keep off disk for.
+                textconv::Converted::InputTooLarge => Err(Substitution::Unconvertible),
+                textconv::Converted::Failed => Err(Substitution::Failed),
             },
         )
     };
