@@ -579,14 +579,10 @@ impl Textconv {
     ///
     /// Bounded by `TEXTCONV_MAX_OUTPUT`, which is the ceiling on the other side's
     /// converted bytes too: this is the one path that would otherwise pull a whole
-    /// 265MB blob into memory to put it beside an archive listing.
-    ///
-    /// **The bound is asked BEFORE the bytes are materialised**, on both arms — a
-    /// `find_blob(..).content().to_vec()` inflates the object and then copies it, so
-    /// measuring afterwards spent ~530MB to discover that 265MB is too much, on the
-    /// heavy lane, having reserved nothing like it. `Odb::read_header` answers from the
-    /// object header without inflating the payload, the same trick `probe_row_cost`
-    /// uses.
+    /// 265MB blob into memory to put it beside an archive listing. The blob arm goes
+    /// through `bounded_blob`, which owns the measure-before-inflating order and the
+    /// three-answer split; the worktree arm is the same rule against a file, where
+    /// `Read::take` is what stops the read early.
     ///
     /// Three answers, not two: over the ceiling is a permanent, reproducible property
     /// of the delta, while an unreadable side is transient. Collapsing them made the
@@ -614,17 +610,11 @@ impl Textconv {
                 }
                 RawSide::Bytes(buf)
             }
-            Side::Blob { oid, .. } => {
-                let Ok((len, _)) = repo.odb().and_then(|odb| odb.read_header(oid)) else {
-                    return RawSide::Unreadable;
-                };
-                if len > TEXTCONV_MAX_OUTPUT {
-                    return RawSide::TooLarge;
-                }
-                repo.find_blob(oid).map_or(RawSide::Unreadable, |blob| {
-                    RawSide::Bytes(blob.content().to_vec())
-                })
-            }
+            Side::Blob { oid, .. } => match bounded_blob(repo, oid) {
+                BoundedBlob::Blob(blob) => RawSide::Bytes(blob.content().to_vec()),
+                BoundedBlob::TooLarge => RawSide::TooLarge,
+                BoundedBlob::Unreadable(_) => RawSide::Unreadable,
+            },
         }
     }
 
@@ -703,13 +693,12 @@ impl Textconv {
     /// Run `driver` over a committed blob, through a temp copy carrying git's own
     /// basename.
     ///
-    /// **The ceiling is asked before the blob is materialised**, exactly as
-    /// `side_bytes` asks it and for the same measured reason: `find_blob(..).content()`
-    /// inflates the object and `TempBlob::write` then copies it to $TMPDIR, so a 265MB
-    /// blob costs ~530MB of heap plus a full temp copy — per side, per delta, on a lane
-    /// whose admission reserved only the row's COMPRESSED bytes, which for an archive
-    /// are a few KB. Asking first cost the undriven side of the same delta a refusal
-    /// while the driven side pulled the whole thing in.
+    /// Through `bounded_blob`, so the ceiling is asked before the blob is materialised
+    /// — this is the site whose absence cost the most: `TempBlob::write` copies the
+    /// content to $TMPDIR on top of the inflate, so a 265MB blob was ~530MB of heap
+    /// plus a full temp copy, per side, per delta, on a lane whose admission reserved
+    /// only the row's COMPRESSED bytes. It used to decline a 20MB `.bin` on the
+    /// undriven side of a delta while pulling a 500MB `.zip` in on the driven one.
     fn convert_blob(
         &self,
         repo: &Repository,
@@ -717,20 +706,13 @@ impl Textconv {
         oid: git2::Oid,
         path: &[u8],
     ) -> Converted {
-        let (len, _) = match repo.odb().and_then(|odb| odb.read_header(oid)) {
-            Ok(header) => header,
-            Err(e) => {
+        let blob = match bounded_blob(repo, oid) {
+            BoundedBlob::Blob(blob) => blob,
+            BoundedBlob::TooLarge => return Converted::InputTooLarge,
+            BoundedBlob::Unreadable(e) => {
                 self.warn_driver(driver, &format!("blob {oid} could not be read: {e}"));
                 return Converted::Failed;
             }
-        };
-        if len > TEXTCONV_MAX_OUTPUT {
-            return Converted::InputTooLarge;
-        }
-        let Ok(blob) = repo.find_blob(oid).inspect_err(|e| {
-            self.warn_driver(driver, &format!("blob {oid} could not be read: {e}"));
-        }) else {
-            return Converted::Failed;
         };
         let Ok(tmp) = TempBlob::write(basename(path), blob.content())
             .inspect_err(|e| self.warn_driver(driver, &format!("no temp copy could be made: {e}")))
@@ -853,24 +835,61 @@ impl Textconv {
     fn cached(repo: &Repository, facts: &DriverFacts, blob: git2::Oid) -> Option<Vec<u8>> {
         let notes_ref = facts.notes.as_deref()?;
         let note = repo.find_note(Some(notes_ref), blob).ok()?;
-        // `TEXTCONV_MAX_OUTPUT` bounds this cache exactly as it bounds a live run, and
-        // the size is asked for BEFORE the bytes are materialised — git applies no
-        // ceiling when it WRITES these notes, so an entry can be arbitrarily large, and
-        // `content().to_vec()` would inflate it and then copy it. Nothing accounts for
-        // it either: the heavy lane admitted the row against the delta's own blobs,
-        // which for an archive are a few compressed KB. Over the ceiling this reports a
-        // miss, so the ordinary path runs the driver and meets the same bound on its own
-        // output — the answer a repo without the cache already gets.
-        let id = note.id();
-        let (len, _) = repo.odb().and_then(|odb| odb.read_header(id)).ok()?;
-        if len > TEXTCONV_MAX_OUTPUT {
-            return None;
-        }
+        // `TEXTCONV_MAX_OUTPUT` bounds this cache exactly as it bounds a live run —
+        // git applies no ceiling when it WRITES these notes, so an entry can be
+        // arbitrarily large, and nothing accounts for it: the heavy lane admitted the
+        // row against the delta's own blobs, which for an archive are a few compressed
+        // KB. `bounded_blob` is where that is enforced, before the bytes exist.
         // The note's own BLOB, read raw, rather than `Note::message_bytes` — libgit2
         // hands the message out as a C string, so converted output containing a NUL
         // would come back truncated where a fresh conversion would not. `find_note`
         // still does the tree walk, so whatever fanout the cache has is handled.
-        Some(repo.find_blob(id).ok()?.content().to_vec())
+        //
+        // Both non-`Blob` answers are a MISS here rather than a failure: the ordinary
+        // path then runs the driver and meets the same bound on its own output, which
+        // is exactly what a repo without the cache already gets.
+        match bounded_blob(repo, note.id()) {
+            BoundedBlob::Blob(blob) => Some(blob.content().to_vec()),
+            BoundedBlob::TooLarge | BoundedBlob::Unreadable(_) => None,
+        }
+    }
+}
+
+/// A blob, when it is readable AND within `TEXTCONV_MAX_OUTPUT`.
+///
+/// **The bound is asked of the object HEADER, before any payload is materialised.**
+/// `find_blob(..).content().to_vec()` inflates the object and then copies it, so
+/// measuring afterwards spends ~530MB to discover that 265MB is too much — on the heavy
+/// lane, whose admission reserved only the row's COMPRESSED bytes, which for an archive
+/// are a few KB. `Odb::read_header` answers from the header alone, the same trick
+/// `probe_row_cost` uses. This is the one place that order is written down; it was
+/// written out three times, each with its own copy of this paragraph, so a fourth blob
+/// reader had to rediscover it rather than being handed something that cannot get it
+/// wrong.
+///
+/// Three answers, not two, and every caller needs the split: over the ceiling is a
+/// permanent, reproducible property of the object, while unreadable is transient.
+/// Collapsing them made the former mark a whole diff `textconv_failed`, so both caches
+/// refused it and every visit re-paid the build — forever, since the blob never shrinks.
+/// The callers map these onto their own three-state answers, which is why this returns
+/// its own enum rather than a `Result`.
+enum BoundedBlob<'r> {
+    Blob(git2::Blob<'r>),
+    TooLarge,
+    Unreadable(git2::Error),
+}
+
+fn bounded_blob(repo: &Repository, oid: git2::Oid) -> BoundedBlob<'_> {
+    let len = match repo.odb().and_then(|odb| odb.read_header(oid)) {
+        Ok((len, _)) => len,
+        Err(e) => return BoundedBlob::Unreadable(e),
+    };
+    if len > TEXTCONV_MAX_OUTPUT {
+        return BoundedBlob::TooLarge;
+    }
+    match repo.find_blob(oid) {
+        Ok(blob) => BoundedBlob::Blob(blob),
+        Err(e) => BoundedBlob::Unreadable(e),
     }
 }
 
