@@ -172,8 +172,9 @@ cp target/release/gitkay ~/.local/bin/   # install
 ## Architecture
 
 One egui/eframe immediate-mode app — all app state lives in the `GitkApp`
-struct. `src/main.rs` (commit history/graph layout, the workers, and the UI)
-plus extracted modules: `src/diff.rs` (the diff **data** layer: `DiffLine` /
+struct. `src/main.rs` holds that state, the frame loop and the rendering; every
+subsystem it drives has been lifted out beside it, so what remains there is the UI
+and the wiring. Those modules: `src/diff.rs` (the diff **data** layer: `DiffLine` /
 `DiffData` / `FileEntry` / `DiffSettings`, `CommitKind` + the sentinel oids,
 `DiffSource` + `RowScope` (what a row's diff is taken over, and the pathspec —
 the one value every diff entry point receives),
