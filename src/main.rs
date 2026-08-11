@@ -441,6 +441,23 @@ struct DiffCacheKey {
     /// edit just cleared, and what lets `load_selected_diff` rebuild the pane the reader
     /// is looking at instead of early-returning on an identical key.
     drivers: u64,
+    /// `[diff.languages]`, as `highlight::languages_fingerprint` reduces it.
+    ///
+    /// The map decides which grammar a file is tokenized with, so an edited one
+    /// changes a cached diff's SPANS without moving the oid or any setting here. In
+    /// the key for exactly the reason `drivers` is: an entry tokenized under the old
+    /// map misses, instead of needing an eviction that every dispatch site and every
+    /// in-flight worker has to be told about.
+    ///
+    /// It is the last of the four span settings that needed one. `theme` and `enabled`
+    /// are their own fields above; `diff_bg` is NOT here and does not belong here,
+    /// because it reaches no span at all — it decides `DiffPalette::added_bg` /
+    /// `deleted_bg`, which `diff_row_job` reads live from `self.diff_palette` at render
+    /// time, and the one palette-derived span (`tokenize`'s grammar-hiccup fallback)
+    /// takes `foreground`, which is theme-derived. So a `diff_bg` change recolours
+    /// rows without invalidating anything, which is why the reload no longer clears
+    /// the cache.
+    languages: u64,
 }
 
 impl DiffCacheKey {
@@ -455,12 +472,14 @@ impl DiffCacheKey {
             enabled,
             content: _,
             drivers,
+            languages,
         } = other;
         self.oid == *oid
             && self.settings == *settings
             && self.theme == *theme
             && self.enabled == *enabled
             && self.drivers == *drivers
+            && self.languages == *languages
     }
 }
 
@@ -473,9 +492,11 @@ impl DiffCacheKey {
 /// yesterday's colours, sticky via `diff_cache.contains`, for the rest of the session
 /// with nothing logged. `DiffSettings` is compared whole for exactly this reason.
 ///
-/// Note only `enabled` and `theme` are in `DiffCacheKey`; `diff_bg` and `languages`
-/// are not, which is why the reload CLEARS the cache and bumps `span_gen` rather than
-/// relying on stale entries missing. See the reload block.
+/// Three of the four are in `DiffCacheKey`: `enabled` and `theme` as their own
+/// fields, `languages` as a fingerprint. The fourth, `diff_bg`, is deliberately not —
+/// it shapes no span at all, only the row backgrounds `diff_row_job` reads live from
+/// `self.diff_palette`. So a stale cache entry MISSES rather than needing to be swept
+/// up, which is why the reload neither clears the cache nor carries a span epoch.
 #[derive(Clone, PartialEq)]
 struct SpanSettings {
     /// false ⇒ original flat per-line colouring, no tokenizing at all.
@@ -1500,6 +1521,10 @@ fn diff_menu_salt(key: Option<&DiffCacheKey>) -> u64 {
             settings,
             content,
             drivers,
+            // Excluded for the same reason as the two below: an edited grammar map
+            // recolours the same rows, so hashing it would dismiss a menu the reader
+            // has open mid-interaction for a change that moved no path and no line.
+            languages: _,
             theme: _,
             enabled: _,
         }) => {
@@ -2480,6 +2505,12 @@ struct GitkApp {
     /// Everything that decides a diff's spans, held whole so the config reload
     /// compares and assigns it in one move. See `SpanSettings`.
     span_settings: SpanSettings,
+    /// `span_settings.languages`, reduced for `DiffCacheKey`. Cached rather than
+    /// hashed per key build: `diff_cache_key` runs ~54 times per prefetch dispatch and
+    /// the map would be a `BTreeMap` walk every time. Derived wherever the map is
+    /// assigned, and only there: `new` (from the value it is about to store) and
+    /// `set_span_settings`, which is the sole later writer.
+    languages_fingerprint: u64,
     diff_palette: highlight::DiffPalette, // theme-derived diff colours (both modes)
     diff_needs_highlight: bool,           // diff_lines changed; re-run highlight_diff
     diff_generation: Epoch, // bumped each highlight pass; lets stale workers bail + results drop
@@ -2555,9 +2586,6 @@ struct GitkApp {
     prewarm_rx: Option<mpsc::Receiver<Arc<Highlighter>>>, // startup-prewarmed highlighter, until installed
     prefetch_tx: mpsc::Sender<WarmResult>,
     prefetch_rx: mpsc::Receiver<WarmResult>,
-    /// Bumped whenever a setting that shapes SPANS changes. Stamped onto every warm
-    /// at dispatch and checked when it returns; see `WarmResult`.
-    span_gen: u64,
     /// The persistent worker pool, started on first dispatch. A dispatch replaces its
     /// queue rather than spawning threads, so concurrency is bounded by construction.
     prefetch_pool: Option<PoolHandle>,
@@ -3110,6 +3138,15 @@ impl GitkApp {
         // the thread bailed without building anyway — so the disabled mode stays
         // cost-free and a mid-session enable takes the synchronous build path.
         let prewarm_rx = if syntax_enabled { prewarm_rx } else { None };
+        // Built before the literal so the fingerprint below is derived from the very
+        // map that is stored, rather than from `cfg` a second time — the same one-source
+        // rule `set_span_settings` enforces for every later assignment.
+        let span_settings = SpanSettings {
+            enabled: syntax_enabled,
+            theme,
+            diff_bg,
+            languages: cfg.diff.languages.clone(),
+        };
 
         log::debug!(
             "perf: startup: GitkApp::new total {:?}",
@@ -3173,12 +3210,8 @@ impl GitkApp {
             file_line_starts: Vec::new(),
             clipboard: None,
             highlighter: None,
-            span_settings: SpanSettings {
-                enabled: syntax_enabled,
-                theme,
-                diff_bg,
-                languages: cfg.diff.languages.clone(),
-            },
+            languages_fingerprint: highlight::languages_fingerprint(&span_settings.languages),
+            span_settings,
             diff_palette,
             diff_needs_highlight: false, // no diff yet — the deferred startup load arms highlighting
             diff_generation: Epoch::default(),
@@ -3197,7 +3230,6 @@ impl GitkApp {
             prewarm_rx,
             prefetch_tx,
             prefetch_rx,
-            span_gen: 0,
             prefetch_pool: None,
             prefetched_gen: 0,
             // Empty, so the first frame always dispatches.
@@ -3371,6 +3403,7 @@ impl GitkApp {
                 .range()
                 .map_or(0, diff::hash_range_ends),
             drivers: self.drivers_fingerprint(),
+            languages: self.languages_fingerprint,
         }
     }
 
@@ -3656,6 +3689,18 @@ impl GitkApp {
     /// store's, which are one cell. See `diff_drivers`.
     fn drivers_fingerprint(&self) -> u64 {
         self.diff_drivers.load(Ordering::Relaxed)
+    }
+
+    /// Install new span settings, re-deriving the cached `[diff.languages]`
+    /// fingerprint from the map being stored.
+    ///
+    /// The only later writer of either, so the fingerprint cannot describe a map that
+    /// is no longer there — which would be silent and permanent: every diff keyed under
+    /// it would hit entries tokenized with the wrong grammar, and `diff_cache.contains`
+    /// would keep any dispatch from rebuilding them.
+    fn set_span_settings(&mut self, spans: SpanSettings) {
+        self.languages_fingerprint = highlight::languages_fingerprint(&spans.languages);
+        self.span_settings = spans;
     }
 
     /// Take the commit-list column's numbers off a built diff, when this diff may speak
@@ -4471,9 +4516,7 @@ impl GitkApp {
         // working through. No threads are created here — that is the whole point: the
         // previous shape spawned a pool per dispatch, and overlapping dispatches
         // stacked pools until they were fighting each other for the CPU.
-        // Read before the `&mut self` borrow that starts the pool.
-        let span_gen = self.span_gen;
-        self.ensure_prefetch_pool(ctx).submit(targets, hl, span_gen);
+        self.ensure_prefetch_pool(ctx).submit(targets, hl);
     }
 
     /// The prefetch pool, started on first use.
@@ -6246,25 +6289,20 @@ impl GitkApp {
                     languages: cfg.diff.languages.clone(),
                 };
                 if new_spans != self.span_settings {
-                    self.span_settings = new_spans;
-                    // Every cached diff's spans were tokenized under the OLD settings,
-                    // and only two of the four are in `DiffCacheKey` — `theme` and
-                    // `enabled` make a stale entry miss on their own, `diff_bg` and
-                    // `languages` do not. So drop the lot rather than key on all four:
-                    // the pool refills the band within a dispatch, and the alternative
-                    // is a neighbour that keeps yesterday's colours (or no colours, for
-                    // the extension just mapped) until something unrelated evicts it.
-                    // This also closes the same pre-existing gap for `diff_bg`.
-                    self.diff_cache.retain_keys(|_| false);
-                    // Clearing is not enough on its own: warms already queued or
-                    // running were dispatched under the OLD span settings, and
-                    // `diff_bg`/`languages` are absent from `DiffCacheKey`, so
-                    // `key_is_current` waves them through and they land back in the
-                    // just-cleared cache carrying the old colours. Every later
-                    // dispatch then skips them via `contains`, so those rows stay
-                    // flat for the session — the exact failure this clear exists to
-                    // prevent, arriving a moment after it.
-                    self.span_gen = self.span_gen.wrapping_add(1);
+                    // No cache clear and no span epoch. Every one of these settings is
+                    // now either IN `DiffCacheKey` — `theme`, `enabled`, and
+                    // `languages` through its fingerprint — or reaches no span at all,
+                    // which is `diff_bg`: it decides `added_bg`/`deleted_bg`, read live
+                    // from `self.diff_palette` by `diff_row_job` at render time and
+                    // never baked into a `Span`. So a stale entry MISSES, and a warm
+                    // still running under the old map comes back failing
+                    // `key_is_current` and is dropped as stale-keyed.
+                    //
+                    // That is strictly better than the clear it replaces, which threw
+                    // away the whole warm band for a `diff_bg` tweak that invalidated
+                    // nothing — and it needs no counterpart for the in-flight warms the
+                    // clear could not reach, which is what `span_gen` existed to do.
+                    self.set_span_settings(new_spans);
                     // If syntax was just turned off, drop any in-flight prewarm
                     // receiver: it would otherwise linger as a dead channel, and
                     // on re-enable a still-warming thread could leave the diff
@@ -6504,16 +6542,10 @@ impl GitkApp {
         // an old context/theme/etc finishes with a key pinning those old settings, so
         // it could never be hit again and would only bloat the LRU. (Settings unchanged
         // but selection moved still matches — those neighbour diffs stay useful.)
-        while let Ok(WarmResult {
-            key,
-            data,
-            span_gen,
-        }) = self.prefetch_rx.try_recv()
-        {
+        while let Ok(WarmResult { key, data }) = self.prefetch_rx.try_recv() {
             match warm_disposition(WarmFacts {
                 awaiting: self.awaiting(&key),
                 key_current: self.key_is_current(&key),
-                spans_current: span_gen == self.span_gen,
                 is_live: self.current_diff_key.as_ref() == Some(&key),
             }) {
                 // The user is sitting on "Loading diff…" for exactly this key and
@@ -6526,17 +6558,14 @@ impl GitkApp {
                     self.install_preferring_cache(key, data);
                 }
                 WarmDisposition::Cache => self.cache_diff(key, data),
-                // Settings/theme changed while the worker ran; the key can never be
-                // hit again. Logged: this completed prefetch was wasted work.
+                // Settings, theme or the grammar map changed while the worker ran;
+                // the key can never be hit again. This covers the spans too — the
+                // grammar map is in the key — so a result tokenized under an edited
+                // `[diff.languages]` is dropped here rather than caching a neighbour
+                // that stays flat for the rest of the session.
+                // Logged: this completed prefetch was wasted work.
                 WarmDisposition::DropStaleKey => {
                     log::debug!("prefetch: drop stale-keyed result for {}", key.oid);
-                }
-                // Its spans were tokenized under span settings that have since
-                // changed — and `diff_bg`/`[diff.languages]` are absent from the
-                // key, so nothing above would have caught it. Caching it is how a
-                // neighbour ends up flat for the rest of the session.
-                WarmDisposition::DropStaleSpans => {
-                    log::debug!("prefetch: drop stale-span result for {}", key.oid);
                 }
                 WarmDisposition::AlreadyLive => {}
             }
@@ -7580,6 +7609,7 @@ mod tests {
             enabled: true,
             content,
             drivers: 0,
+            languages: 0,
         };
         let a = key(diff::oid_uncommitted(), 1);
         let same = key(diff::oid_uncommitted(), 1);
@@ -7886,6 +7916,7 @@ mod tests {
             enabled,
             content,
             drivers: 0,
+            languages: 0,
         };
         let dark = T::CatppuccinMocha;
         let mut c: DiffCache<DiffCacheKey, u32> = DiffCache::new(100);
@@ -7926,6 +7957,71 @@ mod tests {
     /// the edit just cleared, `load_selected_diff` rebuilds the pane the reader is
     /// looking at instead of early-returning on an identical key, and
     /// `install_preferring_cache` installs that rebuild instead of dropping it.
+    /// The grammar map decides which syntax a file is tokenized with, so an edited
+    /// `[diff.languages]` changes a cached diff's SPANS without moving its oid or any
+    /// `DiffSettings` field. In the key it simply misses.
+    ///
+    /// This replaced a `span_gen` epoch stamped on every warm job and threaded through
+    /// the pool's whole protocol. Without the field, a warm dispatched under the old
+    /// map comes back passing `key_is_current`, is cached carrying plain-text spans,
+    /// and is then skipped by every later dispatch via `diff_cache.contains` — flat for
+    /// the rest of the session.
+    #[test]
+    fn diff_cache_key_includes_the_language_map() {
+        let key = |languages: u64| DiffCacheKey {
+            oid: git2::Oid::ZERO_SHA1,
+            settings: ds(),
+            theme: highlight::DEFAULT_THEME,
+            enabled: true,
+            content: 0,
+            drivers: 0,
+            languages,
+        };
+        let mut c: DiffCache<DiffCacheKey, u32> = DiffCache::new(100);
+        c.insert(key(0), 1, 1);
+        assert_eq!(c.remove(&key(7)), None, "different language map ⇒ miss");
+        assert_eq!(c.remove(&key(0)), Some(1), "same key ⇒ hit");
+        assert!(
+            !key(0).same_modulo_content(&key(7)),
+            "and it is row identity, not a content hash: the virtual rows' eviction \
+             sweep must not treat two grammar maps as one row"
+        );
+    }
+
+    /// The fingerprint is a function of the map's CONTENT, not of its identity — two
+    /// equal maps must key alike or every reload of an unchanged config would miss the
+    /// whole cache, and two different ones must not or the miss never happens.
+    #[test]
+    fn the_language_fingerprint_follows_the_maps_content() {
+        let map = |pairs: &[(&str, &str)]| -> highlight::LanguageMap {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        let fp = highlight::languages_fingerprint;
+        assert_eq!(
+            fp(&map(&[("oml", "xml"), ("tfvars", "hcl")])),
+            fp(&map(&[("tfvars", "hcl"), ("oml", "xml")])),
+            "a BTreeMap is ordered, so insertion order must not change the fingerprint"
+        );
+        assert_ne!(
+            fp(&map(&[("oml", "xml")])),
+            fp(&map(&[("oml", "json")])),
+            "a changed grammar must move it"
+        );
+        assert_ne!(
+            fp(&map(&[("oml", "xml")])),
+            fp(&map(&[("oml", "xml"), ("tfvars", "hcl")])),
+            "an added extension must move it"
+        );
+        assert_ne!(
+            fp(&map(&[])),
+            fp(&map(&[("oml", "xml")])),
+            "and the empty map — the default — must not collide with a configured one"
+        );
+    }
+
     #[test]
     fn diff_cache_key_includes_the_driver_fingerprint() {
         let key = |drivers: u64| DiffCacheKey {
@@ -7935,6 +8031,7 @@ mod tests {
             enabled: true,
             content: 0,
             drivers,
+            languages: 0,
         };
         let mut c: DiffCache<DiffCacheKey, u32> = DiffCache::new(100);
         c.insert(key(0), 1, 1);
@@ -7965,6 +8062,7 @@ mod tests {
             enabled: true,
             content,
             drivers: 0,
+            languages: 0,
         };
 
         let ends = diff::RangeEnds {
@@ -8020,6 +8118,7 @@ mod tests {
             enabled: true,
             content: 0,
             drivers: 0,
+            languages: 0,
         };
         let mut c: DiffCache<DiffCacheKey, u32> = DiffCache::new(100);
         c.insert(key(false, false), 1, 1);
@@ -8677,6 +8776,7 @@ mod tests {
             enabled: true,
             content: 0,
             drivers: 7,
+            languages: 0,
         };
         let now = ds();
         assert!(
@@ -8754,6 +8854,7 @@ mod tests {
             enabled: true,
             content,
             drivers: 0,
+            languages: 0,
         };
         let st = |files| {
             Some(CommitStats {

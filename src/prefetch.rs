@@ -445,8 +445,6 @@ enum Job {
         /// read from shared state, so a config reload swapping the highlighter cannot
         /// race a worker mid-row: the job holds the one it was dispatched under.
         hl: Option<Arc<Highlighter>>,
-        /// The span generation this job was dispatched under; see `WarmResult`.
-        span_gen: u64,
     },
 }
 
@@ -492,7 +490,6 @@ enum CoordMsg {
     Submit {
         targets: VecDeque<PrefetchTarget>,
         hl: Option<Arc<Highlighter>>,
-        span_gen: u64,
     },
     /// The commit-list rows still needing numbers, replacing that tier.
     SubmitStats(VecDeque<StatsJob>),
@@ -535,17 +532,8 @@ impl PoolHandle {
     ///
     /// A send failure means the coordinator thread is gone, which only happens if it
     /// could not start — prefetching is off for the session, and nothing else breaks.
-    pub fn submit(
-        &self,
-        targets: VecDeque<PrefetchTarget>,
-        hl: Option<Arc<Highlighter>>,
-        span_gen: u64,
-    ) {
-        let _dropped = self.tx.send(CoordMsg::Submit {
-            targets,
-            hl,
-            span_gen,
-        });
+    pub fn submit(&self, targets: VecDeque<PrefetchTarget>, hl: Option<Arc<Highlighter>>) {
+        let _dropped = self.tx.send(CoordMsg::Submit { targets, hl });
     }
 
     /// Hand the pool the commit-list rows still needing numbers.
@@ -681,9 +669,6 @@ struct Coordinator {
     line_budget: usize,
     /// The highlighter as of the last `Submit`, copied onto each warm job.
     hl: Option<Arc<Highlighter>>,
-    /// The span generation as of the last `Submit`, copied onto each warm job so a
-    /// result can say which span settings it was built under; see `WarmResult`.
-    span_gen: u64,
     /// The epoch of the last `SubmitStats`, copied onto each warm job. Uniform across
     /// a batch — the UI stamps every job in a dispatch from one `stats_epoch.current()`
     /// — so the front job speaks for all of them. A stale one is simply dropped by the
@@ -713,13 +698,8 @@ impl Coordinator {
     /// thread behind it.
     fn run_msg(&mut self, msg: CoordMsg) {
         match msg {
-            CoordMsg::Submit {
-                targets,
-                hl,
-                span_gen,
-            } => {
+            CoordMsg::Submit { targets, hl } => {
                 self.hl = hl;
-                self.span_gen = span_gen;
                 self.warmed = 0;
                 if let Some(target) = targets.front() {
                     self.note_settings(target.key.settings);
@@ -1029,7 +1009,6 @@ impl Coordinator {
             target,
             stats_epoch: self.stats_epoch,
             hl: self.hl.clone(),
-            span_gen: self.span_gen,
         })
     }
 
@@ -1159,7 +1138,6 @@ pub fn spawn_prefetch_pool(
         warmed: 0,
         line_budget: budget.line_budget,
         hl: None,
-        span_gen: 0,
         stats_epoch: 0,
         mailboxes,
         heavy,
@@ -1237,11 +1215,10 @@ fn worker(ctx: &WorkerCtx, repo: &Repository, jobs: &mpsc::Receiver<Job>) {
             // when the worker reports back, and the row is simply re-offered by the
             // next dispatch.
             Job::Warm {
-                span_gen,
                 target,
                 hl,
                 stats_epoch,
-            } => run_caught(|| warm_row(ctx, repo, target, hl.as_deref(), stats_epoch, span_gen))
+            } => run_caught(|| warm_row(ctx, repo, target, hl.as_deref(), stats_epoch))
                 .unwrap_or_else(|| {
                     caught("a diff");
                     Outcome::Nothing
@@ -1395,15 +1372,14 @@ fn send_stats_result(ctx: &WorkerCtx, epoch: u64, oid: git2::Oid, stats: Option<
 
 /// A completed warm, as it comes back to the UI.
 ///
-/// `span_gen` rides along because the result's SPANS are only meaningful under the
-/// span settings in force when it was dispatched, and two of those settings
-/// (`diff_bg`, `[diff.languages]`) are deliberately absent from `DiffCacheKey`, so
-/// the key cannot answer the question. Carried ON the job, like `hl`, for the same
-/// reason: a config reload must not be able to race a worker mid-row.
+/// Carries no span generation: every setting that shapes a span is now either in
+/// `DiffCacheKey` — `theme`, `enabled`, and `[diff.languages]` through its
+/// fingerprint — or shapes none at all, which is `diff_bg`. So `key_is_current`
+/// answers the staleness question for the spans as well as for the diff, and a
+/// result built under an edited grammar map is dropped as stale-KEYED.
 pub struct WarmResult {
     pub key: DiffCacheKey,
     pub data: DiffData,
-    pub span_gen: u64,
 }
 
 /// What the prefetch drain should do with a completed warm.
@@ -1416,46 +1392,38 @@ pub enum WarmDisposition {
     /// Its key pins settings that have since changed, so it could never be hit.
     DropStaleKey,
     /// Its SPANS were tokenized under settings that have since changed.
-    DropStaleSpans,
     /// It is already the live diff; `load_selected_diff` owns that key.
     AlreadyLive,
 }
 
-/// The four facts the drain decides from. A struct rather than four `bool`
+/// The three facts the drain decides from. A struct rather than three `bool`
 /// parameters, which trips `clippy::fn_params_excessive_bools` — and would be
 /// easy to transpose at the one call site besides.
 #[derive(Clone, Copy)]
 pub struct WarmFacts {
     /// The user is on "Loading diff…" for exactly this key.
     pub awaiting: bool,
-    /// The key still pins the current diff-shaping settings.
+    /// The key still pins the current diff-shaping AND span settings.
     pub key_current: bool,
-    /// The spans were tokenized under the current span settings.
-    pub spans_current: bool,
     /// This key is already the diff on screen.
     pub is_live: bool,
 }
 
-/// The drain's decision, as a pure function of those four facts.
+/// The drain's decision, as a pure function of those three facts.
 ///
-/// `spans_current` is the one that is easy to miss, and its check cannot be
-/// folded into `key_current`. Only two of the four span-affecting settings are in
-/// `DiffCacheKey` — `theme` and `enabled` make a stale entry miss on their own,
-/// `diff_bg` and `[diff.languages]` do not. So a warm dispatched under the OLD
-/// language map comes back with a key that IS current, passes `key_current`, and
-/// is cached carrying plain-text spans; every later dispatch then skips it via
-/// `diff_cache.contains`, so it stays flat for the rest of the session. That is
-/// the exact sticky-`DiffOnly` failure the config reload's cache clear exists to
-/// prevent, arriving a few hundred milliseconds after the clear.
+/// There is deliberately no separate "are the spans current" fact. There used to
+/// be — a `span_gen` epoch stamped on every job — because two of the four
+/// span-affecting settings were absent from `DiffCacheKey`, so a warm dispatched
+/// under the old grammar map came back with a key that WAS current, passed
+/// `key_current`, and was cached carrying plain-text spans; every later dispatch
+/// then skipped it via `diff_cache.contains` and it stayed flat for the session.
 ///
-/// Stale spans outrank `awaiting` deliberately: installing one puts plain spans
-/// on the live diff, and because `spans` would then be `Some`,
-/// `diff_fully_highlighted` reads true and nothing ever re-tokenizes it. Dropping
-/// it costs a wait for the diff-load worker that was dispatched alongside.
+/// `[diff.languages]` is in the key now (as a fingerprint, beside `drivers`), and
+/// `diff_bg` shapes no span at all — it decides row backgrounds the renderer reads
+/// live. So `key_current` answers for the spans too, and the epoch, the extra fact
+/// and the `DropStaleSpans` verdict all went away with it.
 pub const fn warm_disposition(f: WarmFacts) -> WarmDisposition {
-    if !f.spans_current {
-        WarmDisposition::DropStaleSpans
-    } else if f.awaiting {
+    if f.awaiting {
         WarmDisposition::Install
     } else if !f.key_current {
         WarmDisposition::DropStaleKey
@@ -1476,7 +1444,6 @@ fn warm_row(
     target: PrefetchTarget,
     hl: Option<&Highlighter>,
     stats_epoch: u64,
-    span_gen: u64,
 ) -> Outcome {
     // Probe first: a row whose blobs are huge costs seconds whatever its patch looks
     // like, and must not hold up the rest of the band. An already-measured row skips it
@@ -1646,7 +1613,6 @@ fn warm_row(
         .send(WarmResult {
             key: target.key,
             data,
-            span_gen,
         })
         .is_err()
     {
@@ -1683,6 +1649,7 @@ mod tests {
             enabled: true,
             content: 0,
             drivers: 0,
+            languages: 0,
         };
         let set: InflightKeys = Arc::default();
 
@@ -1747,7 +1714,6 @@ mod tests {
                 warmed: 0,
                 line_budget: 1_000,
                 hl: None,
-                span_gen: 0,
                 stats_epoch: 0,
                 mailboxes,
                 heavy,
@@ -1768,6 +1734,7 @@ mod tests {
                 enabled: true,
                 content: 0,
                 drivers: 0,
+                languages: 0,
             },
             scope: RowScope::new(DiffSource::Commit(oid(n))),
             depth: WarmDepth::DiffOnly,
@@ -2292,49 +2259,36 @@ mod tests {
         assert_eq!(got, vec![oid(3), oid(4), oid(5), oid(6)]);
     }
 
-    /// The drain's precedence, including the case a live `GitkApp` makes hard to
-    /// reach: a warm whose SPANS predate a `[diff.languages]` or `[diff.bands]`
-    /// change. Those two are absent from `DiffCacheKey`, so `key_current` is true
-    /// for such a result and every other check waves it through.
+    /// The drain's precedence over the three facts it now decides from.
+    ///
+    /// There was a fourth — `spans_current`, from a `span_gen` epoch — which
+    /// outranked all of these, because `[diff.languages]` and `[diff.bands]` were
+    /// absent from `DiffCacheKey` and so a warm carrying stale spans passed
+    /// `key_current`. The grammar map is in the key now and `diff_bg` shapes no
+    /// span, so `key_current` covers both and `DropStaleKey` is the verdict such a
+    /// result gets.
     #[test]
-    fn a_warm_with_stale_spans_is_dropped_however_wanted_it_is() {
-        use WarmDisposition::{AlreadyLive, Cache, DropStaleKey, DropStaleSpans, Install};
-        // spans_current = false wins over everything, awaiting included: installing
-        // it would put plain spans on the live diff, and `spans: Some` makes
-        // `diff_fully_highlighted` true so nothing would ever re-tokenize it.
-        let facts = |awaiting, key_current, spans_current, is_live| WarmFacts {
+    fn the_drain_prefers_an_awaited_warm_and_drops_a_stale_keyed_one() {
+        use WarmDisposition::{AlreadyLive, Cache, DropStaleKey, Install};
+        let facts = |awaiting, key_current, is_live| WarmFacts {
             awaiting,
             key_current,
-            spans_current,
             is_live,
         };
-        for awaiting in [true, false] {
-            for key_current in [true, false] {
-                for is_live in [true, false] {
-                    assert_eq!(
-                        warm_disposition(facts(awaiting, key_current, false, is_live)),
-                        DropStaleSpans,
-                        "awaiting={awaiting} key_current={key_current} is_live={is_live}"
-                    );
-                }
-            }
-        }
-        // With spans current, the pre-existing precedence is unchanged.
-        assert_eq!(warm_disposition(facts(true, true, true, false)), Install);
+        assert_eq!(warm_disposition(facts(true, true, false)), Install);
         assert_eq!(
-            warm_disposition(facts(true, false, true, false)),
+            warm_disposition(facts(true, false, false)),
             Install,
-            "awaiting wins"
+            "awaiting wins: the reader is on the placeholder for exactly this key"
         );
+        assert_eq!(warm_disposition(facts(false, false, false)), DropStaleKey);
         assert_eq!(
-            warm_disposition(facts(false, false, true, false)),
-            DropStaleKey
+            warm_disposition(facts(false, false, true)),
+            DropStaleKey,
+            "a stale key cannot be the live diff, but the order must not depend on it"
         );
-        assert_eq!(
-            warm_disposition(facts(false, true, true, true)),
-            AlreadyLive
-        );
-        assert_eq!(warm_disposition(facts(false, true, true, false)), Cache);
+        assert_eq!(warm_disposition(facts(false, true, true)), AlreadyLive);
+        assert_eq!(warm_disposition(facts(false, true, false)), Cache);
     }
 
     /// LOAD-BEARING. A driven row must never spawn a driver on the commit-list
