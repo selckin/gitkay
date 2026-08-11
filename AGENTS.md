@@ -202,6 +202,10 @@ budget-and-temp-sweep pruner),
 the runner and its watchdog, and reading git's own `cachetextconv` notes cache — the
 one place gitkay runs an external program, and it writes nothing to the repo; see
 **Textconv**),
+`src/workers.rs` (the four persistent foreground workers and the three jobs they
+run — a clicked diff, a history extension, the reload's driver re-resolution. The
+distinction from `prefetch` is simply that someone is waiting; see **Startup &
+timing**),
 `src/prefetch.rs` (the speculative work pool: the `Coordinator` actor, its
 `Job`/`Outcome`/`CoordMsg` protocol, the workers, and the two things they do —
 `run_stats_job` and `warm_row`. `PoolHandle` is the only way in, which the module
@@ -1052,8 +1056,8 @@ parts run off the window-creation critical path:
   highlight batch has landed since a `false`, and never merely because it was asked.
   Accepted limit: a continuous fling still outruns the pool. Nothing that builds a real
   diff per row will not.
-- **Foreground loads run on workers that own a repo handle** (`ForegroundJob`,
-  `spawn_foreground_workers`, `gitkay-fg-{i}`), shared by the diff pane, the
+- **Foreground loads run on workers that own a repo handle** (`src/workers.rs` —
+  `ForegroundJob`, `spawn_foreground_workers`, `gitkay-fg-{i}`), shared by the diff pane, the
   history extension and the reload's textconv re-resolution (`ResolveDrivers` — see
   **Textconv**; it needs a `Repository` and nothing else). `git2::Repository` is `Send` but **not `Sync`**, so a handle
   cannot be shared between threads at all; one per long-lived worker, opened once, is
