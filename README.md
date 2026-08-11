@@ -160,18 +160,27 @@ against the rest of the graph; merged-in history stays bright.
 
 ## Architecture
 
-One immediate-mode egui app. `src/main.rs` holds the commit graph, the workers
-and the UI; the rest is split by concern:
+One immediate-mode egui app. `src/main.rs` holds the app state and the UI; the
+rest is split by concern:
 
 | Module | Concern |
 |---|---|
 | `diff.rs` | The diff data layer — building, shaping and looking up diffs; git2-facing and egui-free |
+| `diff/convert.rs` | Rendering a delta a `textconv` driver applies to as readable text |
+| `diff/anchor.rs` | The diff pane's scroll anchor — where the reader was, found again after a rebuild |
+| `history.rs` | The commit list — walking history into rows, and the ref map that labels them |
+| `graph.rs` | The commit graph's lane and pipe layout |
 | `apply.rs` | The write layer — stage, unstage and revert, and every guard that decides against writing |
+| `workers.rs` | The foreground workers: the jobs someone is waiting on |
+| `prefetch.rs` | The speculative work pool — one coordinator, many workers |
 | `highlight.rs` | syntect: theme and palette resolution, grammar selection, per-line tokenizing |
+| `diff_highlight.rs` | Applying that to a diff — which rows to colour, in what order |
 | `diff_cache.rs` | In-memory LRU diff cache, bounded by total lines |
 | `diff_store.rs` | The persistent layer below it — binary codec, key derivation, pruning |
+| `textconv.rs` | Running a repo's own `diff.<driver>.textconv` command |
 | `config.rs` | TOML config, font resolution, the commented template |
 | `cli.rs` | Argument parsing and rev-vs-path classification |
+| `datefmt.rs` | A commit's timestamp, absolute or as an age |
 | `word_diff.rs` | Intra-line word diffing (tokenizer + LCS alignment) |
 | `mem.rs` | What the system will say about available memory |
 
