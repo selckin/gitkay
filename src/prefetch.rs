@@ -30,10 +30,11 @@ use crate::diff::{
 };
 use crate::highlight::Highlighter;
 use crate::history::CommitInfo;
+use crate::workers::{StatsJob, StatsResult};
 use crate::{
     DiffCacheKey, DiffDeps, PREFETCH_LINE_BUDGET_DIVISOR, PREFETCH_MAX_DIFF_BYTES,
-    PREFETCH_MAX_ENTRY_DIVISOR, PREFETCH_MAX_HIGHLIGHT_LINES, PREFETCH_MAX_WORKERS, StatsJob,
-    StatsResult, build_or_load, highlight_diff, mem, spawn_guarded, store_of, textconv_for,
+    PREFETCH_MAX_ENTRY_DIVISOR, PREFETCH_MAX_HIGHLIGHT_LINES, PREFETCH_MAX_WORKERS, build_or_load,
+    highlight_diff, mem, spawn_guarded, store_of, textconv_for,
 };
 
 /// How much of a prefetched row's diff gets built.
