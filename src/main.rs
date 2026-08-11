@@ -3565,19 +3565,18 @@ impl GitkApp {
                 },
             );
             // The displayed diff's width is already known — reassemble without
-            // rescanning every line (DiffData::new would).
-            let mut data = DiffData::with_max_chars(
+            // rescanning every line (`DiffData::new` would). `from_parts` is the
+            // counterpart of the `into_parts` split `set_diff_content` performs, and
+            // takes every field explicitly: `textconv_failed` is carried on `GitkApp`
+            // across the display precisely because this is where it has to survive to,
+            // and it used to be patched on afterwards by hand — a step a fifth field
+            // would simply not get.
+            let data = DiffData::from_parts(
                 std::mem::take(&mut self.diff_lines),
                 std::mem::take(&mut self.diff_files),
                 self.diff_max_chars,
+                self.diff_textconv_failed,
             );
-            // Carried on `GitkApp` across the display, because this is where the flag
-            // has to survive to. `with_max_chars` states it `false` — right for the
-            // store's decoder, which never holds a failed entry — and reassembling the
-            // DISPLAYED diff through it laundered a transient failure straight past
-            // `cache_diff`'s guard and back into the LRU, for the one diff most likely
-            // to be revisited.
-            data.textconv_failed = self.diff_textconv_failed;
             // A virtual entry is content-keyed, so each working-tree edit — or, for the
             // range row, each move of its endpoints — produces a fresh hash and the
             // previous content would linger under the same sentinel oid as unreachable
@@ -3767,11 +3766,15 @@ impl GitkApp {
         if self.word_diff && !data.lines.is_empty() {
             self.egui_ctx.request_repaint();
         }
-        // Precomputed at build time (on the worker) — no per-line rescan here.
-        self.diff_max_chars = data.max_chars;
-        self.diff_textconv_failed = data.textconv_failed;
-        self.diff_lines = data.lines;
-        self.diff_files = data.files;
+        // Exploded through `into_parts`, whose exhaustive destructure is what makes a
+        // field added to `DiffData` a compile error here rather than a value silently
+        // dropped at the display boundary. `max_chars` is precomputed at build time (on
+        // the worker), so no per-line rescan happens here.
+        let (lines, files, max_chars, textconv_failed) = data.into_parts();
+        self.diff_max_chars = max_chars;
+        self.diff_textconv_failed = textconv_failed;
+        self.diff_lines = lines;
+        self.diff_files = files;
         self.current_diff_key = key;
         self.diff_content_stale = false;
         self.diff_top_line.store(0, Ordering::Relaxed);
