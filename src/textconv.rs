@@ -35,7 +35,7 @@ use crate::apply::path_from_bytes;
 /// Most a driver may write before its conversion is abandoned. A converted archive
 /// listing is kilobytes; anything past this is a driver that has decided to dump the
 /// archive itself, and holding it would cost more than the diff it replaces.
-const TEXTCONV_MAX_OUTPUT: usize = 16 * 1024 * 1024;
+pub const TEXTCONV_MAX_OUTPUT: usize = 16 * 1024 * 1024;
 
 /// How long a single conversion may take.
 ///
@@ -112,23 +112,62 @@ impl Resolved {
     /// `FILE_THEN_INDEX` is libgit2's own default for diff, and the resolution
     /// `diff_store::attrs_id` already fingerprints — so an attributes edit misses the
     /// persistent store rather than serving a diff built under the old rules.
-    pub fn driver_for(&self, repo: &Repository, path: &[u8]) -> Option<Arc<Driver>> {
+    ///
+    /// Three answers, for the reason `Resolved::failed` exists one level up: a lookup
+    /// that FAILED is not "this path has no driver". The identical transient conditions
+    /// (an EMFILE while the pool, the heavy lane and four foreground workers open
+    /// handles; an EIO on `.gitattributes`; a momentarily unreadable index, which
+    /// `FILE_THEN_INDEX` reads too) would otherwise produce an ordinary-looking all-raw
+    /// diff that `worth_persisting` accepts — a `Binary files … differ` written to
+    /// `~/.cache/gitkay/diffs` under a key that does not move, i.e. served on every
+    /// later launch with the driver installed and working.
+    pub fn driver_for(&self, repo: &Repository, path: &[u8]) -> DriverLookup {
         if self.map.is_empty() {
-            return None; // the ordinary repo: no attribute lookup at all
+            return DriverLookup::None; // the ordinary repo: no attribute lookup at all
         }
-        let attr = repo
-            .get_attr_bytes(
-                path_from_bytes(path),
-                "diff",
-                git2::AttrCheckFlags::FILE_THEN_INDEX,
-            )
-            .ok()?;
+        let Ok(attr) = repo.get_attr_bytes(
+            path_from_bytes(path),
+            "diff",
+            git2::AttrCheckFlags::FILE_THEN_INDEX,
+        ) else {
+            return DriverLookup::Failed;
+        };
         // `True`/`False`/`Unspecified` are `diff`/`-diff`/nothing — none of them
         // names a driver. Only a string does.
         match git2::AttrValue::from_bytes(attr) {
-            git2::AttrValue::String(name) => self.map.get(name).map(Arc::clone),
-            _ => None,
+            git2::AttrValue::String(name) => self
+                .map
+                .get(name)
+                .map_or(DriverLookup::None, |d| DriverLookup::Driver(Arc::clone(d))),
+            _ => DriverLookup::None,
         }
+    }
+}
+
+/// What resolving one side's driver produced. See `Resolved::driver_for` for why the
+/// failure may not collapse into `None`.
+pub enum DriverLookup {
+    /// This path names a driver the repo configures a `textconv` for.
+    Driver(Arc<Driver>),
+    /// It names none.
+    None,
+    /// The attribute lookup itself failed, so which it is remains unknown.
+    Failed,
+}
+
+impl DriverLookup {
+    /// The driver, if one resolved. A failure answers `None` here — every caller that
+    /// must tell the two apart asks `failed()` beside this.
+    pub fn driver(self) -> Option<Arc<Driver>> {
+        match self {
+            Self::Driver(d) => Some(d),
+            Self::None | Self::Failed => None,
+        }
+    }
+
+    /// Did the lookup itself fail?
+    pub const fn failed(&self) -> bool {
+        matches!(self, Self::Failed)
     }
 }
 
@@ -169,17 +208,35 @@ fn fingerprint_of(id: &[u8]) -> u64 {
 /// it; a first word that is not a path (`unzip -c -a`) simply has no stamp, which is
 /// the same blind spot git's own cache has and needs a `PATH` search to close.
 ///
-/// A RELATIVE first word is resolved against `base` — the repo's worktree, which is
-/// the cwd `run` gives the driver — so the file stat'd here is the file that will
-/// actually run. Against gitkay's own process cwd it named a different file entirely,
-/// and both outcomes are wrong: usually nothing is there, so there is no stamp at all
-/// and fixing the script invalidates nothing; occasionally something unrelated is, and
-/// its mtime is reported as a driver change that wipes the whole diff cache. With no
-/// worktree to resolve against there is no stamp, rather than a guess.
+/// **"Not a path" means "holds no separator"**, and that test is the whole of it. A
+/// bare word is resolved by `sh` off `PATH`, so stat-ing `<worktree>/<word>` names a
+/// file that will never run — and `fs::metadata` succeeds on a DIRECTORY as readily as
+/// a file, so a repo holding a top-level entry named like the driver's command
+/// (`textconv = docs2text` beside a `docs2text/` fixture dir) stamped that entry: every
+/// file added under it read as a driver edit, wiping the LRU, blanking the commit-list
+/// `+`/`-` column and missing every entry in `~/.cache/gitkay/diffs`, while the
+/// converter that really runs went unwatched. Answering no stamp is the honest version
+/// of the same blind spot.
+///
+/// A RELATIVE first word (`./bin/zipdiff.sh`) is resolved against `base` — the repo's
+/// worktree, which is the cwd `run` gives the driver — so the file stat'd here is the
+/// file that will actually run. Against gitkay's own process cwd it named a different
+/// file entirely. With no worktree to resolve against there is no stamp, rather than a
+/// guess.
+///
+/// The mtime is folded in at NANOSECOND resolution, which `Metadata::modified` carries
+/// on Linux. Truncated to whole seconds, a script re-saved within the same second at
+/// the same byte length — a one-character correction, or an editor that writes twice —
+/// kept its identity, so the memo served the previous version's bytes for the session
+/// and `driver_id` produced a fingerprint that served them from disk on every later
+/// launch. That is exactly the "served for weeks after the script was fixed" outcome
+/// this function exists to prevent, arriving through the clock instead of the string.
 pub fn script_stamp(cmd: &str, base: Option<&Path>) -> Option<(u64, u64)> {
     let word = cmd.split_whitespace().next()?;
     let path = match word.strip_prefix("~/") {
         Some(rest) => PathBuf::from(std::env::var_os("HOME")?).join(rest),
+        // A `PATH` lookup, not a path — nothing here to stat.
+        None if !word.contains('/') => return None,
         None if Path::new(word).is_relative() => base?.join(word),
         None => PathBuf::from(word),
     };
@@ -189,8 +246,8 @@ pub fn script_stamp(cmd: &str, base: Option<&Path>) -> Option<(u64, u64)> {
         .ok()?
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
-        .as_secs();
-    Some((mtime, meta.len()))
+        .as_nanos();
+    Some((u64::try_from(mtime).unwrap_or(u64::MAX), meta.len()))
 }
 
 /// The drivers a repo configures, plus the per-process state that must NOT be
@@ -244,6 +301,18 @@ pub struct Textconv {
     /// as long as it should: an edited command is a different command and gets its own
     /// deadline, while a reload that changed nothing does not re-arm a hang.
     hung: Mutex<HashSet<String>>,
+    /// Has the config read that resolves the map already been reported as failing?
+    ///
+    /// Its failure is deliberately never remembered as an ANSWER (see `drivers`), and
+    /// that left it with no voice at all: while it keeps failing — a syntax error in
+    /// `~/.gitconfig` written while gitkay runs is enough — every diff in the repo is
+    /// marked `textconv_failed` and every row `driven`, so the band is rebuilt from
+    /// scratch on each dispatch, the `+`/`-` column goes blank for every commit and
+    /// nothing is written to `~/.cache/gitkay/diffs`, on a repo that may configure no
+    /// driver at all. `warn_once`'s line cannot cover it: it names a driver, and here
+    /// none ever ran. Cleared by `invalidate`, so a reload that still fails says so
+    /// again rather than the process going quiet after one line.
+    resolve_warned: std::sync::atomic::AtomicBool,
     /// Converted blobs, so rebuilding the same diff under a different `context` or
     /// `ignore_ws` does not re-spawn every driver. See `Memo`.
     memo: Mutex<Memo>,
@@ -263,6 +332,35 @@ pub enum RawSide {
     TooLarge,
     /// The blob, the odb or the worktree file could not be read.
     Unreadable,
+}
+
+/// What `Textconv::convert` produced for a side a driver does apply to.
+///
+/// Three states for the reason `RawSide` has three, and the two enums draw the line in
+/// the same place: an input over `TEXTCONV_MAX_OUTPUT` is a permanent fact about the
+/// delta, so the raw body is the honest rendering and the diff stays cacheable — where
+/// a driver that could not be RUN is transient and must keep the diff off both caches.
+pub enum Converted {
+    /// The driver's output, at or under the ceiling.
+    Bytes(Vec<u8>),
+    /// The blob to convert is itself larger than `TEXTCONV_MAX_OUTPUT`. Permanent.
+    InputTooLarge,
+    /// The driver could not be spawned, exited non-zero, overran the output ceiling or
+    /// hit `TEXTCONV_TIMEOUT`.
+    Failed,
+}
+
+impl Converted {
+    /// The bytes, if any were produced. Test-facing only: the app has to tell the two
+    /// empty-handed states apart and does so by matching, which is the point of the
+    /// enum — collapsing them here in production code would undo it.
+    #[cfg(test)]
+    fn bytes(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Bytes(b) => Some(b),
+            Self::InputTooLarge | Self::Failed => None,
+        }
+    }
 }
 
 /// Which side of a delta is being converted, and where its bytes are.
@@ -316,6 +414,9 @@ impl Textconv {
         if let Ok(mut hung) = self.hung.lock() {
             hung.clear();
         }
+        // A reload is a fresh chance for the config read too, so a resolution that
+        // still fails gets to say so rather than the process going quiet after one line.
+        self.resolve_warned.store(false, Ordering::Relaxed);
     }
 
     /// The new driver fingerprint if the map has CHANGED since the last time this was
@@ -358,35 +459,51 @@ impl Textconv {
         Resolved { map, failed }
     }
 
-    /// One side's converted bytes, or `None` if the conversion FAILED — a driver that
-    /// could not be spawned, exited non-zero, overran `TEXTCONV_MAX_OUTPUT` or hit
-    /// `TEXTCONV_TIMEOUT`.
+    /// One side's converted bytes, or why there are none.
     ///
-    /// git dies and produces no diff at all in that case (measured: `fatal: unable to
-    /// read files to diff`). gitkay must not — blanking a pane because a driver is
-    /// missing on this machine is worse than showing the diff we could always show —
-    /// so the caller falls back to the raw body for that delta and marks the result
-    /// unpersistable. The warning is once per driver per process.
-    pub fn convert(&self, repo: &Repository, driver: &Driver, side: Side<'_>) -> Option<Vec<u8>> {
+    /// A conversion FAILS when the driver could not be spawned, exited non-zero,
+    /// overran `TEXTCONV_MAX_OUTPUT` or hit `TEXTCONV_TIMEOUT`. git dies and produces
+    /// no diff at all in that case (measured: `fatal: unable to read files to diff`).
+    /// gitkay must not — blanking a pane because a driver is missing on this machine is
+    /// worse than showing the diff we could always show — so the caller falls back to
+    /// the raw body for that delta and marks the result unpersistable. The warning is
+    /// once per driver per process.
+    ///
+    /// `InputTooLarge` is the third answer for the reason `RawSide` has three: a blob
+    /// over the ceiling is a permanent, reproducible property of the delta, so the raw
+    /// body is the honest rendering and the diff stays cacheable.
+    pub fn convert(&self, repo: &Repository, driver: &Driver, side: Side<'_>) -> Converted {
         match side {
-            Side::Absent => Some(Vec::new()),
+            Side::Absent => Converted::Bytes(Vec::new()),
             Side::Worktree { path } => {
                 // cwd is the worktree root, so the repo-relative path resolves — the
                 // shape git uses, and the reason no copy is needed. Not memoized
                 // either, for the same reason it is not cached: there is no oid to
                 // key it under, and the file can change between two reads.
-                let dir = repo.workdir()?.to_path_buf();
+                //
+                // No input ceiling: the driver is handed the PATH and reads the file
+                // itself, so nothing here is materialised. Its output meets the same
+                // bound every run does.
+                let Some(dir) = repo.workdir().map(Path::to_path_buf) else {
+                    return Converted::Failed;
+                };
                 self.run_or_warn(driver, path_from_bytes(path), Some(&dir))
+                    .map_or(Converted::Failed, Converted::Bytes)
             }
             Side::Blob { oid, path } => {
                 let under = MemoKey::of(driver, path, repo.workdir());
                 if let Some(hit) = self.remembered(&under, oid) {
-                    return Some(hit);
+                    return Converted::Bytes(hit);
                 }
-                let out = Self::cached(repo, driver, oid)
-                    .or_else(|| self.convert_blob(repo, driver, oid, path))?;
+                let out = match Self::cached(repo, driver, oid) {
+                    Some(hit) => hit,
+                    None => match self.convert_blob(repo, driver, oid, path) {
+                        Converted::Bytes(out) => out,
+                        other => return other,
+                    },
+                };
                 self.remember(&under, oid, &out);
-                Some(out)
+                Converted::Bytes(out)
             }
         }
     }
@@ -459,6 +576,10 @@ impl Textconv {
     /// the "served for weeks after the driver works" outcome `DiffData::textconv_failed`
     /// exists to prevent, reached by the one route that sets nothing.
     fn drivers(&self, repo: &Repository) -> (Arc<Drivers>, bool) {
+        let failed = || {
+            self.warn_resolve_failed();
+            (Arc::new(Drivers::new()), true)
+        };
         let Ok(mut slot) = self.drivers.lock() else {
             // A poisoned lock re-resolves rather than killing the diff, exactly as a
             // poisoned `warned` drops its report — but it must still REPORT what it
@@ -468,7 +589,7 @@ impl Textconv {
             // `None`: neither cache was dropped and the fix needed a restart, which is
             // the whole failure the fingerprint exists to remove.
             let Some((map, fingerprint)) = resolve_drivers(repo) else {
-                return (Arc::new(Drivers::new()), true);
+                return failed();
             };
             self.note_fingerprint(fingerprint);
             return (Arc::new(map), false);
@@ -477,7 +598,7 @@ impl Textconv {
             return (Arc::clone(drivers), false);
         }
         let Some((resolved, fingerprint)) = resolve_drivers(repo) else {
-            return (Arc::new(Drivers::new()), true);
+            return failed();
         };
         self.note_fingerprint(fingerprint);
         let resolved = Arc::new(resolved);
@@ -515,23 +636,45 @@ impl Textconv {
 
     /// Run `driver` over a committed blob, through a temp copy carrying git's own
     /// basename.
+    ///
+    /// **The ceiling is asked before the blob is materialised**, exactly as
+    /// `side_bytes` asks it and for the same measured reason: `find_blob(..).content()`
+    /// inflates the object and `TempBlob::write` then copies it to $TMPDIR, so a 265MB
+    /// blob costs ~530MB of heap plus a full temp copy — per side, per delta, on a lane
+    /// whose admission reserved only the row's COMPRESSED bytes, which for an archive
+    /// are a few KB. Asking first cost the undriven side of the same delta a refusal
+    /// while the driven side pulled the whole thing in.
     fn convert_blob(
         &self,
         repo: &Repository,
         driver: &Driver,
         oid: git2::Oid,
         path: &[u8],
-    ) -> Option<Vec<u8>> {
-        let blob = repo
+    ) -> Converted {
+        let header = repo.odb().and_then(|odb| odb.read_header(oid));
+        let Ok((len, _)) = header else {
+            let why = header.err().map_or_else(String::new, |e| format!(": {e}"));
+            self.warn_once(driver, &format!("blob {oid} could not be read{why}"));
+            return Converted::Failed;
+        };
+        if len > TEXTCONV_MAX_OUTPUT {
+            return Converted::InputTooLarge;
+        }
+        let Ok(blob) = repo
             .find_blob(oid)
             .inspect_err(|e| self.warn_once(driver, &format!("blob {oid} could not be read: {e}")))
-            .ok()?;
-        let tmp = TempBlob::write(basename(path), blob.content())
+        else {
+            return Converted::Failed;
+        };
+        let Ok(tmp) = TempBlob::write(basename(path), blob.content())
             .inspect_err(|e| self.warn_once(driver, &format!("no temp copy could be made: {e}")))
-            .ok()?;
+        else {
+            return Converted::Failed;
+        };
         // cwd matters even here: a driver may resolve a helper relative to the
         // worktree, and git runs it there too.
         self.run_or_warn(driver, &tmp.file, repo.workdir())
+            .map_or(Converted::Failed, Converted::Bytes)
     }
 
     /// `run`, turning its message into the one warning this driver gets — and
@@ -569,6 +712,17 @@ impl Textconv {
     fn note_hung(&self, driver: &Driver) {
         if let Ok(mut hung) = self.hung.lock() {
             hung.insert(driver.cmd.clone());
+        }
+    }
+
+    /// One line per failing resolution per reload — see `resolve_warned`.
+    fn warn_resolve_failed(&self) {
+        if !self.resolve_warned.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "gitkay: this repo's git config could not be read, so no textconv driver \
+                 could be resolved; every diff is showing unconverted content and none is \
+                 being cached"
+            );
         }
     }
 
@@ -682,7 +836,27 @@ fn cache_is_valid(repo: &Repository, notes_ref: &str, cmd: &str) -> bool {
 fn resolve_drivers(repo: &Repository) -> Option<(Drivers, u64)> {
     let mut out = Drivers::new();
     let cfg = repo.config().and_then(|mut c| c.snapshot()).ok()?;
-    let fingerprint = fingerprint_of(&crate::diff_store::driver_id(&cfg, repo.workdir()));
+    // Config is only HALF of what decides whether a delta is driven: the other half is
+    // the `diff=<name>` attribute `driver_for` looks up. Fingerprinting the config
+    // alone left an attributes edit — removing a `*.zip diff=archive` line, the natural
+    // way to turn a driver off, and the half git's own docs pair with the config half —
+    // reporting no change at all: neither cache was dropped, so the LRU kept serving the
+    // pre-edit rendering, and `CoordMsg::DriversChanged` never fired, so every row the
+    // driver had matched stayed in the coordinator's `measured` map with its costly
+    // verdict — pinned to the heavy lane, filtered out of every stats submission, its
+    // `+`/`-` cells blank for the session. That is verbatim the failure
+    // `DriversChanged` was added to prevent, reached through the attributes half.
+    //
+    // Affordable here and nowhere else: this runs once per `Textconv` lifetime (the map
+    // is memoized until `invalidate`), so it is three file reads per `.git` reload
+    // rather than per diff. `attrs_id` is the same function `StoreContext` folds in, so
+    // the live fingerprint and the on-disk key cannot cover different sources.
+    let mut id = crate::diff_store::driver_id(&cfg, repo.workdir());
+    id.extend_from_slice(&crate::diff_store::attrs_id(
+        repo,
+        crate::diff_store::xdg_config_home().as_deref(),
+    ));
+    let fingerprint = fingerprint_of(&id);
     // A regex, not a shell glob: libgit2 matches config entry names with POSIX
     // regexes, so an unescaped `.` would match any character.
     let Ok(mut entries) = cfg.entries(Some(r"^diff\..*\.textconv$")) else {
@@ -1203,8 +1377,18 @@ mod tests {
         let (_t, repo) = temp_repo();
         write_driver(&repo, "gktest", "cat", false, "*.zip");
         let tc = Textconv::new();
-        assert!(tc.resolved(&repo).driver_for(&repo, b"a.zip").is_some());
-        assert!(tc.resolved(&repo).driver_for(&repo, b"a.txt").is_none());
+        assert!(
+            tc.resolved(&repo)
+                .driver_for(&repo, b"a.zip")
+                .driver()
+                .is_some()
+        );
+        assert!(
+            tc.resolved(&repo)
+                .driver_for(&repo, b"a.txt")
+                .driver()
+                .is_none()
+        );
     }
 
     /// The hung latch is what keeps `TEXTCONV_TIMEOUT` a bound on a ROW, and it used
@@ -1253,6 +1437,41 @@ mod tests {
             tc.drivers_changed(),
             None,
             "a reload that moved nothing must not drop anything"
+        );
+    }
+
+    /// Whether a delta is driven is decided jointly by config and `.gitattributes`, so
+    /// an ATTRIBUTES edit is a driver change too.
+    ///
+    /// Removing the `*.zip diff=archive` line is the natural way to turn a driver off,
+    /// and the half git's own docs pair with the config half. Fingerprinted over config
+    /// alone it reported nothing: the LRU went on serving the pre-edit rendering, and
+    /// `CoordMsg::DriversChanged` never fired — so every row the driver had matched
+    /// stayed in the coordinator's `measured` map with its costly verdict, pinned to the
+    /// heavy lane and filtered out of every stats submission, its `+`/`-` cells blank
+    /// for the session. That is verbatim the failure `DriversChanged` was added to
+    /// prevent, reached through the other half.
+    #[test]
+    fn editing_the_attributes_is_a_driver_change_too() {
+        let (_t, repo) = temp_repo();
+        set_config(&repo, "diff.gktest.textconv", "cat");
+        write_attributes(&repo, "*.zip diff=gktest\n");
+        let tc = Textconv::new();
+        tc.resolved(&repo);
+        assert_eq!(tc.drivers_changed(), None, "the first map reports nothing");
+
+        write_attributes(&repo, "");
+        tc.invalidate();
+        assert!(
+            tc.resolved(&repo)
+                .driver_for(&repo, b"a.zip")
+                .driver()
+                .is_none(),
+            "control: the driver no longer applies"
+        );
+        assert!(
+            tc.drivers_changed().is_some(),
+            "and the caches keyed on the old answer have to be told"
         );
     }
 
@@ -1346,6 +1565,7 @@ mod tests {
         let under = |path| {
             let out = tc
                 .convert(&repo, &d, Side::Blob { oid, path })
+                .bytes()
                 .expect("the driver ran");
             String::from_utf8_lossy(&out).trim().to_owned()
         };
@@ -1369,13 +1589,38 @@ mod tests {
         };
         let tc = Textconv::new();
         let run = || {
-            let out = tc.convert(&repo, &d, side).expect("the driver ran");
+            let out = tc.convert(&repo, &d, side).bytes().expect("the driver ran");
             String::from_utf8_lossy(&out).trim().to_owned()
         };
         assert_eq!(run(), "ONE");
-        // A different LENGTH, so the stamp moves even inside one mtime second.
-        driver_script(t.path(), "v.sh", "echo TWO-AND-THEN-SOME\n");
-        assert_eq!(run(), "TWO-AND-THEN-SOME");
+        // **The same LENGTH, deliberately**, and written immediately — a one-character
+        // correction inside one mtime second, which is what an editor saving twice
+        // produces. With the stamp truncated to whole seconds this pair is identical,
+        // so the memo answered "ONE" for the rest of the process and `driver_id` served
+        // that same wrong conversion from `~/.cache/gitkay/diffs` on every later launch.
+        // The test only moved the byte length to work around it.
+        driver_script(t.path(), "v.sh", "echo TWO\n");
+        assert_eq!(run(), "TWO");
+    }
+
+    /// A bare command word is a `PATH` lookup, and stat-ing `<worktree>/<word>` names a
+    /// file that will never run. `fs::metadata` succeeds on a DIRECTORY too, so a repo
+    /// holding a top-level entry named like the driver's command reported that entry's
+    /// mtime as the driver's identity: touching it read as a driver edit that wipes both
+    /// caches and blanks the whole commit-list `+`/`-` column, while the converter that
+    /// really runs went unwatched.
+    #[test]
+    fn a_bare_command_word_is_not_stamped_against_the_worktree() {
+        let (t, _repo) = temp_repo();
+        std::fs::create_dir(t.path().join("bsdtar")).unwrap();
+        assert!(
+            script_stamp("bsdtar -xOf", Some(t.path())).is_none(),
+            "a repo entry that happens to share the command's name is not the converter"
+        );
+        // A path is still a path, however it is spelled.
+        let script = driver_script(t.path(), "v.sh", "echo hi\n");
+        assert!(script_stamp("./v.sh", Some(t.path())).is_some());
+        assert!(script_stamp(&script.display().to_string(), None).is_some());
     }
 
     /// `-diff` is `AttrValue::False` and a bare `diff` is `True`; neither names a
@@ -1386,8 +1631,18 @@ mod tests {
         set_config(&repo, "diff.gktest.textconv", "cat");
         write_attributes(&repo, "*.zip -diff\n*.bin diff\n");
         let tc = Textconv::new();
-        assert!(tc.resolved(&repo).driver_for(&repo, b"a.zip").is_none());
-        assert!(tc.resolved(&repo).driver_for(&repo, b"a.bin").is_none());
+        assert!(
+            tc.resolved(&repo)
+                .driver_for(&repo, b"a.zip")
+                .driver()
+                .is_none()
+        );
+        assert!(
+            tc.resolved(&repo)
+                .driver_for(&repo, b"a.bin")
+                .driver()
+                .is_none()
+        );
     }
 
     /// A `diff=` attribute naming a driver this repo does not configure a textconv
@@ -1398,7 +1653,12 @@ mod tests {
         set_config(&repo, "diff.gktest.textconv", "cat");
         write_attributes(&repo, "*.zip diff=other\n");
         let tc = Textconv::new();
-        assert!(tc.resolved(&repo).driver_for(&repo, b"a.zip").is_none());
+        assert!(
+            tc.resolved(&repo)
+                .driver_for(&repo, b"a.zip")
+                .driver()
+                .is_none()
+        );
     }
 
     /// The measured shape: the file is the LAST argument, after the command's own,
@@ -1424,6 +1684,7 @@ mod tests {
                     path: b"deep/dir/a.zip",
                 },
             )
+            .bytes()
             .expect("the driver ran");
         assert_eq!(
             String::from_utf8_lossy(&out).trim(),
@@ -1457,6 +1718,7 @@ mod tests {
         let tc = Textconv::new();
         let out = tc
             .convert(&repo, &driver(&script.display().to_string()), Side::Absent)
+            .bytes()
             .expect("an absent side converts to nothing");
         assert!(out.is_empty());
         assert!(
@@ -1476,7 +1738,7 @@ mod tests {
         let tc = Textconv::new();
         for cmd in ["/bin/false", "/nonexistent/nope"] {
             assert!(
-                tc.convert(&repo, &driver(cmd), side).is_none(),
+                tc.convert(&repo, &driver(cmd), side).bytes().is_none(),
                 "{cmd} must be reported as a failure, not as an empty conversion"
             );
         }
@@ -1541,13 +1803,16 @@ mod tests {
         let tc = Textconv::new();
 
         let started = std::time::Instant::now();
-        assert!(tc.convert(&repo, &d, side).is_none(), "the first hangs");
+        assert!(
+            tc.convert(&repo, &d, side).bytes().is_none(),
+            "the first hangs"
+        );
         let one = started.elapsed();
         assert!(one >= TEXTCONV_TIMEOUT, "…for the whole deadline: {one:?}");
 
         let again = std::time::Instant::now();
         for _ in 0..3 {
-            assert!(tc.convert(&repo, &d, side).is_none());
+            assert!(tc.convert(&repo, &d, side).bytes().is_none());
         }
         assert!(
             again.elapsed() < TEXTCONV_TIMEOUT / 4,
@@ -1567,19 +1832,31 @@ mod tests {
         let tc = Textconv::new();
         write_attributes(&repo, "*.zip diff=gktest\n");
         assert_eq!(
-            tc.resolved(&repo).driver_for(&repo, b"a.zip").unwrap().cmd,
+            tc.resolved(&repo)
+                .driver_for(&repo, b"a.zip")
+                .driver()
+                .unwrap()
+                .cmd,
             "first"
         );
 
         set_config(&repo, "diff.gktest.textconv", "second");
         assert_eq!(
-            tc.resolved(&repo).driver_for(&repo, b"a.zip").unwrap().cmd,
+            tc.resolved(&repo)
+                .driver_for(&repo, b"a.zip")
+                .driver()
+                .unwrap()
+                .cmd,
             "first",
             "the map is resolved once, so nothing re-reads config on its own"
         );
         tc.invalidate();
         assert_eq!(
-            tc.resolved(&repo).driver_for(&repo, b"a.zip").unwrap().cmd,
+            tc.resolved(&repo)
+                .driver_for(&repo, b"a.zip")
+                .driver()
+                .unwrap()
+                .cmd,
             "second"
         );
     }
@@ -1595,7 +1872,12 @@ mod tests {
         // Nothing to assert about the failure path without breaking a config read,
         // so this pins the half that IS reachable: a successful empty resolution is
         // cached, and `driver_for` short-circuits on it.
-        assert!(tc.resolved(&repo).driver_for(&repo, b"a.zip").is_none());
+        assert!(
+            tc.resolved(&repo)
+                .driver_for(&repo, b"a.zip")
+                .driver()
+                .is_none()
+        );
         assert!(tc.drivers.lock().unwrap().is_some(), "an answer was kept");
     }
 
@@ -1618,7 +1900,7 @@ mod tests {
         let side = zip_side(blob_of(&repo, c, "a.zip"));
         let tc = Textconv::new();
         for _ in 0..4 {
-            assert_eq!(tc.convert(&repo, &d, side).unwrap(), b"CONVERTED\n");
+            assert_eq!(tc.convert(&repo, &d, side).bytes().unwrap(), b"CONVERTED\n");
         }
         assert_eq!(
             std::fs::read(&counter).unwrap().len(),
@@ -1630,7 +1912,7 @@ mod tests {
         // the command beside the bytes rather than trusting the oid alone.
         let other = driver_script(t.path(), "other.sh", "echo OTHER\n");
         let d2 = driver(&other.display().to_string());
-        assert_eq!(tc.convert(&repo, &d2, side).unwrap(), b"OTHER\n");
+        assert_eq!(tc.convert(&repo, &d2, side).bytes().unwrap(), b"OTHER\n");
     }
 
     /// The child's stdout is its OWN open file description, not a `dup` of ours.
@@ -1786,6 +2068,7 @@ mod tests {
         };
         let hit = Textconv::new()
             .convert(&repo, &d, zip_side(blob))
+            .bytes()
             .expect("served from the cache");
         assert_eq!(hit, stored, "the note's bytes, NUL and all");
     }
@@ -1820,6 +2103,7 @@ mod tests {
         };
         let hit = Textconv::new()
             .convert(&repo, &d, zip_side(blob))
+            .bytes()
             .expect("served from the fanned-out cache");
         assert_eq!(hit, b"FANNED\n");
     }
@@ -1847,6 +2131,7 @@ mod tests {
         };
         let out = Textconv::new()
             .convert(&repo, &d, zip_side(blob))
+            .bytes()
             .expect("the driver ran");
         assert_eq!(String::from_utf8_lossy(&out).trim(), "FRESH");
     }
@@ -1864,6 +2149,7 @@ mod tests {
 
         let out = Textconv::new()
             .convert(&repo, &driver(&cmd), zip_side(blob)) // cache: false
+            .bytes()
             .expect("the driver ran");
         assert_eq!(String::from_utf8_lossy(&out).trim(), "FRESH");
     }
@@ -1899,7 +2185,7 @@ mod tests {
 
         let tc = Textconv::new();
         for side in [zip_side(blob), Side::Worktree { path: b"a.zip" }] {
-            let out = tc.convert(&repo, &d, side).expect("the driver ran");
+            let out = tc.convert(&repo, &d, side).bytes().expect("the driver ran");
             assert_eq!(String::from_utf8_lossy(&out).trim(), "CONVERTED");
         }
 

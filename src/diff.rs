@@ -20,7 +20,7 @@ use convert::{
 
 use crate::datefmt::format_commit_time;
 use crate::highlight;
-use crate::textconv::Textconv;
+use crate::textconv::{self, Textconv};
 use crate::word_diff;
 
 /// Sentinel OID for the "uncommitted changes" virtual entry.
@@ -841,12 +841,27 @@ fn append_diff_body(
     // acquisition per diff instead of one per delta on every one of up to sixteen
     // diff-building threads.
     let resolved = tc.map(|tc| tc.resolved(repo));
+    // An attribute lookup that FAILED is the second half of `Resolved::failed`, and it
+    // has to travel the same way: `.ok()` folded it into "this path has no driver", so
+    // the identical transient condition (an EMFILE while eight workers open handles, an
+    // EIO on `.gitattributes`, a momentarily unreadable index) produced an
+    // ordinary-looking all-raw diff that `worth_persisting` accepted — `Binary files …
+    // differ` written to `~/.cache/gitkay/diffs` under a key that does not move, and so
+    // served on every later launch with the driver installed and working.
+    let mut lookup_failed = false;
     let drivers: Vec<DeltaDrivers> = match resolved.as_ref() {
         Some(r) if !r.is_empty() => diff
             .deltas()
-            .map(|d| DeltaDrivers {
-                old: r.driver_for(repo, side_path_bytes(&d, false)),
-                new: r.driver_for(repo, side_path_bytes(&d, true)),
+            .map(|d| {
+                let (old, new) = (
+                    r.driver_for(repo, side_path_bytes(&d, false)),
+                    r.driver_for(repo, side_path_bytes(&d, true)),
+                );
+                lookup_failed |= old.failed() || new.failed();
+                DeltaDrivers {
+                    old: old.driver(),
+                    new: new.driver(),
+                }
             })
             .collect(),
         _ => Vec::new(),
@@ -1062,7 +1077,7 @@ fn append_diff_body(
     // to `~/.cache/gitkay/diffs` under a key that does not move. It is the same
     // transient-failure-served-for-weeks outcome a failed CONVERSION is refused for,
     // arriving one step earlier.
-    failed || resolved.is_some_and(|r| r.failed)
+    failed || lookup_failed || resolved.is_some_and(|r| r.failed)
 }
 
 /// A settings- and pathspec-scoped git diff, rename/copy-coalesced: `scoped_diff_opts`
@@ -1497,6 +1512,31 @@ pub struct RowCostProbe {
     /// Free to resolve where the probe already is: an attribute lookup reads no blob,
     /// and `probe_deltas` runs between the build and `detect_similar`.
     pub driven: bool,
+    /// Could not be determined — the config read or an attribute lookup FAILED, so
+    /// whether any path is driven is unknown rather than false.
+    ///
+    /// Separate from `driven`, and the separation is not cosmetic: the two are read by
+    /// callers whose cost of being wrong differs by orders of magnitude. Routing to the
+    /// heavy lane is a conservative guess that costs one slot and is corrected by the
+    /// row's own diff. `run_stats_job`'s virtual-row arm reads `driven` as a *permanent*
+    /// `LineStats::Withheld`, which `answered()` and so is never re-asked — so
+    /// conflating them let one EMFILE blank the "Uncommitted changes" row's `+`/`-` on a
+    /// repo that configures no textconv driver at all, until the working tree changed
+    /// enough to move that row's content hash.
+    pub driver_unknown: bool,
+}
+
+impl RowCostProbe {
+    /// Should this row go to the heavy lane rather than an ordinary pool worker?
+    ///
+    /// Conservative on purpose, which is why it reads `driver_unknown` too: a
+    /// resolution that failed is not remembered, so the build that follows re-resolves
+    /// and succeeds — spawning a driver per side on the light lane and the top-priority
+    /// stats tier, exactly what `driven` exists to keep off both. Being wrong here costs
+    /// one heavy-lane slot.
+    pub const fn driven_or_unknown(&self) -> bool {
+        self.driven || self.driver_unknown
+    }
 }
 
 /// Measure an already-built diff from the odb headers, inflating nothing. See
@@ -1517,26 +1557,26 @@ fn probe_deltas(
     // case every repo that uses none of this was paying a mutex per delta for.
     let resolved = tc.map(|tc| tc.resolved(repo));
     // A config read that FAILED answers an empty map, which is indistinguishable from
-    // "this repo configures no drivers" — so dropping the flag reported the row as not
-    // driven, and the row then took an ordinary prefetch worker while its stats job
-    // computed line counts. The resolution is deliberately not remembered, so the build
-    // that follows re-resolves and succeeds: ~80 `/bin/sh` + driver processes across the
-    // light lane and the top-priority stats tier, which is precisely what `driven` is
-    // there to keep off both. Called driven instead, the row goes to the heavy lane —
-    // conservative, and the cost of being wrong is one heavy-lane slot.
-    probe.driven = resolved.as_ref().is_some_and(|r| r.failed);
+    // "this repo configures no drivers" — so it is reported as its own dimension rather
+    // than as `driven`. `driven_or_unknown` is what routes the row to the heavy lane, so
+    // the conservative verdict is unchanged; what it no longer does is reach the one
+    // caller that reads `driven` as a permanent answer. See `RowCostProbe`.
+    probe.driver_unknown = resolved.as_ref().is_some_and(|r| r.failed);
     let resolved = resolved.filter(|r| !r.is_empty());
     for delta in diff.deltas() {
         probe.deltas += 1;
         if !probe.driven
             && let Some(resolved) = resolved.as_ref()
         {
-            probe.driven = resolved
-                .driver_for(repo, side_path_bytes(&delta, true))
-                .is_some()
-                || resolved
-                    .driver_for(repo, side_path_bytes(&delta, false))
-                    .is_some();
+            // Both sides, and the attribute lookup's own failure is the config read's
+            // failure by another route — it says nothing about whether a driver applies.
+            for side in [true, false] {
+                match resolved.driver_for(repo, side_path_bytes(&delta, side)) {
+                    textconv::DriverLookup::Driver(_) => probe.driven = true,
+                    textconv::DriverLookup::Failed => probe.driver_unknown = true,
+                    textconv::DriverLookup::None => {}
+                }
+            }
         }
         for file in [delta.old_file(), delta.new_file()] {
             let id = file.id();
