@@ -200,6 +200,9 @@ diff-side orchestration is `src/diff_highlight.rs`), `src/diff_cache.rs` (line-b
 `src/diff_store.rs` (the persistent layer below that cache: a hand-rolled binary
 codec for a diff's structure, key derivation, atomic load/save, and the
 budget-and-temp-sweep pruner),
+`src/diff/convert.rs` (turning a delta a driver applies to into a readable patch
+body: the substitution point, the synthesized header, the `ignore_ws` sweep, and the
+two mode sources — see **Textconv**),
 `src/textconv.rs` (`diff.<driver>.textconv`: driver resolution out of git config,
 the runner and its watchdog, and reading git's own `cachetextconv` notes cache — the
 one place gitkay runs an external program, and it writes nothing to the repo; see
@@ -1718,6 +1721,9 @@ config change, so `handle_git_reload` calls `Textconv::invalidate`. A `OnceLock`
 the fix need a restart, and made one unlucky config read (an EMFILE while eight
 workers open handles) turn textconv off for the session, since `resolve_drivers`
 answers an empty map on failure. It now answers `None` there, which is not cached.
+
+It lives in **`src/diff/convert.rs`** — `textconv.rs` runs the command, and this
+decides when and against what.
 
 **The substitution point** is `append_diff_body`'s existing `diff.print` callback,
 on the `'F'` line of a driven delta: push the real header, then drive the **same
