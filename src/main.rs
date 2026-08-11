@@ -2452,25 +2452,46 @@ struct GitkApp {
     /// first worker to need it, which keeps a config parse off this path.
     diff_deps: DiffDeps,
     /// The fingerprint of the repo's textconv drivers, as of the last CHANGE one of
-    /// the workers reported (`Textconv::drivers_changed`). `0` until then — matching
-    /// `DiffStore::drivers`, so the two halves of the key agree from the first launch.
-    /// Read by `diff_cache_key`; see `DiffCacheKey::drivers`.
-    diff_drivers: u64,
-    /// The same fingerprint, in the cell `DiffStore` keys its entries from.
+    /// the workers reported (`Textconv::drivers_changed`), `0` until then. Read through
+    /// `drivers_fingerprint`; see `DiffCacheKey::drivers`.
     ///
-    /// Held here rather than inside the store because the store does not exist for the
-    /// first frames of a session — it is opened on the `gitkay-cache-prune` thread and
-    /// published through a `OnceLock` — while a driver edit can be noticed at any time.
-    /// Handing the cell to `DiffStore::open` means a fingerprint written before the
-    /// store opens is already in force when it does, which a "publish it to the store
-    /// each frame" retry could not promise: see the field's doc in `diff_store.rs` for
-    /// the entries that came back out of `~/.cache/gitkay/diffs` under `0` because of
-    /// it. Written beside `diff_drivers` — one write, in `apply_driver_change`.
-    store_drivers: Arc<std::sync::atomic::AtomicU64>,
+    /// **One cell, shared with `DiffStore`** — not a copy each. It is held here rather
+    /// than inside the store because the store does not exist for the first frames of a
+    /// session (it is opened on the `gitkay-cache-prune` thread and published through a
+    /// `OnceLock`) while a driver edit can be noticed at any time; handing the cell to
+    /// `DiffStore::open` means a fingerprint written before the store opens is already
+    /// in force when it does. See the field's doc in `diff_store.rs` for the entries
+    /// that came back out of `~/.cache/gitkay/diffs` under `0` when this was two copies
+    /// reconciled per frame. A second field mirroring it here would be the same bug one
+    /// scope in: the invariant would again be an adjacency rule rather than the type.
+    diff_drivers: Arc<std::sync::atomic::AtomicU64>,
     /// The speculative bounds, resolved once so the prefetch pool and the
     /// diff-load worker cannot disagree about what is too big to keep.
     prefetch_budget: PrefetchBudget,
     current_diff_key: Option<DiffCacheKey>, // key the live diff_lines was built under (None ⇒ empty pane; virtual rows get a content-keyed one)
+    /// The content on screen is no longer a valid answer for `current_diff_key`.
+    ///
+    /// `current_diff_key` answers "which diff is on screen"; this answers "is what is
+    /// on screen still right for it", and the two are genuinely different questions
+    /// whenever a build OUTCOME the key does not record has been invalidated. There is
+    /// one such outcome: a diff that fell back to raw content because a driver overran
+    /// `TEXTCONV_TIMEOUT`, after `handle_git_reload` re-arms the latch.
+    ///
+    /// Expressing that by clearing `current_diff_key` — which does make both early
+    /// returns miss — lies to five other readers of that field, and two of them bite
+    /// immediately: `awaiting_first_diff` is `current_diff_key.is_none() && a load is in
+    /// flight`, documented as only ever true at startup, so both speculative pools stand
+    /// down for the whole rebuild — on the one frame that just invalidated the stats map
+    /// and told the pool to retry `unconverted`; and `ScrollPlan::of(None, oid)` answers
+    /// `Restore` rather than `Anchor`, while `stash_current_diff` takes the now-`None`
+    /// key and so never saved the live position, throwing the reader to a stale
+    /// remembered row on every `.git` write. Putting `textconv_failed` in
+    /// `DiffCacheKey` is the other route and is worse: a failed diff is never cached or
+    /// stored, so it would be key material nothing ever looks up, and it would break
+    /// `key_is_current` for worker results that cannot know the flag.
+    ///
+    /// Cleared by `set_diff_content`, which is where content and key are set together.
+    diff_content_stale: bool,
     prewarm_rx: Option<mpsc::Receiver<Arc<Highlighter>>>, // startup-prewarmed highlighter, until installed
     prefetch_tx: mpsc::Sender<WarmResult>,
     prefetch_rx: mpsc::Receiver<WarmResult>,
@@ -2990,12 +3011,12 @@ impl GitkApp {
         // store until the first diff load, which is at least a frame away.
         let diff_store = StoreSlot::default();
         // The app's own cell, so a driver edit noticed before the store is published
-        // is already in force when it opens. See `GitkApp::store_drivers`.
-        let store_drivers: Arc<std::sync::atomic::AtomicU64> = Arc::default();
+        // is already in force when it opens. See `GitkApp::diff_drivers`.
+        let diff_drivers: Arc<std::sync::atomic::AtomicU64> = Arc::default();
         {
             let slot = Arc::clone(&diff_store);
             let repo_path = repo_path.clone();
-            let drivers = Arc::clone(&store_drivers);
+            let drivers = Arc::clone(&diff_drivers);
             let min_build = std::time::Duration::from_millis(cfg.cache.min_build_ms);
             let _ = spawn_guarded(
                 "gitkay-cache-prune",
@@ -3108,10 +3129,10 @@ impl GitkApp {
                 store: diff_store,
                 textconv: Arc::new(Textconv::new()),
             },
-            diff_drivers: 0,
-            store_drivers,
+            diff_drivers,
             prefetch_budget,
             current_diff_key,
+            diff_content_stale: false,
             prewarm_rx,
             prefetch_tx,
             prefetch_rx,
@@ -3288,7 +3309,7 @@ impl GitkApp {
                 .row_source(oid)
                 .range()
                 .map_or(0, diff::hash_range_ends),
-            drivers: self.diff_drivers,
+            drivers: self.drivers_fingerprint(),
         }
     }
 
@@ -3319,7 +3340,7 @@ impl GitkApp {
         // scroll restore so the user keeps their live position.
         let sel = self.selected.filter(|&s| s < self.commits.len());
         if let Some(oid) = self.selected_oid()
-            && self.current_diff_key.as_ref() == Some(&self.diff_cache_key(oid))
+            && self.shows_current(&self.diff_cache_key(oid))
         {
             if self.diff_load_started_at.take().is_some() {
                 self.diff_load_epoch.bump();
@@ -3546,13 +3567,7 @@ impl GitkApp {
         // was introduced to fix for virtual rows, arriving for real commits by another
         // route. The numbers are a sum over the `FileEntry` list, which is what the
         // sidebar beside them shows whether or not a conversion happened.
-        if stats_harvestable(&key, self.diff_settings, self.diff_drivers) {
-            install_stats_result(
-                &mut self.commit_stats,
-                key.oid,
-                Some(diff::stats_from_data(&data)),
-            );
-        }
+        self.harvest_stats(&key, &data);
         if data.textconv_failed {
             log::debug!(
                 "diff cache: not keeping {} — a textconv driver failed, so this diff \
@@ -3563,6 +3578,51 @@ impl GitkApp {
         }
         let weight = data.lines.len();
         self.diff_cache.insert(key, data, weight);
+    }
+
+    /// Is `key`'s diff both the one on screen AND still a valid answer for it?
+    ///
+    /// The single question behind the two early returns that decline to rebuild —
+    /// `load_selected_diff`'s identical-key return and `install_preferring_cache`'s.
+    /// They have always had to agree; routing both through here is what lets a caller
+    /// invalidate the displayed content without reaching for `current_diff_key` and
+    /// taking its other five readers with it. See `diff_content_stale`.
+    fn shows_current(&self, key: &DiffCacheKey) -> bool {
+        !self.diff_content_stale && self.current_diff_key.as_ref() == Some(key)
+    }
+
+    /// The driver fingerprint both halves of a diff key carry — the app's and the
+    /// store's, which are one cell. See `diff_drivers`.
+    fn drivers_fingerprint(&self) -> u64 {
+        self.diff_drivers.load(Ordering::Relaxed)
+    }
+
+    /// Take the commit-list column's numbers off a built diff, when this diff may speak
+    /// for that row.
+    ///
+    /// One function rather than the same three-part rule (harvestable? → sum → install)
+    /// written at both sites that know a diff: `cache_diff`, for the diff being
+    /// replaced, and `apply_loaded_diff`, for the one arriving. `stats_harvestable`'s
+    /// argument list has already grown once — the drivers fingerprint joined the
+    /// settings — and a site left behind by the next such change fails silently and
+    /// terminally, since an `answered()` entry is never re-asked and would disagree with
+    /// the sidebar for the session.
+    ///
+    /// Deliberately does NOT refuse a `textconv_failed` diff, and both callers rely on
+    /// running it before their own refusal: `run_stats_job` sends a driven row's file
+    /// count and stops on the promise that the row's own diff supplies the line counts,
+    /// and a driven row is exactly the one whose driver can fail. Sound because the pane
+    /// shows the same fallback these numbers are summed from, so the column agrees with
+    /// the sidebar either way. (`warm_row`'s two drop sites are a different mechanism —
+    /// a channel, not this map — and deliberately send different values.)
+    fn harvest_stats(&mut self, key: &DiffCacheKey, data: &DiffData) {
+        if stats_harvestable(key, self.diff_settings, self.drivers_fingerprint()) {
+            install_stats_result(
+                &mut self.commit_stats,
+                key.oid,
+                Some(diff::stats_from_data(data)),
+            );
+        }
     }
 
     /// True when `key` still matches the current settings/theme for its oid — the rule
@@ -3603,6 +3663,7 @@ impl GitkApp {
         self.diff_lines = data.lines;
         self.diff_files = data.files;
         self.current_diff_key = key;
+        self.diff_content_stale = false;
         self.diff_top_line.store(0, Ordering::Relaxed);
         self.rebuild_file_rows();
         self.file_line_starts = file_line_starts(&self.diff_files);
@@ -3646,13 +3707,7 @@ impl GitkApp {
         // Same rule and same order as `cache_diff`'s harvest, refusal included: these
         // numbers are a sum over the very `FileEntry` list the sidebar is about to
         // draw, so they agree with the pane whether or not a conversion happened.
-        if stats_harvestable(&key, self.diff_settings, self.diff_drivers) {
-            install_stats_result(
-                &mut self.commit_stats,
-                oid,
-                Some(diff::stats_from_data(&data)),
-            );
-        }
+        self.harvest_stats(&key, &data);
         self.set_diff_content(Some(key), data);
         // Put the reader back on the line they were reading, for a same-oid
         // rebuild. Only when an anchor is actually pending: on a commit switch
@@ -3702,7 +3757,7 @@ impl GitkApp {
         // calling `apply_loaded_diff`, so an anchor left here would otherwise
         // sit dangling until some LATER same-oid install consumed it — the oid
         // tag alone can't catch that, since the oid would still match.
-        if self.current_diff_key.as_ref() == Some(&key) {
+        if self.shows_current(&key) {
             self.diff_load_started_at = None;
             self.pending_anchor = None;
             return;
@@ -5930,16 +5985,15 @@ impl GitkApp {
     fn apply_driver_change(&mut self) {
         if let Some(fingerprint) = self.diff_deps.textconv.drivers_changed() {
             log::debug!("textconv: drivers changed — dropping diffs built under the old ones");
-            self.diff_drivers = fingerprint;
-            // The store's half of the key moves HERE, before the rebuild is dispatched
-            // below. `DiffStore::key` reads it at load time, so a build that starts
-            // first computes the key the pre-edit entries were written under and is
-            // served one of them — deterministically on the synchronous fallback path,
-            // where `dispatch_diff_load` runs `build_or_load` inline on the UI thread.
-            // The reader's fix would then reload the pane to the identical broken
-            // output, out of `~/.cache/gitkay/diffs`. This lands whether or not the
-            // store has been opened yet, the cell being the app's own.
-            self.store_drivers.store(fingerprint, Ordering::Relaxed);
+            // One store, for both halves of the key. It moves HERE, before the rebuild
+            // is dispatched below: `DiffStore::key` reads it at load time, so a build
+            // that starts first computes the key the pre-edit entries were written
+            // under and is served one of them — deterministically on the synchronous
+            // fallback path, where `dispatch_diff_load` runs `build_or_load` inline on
+            // the UI thread. The reader's fix would then reload the pane to the
+            // identical broken output, out of `~/.cache/gitkay/diffs`. This lands
+            // whether or not the store has been opened yet, the cell being the app's own.
+            self.diff_drivers.store(fingerprint, Ordering::Relaxed);
             // Entries under the old fingerprint can no longer be reached, so this frees
             // memory rather than deciding anything — including for a warm still running
             // under the pre-edit map, whose result now fails `key_is_current` and is
@@ -6043,8 +6097,7 @@ impl GitkApp {
                 // content on screen is not a valid answer for it — which is what
                 // `apply_driver_change` gets for free from the fingerprint moving.
                 if self.diff_textconv_failed {
-                    self.current_diff_key = None;
-                    self.diff_textconv_failed = false;
+                    self.diff_content_stale = true;
                     self.load_selected_diff();
                 }
                 // The virtual rows' content moved; every real commit's stats

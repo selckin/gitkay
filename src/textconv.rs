@@ -350,19 +350,6 @@ pub enum Converted {
     Failed,
 }
 
-impl Converted {
-    /// The bytes, if any were produced. Test-facing only: the app has to tell the two
-    /// empty-handed states apart and does so by matching, which is the point of the
-    /// enum — collapsing them here in production code would undo it.
-    #[cfg(test)]
-    fn bytes(self) -> Option<Vec<u8>> {
-        match self {
-            Self::Bytes(b) => Some(b),
-            Self::InputTooLarge | Self::Failed => None,
-        }
-    }
-}
-
 /// Which side of a delta is being converted, and where its bytes are.
 ///
 /// Three cases because git has three, and the difference is observable: the driver
@@ -651,11 +638,12 @@ impl Textconv {
         oid: git2::Oid,
         path: &[u8],
     ) -> Converted {
-        let header = repo.odb().and_then(|odb| odb.read_header(oid));
-        let Ok((len, _)) = header else {
-            let why = header.err().map_or_else(String::new, |e| format!(": {e}"));
-            self.warn_once(driver, &format!("blob {oid} could not be read{why}"));
-            return Converted::Failed;
+        let (len, _) = match repo.odb().and_then(|odb| odb.read_header(oid)) {
+            Ok(header) => header,
+            Err(e) => {
+                self.warn_once(driver, &format!("blob {oid} could not be read: {e}"));
+                return Converted::Failed;
+            }
         };
         if len > TEXTCONV_MAX_OUTPUT {
             return Converted::InputTooLarge;
@@ -852,10 +840,7 @@ fn resolve_drivers(repo: &Repository) -> Option<(Drivers, u64)> {
     // rather than per diff. `attrs_id` is the same function `StoreContext` folds in, so
     // the live fingerprint and the on-disk key cannot cover different sources.
     let mut id = crate::diff_store::driver_id(&cfg, repo.workdir());
-    id.extend_from_slice(&crate::diff_store::attrs_id(
-        repo,
-        crate::diff_store::xdg_config_home().as_deref(),
-    ));
+    id.extend_from_slice(&crate::diff_store::attrs_fingerprint(repo));
     let fingerprint = fingerprint_of(&id);
     // A regex, not a shell glob: libgit2 matches config entry names with POSIX
     // regexes, so an unescaped `.` would match any character.
@@ -1314,6 +1299,18 @@ pub const fn side_is_convertible(mode: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    impl super::Converted {
+        /// The bytes, if any were produced. Lives here because it is only ever right
+        /// here: the app has to tell the two empty-handed states apart, and does so by
+        /// matching.
+        fn bytes(self) -> Option<Vec<u8>> {
+            match self {
+                Self::Bytes(b) => Some(b),
+                Self::InputTooLarge | Self::Failed => None,
+            }
+        }
+    }
+
     use super::*;
     use crate::test_repo::{
         commit_file, driver_script, set_config, temp_repo, write_attributes, write_driver,

@@ -808,16 +808,25 @@ parts run off the window-creation critical path:
   keep busy. `Coordinator::heavy_fits` is the bound that has to hold, deciding per row
   against each row's ACTUAL measurement, since rows range from a few MB to over a
   gigabyte.
-  **`heavy_need` carries a FLOOR (`HEAVY_ROW_FLOOR_BYTES`) because rows reach this lane
-  by two tests and only one of them is a size.** `probed * 2` is right for a blob-heavy
-  row and meaningless for a `driven` one: a commit touching a dozen zips is a few
-  compressed KB probed, while each conversion materialises up to `TEXTCONV_MAX_OUTPUT`
-  per side plus the converted patch. Charged its measurement, every such row looked
-  free — and free is exactly what defeats a bound whose job is stopping `dispatch`'s
-  tight hand-out loop from committing the whole lane at once, on precisely the repos
-  this lane was widened for. The floor is two sides at the textconv ceiling and nothing
-  for the patch beside them, i.e. deliberately an under-estimate of the worst case
-  rather than a guess at the average, so an idle lane still fills on a modest machine.
+  **`heavy_need` has TWO TERMS, because rows reach this lane by two tests and only one
+  of them is a size.** `probed * 2` is right for a blob-heavy row and meaningless for a
+  driven one: a commit touching a dozen zips is a few compressed KB probed, while each
+  conversion materialises up to `TEXTCONV_MAX_OUTPUT` per side plus the converted patch.
+  Charged its measurement alone, every such row looked free — and free is exactly what
+  defeats a bound whose job is stopping `dispatch`'s tight hand-out loop from committing
+  the whole lane at once, on precisely the repos this lane was widened for.
+  **The verdict therefore TRAVELS rather than being guessed back**: both producers hold
+  a whole `RowCostProbe` when they defer, so `Outcome::TooBig`, `Outcome::Stats`,
+  `Coordinator::measured` and `PrefetchTarget::probed` all carry a `RowCost`
+  (`{ bytes, driven }`) instead of a bare `u64`, and `heavy_need` is
+  `bytes * 2 + if driven { DRIVEN_ROW_EXTRA_BYTES }`. **Added, not `max`ed** — a flat
+  floor fixes the small-and-driven row and re-opens the hole for the big-and-driven one,
+  which holds its inflated blobs and its conversion buffers at once; and a third reason
+  to defer then adds a field rather than another constant inside a `max()`, where each
+  new one silently inflates the charge for every row deferred for any other reason. The
+  driven term is two sides at the textconv ceiling and nothing for the patch beside them,
+  i.e. deliberately an under-estimate of the worst case rather than a guess at the
+  average, so an idle lane still fills on a modest machine.
   Matching the pool is affordable because the two lanes are **complementary**: on an
   ordinary repo heavy rows are rare and this lane sleeps, while on a repo of 265MB blobs
   almost nothing is cheap and the pool sleeps — measured, eight pool workers idle for 36
@@ -903,7 +912,7 @@ parts run off the window-creation critical path:
   changed path have a `diff.<driver>.textconv`". Byte-thresholding cannot see that
   coming — a three-file zip behind `bsdtar` is a few KB and several hundred
   milliseconds of subprocess — so it joins the costly test at both sites that ask it
-  (`cost.total_blob_bytes > ctx.limits.max_blob_bytes || cost.driven_or_unknown()`),
+  (`Limits::too_costly`, one copy of the rule for the two sites that ask it),
   which routes the
   row to the heavy lane and makes its stats job send a file count and stop. Free where
   the probe already is: an attribute lookup reads no blob either. See **Textconv**.
@@ -919,10 +928,12 @@ parts run off the window-creation critical path:
   cost of the conservative answer is one heavy-lane slot.
   **It is a FIFTH dimension, `driver_unknown`, and not a second writer of `driven`** —
   the two are read by callers whose cost of being wrong differs by orders of magnitude.
-  `driven_or_unknown()` is what routes to the heavy lane, where the guess costs a slot
-  and the row's own diff corrects it; `run_stats_job`'s driven-virtual arm reads
-  `driven` alone, because there the verdict is a `LineStats::Withheld` that `answered()`
-  and so is never re-asked. Conflated, one EMFILE blanked the "Uncommitted changes" row's
+  Both are PRIVATE, behind accessors that name the question rather than the bit —
+  `may_be_driven()` routes to the heavy lane, where the guess costs a slot and the row's
+  own diff corrects it; `is_driven()` is what `run_stats_job`'s driven-virtual arm asks,
+  because there the verdict is a `LineStats::Withheld` that `answered()` and so is never
+  re-asked. `cost.driven` is the natural spelling and the wrong one, so reading it from
+  outside `diff.rs` is a compile error rather than a doc comment nobody reaches. Conflated, one EMFILE blanked the "Uncommitted changes" row's
   `+`/`-` on a repo configuring no textconv driver at all, until the working tree changed
   enough to move that row's content hash. With the resolution failed the pane is built
   all-raw too, so the raw counts that arm now computes are the ones the sidebar shows.
@@ -2091,8 +2102,9 @@ third state), and it is the one that cannot contradict the sidebar; a later `Cou
 from `cache_diff` still replaces it, and `invalidate_commit_stats` re-asks it when the
 drivers move.
 
-**And the harvest runs for the INCOMING diff as well** (`apply_loaded_diff`, same rule
-and same order). `stash_current_diff` → `cache_diff` covers the diff being *replaced*,
+**And the harvest runs for the INCOMING diff as well** — both sites call one
+`GitkApp::harvest_stats`, so "same rule, same order" is a fact rather than a promise
+two copies make to each other. `stash_current_diff` → `cache_diff` covers the diff being *replaced*,
 which left the SELECTED row — the one commit whose diff is guaranteed to exist — as the
 single row nothing harvested: `prefetch_targets` excludes the selected index and
 `dispatch_prefetch` excludes `current_diff_key`, so the band never warms it either. Its
@@ -2111,18 +2123,18 @@ thread). So the fix re-resolved the map and changed nothing on screen. `Textconv
 fingerprints each resolution and reports a *change* (`drivers_changed`, `None` for the
 first one, which has nothing to differ from); `GitkApp::apply_driver_change` polls it
 each frame, records it in `GitkApp::diff_drivers`, drops the LRU, tells the coordinator
-and writes it to `GitkApp::store_drivers`, a live `Arc<AtomicU64>` folded into
+and writes it to `GitkApp::diff_drivers`, a live `Arc<AtomicU64>` folded into
 `entry_key` beside the context. Four things make that whole rather than half:
 
 - **The fingerprint is one value over one key list.** It is `fingerprint_of` over
-  `diff_store::driver_id`'s bytes **plus `diff_store::attrs_id`'s** — not a hash of the
+  `diff_store::driver_id`'s bytes **plus `diff_store::attrs_fingerprint`'s** — not a hash of the
   resolved MAP, which holds only
   `textconv`/`cachetextconv` while `driver_id` also covers the
   `binary`/`xfuncname`/`funcname` libgit2 itself reads. Two fingerprints over two key
   lists meant the on-disk key moved where the live one did not: adding a
   `diff.rust.xfuncname` missed the store (correct) while every diff already in the LRU
   kept the old `@@` function context for the session.
-  **`attrs_id` is there because config is only half of what decides whether a delta is
+  **The attributes half is there because config is only half of what decides whether a delta is
   driven**, the other half being the `diff=<name>` attribute `driver_for` looks up.
   Over config alone, removing a `*.zip diff=archive` line — the natural way to turn a
   driver off, and the half git's own docs pair with the config half — reported no change
@@ -2132,8 +2144,10 @@ and writes it to `GitkApp::store_drivers`, a live `Arc<AtomicU64>` folded into
   submission, its `+`/`-` cells blank for the session — verbatim the failure
   `DriversChanged` exists to prevent, through the other half. Affordable only here:
   `resolve_drivers` runs once per `Textconv` lifetime, so it is three file reads per
-  `.git` reload rather than per diff, and it is the same function `StoreContext` folds
-  in, so the live fingerprint and the on-disk key cannot cover different sources. **It is published `Release` and
+  `.git` reload rather than per diff. `attrs_fingerprint` is the single spelling of
+  *which* files — `StoreContext` folds in the same call — so the live fingerprint and the
+  on-disk key cannot end up covering different sources; the `xdg`-taking `attrs_id`
+  behind it stays private, for the suite that needs to point the fallback elsewhere. **It is published `Release` and
   read `Acquire`**, because it travels as two atomics — the value and a one-shot
   `changed` flag — and `drivers_changed` consumes the flag with nothing to re-arm it.
   Relaxed on both sides, a reader could see the flag while still holding the PREVIOUS
@@ -2172,7 +2186,10 @@ and writes it to `GitkApp::store_drivers`, a live `Arc<AtomicU64>` folded into
   `cache_diff` pinned it in the LRU under the new key, where `diff_cache.contains` kept
   every later dispatch from rebuilding it. `GitkApp::store_drivers` is now an
   `Arc<AtomicU64>` handed to `DiffStore::open`, so a fingerprint written before the store
-  exists is already in force when it opens, and there is nothing to retry.
+  exists is already in force when it opens, and there is nothing to retry. There is no
+  second `u64` on `GitkApp` mirroring it either — `drivers_fingerprint()` reads the cell
+  — since a mirror inside one struct is the same two-copies-kept-in-step rule one scope
+  in, held by an adjacency comment instead of by the type.
 - **The commit-list column is dropped too** (`invalidate_commit_stats`). `CommitStats`
   records nothing about which driver produced it, and `cache_diff` harvests a driven
   row's `+`/`-` straight off its diff — so every row the band reached under the broken
@@ -2217,10 +2234,21 @@ of `DiffCacheKey` — so the reload's closing `load_selected_diff` takes its ide
 early return, and `install_preferring_cache` would drop the result even if it did not.
 The band meanwhile re-warms that row successfully, so the cache ends up holding the
 converted patch while the pane keeps `Binary files … differ` until the reader navigates
-away and back. `handle_git_reload` therefore drops `current_diff_key` when
-`diff_textconv_failed` is set, which states what is true — the content on screen is not a
-valid answer for that key — and is what `apply_driver_change` gets for free from the
-fingerprint moving.
+away and back. `handle_git_reload` therefore sets **`diff_content_stale`**, which states
+what is true — the content on screen is not a valid answer for its key — and is what
+`apply_driver_change` gets for free from the fingerprint moving. Both early returns ask
+one predicate, `shows_current`, so they cannot disagree about it.
+**Clearing `current_diff_key` instead does make both returns miss, and is wrong**: that
+field answers "which diff is on screen", and five other readers believe it. Two bite at
+once — `awaiting_first_diff` is `current_diff_key.is_none()` plus a load in flight,
+documented as only ever true at startup, so both speculative pools stand down for the
+whole rebuild, on the one frame that just invalidated the stats map and told the pool to
+retry `unconverted`; and `ScrollPlan::of(None, …)` answers `Restore` rather than
+`Anchor` while `stash_current_diff` takes the now-`None` key and so never saved the live
+position, throwing the reader to a stale remembered row on every `.git` write. Putting
+`textconv_failed` into `DiffCacheKey` is the other route and is worse still: a failed
+diff is never cached or stored, so it would be key material nothing ever looks up, and it
+would break `key_is_current` for worker results that cannot know the flag.
 
 **`cachetextconv` is honoured for READ ONLY**, gated on the repo's own setting exactly
 as git is. `refs/notes/textconv/<driver>`'s tip commit subject must equal the command
@@ -2641,8 +2669,8 @@ over real temp repos, and the pruner's eviction + temp sweep), `word_diff` (LCS 
 alignment), `prefetch` (the coordinator's scheduling decisions, driven through its message
 protocol rather than by reaching into its fields: the heavy lane's two admission
 bounds and the stampede a whole dispatch would otherwise commit, the deferral round
-trip, the floor that keeps a driven row from being admitted as free, stats claiming,
-and `warm_disposition`'s precedence),
+trip, the conversion charge that keeps a driven row from being admitted as free, stats
+claiming, and `warm_disposition`'s precedence),
 `history` (the walk over real temp repos: the tail extension against a full walk,
 the provisional walk's agreement with the real one and the two orderings that break
 it, the path filter's parent rewriting, `--first-parent`, `--follow`, the reflog and

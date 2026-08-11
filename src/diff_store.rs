@@ -356,7 +356,7 @@ impl StoreContext {
 fn context_digest(repo: &git2::Repository, version: &str) -> Option<[u8; 20]> {
     let mut b = Vec::new();
     put_bytes(&mut b, repo_id(repo).as_os_str().as_bytes());
-    put_bytes(&mut b, &attrs_id(repo, xdg_config_home().as_deref()));
+    put_bytes(&mut b, &attrs_fingerprint(repo));
     put_bytes(&mut b, &config_id(repo));
     // The crate version, because `VERSION` above guards only the byte LAYOUT.
     // A change to what the diff BUILDER emits — a header line, the stat block,
@@ -403,7 +403,7 @@ fn repo_id(repo: &git2::Repository) -> PathBuf {
 /// `$XDG_CONFIG_HOME`, or `$HOME/.config` — where libgit2 looks for
 /// `git/attributes` when `core.attributesFile` is unset. Read from the
 /// environment rather than through `dirs`, so a test can point it elsewhere.
-pub fn xdg_config_home() -> Option<PathBuf> {
+fn xdg_config_home() -> Option<PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
@@ -425,7 +425,18 @@ pub fn xdg_config_home() -> Option<PathBuf> {
 /// Known gap: nested `.gitattributes` in subdirectories, and the system-wide
 /// file, are not included. A bounded tree walk is not worth its cost; the escape
 /// hatch is deleting the cache directory.
-pub fn attrs_id(repo: &git2::Repository, xdg: Option<&Path>) -> Vec<u8> {
+/// `attrs_id` over the attribute sources gitkay actually reads.
+///
+/// The single spelling of *which* files, so `StoreContext`'s on-disk key and the live
+/// driver fingerprint `textconv::resolve_drivers` builds cannot end up covering
+/// different ones. The `xdg` parameter below exists only so a test can point the
+/// fallback elsewhere, which is why the production pairing is named once here rather
+/// than repeated at both call sites.
+pub fn attrs_fingerprint(repo: &git2::Repository) -> Vec<u8> {
+    attrs_id(repo, xdg_config_home().as_deref())
+}
+
+fn attrs_id(repo: &git2::Repository, xdg: Option<&Path>) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut fold = |p: Option<PathBuf>| {
         let content = p.and_then(|p| std::fs::read(p).ok()).unwrap_or_default();

@@ -849,23 +849,23 @@ fn append_diff_body(
     // differ` written to `~/.cache/gitkay/diffs` under a key that does not move, and so
     // served on every later launch with the driver installed and working.
     let mut lookup_failed = false;
-    let drivers: Vec<DeltaDrivers> = match resolved.as_ref() {
-        Some(r) if !r.is_empty() => diff
-            .deltas()
-            .map(|d| {
-                let (old, new) = (
-                    r.driver_for(repo, side_path_bytes(&d, false)),
-                    r.driver_for(repo, side_path_bytes(&d, true)),
-                );
-                lookup_failed |= old.failed() || new.failed();
-                DeltaDrivers {
-                    old: old.driver(),
-                    new: new.driver(),
-                }
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
+    let mut drivers: Vec<DeltaDrivers> = Vec::new();
+    // A plain loop, not `.map().collect()`: the accumulator below is a second output of
+    // this pass, and hiding it in an iterator adapter makes the closure side-effecting
+    // for a reader who has every reason to assume it is not.
+    if let Some(r) = resolved.as_ref().filter(|r| !r.is_empty()) {
+        for d in diff.deltas() {
+            let (old, new) = (
+                r.driver_for(repo, side_path_bytes(&d, false)),
+                r.driver_for(repo, side_path_bytes(&d, true)),
+            );
+            lookup_failed |= old.failed() || new.failed();
+            drivers.push(DeltaDrivers {
+                old: old.driver(),
+                new: new.driver(),
+            });
+        }
+    }
     let driver_at = |i: usize| drivers.get(i).filter(|d| d.any());
 
     // Stats — the diffstat block (per-file list + summary) plus its trailing
@@ -1511,31 +1511,55 @@ pub struct RowCostProbe {
     ///
     /// Free to resolve where the probe already is: an attribute lookup reads no blob,
     /// and `probe_deltas` runs between the build and `detect_similar`.
-    pub driven: bool,
+    ///
+    /// **Private, behind two accessors that name the question rather than the bit.** A
+    /// consumer wanting "is this row expensive" writes `cost.driven`, which is the
+    /// natural spelling and the wrong one — see `driver_unknown`. Making the wrong read
+    /// a compile error is what keeps that from being a doc comment nobody reaches.
+    driven: bool,
     /// Could not be determined — the config read or an attribute lookup FAILED, so
     /// whether any path is driven is unknown rather than false.
     ///
     /// Separate from `driven`, and the separation is not cosmetic: the two are read by
     /// callers whose cost of being wrong differs by orders of magnitude. Routing to the
     /// heavy lane is a conservative guess that costs one slot and is corrected by the
-    /// row's own diff. `run_stats_job`'s virtual-row arm reads `driven` as a *permanent*
-    /// `LineStats::Withheld`, which `answered()` and so is never re-asked — so
-    /// conflating them let one EMFILE blank the "Uncommitted changes" row's `+`/`-` on a
-    /// repo that configures no textconv driver at all, until the working tree changed
-    /// enough to move that row's content hash.
-    pub driver_unknown: bool,
+    /// row's own diff, so it takes `may_be_driven`. `run_stats_job`'s virtual-row arm
+    /// installs a *permanent* `LineStats::Withheld`, which `answered()` and so is never
+    /// re-asked, so it takes `is_driven` — conflating the two let one EMFILE blank the
+    /// "Uncommitted changes" row's `+`/`-` on a repo that configures no textconv driver
+    /// at all, until the working tree changed enough to move that row's content hash.
+    driver_unknown: bool,
 }
 
 impl RowCostProbe {
-    /// Should this row go to the heavy lane rather than an ordinary pool worker?
+    /// Did a driver certainly match a changed path?
     ///
-    /// Conservative on purpose, which is why it reads `driver_unknown` too: a
-    /// resolution that failed is not remembered, so the build that follows re-resolves
-    /// and succeeds — spawning a driver per side on the light lane and the top-priority
-    /// stats tier, exactly what `driven` exists to keep off both. Being wrong here costs
-    /// one heavy-lane slot.
-    pub const fn driven_or_unknown(&self) -> bool {
+    /// The strict reading, for the caller whose answer is permanent.
+    pub const fn is_driven(&self) -> bool {
+        self.driven
+    }
+
+    /// Might this row spawn a driver — including "the resolution failed, so we cannot
+    /// say"?
+    ///
+    /// The loose reading, for the caller that can afford to be wrong. A resolution that
+    /// failed is not remembered, so the build that follows re-resolves and succeeds —
+    /// spawning a driver per side on the light lane and the top-priority stats tier,
+    /// exactly what `driven` exists to keep off both. Being wrong here costs one
+    /// heavy-lane slot.
+    pub const fn may_be_driven(&self) -> bool {
         self.driven || self.driver_unknown
+    }
+
+    /// The `, textconv` suffix the two defer logs print, or nothing. Beside the
+    /// predicate rather than spelled out at both macros, where it no longer fits on the
+    /// line and became a five-line block in each.
+    pub const fn textconv_note(&self) -> &'static str {
+        if self.may_be_driven() {
+            ", textconv"
+        } else {
+            ""
+        }
     }
 }
 
@@ -1558,7 +1582,7 @@ fn probe_deltas(
     let resolved = tc.map(|tc| tc.resolved(repo));
     // A config read that FAILED answers an empty map, which is indistinguishable from
     // "this repo configures no drivers" — so it is reported as its own dimension rather
-    // than as `driven`. `driven_or_unknown` is what routes the row to the heavy lane, so
+    // than as `driven`. `may_be_driven` is what routes the row to the heavy lane, so
     // the conservative verdict is unchanged; what it no longer does is reach the one
     // caller that reads `driven` as a permanent answer. See `RowCostProbe`.
     probe.driver_unknown = resolved.as_ref().is_some_and(|r| r.failed);
@@ -2773,12 +2797,12 @@ mod tests {
         assert!(
             probe_row_cost(&repo, &scope, conv_settings(), Some(&tc))
                 .unwrap()
-                .driven
+                .is_driven()
         );
         assert!(
             !probe_row_cost(&repo, &scope, base_settings(), None)
                 .unwrap()
-                .driven,
+                .is_driven(),
             "with textconv off no row is driven"
         );
         // And the measurement taken on the diff the stats path builds anyway agrees.
@@ -2786,7 +2810,7 @@ mod tests {
             measured_row_diff(&repo, &scope, conv_settings(), Some(&tc))
                 .unwrap()
                 .cost
-                .driven
+                .is_driven()
         );
     }
 
