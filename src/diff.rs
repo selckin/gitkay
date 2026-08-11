@@ -850,10 +850,30 @@ fn append_diff_body(
     // served on every later launch with the driver installed and working.
     let mut lookup_failed = false;
     let mut drivers: Vec<DeltaDrivers> = Vec::new();
-    // A plain loop, not `.map().collect()`: the accumulator below is a second output of
-    // this pass, and hiding it in an iterator adapter makes the closure side-effecting
-    // for a reader who has every reason to assume it is not.
+    // A plain loop, not `.map().collect()`: the accumulators below are a second output
+    // of this pass, and hiding them in an iterator adapter makes the closure
+    // side-effecting for a reader who has every reason to assume it is not.
     if let Some(r) = resolved.as_ref().filter(|r| !r.is_empty()) {
+        // The per-driver facts THIS build needs, taken once each and shared by every
+        // delta that names the driver. Both are properties of the driver rather than of
+        // a delta — the `stat(2)` behind `script_stamp`, and the refdb hit plus
+        // commit-object load behind the notes cache's validity — and both used to be
+        // re-derived per SIDE of every driven delta, so a commit touching fifty
+        // archives paid each of them a hundred times for one unchanging answer.
+        //
+        // Lazily, keyed by driver name: a repo that configures a `*.zip` driver but
+        // whose commit touches only `.rs` files must still pay nothing, which an eager
+        // pass over the whole map would not honour.
+        let mut facts: std::collections::HashMap<String, std::sync::Arc<textconv::DriverFacts>> =
+            std::collections::HashMap::new();
+        let mut run_for = |lookup: textconv::DriverLookup| {
+            let driver = lookup.driver()?;
+            let facts =
+                std::sync::Arc::clone(facts.entry(driver.name.clone()).or_insert_with(|| {
+                    std::sync::Arc::new(textconv::DriverFacts::of(repo, &driver))
+                }));
+            Some(textconv::DriverRun { driver, facts })
+        };
         for d in diff.deltas() {
             let (old, new) = (
                 r.driver_for(repo, side_path_bytes(&d, false)),
@@ -861,8 +881,8 @@ fn append_diff_body(
             );
             lookup_failed |= old.failed() || new.failed();
             drivers.push(DeltaDrivers {
-                old: old.driver(),
-                new: new.driver(),
+                old: run_for(old),
+                new: run_for(new),
             });
         }
     }

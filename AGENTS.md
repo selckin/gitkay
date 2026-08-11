@@ -2003,6 +2003,27 @@ two were one variant, so a `try_wait` failing with EINTR or ECHILD reported `tim
 and latched a driver that works and never hung. The deadline is also what bounds the
 synchronous spawn-failure fallback in `load_selected_diff`, the one builder that is not
 a worker.
+**The per-driver facts a build needs are taken ONCE for that build** (`DriverFacts`,
+paired with its driver as a `DriverRun`). Two of them: `script_stamp`'s `(mtime, size)`
+— a `stat(2)` — and the notes cache's validity, which is a refdb hit plus a
+commit-object load. Both are properties of the DRIVER, and both used to be re-derived
+per SIDE of every driven delta: `MemoKey::of` built the whole key, stamp included,
+*before* consulting the memo, so a commit touching fifty archives paid ~100 stats and
+~300 allocations on the fast path of the cache that exists to avoid work, and `cached`
+re-resolved `refs/notes/textconv/<driver>` for every blob.
+**Per BUILD is the granularity that makes it correct**, and it must not drift either
+way. Cached on `Driver` — i.e. per `resolve_drivers` — it would only be re-taken on a
+`.git` reload, which a `~/bin/zipdiff.sh` edit does not trip, so the whole point of the
+stamp is lost. Recomputed per delta it is merely cost. The memo lives in
+`build_diff_data`'s existing per-delta driver loop, keyed by driver name and filled
+**lazily**: a repo that configures a `*.zip` driver but whose commit touches only `.rs`
+files must still pay nothing, which an eager pass over the driver map would not honour.
+`DriverRun` bundles the driver with its facts so a conversion cannot be handed one
+driver's stamp with another's command — the pairing is made where the facts are
+computed and travels as a unit. The suite's `run_of` makes the same pairing, so a test
+exercises the real one; call it once per conversion the test means to be a separate
+build.
+
 **Conversions are memoized per process** (`Memo`, blob oid → `(command + basename +
 script stamp, bytes)`), so a rebuild of the same diff does not re-spawn every driver —
 and a rebuild is ordinary, not exceptional: the diff store's key carries `context` and
@@ -2274,7 +2295,9 @@ would break `key_is_current` for worker results that cannot know the flag.
 **`cachetextconv` is honoured for READ ONLY**, gated on the repo's own setting exactly
 as git is. `refs/notes/textconv/<driver>`'s tip commit subject must equal the command
 string or the cache is empty (git's own rule, and why an edited command re-converts
-instead of serving stale content); the note's own blob is read raw rather than through
+instead of serving stale content) — that verdict is `DriverFacts::notes`, decided once
+per driver per build rather than per blob, so `cached` is handed the ref to read or
+nothing at all; the note's own blob is read raw rather than through
 `Note::message_bytes`, which is a C string and would truncate at a NUL. The lookup goes
 through `find_note`, so a cache in either layout is served. **`TEXTCONV_MAX_OUTPUT`
 bounds this cache as it bounds a live run**, and the size is asked of `Odb::read_header`
