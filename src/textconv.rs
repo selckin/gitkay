@@ -286,36 +286,43 @@ pub struct Textconv {
     /// reader having edited a `diff.<name>.textconv`. Read and cleared by the UI, which
     /// then drops the caches that would otherwise serve the old command's output.
     changed: std::sync::atomic::AtomicBool,
-    /// Drivers already complained about, by `(name, command)`. Behind a mutex on the
-    /// SHARED value, like `highlight`'s missing-grammar set: every worker would
-    /// otherwise warn on its own first row, so a repo with one missing driver would
-    /// print a line per worker per band. Keyed by the command as well as the name so
-    /// an EDITED command gets its own line — the old one's silence says nothing about
-    /// the new one.
-    warned: Mutex<HashSet<(String, String)>>,
+    /// Everything already complained about, and the ONE place the complaining policy
+    /// lives.
+    ///
+    /// Behind a mutex on the SHARED value, like `highlight`'s missing-grammar set:
+    /// every worker would otherwise warn on its own first row, so a repo with one
+    /// missing driver would print a line per worker per band.
+    ///
+    /// One set rather than a set for drivers plus a flag for the resolution, which is
+    /// what it was: the two differed in LIFETIME (per-process against per-reload)
+    /// rather than in kind, and an unshared lifetime is a policy nobody can check. It
+    /// is decided in one place now — `invalidate`, which re-arms a warning exactly when
+    /// it re-arms the thing the warning describes.
+    warned: Mutex<HashSet<Warning>>,
     /// Commands that have already hit `TEXTCONV_TIMEOUT` once. See that constant: the
     /// deadline bounds one conversion, and without this a hung driver is paid for
     /// twice per delta for as long as the row has files.
     ///
-    /// Keyed by the COMMAND, not the driver name, so it survives `invalidate` exactly
-    /// as long as it should: an edited command is a different command and gets its own
-    /// deadline, while a reload that changed nothing does not re-arm a hang.
+    /// Keyed by the COMMAND, not the driver name, so an edited command is a different
+    /// command and gets its own deadline. `invalidate` clears it — see there for why
+    /// the latch needs an exit at all, and why the warning has to follow it out.
     hung: Mutex<HashSet<String>>,
-    /// Has the config read that resolves the map already been reported as failing?
-    ///
-    /// Its failure is deliberately never remembered as an ANSWER (see `drivers`), and
-    /// that left it with no voice at all: while it keeps failing — a syntax error in
-    /// `~/.gitconfig` written while gitkay runs is enough — every diff in the repo is
-    /// marked `textconv_failed` and every row `driven`, so the band is rebuilt from
-    /// scratch on each dispatch, the `+`/`-` column goes blank for every commit and
-    /// nothing is written to `~/.cache/gitkay/diffs`, on a repo that may configure no
-    /// driver at all. `warn_once`'s line cannot cover it: it names a driver, and here
-    /// none ever ran. Cleared by `invalidate`, so a reload that still fails says so
-    /// again rather than the process going quiet after one line.
-    resolve_warned: std::sync::atomic::AtomicBool,
     /// Converted blobs, so rebuilding the same diff under a different `context` or
     /// `ignore_ws` does not re-spawn every driver. See `Memo`.
     memo: Mutex<Memo>,
+}
+
+/// Something worth one log line, and the key deciding when a second one is due.
+#[derive(PartialEq, Eq, Hash)]
+enum Warning {
+    /// A driver failed — could not be spawned, exited non-zero, overran the output
+    /// ceiling or the deadline. Keyed by the command as well as the name so an EDITED
+    /// command gets its own line: the old one's silence says nothing about the new one.
+    Driver(String, String),
+    /// The config read that resolves the map failed, so no driver could even be looked
+    /// up. Unkeyed — there is no driver to name, which is exactly why `Driver`'s line
+    /// cannot cover this case.
+    Resolution,
 }
 
 /// What `Textconv::side_bytes` found for a side no driver of its own applies to.
@@ -391,19 +398,40 @@ impl Textconv {
     /// a different string the only way back. Re-arming costs at most one deadline per
     /// reload, and a reload is debounced and rare; not re-arming costs the feature.
     ///
-    /// The warn-once set and the memo are left alone: both are keyed by the driver
-    /// COMMAND (the memo by its script's stamp too), so they invalidate themselves
-    /// exactly when the thing they describe changes.
+    /// **A warning is re-armed exactly when the thing it describes is**, which is why
+    /// the two live in one function. Re-arming the deadline while keeping the line
+    /// meant the second overrun cost `TEXTCONV_TIMEOUT` per row again with nothing in
+    /// the log to say why the pane had stalled — the failure the line exists to explain,
+    /// silent on its second occurrence. So the hung commands' warnings go out with the
+    /// latch, and `Warning::Resolution` goes with them because every build from here on
+    /// retries that config read. A driver that merely does not exist keeps its silence:
+    /// nothing about its verdict moved, and its next line would be identical.
+    ///
+    /// The memo is left alone: it is keyed by the driver COMMAND and its script's stamp,
+    /// so it invalidates itself exactly when the converter changes.
     pub fn invalidate(&self) {
         if let Ok(mut slot) = self.drivers.lock() {
             *slot = None;
         }
-        if let Ok(mut hung) = self.hung.lock() {
-            hung.clear();
+        // Re-arm the hung latch — and, in the same breath, the WARNING for exactly the
+        // commands it covered. That pairing is the whole reason the two live together:
+        // re-arming a deadline without re-arming its line means the second overrun
+        // costs `TEXTCONV_TIMEOUT` per row again with nothing in the log to say why the
+        // pane stalled. A warning is re-armed when, and only when, the thing it
+        // describes is.
+        let rearmed: HashSet<String> = self
+            .hung
+            .lock()
+            .map(|mut hung| hung.drain().collect())
+            .unwrap_or_default();
+        if let Ok(mut warned) = self.warned.lock() {
+            // The config read is retried by every build from here on, so a resolution
+            // that still fails says so again rather than the process going quiet after
+            // one line. A driver that merely does not exist is NOT re-armed: nothing
+            // about its verdict changed, and its next line would be identical.
+            warned.remove(&Warning::Resolution);
+            warned.retain(|w| !matches!(w, Warning::Driver(_, cmd) if rearmed.contains(cmd)));
         }
-        // A reload is a fresh chance for the config read too, so a resolution that
-        // still fails gets to say so rather than the process going quiet after one line.
-        self.resolve_warned.store(false, Ordering::Relaxed);
     }
 
     /// The new driver fingerprint if the map has CHANGED since the last time this was
@@ -641,21 +669,20 @@ impl Textconv {
         let (len, _) = match repo.odb().and_then(|odb| odb.read_header(oid)) {
             Ok(header) => header,
             Err(e) => {
-                self.warn_once(driver, &format!("blob {oid} could not be read: {e}"));
+                self.warn_driver(driver, &format!("blob {oid} could not be read: {e}"));
                 return Converted::Failed;
             }
         };
         if len > TEXTCONV_MAX_OUTPUT {
             return Converted::InputTooLarge;
         }
-        let Ok(blob) = repo
-            .find_blob(oid)
-            .inspect_err(|e| self.warn_once(driver, &format!("blob {oid} could not be read: {e}")))
-        else {
+        let Ok(blob) = repo.find_blob(oid).inspect_err(|e| {
+            self.warn_driver(driver, &format!("blob {oid} could not be read: {e}"));
+        }) else {
             return Converted::Failed;
         };
         let Ok(tmp) = TempBlob::write(basename(path), blob.content())
-            .inspect_err(|e| self.warn_once(driver, &format!("no temp copy could be made: {e}")))
+            .inspect_err(|e| self.warn_driver(driver, &format!("no temp copy could be made: {e}")))
         else {
             return Converted::Failed;
         };
@@ -683,7 +710,7 @@ impl Textconv {
                 if failure.timed_out {
                     self.note_hung(driver);
                 }
-                self.warn_once(driver, &failure.why);
+                self.warn_driver(driver, &failure.why);
                 None
             }
         }
@@ -703,30 +730,40 @@ impl Textconv {
         }
     }
 
-    /// One line per failing resolution per reload — see `resolve_warned`.
+    /// The config read that resolves the map failed. See `Warning::Resolution`: no
+    /// driver ran, so `warn_driver`'s line — which names one — cannot report it, and the
+    /// degradation is repo-wide (every diff marked `textconv_failed`, the band rebuilt
+    /// on each dispatch, the `+`/`-` column blank, nothing written to
+    /// `~/.cache/gitkay/diffs`) on a repo that may configure no driver at all.
     fn warn_resolve_failed(&self) {
-        if !self.resolve_warned.swap(true, Ordering::Relaxed) {
-            log::warn!(
-                "gitkay: this repo's git config could not be read, so no textconv driver \
-                 could be resolved; every diff is showing unconverted content and none is \
-                 being cached"
-            );
-        }
+        self.warn_once(
+            Warning::Resolution,
+            "gitkay: this repo's git config could not be read, so no textconv driver \
+             could be resolved; every diff is showing unconverted content and none is \
+             being cached",
+        );
     }
 
-    /// One line per driver command per process, whatever went wrong. Every worker
-    /// would otherwise warn on its own first row.
-    fn warn_once(&self, driver: &Driver, why: &str) {
+    /// One line per driver command, whatever went wrong.
+    fn warn_driver(&self, driver: &Driver, why: &str) {
+        self.warn_once(
+            Warning::Driver(driver.name.clone(), driver.cmd.clone()),
+            &format!(
+                "gitkay: textconv driver \"{}\" ({}) failed — {why}; \
+                 showing the unconverted diff instead",
+                driver.name, driver.cmd
+            ),
+        );
+    }
+
+    /// Log `line`, unless `what` has already been reported. The single gate, so the
+    /// question of when a second line is due is answered in one place — `invalidate`.
+    fn warn_once(&self, what: Warning, line: &str) {
         let Ok(mut seen) = self.warned.lock() else {
             return; // a poisoned lock drops the report rather than killing the diff
         };
-        if seen.insert((driver.name.clone(), driver.cmd.clone())) {
-            log::warn!(
-                "gitkay: textconv driver \"{}\" ({}) failed — {why}; \
-                 showing the unconverted diff instead",
-                driver.name,
-                driver.cmd
-            );
+        if seen.insert(what) {
+            log::warn!("{line}");
         }
     }
 
@@ -1815,6 +1852,32 @@ mod tests {
             again.elapsed() < TEXTCONV_TIMEOUT / 4,
             "later conversions must not spawn it again: {:?}",
             again.elapsed()
+        );
+
+        // **A re-armed deadline gets a re-armed LINE.** `invalidate` gives this command
+        // another go, so the next overrun costs `TEXTCONV_TIMEOUT` per row all over
+        // again — and with its one warning already spent there was nothing in the log
+        // saying why the pane had stalled. Riding on this test rather than its own
+        // because the deadline above is already paid here.
+        let hung = || Warning::Driver(d.name.clone(), d.cmd.clone());
+        let missing = || Warning::Driver("absent".to_owned(), "no-such-command".to_owned());
+        assert!(
+            tc.warned.lock().unwrap().contains(&hung()),
+            "control: the hang was reported once"
+        );
+        tc.warned.lock().unwrap().insert(missing());
+        tc.invalidate();
+        let (rearmed, kept) = {
+            let warned = tc.warned.lock().unwrap();
+            (!warned.contains(&hung()), warned.contains(&missing()))
+        };
+        assert!(
+            rearmed,
+            "the command whose deadline was re-armed may speak again"
+        );
+        assert!(
+            kept,
+            "a driver that merely does not exist has nothing new to say"
         );
     }
 

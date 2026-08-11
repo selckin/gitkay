@@ -1761,7 +1761,8 @@ config change, so `handle_git_reload` calls `Textconv::invalidate`. A `OnceLock`
 the fix need a restart, and made one unlucky config read (an EMFILE while eight
 workers open handles) turn textconv off for the session, since `resolve_drivers`
 answers an empty map on failure. It now answers `None` there, which is not cached — and **says so**, once per reload
-(`Textconv::warn_resolve_failed`). Not remembering the failure left it with no voice at
+(`Textconv::warn_resolve_failed`, gated by `Warning::Resolution` in the one warn
+registry). Not remembering the failure left it with no voice at
 all: while the read keeps failing (a syntax error in `~/.gitconfig` saved while gitkay
 runs is enough) every diff in the repo is marked `textconv_failed` and every row costly,
 so the band is rebuilt from scratch on each dispatch, the commit-list `+`/`-` column goes
@@ -1971,8 +1972,17 @@ so `Textconv::hung` latches the first command to reach the deadline and refuses 
 later conversion under it without spawning. Without that latch a hundred driven files
 behind a blocking driver is `2 × 100 × 10s` of one worker: the failure the constant
 names, reached by repeating it rather than by exceeding it. Latched by the COMMAND, so
-an edited one gets its own deadline. **`invalidate` clears it**, and that is a
-correction: keeping it across a reload ("the same command is the same command") left
+an edited one gets its own deadline. **`invalidate` clears it — and clears that
+command's WARNING with it**, since re-arming a deadline while keeping its one line
+spent means the second overrun costs `TEXTCONV_TIMEOUT` per row again with nothing in
+the log saying why the pane stalled. That pairing is the whole reason the warn registry
+and the latch are cleared in one function: `Textconv::warned` is a single
+`HashSet<Warning>` (`Driver(name, cmd)` | `Resolution`) rather than a set plus a flag,
+because the two differed in LIFETIME rather than in kind and an unshared lifetime is a
+policy nobody can check. A driver that merely does not exist is NOT re-armed — nothing
+about its verdict moved.
+Clearing the latch at all is itself a correction: keeping it across a reload ("the same
+command is the same command") left
 the latch with no exit at all, so one transient overrun — the contention `cache_diff`'s
 own doc names — turned every driven file in the repo into `Binary files … differ` for
 the rest of the process, with editing the command to a different string the only way

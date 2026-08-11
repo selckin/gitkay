@@ -9538,7 +9538,6 @@ mod tests {
             dir.path().to_path_buf(),
             StoreContext::of(&repo).expect("hashable"),
             std::time::Duration::from_hours(1),
-            Arc::default(),
         );
         let built = build_or_load(Some(&never), &repo, &scope, s, None, None);
         assert!(!built.lines.is_empty(), "control: the diff is real");
@@ -9553,7 +9552,6 @@ mod tests {
             dir.path().to_path_buf(),
             StoreContext::of(&repo).expect("hashable"),
             std::time::Duration::ZERO,
-            Arc::default(),
         );
         let a = build_or_load(Some(&always), &repo, &scope, s, None, None);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "written");
@@ -9598,7 +9596,6 @@ mod tests {
             store_dir.path().to_path_buf(),
             StoreContext::of(&repo).expect("hashable"),
             std::time::Duration::ZERO,
-            Arc::default(),
         );
         build_or_load(Some(&store), &repo, &scope, s, Some(&tc), None);
         assert_eq!(
@@ -9628,7 +9625,7 @@ mod tests {
         drop(repo);
         crate::test_repo::remove_loose_object(dir.path(), oid);
         let repo = crate::test_repo::open_repo(dir.path());
-        let store = DiffStore::at(root, ctx, std::time::Duration::ZERO, Arc::default());
+        let store = DiffStore::at(root, ctx, std::time::Duration::ZERO);
 
         let data = build_or_load(Some(&store), &repo, &scope, s, None, None);
         assert!(data.lines.is_empty(), "control: the build did fail");
@@ -9684,7 +9681,6 @@ mod tests {
             store_dir.path().to_path_buf(),
             ctx,
             std::time::Duration::ZERO,
-            Arc::default(),
         );
         build_or_load(
             Some(&store),
@@ -9710,7 +9706,6 @@ mod tests {
             store_dir.path().to_path_buf(),
             ctx,
             std::time::Duration::ZERO,
-            Arc::default(),
         );
         build_or_load(
             Some(&store),
@@ -9746,7 +9741,6 @@ mod tests {
                 dir.to_path_buf(),
                 StoreContext::of(&repo).expect("hashable"),
                 std::time::Duration::ZERO,
-                Arc::default(),
             )
         };
 
@@ -9786,7 +9780,6 @@ mod tests {
             dir.path().to_path_buf(),
             StoreContext::of(&repo).expect("hashable"),
             std::time::Duration::from_hours(1),
-            Arc::default(),
         );
 
         build_or_load(Some(&store), &repo, &scope, s, None, None);
