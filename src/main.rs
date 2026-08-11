@@ -3014,45 +3014,41 @@ impl GitkApp {
         // One handle per worker, opened once — see `ForegroundJob`.
         let foreground_workers = spawn_foreground_workers(&repo_path);
 
-        let (commits, walk_oids, pending_history) = match history_rx.try_recv() {
-            Ok(HistoryWalk { commits, oids }) => {
+        // A walk to install now, or a receiver to install from later. `new` builds the
+        // app around an EMPTY list either way and hands any walk it already has to
+        // `install_startup_history` below — the same function `apply_pending_history`
+        // and the provisional path use. It used to derive and install inline, which
+        // made two definitions of "what a commit list sets", and they had already
+        // drifted: this one left `startup_auto_selected` as `None` where the install
+        // records the row it picked, harmless only for as long as nothing but
+        // `history_is_provisional` reads that field.
+        let (startup_walk, pending_history) = match history_rx.try_recv() {
+            Ok(walk) => {
                 log::debug!(
                     "perf: startup: history ready ({} rows, new() waited {:?})",
-                    commits.len(),
+                    walk.commits.len(),
                     t_history.elapsed()
                 );
-                (commits, oids, None)
+                (Some(walk), None)
             }
             Err(mpsc::TryRecvError::Empty) => {
                 log::debug!("perf: startup: history still walking — window first, rows to follow");
-                (Vec::new(), None, Some(history_rx))
+                (None, Some(history_rx))
             }
             Err(mpsc::TryRecvError::Disconnected) => {
-                let walk = load_history(&repo, INITIAL_COMMITS, &scope);
-                (walk.commits, walk.oids, None)
+                (Some(load_history(&repo, INITIAL_COMMITS, &scope)), None)
             }
         };
-        if pending_history.is_none() {
-            warn_if_empty_view(&scope, &commits);
-        }
-        let t_layout = std::time::Instant::now();
+        // The empty-list derived state, taken from the real function rather than
+        // hand-written defaults, so it cannot drift from what one frame of
+        // `derive_from_commits` would produce.
         let DerivedHistory {
             graph_rows,
             graph_max_cols,
             commit_index_by_oid,
             first_child_of,
             layout_state,
-        } = derive_from_commits(&commits);
-        log::debug!(
-            "perf: startup: derive_from_commits {:?}",
-            t_layout.elapsed()
-        );
-
-        // Which row to open on: the combined range row under `--combined`, otherwise
-        // the first row that is not it. Its diff is generated lazily on the first
-        // update() frame (see StartupDiff) — not here — so window creation isn't
-        // blocked on a potentially slow get_diff_data.
-        let selected = startup_selection(&commits, scope.combined);
+        } = derive_from_commits(&[]);
 
         // Restore persisted diff options.
         // clamp a stale/hand-edited value to the UI range
@@ -3062,16 +3058,11 @@ impl GitkApp {
 
         // The startup diff is deferred to the first frame: empty here, filled by
         // load_selected_diff on the StartupDiff::NeedsLoad pass. With no commits
-        // there's nothing to load, so go straight to Done.
+        // there's nothing to load, so go straight to Done — and the install below
+        // re-decides it for the list it brings.
         let diff_lines: Vec<DiffLine> = Vec::new();
         let diff_files: Vec<FileEntry> = Vec::new();
         let current_diff_key: Option<DiffCacheKey> = None;
-        let startup_diff = if selected.is_none() {
-            StartupDiff::Done
-        } else {
-            StartupDiff::NeedsPaint
-        };
-        let all_loaded = real_commit_count(&commits) < INITIAL_COMMITS;
 
         // Watch .git for changes — refs, HEAD, index (see make_git_watcher).
         let needs_reload = Arc::new(AtomicBool::new(false));
@@ -3152,15 +3143,16 @@ impl GitkApp {
             "perf: startup: GitkApp::new total {:?}",
             startup_t0.elapsed()
         );
-        Ok(Self {
-            commits,
+        let mut app = Self {
+            commits: Vec::new(),
             graph_rows,
             graph_max_cols,
             commit_index_by_oid,
             first_child_of,
             graph_layout_state: layout_state,
-            selected,
-            startup_diff,
+            selected: None,
+            // Re-decided by the install below when there is a list to decide from.
+            startup_diff: StartupDiff::Done,
             diff_lines,
             diff_files,
             // Empty like diff_files — the deferred startup load rebuilds them together.
@@ -3179,7 +3171,10 @@ impl GitkApp {
             search_matches: Vec::new(),
             search_cursor: 0,
             copied_toast: None,
-            all_loaded,
+            // True for an empty list, exactly as `real_commit_count(&[]) <
+            // INITIAL_COMMITS` answered when this was computed here; the install
+            // recomputes it for the list it brings.
+            all_loaded: true,
             needs_reload,
             reload_armed_at: None,
             search_diff_armed_at: None,
@@ -3198,7 +3193,7 @@ impl GitkApp {
             history_wait_since: std::time::Instant::now(),
             history_is_provisional: false,
             startup_auto_selected: None,
-            history_oids: walk_oids,
+            history_oids: None,
             foreground: foreground_workers,
             config_path,
             needs_config_reload,
@@ -3265,7 +3260,16 @@ impl GitkApp {
             apply_rx,
             apply_in_flight: false,
             apply_status: None,
-        })
+        };
+        // The single definition of "what a loaded commit list sets", shared with
+        // `apply_pending_history` and the provisional path. `new` reaches it with a
+        // walk only when the prefetch had already finished (or had to be redone
+        // synchronously); otherwise the window opens on the empty list above and
+        // `apply_pending_history` calls this a few frames later.
+        if let Some(walk) = startup_walk {
+            app.install_startup_history(walk, false, &cc.egui_ctx);
+        }
+        Ok(app)
     }
 
     fn refresh_search_matches(&mut self) {
@@ -5999,10 +6003,16 @@ impl GitkApp {
 
     /// Install a startup commit list, real or provisional.
     ///
-    /// Sets exactly what `new()` sets from a commit list and nothing more, except
-    /// that a list replacing a PROVISIONAL one keeps the reader's selection by oid
-    /// instead of resetting: by then they may have clicked, and the whole point of
-    /// showing early rows is that they are usable.
+    /// The ONE definition of what a loaded commit list sets — `new` calls it too, on
+    /// the empty app it builds, rather than deriving and installing inline. It used to
+    /// do both, and the two had already drifted: `new` left `startup_auto_selected` as
+    /// `None` where this records the row it picked, which was harmless only for as long
+    /// as nothing but `history_is_provisional` read that field, an argument no comment
+    /// made and nothing checked.
+    ///
+    /// A list replacing a PROVISIONAL one keeps the reader's selection by oid instead
+    /// of resetting: by then they may have clicked, and the whole point of showing
+    /// early rows is that they are usable.
     ///
     /// "The reader's" is the load-bearing word, and it is why the app's own pick is
     /// remembered rather than merely the selection. The provisional list holds no
