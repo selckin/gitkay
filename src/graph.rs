@@ -15,7 +15,7 @@
 
 use std::collections::HashSet;
 
-use crate::CommitInfo;
+use crate::history::CommitInfo;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct GraphRow {
@@ -211,7 +211,7 @@ pub fn layout_graph_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::CommitInfo;
+    use crate::history::CommitInfo;
     use crate::tests::{commit, oid};
 
     /// The incremental append (`append_commits`) is only sound because resuming

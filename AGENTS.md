@@ -202,6 +202,13 @@ budget-and-temp-sweep pruner),
 the runner and its watchdog, and reading git's own `cachetextconv` notes cache — the
 one place gitkay runs an external program, and it writes nothing to the repo; see
 **Textconv**),
+`src/history.rs` (the commit list: walking a repo's history into the `CommitInfo`
+rows the app draws, plus the ref map that labels them — `history_revwalk` and the
+loaders, the provisional walk and its `topo_window`, the resumable tail extension,
+the local probes, and `build_ref_map`. git2-facing and egui-free, the same shape
+`diff.rs` has: everything here answers "which rows are there", never "how are they
+drawn". See **Startup & timing** for why the walk needs three strategies rather
+than one),
 `src/graph.rs` (the commit graph's lane/pipe layout: `CommitInfo`s in, per-row
 node columns and line segments out — pure and egui-free, a row's colour being an
 INDEX the renderer resolves, which is what lets its suite run on fake oids with no
@@ -237,7 +244,7 @@ The big picture, ahead of the detail sections below:
   pane both virtualize with egui `show_rows`, and diffs compute +
   syntax-highlight asynchronously off the UI thread.
 
-### Data Layer
+### Data Layer (`src/history.rs` + `src/diff.rs`)
 - `load_commits()` — revwalk via `git2`, topological + time order, precomputed ref map
 - `load_commits_tail()` — incremental extension for the plain (no path filter,
   non-reflog) scope: re-runs the same deterministic walk (`history_revwalk` is the
@@ -2482,7 +2489,11 @@ alone — the scroll anchor's rung 4 against the swept entry the sweep leaves at
 tail), `diff_cache` (LRU eviction), `diff_store`
 (codec round trips including a non-UTF-8 path and every tag, key derivation, load/save
 over real temp repos, and the pruner's eviction + temp sweep), `word_diff` (LCS word
-alignment), `textconv` (driver resolution and its re-resolution after `invalidate`, the
+alignment), `history` (the walk over real temp repos: the tail extension against a full walk,
+the provisional walk's agreement with the real one and the two orderings that break
+it, the path filter's parent rewriting, `--first-parent`, `--follow`, the reflog and
+the range endpoints — sharing `main`'s `scope`/`summaries`/`real_commits` fixtures
+rather than keeping copies that drift), `textconv` (driver resolution and its re-resolution after `invalidate`, the
 runner's argument shape, its two bounds and the fork that used to defeat them, the
 hung-driver latch and the reload that re-arms it, the reported driver CHANGE that lets
 the two caches be dropped — including one carried by a key only libgit2 reads, which
