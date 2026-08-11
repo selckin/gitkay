@@ -202,6 +202,10 @@ budget-and-temp-sweep pruner),
 the runner and its watchdog, and reading git's own `cachetextconv` notes cache — the
 one place gitkay runs an external program, and it writes nothing to the repo; see
 **Textconv**),
+`src/prefetch.rs` (the speculative work pool: the `Coordinator` actor, its
+`Job`/`Outcome`/`CoordMsg` protocol, the workers, and the two things they do —
+`run_stats_job` and `warm_row`. `PoolHandle` is the only way in, which the module
+boundary now enforces rather than merely asserting; see **Background work pool**),
 `src/history.rs` (the commit list: walking a repo's history into the `CommitInfo`
 rows the app draws, plus the ref map that labels them — `history_revwalk` and the
 loaders, the provisional walk and its `topo_window`, the resumable tail extension,
@@ -687,7 +691,9 @@ parts run off the window-creation critical path:
   The floor is the value gitkay shipped with, so it is known to work — and it is what
   keeps `max_entry_lines` above `PREFETCH_MAX_HIGHLIGHT_LINES` at *every* budget the
   derivation can produce, which the `const` block asserts.
-  **The pool is an actor.** One `Coordinator` thread owns every scheduling decision and
+  **The pool is an actor**, and since it became its own module (`src/prefetch.rs`)
+  that is a rule the compiler keeps rather than a convention an edit could quietly
+  break. One `Coordinator` thread owns every scheduling decision and
   **nothing else touches its fields**, so the queues, the memos and the in-flight sets
   are plain `VecDeque`/`HashMap`/`HashSet` — no mutexes, no RAII guards, no lock
   ordering. Workers are pure: `worker()` receives a `Job`, does it, and reports an
@@ -2489,7 +2495,11 @@ alone — the scroll anchor's rung 4 against the swept entry the sweep leaves at
 tail), `diff_cache` (LRU eviction), `diff_store`
 (codec round trips including a non-UTF-8 path and every tag, key derivation, load/save
 over real temp repos, and the pruner's eviction + temp sweep), `word_diff` (LCS word
-alignment), `history` (the walk over real temp repos: the tail extension against a full walk,
+alignment), `prefetch` (the coordinator's scheduling decisions, driven through its message
+protocol rather than by reaching into its fields: the heavy lane's two admission
+bounds and the stampede a whole dispatch would otherwise commit, the deferral round
+trip, stats claiming, and `warm_disposition`'s precedence),
+`history` (the walk over real temp repos: the tail extension against a full walk,
 the provisional walk's agreement with the real one and the two orderings that break
 it, the path filter's parent rewriting, `--first-parent`, `--follow`, the reflog and
 the range endpoints — sharing `main`'s `scope`/`summaries`/`real_commits` fixtures
