@@ -186,15 +186,17 @@ parent" diff — the pane, the path filter, the `--follow` tracer — goes throu
 emphasis driver, the content hash,
 the diff pane's scroll anchor (`DiffAnchor` / `capture_anchor` /
 `resolve_anchor` — pure, so all five resolution rungs are unit-testable), and
-the pure line/file lookups — git2-facing and egui-free; cache keying,
-highlight orchestration, and rendering stay in `main.rs`), `src/apply.rs` (the
+the pure line/file lookups — git2-facing and egui-free; cache keying
+and rendering stay in `main.rs`, highlight orchestration in
+`src/diff_highlight.rs`), `src/apply.rs` (the
 write layer: `ApplyAction`/`ApplyRequest`/`ApplyError`, the
 `CommitKind`-driven verb mapping, and the three write mechanisms — see below),
 `src/config.rs`
 (`[fonts]`/`[text]`/`[diff]`/`[cache]` config: TOML parsing, `[diff.bands]` resolution
 (`resolve_diff_bg`), `[diff.languages]`, fontdb resolution + cache,
 role→FontId map), `src/highlight.rs` (syntect highlighter, theme/palette
-resolution, grammar selection, per-line tokenization), `src/diff_cache.rs` (line-budget LRU cache),
+resolution, grammar selection, per-line tokenization — no diff knowledge; the
+diff-side orchestration is `src/diff_highlight.rs`), `src/diff_cache.rs` (line-budget LRU cache),
 `src/diff_store.rs` (the persistent layer below that cache: a hand-rolled binary
 codec for a diff's structure, key derivation, atomic load/save, and the
 budget-and-temp-sweep pruner),
@@ -202,6 +204,10 @@ budget-and-temp-sweep pruner),
 the runner and its watchdog, and reading git's own `cachetextconv` notes cache — the
 one place gitkay runs an external program, and it writes nothing to the repo; see
 **Textconv**),
+`src/diff_highlight.rs` (applying a `Highlighter` to a built diff — which rows, in
+what order, on which thread. Separate from `highlight.rs`, which knows syntect and
+nothing about diffs: this half knows `DiffLine`, `FileEntry` and the viewport, and
+is about ORDER rather than colour),
 `src/workers.rs` (the four persistent foreground workers and the three jobs they
 run — a clicked diff, a history extension, the reload's driver re-resolution. The
 distinction from `prefetch` is simply that someone is waiting; see **Startup &
