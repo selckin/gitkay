@@ -620,7 +620,7 @@ type StatGalleys = (Arc<egui::Galley>, Arc<egui::Galley>);
 /// Lazily-built render caches for the file-list sidebar. The sidebar isn't
 /// row-virtualized — every row draws every frame — so per-row text is elided and
 /// laid out into galleys once, not re-allocated and re-measured per frame. Scoped
-/// to the current `file_rows`: `rebuild_file_rows` resets it (a font change must
+/// to the current `file_rows`: `resync_file_layout` resets it (a font change must
 /// too), and `ensure` drops the elided labels whenever the row width changes
 /// (sidebar drag / window resize).
 #[derive(Default)]
@@ -3778,8 +3778,7 @@ impl GitkApp {
         self.current_diff_key = key;
         self.diff_content_stale = false;
         self.diff_top_line.store(0, Ordering::Relaxed);
-        self.rebuild_file_rows();
-        self.file_line_starts = file_line_starts(&self.diff_files);
+        self.resync_file_layout();
         self.invalidate_diff_highlight();
     }
 
@@ -4806,17 +4805,52 @@ impl GitkApp {
         self.load_selected_diff();
     }
 
-    /// Recompute the cached file-list rows. Call after `diff_files` or
-    /// `file_list` changes — the rows are otherwise static between commit
-    /// selections, and the sidebar isn't virtualized, so the draw loop reads this
-    /// cache instead of rebuilding (and re-sorting) every frame.
-    fn rebuild_file_rows(&mut self) {
+    /// Recompute everything the file-list layout decides: the cached sidebar rows,
+    /// the order the pane's patch bodies are laid out in, and the file-boundary
+    /// index derived from them. Call after `diff_files` or `file_list` changes — the
+    /// rows are otherwise static between commit selections, and the sidebar isn't
+    /// virtualized, so the draw loop reads this cache instead of rebuilding (and
+    /// re-sorting) every frame.
+    ///
+    /// The three move together deliberately. `build_file_rows` is the ONE place that
+    /// decides what order files are read in — grouped by directory, root-level files
+    /// last — and `diff::order_files` re-lays the pane to match, so the pane and the
+    /// list beside it can never disagree in any layout. `file_line_starts` is derived
+    /// from the positions that re-lay produces, so leaving it to the caller would let
+    /// a layout-only config reload (which reaches here and nothing else) point every
+    /// jump, hunk click and page-step at the wrong file.
+    fn resync_file_layout(&mut self) {
         let files: Vec<(&str, Option<&str>)> = self
             .diff_files
             .iter()
             .map(|f| (f.path.as_str(), f.old_path.as_deref()))
             .collect();
         self.file_rows = build_file_rows(&files, self.file_list);
+        // Lay the pane out in the order those rows list. A row's `idx` names a
+        // position in `diff_files`, which the permutation moves, so renumber: after
+        // it, the k-th file row IS `diff_files[k]`.
+        let order: Vec<usize> = self
+            .file_rows
+            .iter()
+            .filter_map(|r| match *r {
+                FileListRow::File { idx, .. } => Some(idx),
+                FileListRow::Header { .. } => None,
+            })
+            .collect();
+        if diff::order_files(&mut self.diff_lines, &mut self.diff_files, &order) {
+            for (k, idx) in self
+                .file_rows
+                .iter_mut()
+                .filter_map(|r| match r {
+                    FileListRow::File { idx, .. } => Some(idx),
+                    FileListRow::Header { .. } => None,
+                })
+                .enumerate()
+            {
+                *idx = k;
+            }
+        }
+        self.file_line_starts = file_line_starts(&self.diff_files);
         // New rows ⇒ the per-row galleys no longer correspond; rebuild lazily.
         self.sidebar_cache = SidebarCache::default();
     }
@@ -6411,16 +6445,18 @@ impl GitkApp {
                 if stats_off {
                     self.invalidate_commit_stats();
                 }
-                // The file-list layout is render-only (it doesn't touch diff data).
-                // Update it before any reload so the reload rebuilds the rows under
-                // the new layout in one pass; if nothing reloads, rebuild the rows
-                // here for a layout-only change.
+                // The file-list layout is render-only: it decides the order files are
+                // read in, in both the sidebar and the pane, but changes no diff data
+                // — which is why it stays out of `DiffSettings` and neither cache is
+                // invalidated here. Update it before any reload so the reload lays
+                // both out under the new layout in one pass; if nothing reloads,
+                // re-lay them here for a layout-only change.
                 let layout_changed = self.file_list != cfg.diff.file_list;
                 self.file_list = cfg.diff.file_list;
                 if reload_diff {
                     self.load_selected_diff();
                 } else if layout_changed {
-                    self.rebuild_file_rows();
+                    self.resync_file_layout();
                 }
                 self.config_error_toast = warned.then(std::time::Instant::now);
             }
@@ -9432,6 +9468,63 @@ mod tests {
                 "F:4:README.md:false", // root, no header, last
             ]
         );
+    }
+
+    /// The pane and the sidebar read in the SAME order, because it is the same
+    /// decision made once: `resync_file_layout` derives the permutation from
+    /// `build_file_rows`' own rows and hands it to `diff::order_files`. Pinned as a
+    /// pairing — the two halves live in different modules, and nothing else makes the
+    /// grouped layout's root-files-last order reach the patch bodies.
+    #[test]
+    fn the_pane_is_laid_out_in_the_order_the_sidebar_lists_its_files() {
+        // Delta order — what the diff was built in.
+        let blocks = [
+            ("src/main/java/com/acme/Foo.java", 2),
+            ("src/main/java/com/acme/Bar.java", 2),
+            ("README.md", 2),
+            ("docs/guide.md", 2),
+        ];
+        let (mut lines, mut entries) = diff::tests::paned(1, &blocks);
+
+        let order = |entries: &[diff::FileEntry]| {
+            let paths: Vec<(&str, Option<&str>)> =
+                entries.iter().map(|f| (f.path.as_str(), None)).collect();
+            build_file_rows(&paths, FileListLayout::Grouped)
+                .iter()
+                .filter_map(|r| match *r {
+                    FileListRow::File { idx, .. } => Some(idx),
+                    FileListRow::Header { .. } => None,
+                })
+                .collect::<Vec<usize>>()
+        };
+        let sidebar = order(&entries);
+        assert!(diff::order_files(&mut lines, &mut entries, &sidebar));
+
+        // Grouped order: docs/ then src/…/acme/ (Bar before Foo), root file last.
+        let paths: Vec<&str> = entries.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "docs/guide.md",
+                "src/main/java/com/acme/Bar.java",
+                "src/main/java/com/acme/Foo.java",
+                "README.md",
+            ]
+        );
+        // Each entry's recorded start really is where its own rows now sit.
+        for f in &entries {
+            let start = f.diff_line_idx.expect("every fixture file has a body");
+            assert!(
+                lines[start].text.starts_with(&f.path),
+                "{} claims line {start}, which reads {}",
+                f.path,
+                lines[start].text
+            );
+        }
+        // Re-deriving over the laid-out entries is the identity — what makes the
+        // install-time call free on a cache hit and in the two flat layouts.
+        let again = order(&entries);
+        assert!(!diff::order_files(&mut lines, &mut entries, &again));
     }
 
     #[test]

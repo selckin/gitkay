@@ -1834,6 +1834,94 @@ pub fn file_line_starts(files: &[FileEntry]) -> Vec<(usize, usize)> {
     starts
 }
 
+/// Re-lay a built diff so its patch bodies read in `order` — the file indices in the
+/// sequence the file-list sidebar draws them — permuting `files` to match and
+/// rewriting each entry's `diff_line_idx`. Returns whether anything moved.
+///
+/// The sidebar's grouped layout is not the delta order the diff was built in: it sorts
+/// directories alphabetically and trails the root-level files last. Without this the
+/// pane and the list beside it read in two different sequences. `files`' own order IS
+/// the pane's order — the textconv sweep's `move_to_end` and `resolve_anchor`'s rung 4
+/// both rest on that — so the two move together here and neither claim breaks.
+///
+/// Everything above the first file's patch (the commit header, the diffstat block)
+/// stays put; a file with no patch body moves as an entry only. Deliberately NOT part
+/// of the build: the order a diff is READ in is a display decision, and keeping it out
+/// of the builder is what keeps the layout out of `DiffSettings` — and so out of both
+/// cache keys — for a setting that changes no diff data. The cost is one pass over
+/// `lines` at install; `DiffLine`'s text is an `Arc`, so a row moves without touching
+/// its string.
+///
+/// **Idempotent**, which is what lets every install call it: re-ordering an
+/// already-ordered diff yields the identity `order` and returns `false` before
+/// touching anything, so a cache hit (whose lines were laid out under this same
+/// order) and the two flat layouts (whose order is the identity by construction) both
+/// pay an O(files) scan and nothing more.
+pub fn order_files(lines: &mut Vec<DiffLine>, files: &mut Vec<FileEntry>, order: &[usize]) -> bool {
+    let n = files.len();
+    if order.len() != n {
+        return false;
+    }
+    // Each file's position in the new order — and, in passing, the check that `order`
+    // really is a permutation. A repeated or out-of-range index would drop a file's
+    // entry while its lines stayed, so it is refused whole rather than half-applied;
+    // `build_file_rows` lists every file exactly once, so this cannot fire.
+    let mut rank = vec![usize::MAX; n];
+    for (k, &i) in order.iter().enumerate() {
+        if i >= n || rank[i] != usize::MAX {
+            return false;
+        }
+        rank[i] = k;
+    }
+    if rank.iter().enumerate().all(|(i, &k)| i == k) {
+        return false;
+    }
+
+    // Where each file's patch sits now. `file_line_ranges` is ordered by start and
+    // skips bodyless files, so it also gives the head region: everything before the
+    // first patch belongs to no file and stays where it is.
+    let mut span: Vec<Option<(usize, usize)>> = vec![None; n];
+    let ranges = file_line_ranges(files, lines.len());
+    let head = ranges.first().map_or(lines.len(), |&(_, s, _)| s);
+    for &(i, s, e) in &ranges {
+        span[i] = Some((s, e));
+    }
+
+    // Rows are MOVED, never cloned: wrapping in `Option` (free — `Arc<String>`'s niche
+    // keeps the layout identical, so the collect is done in place) lets each row be
+    // `take`n out with a plain memcpy. Leaving a blank `DiffLine` behind instead reads
+    // just as well and is what this did first, but the filler has to be CLONED per row,
+    // which costs an atomic refcount bump on the way in and another on the way out:
+    // 9.8ms against 7.5ms over a 100k-line diff. What is left is the second buffer
+    // itself, which is the price of moving blocks around at all.
+    let mut src: Vec<Option<DiffLine>> = std::mem::take(lines).into_iter().map(Some).collect();
+    let mut out: Vec<DiffLine> = Vec::with_capacity(src.len());
+    let mut start: Vec<Option<usize>> = vec![None; n];
+    let mut move_rows = |out: &mut Vec<DiffLine>, r: std::ops::Range<usize>| {
+        out.extend(src[r].iter_mut().filter_map(Option::take));
+    };
+    move_rows(&mut out, 0..head);
+    for &i in order {
+        if let Some((s, e)) = span[i] {
+            start[i] = Some(out.len());
+            move_rows(&mut out, s..e);
+        }
+    }
+    *lines = out;
+
+    let mut ranked: Vec<(usize, FileEntry)> = std::mem::take(files)
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut f)| {
+            f.diff_line_idx = start[i];
+            (rank[i], f)
+        })
+        .collect();
+    ranked.sort_unstable_by_key(|&(k, _)| k);
+    files.extend(ranked.into_iter().map(|(_, f)| f));
+    true
+}
+
 /// Index of the file whose patch region contains `line` (the last start at or
 /// before it), or `None` when `line` is in the pre-file header region. A binary
 /// search over the per-diff `file_line_starts`.
@@ -2602,6 +2690,117 @@ pub mod tests {
         assert_eq!(file_line_ranges(&files, 9), vec![(1, 2, 5), (0, 5, 9)]);
         // total_lines below a start clamps both ends to total.
         assert_eq!(file_line_ranges(&files, 3), vec![(1, 2, 3), (0, 3, 3)]);
+    }
+
+    /// A built pane: `head` rows belonging to no file (a commit header / diffstat
+    /// block), then one block per `(path, rows)` in delta order. Every row names its
+    /// own file, so a block that moved is visible in the text.
+    pub fn paned(head: usize, blocks: &[(&str, usize)]) -> (Vec<DiffLine>, Vec<FileEntry>) {
+        let mut lines: Vec<DiffLine> = (0..head)
+            .map(|i| DiffLine::new(format!("head{i}"), LineKind::Meta))
+            .collect();
+        let files = blocks
+            .iter()
+            .map(|&(path, rows)| {
+                let start = (rows > 0).then_some(lines.len());
+                lines
+                    .extend((0..rows).map(|i| DiffLine::new(format!("{path}#{i}"), LineKind::Add)));
+                fe(path, start)
+            })
+            .collect();
+        (lines, files)
+    }
+
+    fn rows(lines: &[DiffLine]) -> Vec<String> {
+        lines.iter().map(|l| l.text.to_string()).collect()
+    }
+
+    /// Each entry as `path@start`, in entry order — `@-` for a file with no body.
+    fn laid_out(files: &[FileEntry]) -> Vec<String> {
+        files
+            .iter()
+            .map(|f| {
+                let at = f
+                    .diff_line_idx
+                    .map_or_else(|| "-".to_string(), |s| s.to_string());
+                format!("{}@{at}", f.path)
+            })
+            .collect()
+    }
+
+    /// The pane reads in the sidebar's order, which the grouped layout takes root
+    /// files out of delta order to produce. Both the lines and the entries move, and
+    /// the head region does not.
+    #[test]
+    fn order_files_relays_the_pane_and_its_entries_together() {
+        let (mut lines, mut files) =
+            paned(2, &[("src/a.rs", 3), ("Cargo.toml", 2), ("src/b.rs", 1)]);
+        // What `build_file_rows` lists for this diff: src/ first, root last.
+        assert!(order_files(&mut lines, &mut files, &[0, 2, 1]));
+
+        assert_eq!(
+            rows(&lines),
+            [
+                "head0",
+                "head1",
+                "src/a.rs#0",
+                "src/a.rs#1",
+                "src/a.rs#2",
+                "src/b.rs#0",
+                "Cargo.toml#0",
+                "Cargo.toml#1",
+            ]
+        );
+        assert_eq!(
+            laid_out(&files),
+            ["src/a.rs@2", "src/b.rs@5", "Cargo.toml@6"]
+        );
+        // The claim `files`' order makes about where each patch is still holds — the
+        // whole point of moving the entries with the lines.
+        let starts = file_line_starts(&files);
+        assert_eq!(file_index_at_line_opt(&starts, 5), Some(1)); // src/b.rs
+        assert_eq!(file_index_at_line_opt(&starts, 7), Some(2)); // Cargo.toml
+        assert_eq!(file_index_at_line_opt(&starts, 1), None); // head region
+    }
+
+    /// Idempotent, which is what lets every install call it: the order derived from
+    /// an already-ordered diff is the identity, and that is refused before anything
+    /// is touched.
+    #[test]
+    fn order_files_is_idempotent() {
+        let (mut lines, mut files) = paned(1, &[("src/a.rs", 2), ("Cargo.toml", 1)]);
+        assert!(order_files(&mut lines, &mut files, &[1, 0]));
+        let (once, entries) = (rows(&lines), laid_out(&files).len());
+
+        // The same list re-derived over the permuted files is [0, 1].
+        assert!(!order_files(&mut lines, &mut files, &[0, 1]));
+        assert_eq!(rows(&lines), once);
+        assert_eq!(laid_out(&files).len(), entries);
+    }
+
+    /// A file with no patch body (a whitespace-only change under `ignore_ws`, a
+    /// mode-only entry) moves as an entry and takes no rows with it.
+    #[test]
+    fn order_files_moves_a_bodyless_entry_without_moving_rows() {
+        let (mut lines, mut files) = paned(0, &[("src/a.rs", 2), ("mode-only", 0), ("z.txt", 1)]);
+        assert!(order_files(&mut lines, &mut files, &[2, 1, 0]));
+
+        assert_eq!(rows(&lines), ["z.txt#0", "src/a.rs#0", "src/a.rs#1"]);
+        assert_eq!(laid_out(&files), ["z.txt@0", "mode-only@-", "src/a.rs@1"]);
+    }
+
+    /// An order that is not a permutation would drop a file's entry while its rows
+    /// stayed, so it is refused whole rather than half-applied.
+    #[test]
+    fn order_files_refuses_anything_that_is_not_a_permutation() {
+        let (mut lines, mut files) = paned(1, &[("a", 1), ("b", 1)]);
+        let (before, entries) = (rows(&lines), laid_out(&files));
+
+        for bad in [&[0][..], &[0, 1, 0][..], &[1, 1][..], &[0, 2][..]] {
+            assert!(!order_files(&mut lines, &mut files, bad), "{bad:?}");
+            assert_eq!(rows(&lines), before, "{bad:?}");
+            assert_eq!(laid_out(&files), entries, "{bad:?}");
+        }
     }
 
     #[test]
