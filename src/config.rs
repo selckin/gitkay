@@ -473,8 +473,9 @@ fn default_template() -> String {
          # so set this to false to keep it from running external commands at all.\n\
          # textconv = true\n\
          # File-list sidebar layout. \"grouped\" (default) groups files under\n\
-         # directory headers with basenames indented; \"full\" shows each file's\n\
-         # full repo-relative path; \"name\" shows just basenames.\n\
+         # directory headers with basenames indented, root-level files last;\n\
+         # \"full\" shows each file's full repo-relative path; \"name\" shows just\n\
+         # basenames. The diff pane lays its patches out in the same order.\n\
          # file_list = \"grouped\"\n\
          # Syntax-highlight diffs. false = the original flat per-role coloring.\n\
          # syntax = true\n\

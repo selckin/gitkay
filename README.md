@@ -301,7 +301,7 @@ or `500` cannot make the window unusable.
 | `syntax` | `true` | Syntax-highlight diffs. `false` restores flat per-role colouring — no theme, no highlighter |
 | `theme` | `"catppuccin-mocha"` | Highlight theme; one of the 29 slugs below. An unknown value warns and falls back |
 | `show_stats` | `true` | Show the diffstat block between the commit message and the patch. The file sidebar is independent and always shown |
-| `file_list` | `"grouped"` | Sidebar layout: `"grouped"` puts files under directory headers, `"full"` shows full repo-relative paths, `"name"` shows basenames only |
+| `file_list` | `"grouped"` | Sidebar layout, and the order the diff pane lays its patches out in: `"grouped"` puts files under directory headers with root-level files last, `"full"` shows full repo-relative paths, `"name"` shows basenames only |
 | `detect_renames` | `true` | Show a rename as one `old → new` entry instead of a delete + add (git `-M`) |
 | `detect_copies` | `false` | Show a file copied from another *modified* file as `source → copy` (git `-C`). More expensive than renames |
 | `textconv` | `true` | Run `diff.<driver>.textconv` when `.gitattributes` names a driver for a path, as git does — what turns an archive or a PDF into a readable diff instead of "Binary files … differ" |
