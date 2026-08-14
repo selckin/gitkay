@@ -324,12 +324,20 @@ const LOAD_BATCH: usize = 500;
 /// checkout still feels immediate.
 const RELOAD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// Debounce for search-keystroke diff loads: each changed keystroke selects and
-/// centers its match instantly, but the diff load fires only once typing has
-/// paused this long — typing "fix bug" selects seven transient matches without
-/// spawning a diff worker (and a full `get_diff_data`) for each. Short enough
-/// that the diff still feels immediate when typing stops.
-const SEARCH_DIFF_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
+/// Debounce for diff loads driven by a BURST of input, where every event but the
+/// last names a state the reader is passing through. Search keystrokes are the one
+/// such input today: each changed keystroke selects and centers its match instantly,
+/// but typing "fix bug" must not spawn a diff worker (and a full `get_diff_data`) for
+/// each of seven transient matches. A click or a keypress is self-limiting and loads
+/// immediately instead.
+///
+/// It cannot be left to supersession, which drops a stale result but never cancels a
+/// running build: with `FOREGROUND_WORKERS` free, a burst starts several complete
+/// builds — on the one path deliberately unguarded by `probe_row_cost`, so a
+/// big-blob or textconv-driven commit forks seconds of work apiece — and then
+/// refuses to cache any of them, `key_is_current` being false by the time they land.
+/// Short enough that the diff still feels immediate once the input settles.
+const DIFF_LOAD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
 
 /// How long an async diff load may run before the "Loading diff…" placeholder is
 /// shown. A load that resolves faster than this (a small uncached diff) never flashes
@@ -2449,10 +2457,10 @@ struct GitkApp {
     all_loaded: bool,
     needs_reload: Arc<AtomicBool>,
     reload_armed_at: Option<std::time::Instant>, // debounce timer for watcher reloads
-    /// Debounce timer for search-keystroke diff loads: armed by
-    /// `jump_to_current_match_deferred`, fired by `handle_search_debounce`,
-    /// cancelled by any direct `load_selected_diff`.
-    search_diff_armed_at: Option<std::time::Instant>,
+    /// Debounce timer for a diff load deferred behind a burst of input (see
+    /// `DIFF_LOAD_DEBOUNCE`): armed through `defer_diff_load`, fired by
+    /// `handle_deferred_diff_load`, cancelled by any direct `load_selected_diff`.
+    deferred_diff_load_at: Option<std::time::Instant>,
     _watcher: Option<RecommendedWatcher>,
     branch_highlight: HashSet<usize>, // indices of commits on the same branch as selected
     commit_panel_height: f32,         // persisted commit-list panel height (see App::save)
@@ -3177,7 +3185,7 @@ impl GitkApp {
             all_loaded: true,
             needs_reload,
             reload_armed_at: None,
-            search_diff_armed_at: None,
+            deferred_diff_load_at: None,
             _watcher: watcher,
             branch_highlight: HashSet::new(),
             commit_panel_height,
@@ -3303,22 +3311,28 @@ impl GitkApp {
     }
 
     /// `jump_to_current_match` with the diff load deferred behind
-    /// `SEARCH_DIFF_DEBOUNCE`: selection and graph scroll track the keystroke
+    /// `DIFF_LOAD_DEBOUNCE`: selection and graph scroll track the keystroke
     /// instantly, but the diff (a worker spawn + full `get_diff_data` per
     /// dispatch) loads only once typing pauses — the pane keeps showing the
     /// previous diff meanwhile, exactly as during an in-flight async load.
-    /// `handle_search_debounce` fires the load; a direct `load_selected_diff`
+    /// `handle_deferred_diff_load` fires the load; a direct `load_selected_diff`
     /// (click, arrow key, Enter) cancels the pending one.
     fn jump_to_current_match_deferred(&mut self) {
         if let Some(&idx) = self.search_matches.get(self.search_cursor) {
             self.set_selected(idx);
             self.graph_scroll_to = Some((idx, Some(egui::Align::Center)));
-            self.search_diff_armed_at = Some(std::time::Instant::now());
-            // This runs mid-frame, after handle_search_debounce already ran —
-            // schedule the wake here so a typing pause still fires the load
-            // promptly even with no further input.
-            self.egui_ctx.request_repaint_after(SEARCH_DIFF_DEBOUNCE);
+            self.defer_diff_load();
         }
+    }
+
+    /// Arm (or re-arm) the deferred diff load — see `DIFF_LOAD_DEBOUNCE` for which
+    /// inputs defer and why. Every caller runs mid-frame, i.e. after
+    /// `handle_deferred_diff_load` has already run for this frame, so the wake is
+    /// scheduled here: a burst that stops with no further input would otherwise
+    /// leave the load waiting on the next unrelated repaint.
+    fn defer_diff_load(&mut self) {
+        self.deferred_diff_load_at = Some(std::time::Instant::now());
+        self.egui_ctx.request_repaint_after(DIFF_LOAD_DEBOUNCE);
     }
 
     fn set_selected(&mut self, idx: usize) {
@@ -3423,7 +3437,7 @@ impl GitkApp {
         // pending — left armed, the timer would fire after e.g. a click and
         // re-enter here for the same selection, cancelling that click's
         // in-flight load through the early-return path's epoch bump.
-        self.search_diff_armed_at = None;
+        self.deferred_diff_load_at = None;
         // Already showing this exact diff (same commit + options)? Then there's nothing
         // to load. Two cases converge here: a reload/refresh of the unchanged current
         // commit (e.g. a fetch/rebase debounce), and navigating back to the on-screen
@@ -6281,8 +6295,8 @@ impl GitkApp {
     /// Fire the debounced search diff load once typing has paused (see
     /// `jump_to_current_match_deferred`) — the same arm/expire shape as
     /// `handle_git_reload`.
-    fn handle_search_debounce(&mut self, ctx: &egui::Context) {
-        if debounce_expired(&mut self.search_diff_armed_at, SEARCH_DIFF_DEBOUNCE, ctx) {
+    fn handle_deferred_diff_load(&mut self, ctx: &egui::Context) {
+        if debounce_expired(&mut self.deferred_diff_load_at, DIFF_LOAD_DEBOUNCE, ctx) {
             self.load_selected_diff();
         }
     }
@@ -6854,7 +6868,7 @@ impl eframe::App for GitkApp {
         self.apply_pending_history(&ctx);
         self.apply_pending_fonts(&ctx);
         self.handle_git_reload(&ctx);
-        self.handle_search_debounce(&ctx);
+        self.handle_deferred_diff_load(&ctx);
         self.handle_config_reload(&ctx);
         self.drain_history_results();
         self.drain_worker_results(&ctx);
