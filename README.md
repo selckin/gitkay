@@ -59,7 +59,7 @@
 - File list sidebar with per-file `+/-` stats, grouped under directory headers by default (`[diff] file_list` = `grouped`/`full`/`name`)
 - Renamed/copied files shown git-style — one `dir/{old ⇒ new}` entry instead of a delete + add pair
 - **Word diff** toggle — highlights the exact words that changed within a modified line
-- Hover toolbar on the diff: context-line count, ignore whitespace, rename/copy detection, word diff
+- Hover toolbar on the diff: context-line count (click `±`, or scroll over it), ignore whitespace, rename/copy detection, word diff
 - Highlighting runs in the background, on-screen files first — large diffs never block the UI; diffs are cached and the neighbouring commits prefetched, so stepping through history is instant
 - Click a file to jump to its diff section; the sidebar tracks your position, highlighting the file under the diff view as you scroll
 - Commit header with author, date, full message

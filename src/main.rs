@@ -325,18 +325,18 @@ const LOAD_BATCH: usize = 500;
 const RELOAD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Debounce for diff loads driven by a BURST of input, where every event but the
-/// last names a state the reader is passing through. Search keystrokes are the one
-/// such input today: each changed keystroke selects and centers its match instantly,
-/// but typing "fix bug" must not spawn a diff worker (and a full `get_diff_data`) for
-/// each of seven transient matches. A click or a keypress is self-limiting and loads
-/// immediately instead.
+/// last names a state the reader is passing through: search keystrokes (each changed
+/// keystroke selects and centers its match instantly, but typing "fix bug" must not
+/// spawn seven diff workers) and wheel steps over the context width (the number
+/// tracks the wheel, the patch is rebuilt once the wheel stops). A click or a
+/// keypress is self-limiting and loads immediately instead.
 ///
 /// It cannot be left to supersession, which drops a stale result but never cancels a
-/// running build: with `FOREGROUND_WORKERS` free, a burst starts several complete
-/// builds — on the one path deliberately unguarded by `probe_row_cost`, so a
-/// big-blob or textconv-driven commit forks seconds of work apiece — and then
-/// refuses to cache any of them, `key_is_current` being false by the time they land.
-/// Short enough that the diff still feels immediate once the input settles.
+/// running build: with `FOREGROUND_WORKERS` free, a flick starts several complete
+/// `get_diff_data` runs — on the one path deliberately unguarded by
+/// `probe_row_cost`, so a big-blob or textconv-driven commit forks seconds of work
+/// per step — and then refuses to cache any of them, `key_is_current` being false by
+/// the time they land. Short enough that the diff still feels immediate on settling.
 const DIFF_LOAD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
 
 /// How long an async diff load may run before the "Loading diff…" placeholder is
@@ -391,6 +391,11 @@ const _: () = {
         SHA_SAMPLE.len() == history::SHORT_SHA_LEN,
         "the SHA column is measured from this sample and filled by `CommitInfo::new`, \
          so a sample of the wrong width mismeasures every column to its right"
+    );
+    assert!(
+        CONTEXT_SAMPLE.len() == MAX_DIFF_CONTEXT.ilog10() as usize + 1,
+        "the context cell is measured from this sample, so a sample narrower than the \
+         widest width it must hold lets the number shove the `+` button as it grows"
     );
     assert!(
         PREHIGHLIGHT_CHUNK < HIGHLIGHT_CHUNK,
@@ -1251,6 +1256,60 @@ const BOTTOM_PAD_ROWS: usize = 2;
 /// and have nothing else bound to a primary drag.
 const SCROLL_SOURCE: egui::containers::scroll_area::ScrollSource =
     egui::containers::scroll_area::ScrollSource::ALL;
+
+/// The context width's ceiling. `git diff -U<n>` takes any number, but past a
+/// screenful the patch is the whole file, and the toolbar's cell is sized from this.
+/// Two sites clamp to it: the one place the width is adjusted, and the value restored
+/// from storage, which is not trusted to be in range.
+const MAX_DIFF_CONTEXT: u32 = 99;
+/// The widest value `MAX_DIFF_CONTEXT` allows, as text — the toolbar's number cell is
+/// MEASURED from this rather than multiplied out from a digit count, so a proportional
+/// `[text] ui` font still fits (the same reason `STATS_CELL_CHARS` is a string). The
+/// assert below ties its width to the ceiling.
+const CONTEXT_SAMPLE: &str = "99";
+
+/// How far a trackpad must travel, in points, to move the context width by one.
+///
+/// It paces **only** devices reporting `MouseWheelUnit::Point`. A wheel reports
+/// `Line`, one per notch, and a notch is one step by construction — nothing is
+/// converted, so this number cannot re-tune it, and neither can egui's own
+/// `InputOptions::line_scroll_speed` moving underneath us.
+const TRACKPAD_POINTS_PER_STEP: f32 = 40.0;
+
+/// Wheel input this frame as whole steps — positive when scrolled up, i.e. when the
+/// content would move down.
+///
+/// Read from the raw `MouseWheel` events rather than `InputState::smooth_scroll_delta`
+/// because that field is smoothed over several frames: one notch arrives as a decaying
+/// tail, which a threshold either splits into several steps or swallows whole. The raw
+/// events are discrete, so a notch is a step and only `Point` devices need pacing.
+///
+/// `accum` carries the sub-step remainder between frames so a slow drag still steps
+/// eventually.
+fn wheel_steps(events: &[egui::Event], accum: &mut f32) -> i32 {
+    for event in events {
+        if let egui::Event::MouseWheel {
+            unit,
+            delta,
+            modifiers,
+            ..
+        } = event
+            // egui's own zoom predicate, rather than a hand-spelled one: with the
+            // default `zoom_modifier` this is ctrl/cmd-scroll, which is a zoom
+            // gesture and not a widget's to reinterpret.
+            && !modifiers.matches_any(egui::Modifiers::COMMAND)
+        {
+            *accum += match unit {
+                egui::MouseWheelUnit::Point => delta.y / TRACKPAD_POINTS_PER_STEP,
+                // A notch, whatever the backend counts it in.
+                egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page => delta.y,
+            };
+        }
+    }
+    let steps = accum.trunc();
+    *accum -= steps;
+    steps as i32
+}
 
 /// Minimum height of one file-list row, in points — the floor `GitkApp::file_row_h`
 /// grows from when the configured file-list font is larger than the default.
@@ -2458,8 +2517,9 @@ struct GitkApp {
     needs_reload: Arc<AtomicBool>,
     reload_armed_at: Option<std::time::Instant>, // debounce timer for watcher reloads
     /// Debounce timer for a diff load deferred behind a burst of input (see
-    /// `DIFF_LOAD_DEBOUNCE`): armed through `defer_diff_load`, fired by
-    /// `handle_deferred_diff_load`, cancelled by any direct `load_selected_diff`.
+    /// `DIFF_LOAD_DEBOUNCE`): armed by `jump_to_current_match_deferred` and by the
+    /// toolbar's context wheel, fired by `handle_deferred_diff_load`, cancelled by
+    /// any direct `load_selected_diff`.
     deferred_diff_load_at: Option<std::time::Instant>,
     _watcher: Option<RecommendedWatcher>,
     branch_highlight: HashSet<usize>, // indices of commits on the same branch as selected
@@ -2474,7 +2534,10 @@ struct GitkApp {
     word_diff: bool,           // highlight changed words within +/- lines (persisted)
     file_list: FileListLayout, // file-list sidebar layout (config [diff].file_list)
     diff_toolbar_rect: Option<egui::Rect>, // last shown hover-toolbar bounds (flicker guard)
-    fonts: Fonts,              // resolved, clamped font settings; call .font_id(role) for a FontId
+    /// Unspent trackpad scrolling over the toolbar's context-width group, in steps —
+    /// see `wheel_steps`. Dropped when the toolbar stops being shown.
+    diff_context_scroll: f32,
+    fonts: Fonts, // resolved, clamped font settings; call .font_id(role) for a FontId
     // Deferred FontDefinitions from the off-thread build: Some until applied. Set when a
     // cold fontdb scan outlives window-init, so the window paints in default fonts and
     // swaps to the configured ones once the scan lands (polled in ui()). None once applied.
@@ -3060,7 +3123,7 @@ impl GitkApp {
 
         // Restore persisted diff options.
         // clamp a stale/hand-edited value to the UI range
-        let diff_context: u32 = stored(cc.storage, "diff_context", 3u32).min(99);
+        let diff_context: u32 = stored(cc.storage, "diff_context", 3u32).min(MAX_DIFF_CONTEXT);
         let diff_ignore_ws: bool = stored(cc.storage, "diff_ignore_ws", false);
         let word_diff: bool = stored(cc.storage, "word_diff", false);
 
@@ -3194,6 +3257,7 @@ impl GitkApp {
             word_diff,
             file_list: cfg.diff.file_list,
             diff_toolbar_rect: None,
+            diff_context_scroll: 0.0,
             fonts,
             pending_fonts,
             pending_history,
@@ -5808,10 +5872,15 @@ impl GitkApp {
         // reload, leaving the pane on the old shape and the column on counts from
         // settings that no longer apply — and the omission would read as deliberate,
         // since `word_diff` beside them legitimately does not trigger a reload. It is
-        // also more precise: `-` at context 0 and `+` at 99 set the flag while
-        // changing nothing. `word_diff` is not a `DiffSettings` field, so it stays
-        // excluded for free.
+        // also more precise: `-` at context 0 and `+` at `MAX_DIFF_CONTEXT` set the
+        // flag while changing nothing. `word_diff` is not a `DiffSettings` field, so
+        // it stays excluded for free.
         let before = self.diff_settings;
+        // Which control moved it decides only WHEN the diff is rebuilt, never
+        // whether — the comparison above is still the one answer to that, so a
+        // control added below and forgotten here reloads immediately, which is the
+        // safe half of the choice.
+        let mut wheeled = false;
         if show_toolbar {
             let area = egui::Area::new(egui::Id::new("diff_opts_toolbar"))
                 .order(egui::Order::Foreground)
@@ -5819,18 +5888,58 @@ impl GitkApp {
                 .show(ctx, |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label("Context:");
-                            if ui.small_button("-").clicked() {
-                                self.diff_settings.context =
-                                    self.diff_settings.context.saturating_sub(1);
+                            // The context controls in their own group, so the wheel
+                            // target below is egui's own rect for them — the spacing
+                            // between them included — rather than a union of their
+                            // rects that a control added here must remember to join.
+                            let group = ui.horizontal(|ui| {
+                                ui.label("Context:");
+                                let mut steps = -i32::from(ui.small_button("-").clicked());
+                                // A cell fixed at the widest width the ceiling allows,
+                                // so the number cannot widen at 9 → 10 and shove the
+                                // `+` button out from under the pointer mid-scroll.
+                                let font = self.fonts.font_id(Role::Ui);
+                                let cell = egui::vec2(
+                                    text_width(ui.painter(), CONTEXT_SAMPLE, &font),
+                                    ui.spacing().interact_size.y,
+                                );
+                                let (_, rect) = ui.allocate_space(cell);
+                                ui.painter().text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    self.diff_settings.context,
+                                    font,
+                                    ui.visuals().text_color(),
+                                );
+                                steps += i32::from(ui.small_button("+").clicked());
+                                steps
+                            });
+                            // Scrolling anywhere over that group nudges the width too —
+                            // the group and not just the number, a two-character cell
+                            // too small to aim a wheel at. `rect_contains_pointer` is
+                            // occlusion-aware, which is also what keeps the diff pane
+                            // still while this reads the wheel: `ScrollArea` asks the
+                            // same of its own rect and loses it to this foreground
+                            // `Area`. Deliberately unlabelled — an `on_hover_text`
+                            // would put an interactable tooltip layer under the
+                            // pointer, which wins the hit-test and swallows the very
+                            // wheel events this reads (see AGENTS.md's tooltip pitfall).
+                            let mut steps = group.inner;
+                            if ui.rect_contains_pointer(group.response.rect) {
+                                let wheel = ui.input(|i| {
+                                    wheel_steps(&i.events, &mut self.diff_context_scroll)
+                                });
+                                wheeled |= wheel != 0;
+                                steps += wheel;
                             }
-                            ui.label(
-                                egui::RichText::new(self.diff_settings.context.to_string())
-                                    .font(self.fonts.font_id(Role::Ui)),
-                            );
-                            if ui.small_button("+").clicked() {
-                                self.diff_settings.context =
-                                    self.diff_settings.context.saturating_add(1).min(99);
+                            // One clamp for all three adjusters — a fourth cannot be
+                            // added past the width the rest of the UI is sized for.
+                            if steps != 0 {
+                                self.diff_settings.context = self
+                                    .diff_settings
+                                    .context
+                                    .saturating_add_signed(steps)
+                                    .min(MAX_DIFF_CONTEXT);
                             }
                             ui.add_space(12.0);
                             ui.checkbox(&mut self.diff_settings.ignore_ws, "Ignore whitespace");
@@ -5852,10 +5961,24 @@ impl GitkApp {
             self.diff_toolbar_rect = Some(area.response.rect);
         } else {
             self.diff_toolbar_rect = None;
+            // The toolbar's transient state, dropped together. The remainder has to
+            // be cleared where "the toolbar is not live" is decided rather than
+            // inside the group's own hover test: the closure above doesn't run at
+            // all on the way out, which is the exit that actually happens.
+            self.diff_context_scroll = 0.0;
         }
         if self.diff_settings != before {
             self.invalidate_stats_if_counts_changed(before);
-            self.load_selected_diff();
+            // A wheel step is one of a burst, and every step but the last names a
+            // width the reader is scrolling past — so the patch is rebuilt once the
+            // wheel stops (see `DIFF_LOAD_DEBOUNCE`). The number in the cell reads
+            // `diff_settings` directly, so it still tracks the wheel frame by frame.
+            // Clicks and checkboxes are self-limiting and load at once.
+            if wheeled {
+                self.defer_diff_load();
+            } else {
+                self.load_selected_diff();
+            }
         }
     }
 
@@ -9746,6 +9869,90 @@ mod tests {
         let out = right_elide("αβγδε.rs", 4.0, char_count);
         assert!(out.ends_with('…'));
         assert!(char_count(&out) <= 4.0);
+    }
+
+    /// One `MouseWheel` event, as a backend reports it.
+    fn wheel(unit: egui::MouseWheelUnit, dy: f32, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::MouseWheel {
+            unit,
+            delta: egui::vec2(0.0, dy),
+            phase: egui::TouchPhase::Move,
+            modifiers,
+        }
+    }
+
+    /// A wheel reports whole lines, and a notch must be exactly one step — not
+    /// several (the context width would race to its ceiling on one flick) and not
+    /// none. Sign follows egui's: positive delta moves the content down, i.e. the
+    /// wheel rolled up, which reads more context.
+    #[test]
+    fn one_wheel_notch_is_one_context_step() {
+        let mut accum = 0.0;
+        let up = [wheel(
+            egui::MouseWheelUnit::Line,
+            1.0,
+            egui::Modifiers::NONE,
+        )];
+        assert_eq!(wheel_steps(&up, &mut accum), 1);
+        assert_eq!(accum, 0.0, "a notch leaves no remainder to drift on");
+
+        let down = [wheel(
+            egui::MouseWheelUnit::Line,
+            -1.0,
+            egui::Modifiers::NONE,
+        )];
+        assert_eq!(wheel_steps(&down, &mut accum), -1);
+        assert_eq!(accum, 0.0);
+    }
+
+    /// A trackpad streams deltas far below one step. They must accumulate ACROSS
+    /// frames — a per-frame threshold would ignore a slow drag entirely — and the
+    /// remainder must be kept, or a stream of sub-step deltas that adds up to two
+    /// steps would deliver one.
+    #[test]
+    fn trackpad_points_accumulate_across_frames_and_keep_the_remainder() {
+        let mut accum = 0.0;
+        let nudge = [wheel(
+            egui::MouseWheelUnit::Point,
+            TRACKPAD_POINTS_PER_STEP * 0.3,
+            egui::Modifiers::NONE,
+        )];
+        assert_eq!(wheel_steps(&nudge, &mut accum), 0, "0.3 of a step");
+        assert_eq!(wheel_steps(&nudge, &mut accum), 0, "0.6 of a step");
+        assert_eq!(wheel_steps(&nudge, &mut accum), 0, "0.9 of a step");
+        assert_eq!(wheel_steps(&nudge, &mut accum), 1, "1.2 crosses it");
+        assert!(
+            (accum - 0.2).abs() < 0.001,
+            "the remainder carries: {accum}"
+        );
+    }
+
+    /// Several events in one frame are one decision, and a flick may well be
+    /// worth more than one step.
+    #[test]
+    fn a_frames_events_are_summed() {
+        let mut accum = 0.0;
+        let flick = [
+            wheel(egui::MouseWheelUnit::Line, 2.0, egui::Modifiers::NONE),
+            wheel(egui::MouseWheelUnit::Line, 1.0, egui::Modifiers::NONE),
+        ];
+        assert_eq!(wheel_steps(&flick, &mut accum), 3);
+    }
+
+    /// Ctrl-scroll is egui's zoom gesture. A widget that happens to be under the
+    /// pointer must not also read it — the user asked to zoom, and the re-diff
+    /// this would trigger is not free. All three spellings of that modifier, since
+    /// the veto asks egui's `matches_any` rather than naming the fields itself.
+    #[test]
+    fn zoom_scroll_is_not_a_context_step() {
+        let mut accum = 0.0;
+        let zoom = [
+            wheel(egui::MouseWheelUnit::Line, 1.0, egui::Modifiers::CTRL),
+            wheel(egui::MouseWheelUnit::Line, 1.0, egui::Modifiers::COMMAND),
+            wheel(egui::MouseWheelUnit::Line, 1.0, egui::Modifiers::MAC_CMD),
+        ];
+        assert_eq!(wheel_steps(&zoom, &mut accum), 0);
+        assert_eq!(accum, 0.0, "and it leaves nothing behind to step later");
     }
 
     /// A pending anchor may only ever be captured on `Anchor`, and `Restore`

@@ -353,7 +353,7 @@ The invariants:
 - **Color tracking**: per-pipe color index, persists through column shifts
 
 ### UI (egui immediate mode)
-- **Top panel**: search bar (SHA/author/message/ref), Enter cycles matches, any keypress focuses search, graph auto-scrolls to match. A changed keystroke selects and centers its match instantly but defers the diff load behind `DIFF_LOAD_DEBOUNCE` (120ms of input pause), so typing a word doesn't spawn a diff worker per keystroke; Enter/arrow match-cycling and clicks load immediately, and any direct `load_selected_diff` cancels the pending debounced load. That timer is **not the search bar's own** — it is the one mechanism for any diff load deferred behind a burst of input, armed through `defer_diff_load`, because supersession drops a stale result but never cancels a running build: with the foreground workers free, a burst starts several complete `get_diff_data` runs on the one path deliberately unguarded by `probe_row_cost`, then refuses to cache any of them
+- **Top panel**: search bar (SHA/author/message/ref), Enter cycles matches, any keypress focuses search, graph auto-scrolls to match. A changed keystroke selects and centers its match instantly but defers the diff load behind `DIFF_LOAD_DEBOUNCE` (120ms of input pause), so typing a word doesn't spawn a diff worker per keystroke; Enter/arrow match-cycling and clicks load immediately, and any direct `load_selected_diff` cancels the pending debounced load. That timer is **one mechanism, not the search bar's own** — the toolbar's context wheel arms it too (`defer_diff_load`), because supersession drops a stale result but never cancels a running build: with the foreground workers free, a burst starts several complete `get_diff_data` runs on the one path deliberately unguarded by `probe_row_cost`, then refuses to cache any of them
 - **Central panel**: commit graph + list (`show_commit_list`), virtualized with egui `show_rows` (same mechanism as the diff pane). Lazy loading: 200 initial, +500 on scroll-near-bottom — computed on a `gitkay-history-load` worker (never the frame loop), appended incrementally via `load_commits_tail` in the common plain scope, full background rebuild otherwise. The debounced git-watcher reload takes the same worker path. `history_epoch` supersedes stale results; both land in `drain_history_results`. An append installs through `append_commits` — O(tail), not O(history): the graph layout **resumes** from the stored `GraphLayoutState` (pipes + colour counter) and the lookup maps / search matches extend in place, leaving selection and scroll untouched. The resume is unsound when a previously out-of-scope merge parent lands in the tail (its already-laid-out merge row would gain a diagonal only a relayout can add) — `deferred_parents` tracks those and forces a full `resync_commits` then; `layout_resume_matches_full_layout` pins the parity. A rebuild arrives with its `DerivedHistory` already computed on the worker (`rebuild_load`), so the frame loop only installs it and restores the selection (`install_derived` + `finish_resync`)
 - **Commit-list stats column**: each row's files-changed / `+`/`-` counts, from
   `diff::commit_stats` — the same `scoped_diff` prologue the pane's own
@@ -573,8 +573,21 @@ The invariants:
   and `load_selected_diff`, leaving the pane on the old shape and the column on counts
   from settings that no longer apply; and the omission would read as deliberate, since
   `word_diff` beside them legitimately triggers no reload. The comparison is also more
-  precise than a flag — `-` at context 0 and `+` at 99 change nothing — and `word_diff`
-  stays excluded for free by not being a `DiffSettings` field.
+  precise than a flag — `-` at context 0 and `+` at `MAX_DIFF_CONTEXT` change nothing —
+  and `word_diff` stays excluded for free by not being a `DiffSettings` field.
+  **The context width also takes the wheel**, over the whole `Context: - N +` group
+  (`wheel_steps`). Four things there are load-bearing. It reads the raw `MouseWheel`
+  events and **never `InputState::smooth_scroll_delta`**, which is smoothed across
+  frames — one notch arrives as a decaying tail that any threshold either splits into
+  several steps or swallows whole; raw `Line` events make a notch one step by
+  construction, so only `Point` devices are paced. The group is **deliberately
+  unlabelled** — an `on_hover_text` parks an interactable tooltip layer under the
+  pointer, which wins the hit-test and swallows the very wheel events this reads (see
+  the tooltip pitfall below). All three adjusters clamp at **one** site, so the width
+  cannot escape the `MAX_DIFF_CONTEXT` the number's fixed-width cell is measured from.
+  And a wheel step **defers** its re-diff (`defer_diff_load`) where a click loads at
+  once — see the top panel's `DIFF_LOAD_DEBOUNCE` for why supersession does not cover
+  a burst.
 - **Bottom panel**: diff view (left, syntax-highlighted) + file list sidebar
   (right, dynamic width). **Both read in the same order, and it is the sidebar's**
   — one decision made once in `build_file_rows`, whose grouped layout is not the
