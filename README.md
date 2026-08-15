@@ -59,8 +59,8 @@
 - File list sidebar with per-file `+/-` stats, grouped under directory headers by default (`[diff] file_list` = `grouped`/`full`/`name`)
 - Renamed/copied files shown git-style — one `dir/{old ⇒ new}` entry instead of a delete + add pair
 - **Word diff** toggle — highlights the exact words that changed within a modified line
-- Optional line numbers beside every patch line — old and new, in columns sized once per diff so they line up across every file in it (`[diff] line_numbers`, off by default)
-- Hover toolbar on the diff: context-line count (click `±`, or scroll over it), ignore whitespace, rename/copy detection, word diff, line numbers
+- Optional line numbers beside every patch line — old and new, in columns sized once per diff so they line up across every file in it
+- Hover toolbar on the diff: context-line count (click `±`, or scroll over it), ignore whitespace, rename/copy detection, word diff, line numbers — all remembered across runs
 - Highlighting runs in the background, on-screen files first — large diffs never block the UI; diffs are cached and the neighbouring commits prefetched, so stepping through history is instant
 - Click a file to jump to its diff section; the sidebar tracks your position, highlighting the file under the diff view as you scroll
 - Commit header with author, date, full message
@@ -303,14 +303,22 @@ or `500` cannot make the window unusable.
 | `theme` | `"catppuccin-mocha"` | Highlight theme; one of the 29 slugs below. An unknown value warns and falls back |
 | `show_stats` | `true` | Show the diffstat block between the commit message and the patch. The file sidebar is independent and always shown |
 | `file_list` | `"grouped"` | Sidebar layout, and the order the diff pane lays its patches out in: `"grouped"` puts files under directory headers with root-level files last, `"full"` shows full repo-relative paths, `"name"` shows basenames only |
-| `line_numbers` | `false` | Show each patch line's old and new line numbers, in a gutter left of the `+`/`-` marker. One column width per diff, so the numbers line up across files; the commit message and diffstat above the first file keep their own margin |
-| `detect_renames` | `true` | Show a rename as one `old → new` entry instead of a delete + add (git `-M`) |
-| `detect_copies` | `false` | Show a file copied from another *modified* file as `source → copy` (git `-C`). More expensive than renames |
 | `textconv` | `true` | Run `diff.<driver>.textconv` when `.gitattributes` names a driver for a path, as git does — what turns an archive or a PDF into a readable diff instead of "Binary files … differ" |
 
-`detect_renames`, `detect_copies` and `line_numbers` are also on the diff's hover
-toolbar. The config is authoritative: the toolbar is a session override, and a
-config reload re-asserts the configured value over it.
+**Everything on the diff's hover toolbar is set there, not here** — context width,
+ignore whitespace, rename detection, copy detection, word diff and line numbers.
+Each is remembered across runs, so the pane reopens the way you left it, and none
+has a config key that could contradict it. There is no third state to reason
+about: what you ticked is what you get.
+
+| Toolbar control | Default | Meaning |
+|---|---|---|
+| Context | `3` | Context lines around each hunk. Click `±` or scroll over the group |
+| Ignore whitespace | off | Ignore whitespace-only changes (git `-w`) |
+| Detect renames | on | Show a rename as one `old → new` entry instead of a delete + add (git `-M`) |
+| Detect copies | off | Show a file copied from another *modified* file as `source → copy` (git `-C`). More expensive than renames |
+| Word diff | off | Highlight the exact words that changed within a modified line |
+| Line numbers | off | Old and new line numbers in a gutter left of the `+`/`-` marker. One column width per diff, so they line up across files; the commit message and diffstat above the first file keep their own margin |
 
 `textconv` is the one setting that lets gitkay run an external program. The command
 comes from git **config**, never from a file in the repository, so cloning a hostile

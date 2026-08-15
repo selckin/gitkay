@@ -1996,23 +1996,91 @@ fn resolve_config_visuals(cfg: &config::Config) -> (highlight::EmbeddedThemeName
     (theme, diff_bg, warned)
 }
 
-/// Build the app's `DiffSettings` from the `[diff]` config section plus the two
-/// toolbar-owned fields (persisted `context`/`ignore_ws`). The single site listing
-/// which fields config owns — startup and the live reload both build through it, so
-/// a config-owned field can't be wired into one path and silently miss the other
-/// (and a new `DiffSettings` field fails to compile here until someone decides who
-/// owns it).
-const fn config_diff_settings(
-    diff: &config::DiffSection,
+/// The `DiffSettings` fields the diff toolbar owns, and `App::save` persists.
+///
+/// Grouped into a struct so `config_diff_settings` can list every field of its
+/// result in one literal without taking four loose parameters — three of them
+/// bools, which `clippy::fn_params_excessive_bools` refuses, and rightly: four
+/// positional bools at a call site are four chances to swap two.
+///
+/// Not the whole of what the toolbar owns: `word_diff` and `line_numbers` are
+/// toolbar-owned and persisted too, but change no diff DATA and so are not
+/// `DiffSettings` fields at all.
+#[derive(Clone, Copy)]
+struct ToolbarDiffSettings {
     context: u32,
     ignore_ws: bool,
+    detect_renames: bool,
+    detect_copies: bool,
+}
+
+impl ToolbarDiffSettings {
+    /// The toolbar-owned half of live settings — what the reload keeps hold of
+    /// while it replaces the config-owned half.
+    const fn of(s: DiffSettings) -> Self {
+        Self {
+            context: s.context,
+            ignore_ws: s.ignore_ws,
+            detect_renames: s.detect_renames,
+            detect_copies: s.detect_copies,
+        }
+    }
+
+    /// Restore from storage, or the toolbar's own defaults.
+    ///
+    /// Paired with `save`, and the pair is what makes "every control the toolbar
+    /// owns is remembered" a compiled property rather than a promise in a doc
+    /// comment: this is an exhaustive struct literal and `save` destructures
+    /// exhaustively, so a field added above fails to build in both directions.
+    /// Without that a fifth control compiles clean and quietly resets at every
+    /// launch — the exact failure moving these off config was meant to end.
+    fn load(storage: Option<&dyn eframe::Storage>) -> Self {
+        Self {
+            // Clamped: a stale or hand-edited value must not escape the range the
+            // toolbar's own buttons are bounded by.
+            context: stored(storage, "diff_context", 3u32).min(MAX_DIFF_CONTEXT),
+            ignore_ws: stored(storage, "diff_ignore_ws", false),
+            detect_renames: stored(storage, "diff_detect_renames", true),
+            detect_copies: stored(storage, "diff_detect_copies", false),
+        }
+    }
+
+    /// Persist. Keys are `diff_`-prefixed because these are `DiffSettings`
+    /// fields; `word_diff`/`line_numbers` are stored bare beside them, being
+    /// `GitkApp`'s own.
+    fn save(self, storage: &mut dyn eframe::Storage) {
+        let Self {
+            context,
+            ignore_ws,
+            detect_renames,
+            detect_copies,
+        } = self;
+        eframe::set_value(storage, "diff_context", &context);
+        eframe::set_value(storage, "diff_ignore_ws", &ignore_ws);
+        eframe::set_value(storage, "diff_detect_renames", &detect_renames);
+        eframe::set_value(storage, "diff_detect_copies", &detect_copies);
+    }
+}
+
+/// Build the app's `DiffSettings` from the `[diff]` config section plus the
+/// toolbar-owned fields. The single site listing which fields config owns —
+/// startup and the live reload both build through it, so a config-owned field
+/// can't be wired into one path and silently miss the other (and a new
+/// `DiffSettings` field fails to compile here until someone decides who owns it).
+const fn config_diff_settings(
+    diff: &config::DiffSection,
+    toolbar: ToolbarDiffSettings,
 ) -> DiffSettings {
     DiffSettings {
-        context,
-        ignore_ws,
+        // Toolbar-owned: set while reading a diff, persisted across runs, and
+        // never overwritten by a config reload — there is no key to overwrite
+        // them with.
+        context: toolbar.context,
+        ignore_ws: toolbar.ignore_ws,
+        detect_renames: toolbar.detect_renames,
+        detect_copies: toolbar.detect_copies,
+        // Config-owned: no toolbar control, so config is the only source.
         show_stats: diff.show_stats,
-        detect_renames: diff.detect_renames,
-        detect_copies: diff.detect_copies,
         textconv: diff.textconv,
     }
 }
@@ -2559,16 +2627,15 @@ struct GitkApp {
     // The diff-shaping settings, grouped into their one type. This IS what keys the diff
     // cache (see diff_cache_key), so a new data-affecting setting added to DiffSettings is
     // automatically part of the cache key AND the config-reload comparison — no separate
-    // bucket to keep in sync. context/ignore_ws are toolbar-owned + persisted;
-    // show_stats/detect_* come from config.
+    // bucket to keep in sync. context/ignore_ws/detect_* are toolbar-owned +
+    // persisted (ToolbarDiffSettings); show_stats/textconv come from config.
     diff_settings: DiffSettings,
     word_diff: bool,           // highlight changed words within +/- lines (persisted)
     file_list: FileListLayout, // file-list sidebar layout (config [diff].file_list)
-    /// Draw each patch row's old/new line numbers (config `[diff].line_numbers`,
-    /// mirrored by a toolbar checkbox). Render-only — see `LineNoGutter`: it is
-    /// not a `DiffSettings` field, so flipping it rebuilds nothing and invalidates
-    /// neither cache. Config is authoritative, as it is for the detection
-    /// toggles: the checkbox is a session override a reload re-asserts over.
+    /// Draw each patch row's old/new line numbers. Toolbar-owned and persisted
+    /// (`App::save`), like every other control there. Render-only — see
+    /// `LineNoGutter`: it is not a `DiffSettings` field, so flipping it rebuilds
+    /// nothing and invalidates neither cache.
     line_numbers: bool,
     diff_toolbar_rect: Option<egui::Rect>, // last shown hover-toolbar bounds (flicker guard)
     /// Unspent trackpad scrolling over the toolbar's context-width group, in steps —
@@ -3170,11 +3237,12 @@ impl GitkApp {
             layout_state,
         } = derive_from_commits(&[]);
 
-        // Restore persisted diff options.
-        // clamp a stale/hand-edited value to the UI range
-        let diff_context: u32 = stored(cc.storage, "diff_context", 3u32).min(MAX_DIFF_CONTEXT);
-        let diff_ignore_ws: bool = stored(cc.storage, "diff_ignore_ws", false);
+        // Restore persisted diff options — every control on the diff toolbar, so a
+        // reader's view of a diff is the one they left. The defaults are the
+        // toolbar's own; there is no config key behind any of them.
+        let toolbar_diff = ToolbarDiffSettings::load(cc.storage);
         let word_diff: bool = stored(cc.storage, "word_diff", false);
+        let line_numbers: bool = stored(cc.storage, "line_numbers", false);
 
         // The startup diff is deferred to the first frame: empty here, filled by
         // load_selected_diff on the StartupDiff::NeedsLoad pass. With no commits
@@ -3302,10 +3370,10 @@ impl GitkApp {
             branch_highlight: HashSet::new(),
             commit_panel_height,
             file_list_width,
-            diff_settings: config_diff_settings(&cfg.diff, diff_context, diff_ignore_ws),
+            diff_settings: config_diff_settings(&cfg.diff, toolbar_diff),
             word_diff,
             file_list: cfg.diff.file_list,
-            line_numbers: cfg.diff.line_numbers,
+            line_numbers,
             diff_toolbar_rect: None,
             diff_context_scroll: 0.0,
             fonts,
@@ -6601,19 +6669,16 @@ impl GitkApp {
                     // queued spans are dropped, not applied for a frame.
                     self.invalidate_diff_highlight();
                 }
-                // show_stats and rename/copy detection all change the diff DATA
-                // (stat lines appear/vanish; renamed files coalesce), so a change
-                // to any needs a full rebuild, not just a re-highlight. Update the
-                // fields first so the rebuild keys/builds under the new values; the
-                // new cache key misses and rebuilds, stale entries evict. Config is
-                // authoritative for the detection toggles — this re-asserts the
-                // config value over any live toolbar toggle (a session override
-                // that also resets on launch; config wins). Reload at most once,
-                // even when several of these flip in the same save.
-                // Config owns show_stats + rename/copy detection; context/ignore_ws are
-                // toolbar-owned, so the current values pass through (the ownership split
-                // lives in config_diff_settings). Comparing the whole DiffSettings means
-                // a field added to it can't silently skip the reload.
+                // show_stats changes the diff DATA (the stat lines appear or
+                // vanish), so a change to it needs a full rebuild, not just a
+                // re-highlight. Update the field first so the rebuild keys/builds
+                // under the new value; the new cache key misses and rebuilds,
+                // stale entries evict. Reload at most once, even when several
+                // config keys flip in the same save.
+                // Everything the toolbar owns passes through untouched — config has
+                // no key for any of it (the ownership split lives in
+                // `config_diff_settings`). Comparing the whole DiffSettings means a
+                // field added to it can't silently skip the reload.
                 // `[cache] min_build_ms` applies live like every other key — the
                 // template promises it, and the store is shared as an `Arc`, so
                 // the threshold moves in place rather than needing a reopen (which
@@ -6622,11 +6687,8 @@ impl GitkApp {
                     store.set_min_build(std::time::Duration::from_millis(cfg.cache.min_build_ms));
                 }
                 let before_settings = self.diff_settings;
-                let new_settings = config_diff_settings(
-                    &cfg.diff,
-                    self.diff_settings.context,
-                    self.diff_settings.ignore_ws,
-                );
+                let new_settings =
+                    config_diff_settings(&cfg.diff, ToolbarDiffSettings::of(self.diff_settings));
                 let reload_diff = new_settings != self.diff_settings;
                 self.diff_settings = new_settings;
                 self.invalidate_stats_if_counts_changed(before_settings);
@@ -6653,11 +6715,6 @@ impl GitkApp {
                 // re-lay them here for a layout-only change.
                 let layout_changed = self.file_list != cfg.diff.file_list;
                 self.file_list = cfg.diff.file_list;
-                // Render-only too, and cheaper still: the gutter needs neither a
-                // rebuild nor a re-lay — the widths were measured when the diff
-                // installed and the next frame reads this field. Config wins over
-                // the toolbar checkbox here, as it does for the detection toggles.
-                self.line_numbers = cfg.diff.line_numbers;
                 if reload_diff {
                     self.load_selected_diff();
                 } else if layout_changed {
@@ -7012,9 +7069,13 @@ impl eframe::App for GitkApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, "commit_panel_height", &self.commit_panel_height);
         eframe::set_value(storage, "file_list_width", &self.file_list_width);
-        eframe::set_value(storage, "diff_context", &self.diff_settings.context);
-        eframe::set_value(storage, "diff_ignore_ws", &self.diff_settings.ignore_ws);
+        // Every control on the diff toolbar, so the pane reopens as it was left.
+        // None of these has a config key: a setting the reader flips while reading
+        // is owned by the place they flipped it, and one that a config reload could
+        // overwrite is one they would have to set twice.
+        ToolbarDiffSettings::of(self.diff_settings).save(storage);
         eframe::set_value(storage, "word_diff", &self.word_diff);
+        eframe::set_value(storage, "line_numbers", &self.line_numbers);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {

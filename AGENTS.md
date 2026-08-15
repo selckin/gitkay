@@ -576,7 +576,17 @@ The invariants:
   from settings that no longer apply; and the omission would read as deliberate, since
   `word_diff` beside them legitimately triggers no reload. The comparison is also more
   precise than a flag — `-` at context 0 and `+` at `MAX_DIFF_CONTEXT` change nothing —
-  and `word_diff` stays excluded for free by not being a `DiffSettings` field.
+  and `word_diff`/`line_numbers` stay excluded for free by not being `DiffSettings`
+  fields. **Every control here is persisted and none has a config key**: a setting
+  the reader flips while reading is owned by the place they flipped it.
+  `detect_renames`/`detect_copies`/`line_numbers` were `[diff]` keys the toolbar
+  overrode for a session, which meant a save to an unrelated config key silently
+  reverted a tick. For the four that are `DiffSettings` fields that is *compiled*
+  rather than promised — `ToolbarDiffSettings::load` is an exhaustive struct literal
+  and `save` an exhaustive destructure, so a fifth field fails to build in both
+  directions instead of silently resetting every launch. `word_diff` and
+  `line_numbers` sit outside that struct (they change no diff data) and are still
+  two hand-written keys each.
   **The context width also takes the wheel**, over the whole `Context: - N +` group
   (`wheel_steps`). Four things there are load-bearing. It reads the raw `MouseWheel`
   events and **never `InputState::smooth_scroll_delta`**, which is smoothed across
@@ -612,8 +622,8 @@ The invariants:
   What that pass costs is filling a second buffer, so it scales with LINES and not
   with how far anything moved; a big commit pays one extra half-frame at install,
   against the seconds its diff took to build.
-  The **line-number gutter** (`diff::LineNoGutter`, `[diff] line_numbers`, off by
-  default, mirrored by a toolbar checkbox) is render-only in the strongest sense:
+  The **line-number gutter** (`diff::LineNoGutter`, a persisted toolbar checkbox,
+  off until ticked) is render-only in the strongest sense:
   the numbers are `DiffLine::old_lineno`/`new_lineno`, which every diff already
   carries for the scroll anchor and the store already encodes — so it keys nothing,
   invalidates nothing, and a stored diff from before the feature renders them. Its
@@ -698,15 +708,16 @@ The invariants:
   `LineKind::Context` by the time only the kind is left.
 - **Rename/copy detection**: `detect_similar` (`git2::Diff::find_similar`) post-passes
   `get_diff_data`/`get_working_tree_diff`/`get_staged_diff`, coalescing an add+delete pair
-  into one `old → new` entry. `[diff].detect_renames` (default on, git `-M`) and
-  `[diff].detect_copies` (default off, git `-C`; a copy source is **not** required to
+  into one `old → new` entry. `detect_renames` (default on, git `-M`) and
+  `detect_copies` (default off, git `-C`; a copy source is **not** required to
   be modified — `is_rename_source` takes a deleted or typechanged delta outright, a
   modified one under `-C`, an unmodified one only under `--find-copies-harder`, and
   rejects the rest: added, untracked, ignored, unreadable, conflicted, and anything
-  whose old mode is not a blob) are mirrored by hover-toolbar checkboxes. **Config is authoritative**:
-  the checkboxes are a session override seeded at `GitkApp::new`, a live config reload
-  re-asserts the config value over any toggle, and neither is persisted (unlike
-  `diff_ignore_ws`). Sidebar rendering goes through `rename_brace` git-style braces
+  whose old mode is not a blob) are **toolbar checkboxes, persisted, with no config
+  key** — see `ToolbarDiffSettings`. They used to be `[diff]` keys the checkbox
+  overrode for a session and a reload re-asserted, which is one state too many:
+  the reader ticks a box, a save to an unrelated key unticks it, and nothing says
+  why. Sidebar rendering goes through `rename_brace` git-style braces
   (`wm/{foo ⇒ baz}/Bar.java`); in `Grouped` layout the file groups under the directory
   common to old and new (the brace prefix). **Limitations**: working-tree detection is
   tracked-only (index→workdir diff — an untracked file never forms the old side), and a
@@ -1035,7 +1046,7 @@ ones that actually fail when the write is removed.
 - Working-tree edits do not touch `.git`; refresh commits/diff on selection changes to keep virtual staged/uncommitted entries current without a recursive worktree watcher
 - Branch highlighting walks first-parent children upward, but all parents downward, so merge commits keep merged history highlighted
 - File-list sidebar is not row-virtualized — every row draws each frame, so per-row file text goes through `SidebarCache`: elided labels (laid out in `Color32::PLACEHOLDER` so normal/hover color applies at paint time) and `+n`/`-n` stat galleys are built once per (diff, width, font) — `resync_file_layout` and a font reload reset the cache, `ensure` re-keys it on width change. Both stat galleys always exist, a zero count included (`+0`/`-0`, as in the commit list), so `StatGalleys` holds no `Option` and the row's stats block is a fixed distance from its right edge instead of sliding when one side is empty. `build_file_rows` (pure) turns `(new_path, Option<old_path>)` pairs into header/file rows per `[diff] file_list` (`grouped` = one header per directory, files sorted by label, root-level files last; renames/copies group under their `rename_brace` common directory) — and it is the single decision of what order files are read in, the **diff pane** included (see **Bottom panel**); `left_elide` left-truncates labels, measuring the full string once and binary-searching only when it overflows (directory headers still elide per frame — they're the minority of rows). `grouped` directory headers are drawn breadcrumb-style (`draw_dir_header` + `common_dir_prefix_len`): the ancestor path a header shares with the header drawn just above it is dimmed (`SUBTEXT_DIM`) and the distinguishing tail is `SUBTEXT`, so deep trees don't repeat the same long prefix on every header
-- Any new diff-*data*-affecting setting goes in `DiffSettings` only. `GitkApp` holds one `DiffSettings` field (the diff-shaping state — `context`/`ignore_ws` are toolbar-owned + persisted, `show_stats`/`detect_renames`/`detect_copies` come from `[diff]` config), and `DiffCacheKey` *embeds* a `DiffSettings`. (It also carries a `drivers` fingerprint, which is NOT a setting — it is the repo's own `diff.<name>.textconv` config, and it is in the key for the same reason: an edited driver changes a driven file's whole body without moving the oid. See **Textconv**.) So a field added to `DiffSettings` is automatically (a) part of the cache key — cached diffs invalidate when it changes, no second edit site — and (b) covered by the config-reload's whole-struct comparison (`new_settings != self.diff_settings`), which triggers the re-diff. The prefetch mapping reads it back as `key.settings`. Settings that only change *spans* (theme, syntax on/off, `diff_bg`, `[diff.languages]`) or *render* (`word_diff`, `file_list`, `line_numbers`) are handled by their own branches in the config-reload block, not `DiffSettings`. `line_numbers` is the cheapest of those and shows where the floor is: its data is already on every `DiffLine`, so its reload branch is the assignment alone — no rebuild, no re-lay, not even a repaint nudge. `file_list` decides the order the pane's patch bodies are laid out in as well as the sidebar's rows, which is a re-lay of built data and not a re-diff — it stays out here because `diff::order_files` is idempotent, so a cached or stored diff is re-laid on install rather than rebuilt (see **Bottom panel**).
+- Any new diff-*data*-affecting setting goes in `DiffSettings` only. `GitkApp` holds one `DiffSettings` field (the diff-shaping state — `context`/`ignore_ws`/`detect_renames`/`detect_copies` are toolbar-owned + persisted, grouped as `ToolbarDiffSettings`; `show_stats`/`textconv` come from `[diff]` config), and `DiffCacheKey` *embeds* a `DiffSettings`. (It also carries a `drivers` fingerprint, which is NOT a setting — it is the repo's own `diff.<name>.textconv` config, and it is in the key for the same reason: an edited driver changes a driven file's whole body without moving the oid. See **Textconv**.) So a field added to `DiffSettings` is automatically (a) part of the cache key — cached diffs invalidate when it changes, no second edit site — and (b) covered by the config-reload's whole-struct comparison (`new_settings != self.diff_settings`), which triggers the re-diff. The prefetch mapping reads it back as `key.settings`. Settings that only change *spans* (theme, syntax on/off, `diff_bg`, `[diff.languages]`) or *render* (`file_list`) are handled by their own branches in the config-reload block, not `DiffSettings`. The two render-only settings the TOOLBAR owns — `word_diff` and `line_numbers` — have no reload branch at all, because they have no config key to reload from; a render-only setting added later has to choose which of those two shapes it is. `file_list` decides the order the pane's patch bodies are laid out in as well as the sidebar's rows, which is a re-lay of built data and not a re-diff — it stays out here because `diff::order_files` is idempotent, so a cached or stored diff is re-laid on install rather than rebuilt (see **Bottom panel**).
   The span half is **one struct too** (`SpanSettings`, held as `GitkApp::span_settings`), compared and assigned whole for the same reason `DiffSettings` is: as four loose fields the reload's test was a four-term `||` chain that a fifth setting could silently miss, and missing it is not a lost frame — every cached diff keeps yesterday's colours, sticky via `diff_cache.contains`, for the session with nothing logged. Which of the four are in `DiffCacheKey` is unchanged and is the next paragraph's subject.
   **Three of those four span settings are in `DiffCacheKey`, and the fourth shapes no span** — so a stale entry simply misses, and the reload neither clears the cache nor carries an epoch. `theme` and `enabled` are their own key fields; `[diff.languages]` is a `u64` from `highlight::languages_fingerprint`, cached on `GitkApp` because `diff_cache_key` runs ~54 times per dispatch and the map is a `BTreeMap`. `diff_bg` is **not** in the key and must not be: it decides `DiffPalette::added_bg`/`deleted_bg`, which `diff_row_job` reads live from `self.diff_palette` at render time, and the one palette-derived span (`tokenize`'s grammar-hiccup fallback) takes `foreground`, which is theme-derived. Nothing bakes it into a `Span`. `set_span_settings` is the sole later writer of the map and the fingerprint both, so the cached value cannot describe a map that is gone — which would be silent and permanent, every key hitting entries tokenized with the wrong grammar while `diff_cache.contains` kept any dispatch from rebuilding them.
   **This replaced a cache clear plus a `span_gen` epoch, and the epoch is the part worth understanding.** The clear could not reach warms already queued or running: they were dispatched under the OLD span settings, and with `diff_bg`/`languages` absent from the key `key_is_current` waved their results through, so they landed back in the just-cleared cache carrying the old colours — after which every dispatch skipped them via `contains` and those rows stayed flat for the session. The fix at the time was to stamp a generation on every warm job (on the job, like `hl`, so a reload could not race a worker mid-row) and check it on return, which cost a `u64` threaded through seven layers: `GitkApp` → `PoolHandle::submit` → `CoordMsg::Submit` → `Coordinator` → `Job::Warm` → `warm_row` → `WarmResult` → `WarmFacts::spans_current` → `WarmDisposition::DropStaleSpans`. Putting `languages` in the key retires all of it: such a warm now fails `key_is_current` and is dropped as **stale-KEYED**, by the mechanism that already existed for every other setting. It is also strictly better than the clear, which threw away the whole warm band for a `diff_bg` tweak that invalidated nothing. `DiffCacheKey.drivers` had already solved the identical problem — a config-shaped input that changes a diff without moving the oid — the same way; this is that lesson applied to the last input that had not learned it. **A span setting added later joins the KEY**, unless it can be shown to reach no span.
