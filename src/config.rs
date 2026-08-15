@@ -135,6 +135,11 @@ pub enum FileListLayout {
 }
 
 /// `[diff]` — diff-pane rendering options.
+///
+/// Everything the diff's hover toolbar controls is deliberately absent: context
+/// width, ignore-whitespace, rename/copy detection, word diff and line numbers are
+/// set where they are read and persisted across runs (`App::save`), with no key
+/// here to contradict them. What remains is what has no toolbar control.
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DiffSection {
@@ -147,25 +152,9 @@ pub struct DiffSection {
     /// File-list sidebar layout: grouped under directory headers, flat full
     /// paths, or flat basenames.
     pub(crate) file_list: FileListLayout,
-    /// Show each patch row's pre- and post-image line numbers in a gutter left of
-    /// the `+`/`-` marker. Off by default: the column costs ~7-13 characters of
-    /// every row, which is a trade only the reader can make.
-    ///
-    /// Render-only, and deliberately NOT a `DiffSettings` field: every built diff
-    /// already carries the numbers (`DiffLine::old_lineno`/`new_lineno`, kept for
-    /// the scroll anchor and encoded in the persistent store), so this changes
-    /// what is drawn and nothing that is computed — putting it in `DiffSettings`
-    /// would invalidate every cached and stored diff to redraw the same data.
-    pub(crate) line_numbers: bool,
     /// Highlight theme slug (see `default_template()` for valid slugs). None ⇒ default.
     pub(crate) theme: Option<String>,
     pub(crate) bands: BandsSection,
-    /// Detect renamed files (git -M): a rename renders as one `old → new` entry
-    /// instead of a separate delete + add. Cheap.
-    pub(crate) detect_renames: bool,
-    /// Detect copied files (git -C): a new file copied from another modified file
-    /// renders as `source → copy`. Off by default — more expensive than renames.
-    pub(crate) detect_copies: bool,
     /// Run `diff.<driver>.textconv` when `.gitattributes` names a driver for a
     /// path, as git does — which is what turns a zip or a PDF into a readable
     /// diff. On by default, and an off switch precisely because it runs an
@@ -184,11 +173,8 @@ impl Default for DiffSection {
             syntax: true,
             show_stats: true,
             file_list: FileListLayout::Grouped,
-            line_numbers: false,
             theme: None,
             bands: BandsSection::default(),
-            detect_renames: true,
-            detect_copies: false,
             textconv: true,
             languages: crate::highlight::LanguageMap::new(),
         }
@@ -465,17 +451,14 @@ fn default_template() -> String {
          # ui             = {{ size = {ui}, font = \"monospace\" }}   # search bar + diff toolbar\n\
          \n\
          [diff]\n\
+         # Context width, ignore whitespace, rename/copy detection, word diff and\n\
+         # line numbers are not here: they live on the diff's hover toolbar, which\n\
+         # remembers them across runs. Setting them is reading, so they are set\n\
+         # where they are read.\n\
          # Show the diffstat block (per-file change list + summary) between the\n\
          # commit message and the patch. false = hide it; the file-list sidebar\n\
          # still lists every changed file.\n\
          # show_stats = true\n\
-         # Detect renamed files (git -M): a rename shows as one entry \"old → new\"\n\
-         # instead of a separate delete + add. Cheap; on by default.\n\
-         # detect_renames = true\n\
-         # Detect copied files (git -C): a new file copied from another shows as\n\
-         # \"source → copy\". Only files modified in the same commit are copy sources.\n\
-         # More expensive than renames; off by default.\n\
-         # detect_copies = false\n\
          # Run diff.<driver>.textconv when .gitattributes names a driver for a\n\
          # path, as git does — the setting that makes an archive or a PDF diff as\n\
          # readable text instead of \"Binary files ... differ\". The command comes\n\
@@ -488,12 +471,6 @@ fn default_template() -> String {
          # \"full\" shows each file's full repo-relative path; \"name\" shows just\n\
          # basenames. The diff pane lays its patches out in the same order.\n\
          # file_list = \"grouped\"\n\
-         # Show each patch line's old and new line numbers, in a gutter left of\n\
-         # the +/- marker. The commit message and the diffstat above the first\n\
-         # file keep their own margin. Also on the diff's hover toolbar, as a\n\
-         # session override: this value wins again on the next config reload,\n\
-         # and on the next launch.\n\
-         # line_numbers = false\n\
          # Syntax-highlight diffs. false = the original flat per-role coloring.\n\
          # syntax = true\n\
          # Diff syntax-highlighting theme. Any of:\n\
@@ -986,8 +963,6 @@ mod tests {
         assert_eq!(cfg.diff.file_list, FileListLayout::Grouped); // default
         assert_eq!(cfg.diff.bands.source, BandSource::Fixed);
         assert_eq!(cfg.diff.bands.added, None);
-        assert!(cfg.diff.detect_renames); // default on (matches git -M)
-        assert!(!cfg.diff.detect_copies); // default off (git -C, expensive)
         assert!(cfg.diff.textconv); // default on, matching git
     }
 
@@ -1012,19 +987,33 @@ mod tests {
         assert!(Config::default().diff.textconv);
     }
 
+    /// The toolbar's settings are persisted, not configured, so `[diff]` must not
+    /// quietly accept a key for one — a config that sets it and a toolbar that
+    /// ignores it is worse than an error. `deny_unknown_fields` makes each of
+    /// these a parse error; this is what pins that they were removed from BOTH the
+    /// struct and the template rather than only from the template.
     #[test]
-    fn line_numbers_parses_and_defaults_off() {
-        let cfg: Config = toml::from_str("[diff]\nline_numbers = true\n").unwrap();
-        assert!(cfg.diff.line_numbers);
-        assert!(!Config::default().diff.line_numbers);
-    }
-
-    #[test]
-    fn detect_rename_copy_keys_parse() {
-        let cfg: Config =
-            toml::from_str("[diff]\ndetect_renames = false\ndetect_copies = true\n").unwrap();
-        assert!(!cfg.diff.detect_renames);
-        assert!(cfg.diff.detect_copies);
+    fn a_toolbar_setting_is_not_a_config_key() {
+        let template = default_template();
+        for (key, value) in [
+            ("detect_renames", "true"),
+            ("detect_copies", "true"),
+            ("line_numbers", "true"),
+            ("context", "5"),
+            ("ignore_ws", "true"),
+            ("word_diff", "true"),
+        ] {
+            assert!(
+                toml::from_str::<Config>(&format!("[diff]\n{key} = {value}\n")).is_err(),
+                "[diff] must not accept {key}"
+            );
+            // The assignment form, not the bare word: the comments above these
+            // keys are free to talk about context width or word diff in prose.
+            assert!(
+                !template.contains(&format!("{key} =")),
+                "the template must not offer {key}"
+            );
+        }
     }
 
     #[test]
@@ -1046,10 +1035,7 @@ mod tests {
         let t = default_template();
         assert!(t.contains("[diff]"));
         assert!(t.contains("show_stats ="));
-        assert!(t.contains("detect_renames ="));
-        assert!(t.contains("detect_copies ="));
         assert!(t.contains("textconv ="));
-        assert!(t.contains("line_numbers ="));
     }
 
     #[test]
