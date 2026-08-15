@@ -1663,6 +1663,13 @@ fn show_virtualized_diff(
     // Size the horizontal scroll to the widest line in the whole diff —
     // virtualization only lays out visible rows, so egui can't otherwise know an
     // off-screen line is wide. Monospace assumption.
+    //
+    // The `+ 1` is the MARKER column, not slack: `DiffData::max_chars` counts each
+    // line's own text, and `diff_row_job` draws every code row one character wider
+    // than that — a context row carries no `+`/`-` byte and is given a space in its
+    // place, in both render modes. Drop it and the widest context line loses its
+    // last character, but only while off screen, since a laid-out row widens the
+    // ScrollArea itself. `content_chars` already includes the line-number gutter.
     let char_w = ui.fonts_mut(|f| f.glyph_width(font_id, ' '));
     let content_w = (content_chars as f32 + 1.0) * char_w;
     scroll.show_rows(ui, row_h, total_rows, |ui, rows| {
@@ -2123,8 +2130,10 @@ fn append_body(
 /// `syntax` on, code lines render their token spans over the theme foreground, an
 /// accent +/-/space gutter (synthesized from `kind`, so context and changed lines
 /// share one column), and an add/del row tint. With `syntax` off the whole line
-/// takes one flat `kind_color`, the literal +/- marker is kept verbatim, and there
-/// is no row tint. Word-diff emphasis backgrounds apply either way — blended from
+/// takes one flat `kind_color` and there is no row tint — but the marker column is
+/// still one character wide in both modes: the literal `+`/`-` where the text has
+/// one, a synthesized space where it does not (git2 gives a context row no origin
+/// char). Word-diff emphasis backgrounds apply either way — blended from
 /// the row tint when syntax-on, from the pane background when off. Structural
 /// (non-code) lines render whole in one palette colour in both modes.
 ///
@@ -2175,7 +2184,11 @@ fn diff_row_job(
         };
         job.append(glyph, 0.0, fmt(glyph_color));
     } else {
-        // Keep the literal marker bytes (only Add/Del carry one) in the flat colour.
+        // Keep the literal marker bytes (only Add/Del carry one) in the flat
+        // colour — and stand a space in where there are none. git2 excludes the
+        // origin char from a context row's content, so without this a context
+        // body starts one column left of every +/- body, which is not what git's
+        // own output does and is plain to see against the line-number column.
         let marker_len = line.text.len() - line.body().len();
         if marker_len > 0 {
             job.append(
@@ -2183,6 +2196,8 @@ fn diff_row_job(
                 0.0,
                 fmt(kind_color(line.kind, palette)),
             );
+        } else {
+            job.append(" ", 0.0, fmt(palette.marker));
         }
     }
 
@@ -8054,6 +8069,18 @@ mod tests {
         // existed — the zero-width default writes nothing, for every kind.
         assert_eq!(row(1, LineNoGutter::default()), "@@ -9,2 +9,2 @@");
         assert_eq!(row(2, LineNoGutter::default()), " ctx");
+
+        // Flat mode too: git2 hands a context row no origin char, so the marker
+        // column is stood in for rather than skipped — else the context bodies
+        // sit one column left of the changed ones, beside a column of numbers
+        // that lines up perfectly.
+        let flat = |i: usize| {
+            diff_row_job(&lines[i], &palette, &fid, g, false, false)
+                .0
+                .text
+        };
+        assert_eq!(flat(2), " 9   9  ctx");
+        assert_eq!(flat(3), "10     -old");
     }
 
     #[test]
