@@ -147,6 +147,16 @@ pub struct DiffSection {
     /// File-list sidebar layout: grouped under directory headers, flat full
     /// paths, or flat basenames.
     pub(crate) file_list: FileListLayout,
+    /// Show each patch row's pre- and post-image line numbers in a gutter left of
+    /// the `+`/`-` marker. Off by default: the column costs ~7-13 characters of
+    /// every row, which is a trade only the reader can make.
+    ///
+    /// Render-only, and deliberately NOT a `DiffSettings` field: every built diff
+    /// already carries the numbers (`DiffLine::old_lineno`/`new_lineno`, kept for
+    /// the scroll anchor and encoded in the persistent store), so this changes
+    /// what is drawn and nothing that is computed — putting it in `DiffSettings`
+    /// would invalidate every cached and stored diff to redraw the same data.
+    pub(crate) line_numbers: bool,
     /// Highlight theme slug (see `default_template()` for valid slugs). None ⇒ default.
     pub(crate) theme: Option<String>,
     pub(crate) bands: BandsSection,
@@ -174,6 +184,7 @@ impl Default for DiffSection {
             syntax: true,
             show_stats: true,
             file_list: FileListLayout::Grouped,
+            line_numbers: false,
             theme: None,
             bands: BandsSection::default(),
             detect_renames: true,
@@ -477,6 +488,12 @@ fn default_template() -> String {
          # \"full\" shows each file's full repo-relative path; \"name\" shows just\n\
          # basenames. The diff pane lays its patches out in the same order.\n\
          # file_list = \"grouped\"\n\
+         # Show each patch line's old and new line numbers, in a gutter left of\n\
+         # the +/- marker. The commit message and the diffstat above the first\n\
+         # file keep their own margin. Also on the diff's hover toolbar, as a\n\
+         # session override: this value wins again on the next config reload,\n\
+         # and on the next launch.\n\
+         # line_numbers = false\n\
          # Syntax-highlight diffs. false = the original flat per-role coloring.\n\
          # syntax = true\n\
          # Diff syntax-highlighting theme. Any of:\n\
@@ -996,6 +1013,13 @@ mod tests {
     }
 
     #[test]
+    fn line_numbers_parses_and_defaults_off() {
+        let cfg: Config = toml::from_str("[diff]\nline_numbers = true\n").unwrap();
+        assert!(cfg.diff.line_numbers);
+        assert!(!Config::default().diff.line_numbers);
+    }
+
+    #[test]
     fn detect_rename_copy_keys_parse() {
         let cfg: Config =
             toml::from_str("[diff]\ndetect_renames = false\ndetect_copies = true\n").unwrap();
@@ -1025,6 +1049,7 @@ mod tests {
         assert!(t.contains("detect_renames ="));
         assert!(t.contains("detect_copies ="));
         assert!(t.contains("textconv ="));
+        assert!(t.contains("line_numbers ="));
     }
 
     #[test]

@@ -38,9 +38,9 @@ use config::{FileListLayout, Fonts, Role};
 use datefmt::{RELATIVE_DATE_SAMPLE, format_commit_time, format_relative_time};
 use diff::{
     CommitKind, CommitStats, DiffAnchor, DiffData, DiffLine, DiffSettings, DiffSource, FileEntry,
-    LineKind, RowScope, StatsWant, capture_anchor, emphasize_rows, file_index_at_line,
-    file_index_at_line_opt, file_line_starts, get_diff_data, hash_diff_content, is_real_commit,
-    next_file_line, resolve_anchor,
+    LineKind, LineNoGutter, RowScope, StatsWant, capture_anchor, emphasize_rows,
+    file_index_at_line, file_index_at_line_opt, file_line_starts, get_diff_data, hash_diff_content,
+    is_real_commit, next_file_line, resolve_anchor,
 };
 use diff_cache::DiffCache;
 use diff_highlight::{
@@ -2127,10 +2127,17 @@ fn append_body(
 /// is no row tint. Word-diff emphasis backgrounds apply either way — blended from
 /// the row tint when syntax-on, from the pane background when off. Structural
 /// (non-code) lines render whole in one palette colour in both modes.
+///
+/// `linenos` prepends the line-number gutter, ahead of the +/- column and ahead of
+/// the structural early return — a hunk or file header belongs to the patch and so
+/// keeps the column (blank), or every header would sit a gutter-width left of the
+/// code under it. A zero-width gutter (the feature off) writes nothing, in both
+/// modes and for every kind.
 fn diff_row_job(
     line: &DiffLine,
     palette: &highlight::DiffPalette,
     font_id: &egui::FontId,
+    linenos: LineNoGutter,
     word_diff: bool,
     syntax: bool,
 ) -> (egui::text::LayoutJob, Option<egui::Color32>) {
@@ -2141,6 +2148,15 @@ fn diff_row_job(
         ..Default::default()
     };
     let mut job = LayoutJob::default();
+
+    // The numbers take the palette's dim colour in both modes rather than the
+    // row's: they are not part of the line, and a `+` line whose number was green
+    // too would read as content.
+    let mut gutter = String::new();
+    linenos.write(line, &mut gutter);
+    if !gutter.is_empty() {
+        job.append(&gutter, 0.0, fmt(palette.dim));
+    }
 
     // Non-code lines (hunk/file header/meta/stat) take one flat colour in both modes.
     if !line.kind.is_code() {
@@ -2533,6 +2549,12 @@ struct GitkApp {
     diff_settings: DiffSettings,
     word_diff: bool,           // highlight changed words within +/- lines (persisted)
     file_list: FileListLayout, // file-list sidebar layout (config [diff].file_list)
+    /// Draw each patch row's old/new line numbers (config `[diff].line_numbers`,
+    /// mirrored by a toolbar checkbox). Render-only — see `LineNoGutter`: it is
+    /// not a `DiffSettings` field, so flipping it rebuilds nothing and invalidates
+    /// neither cache. Config is authoritative, as it is for the detection
+    /// toggles: the checkbox is a session override a reload re-asserts over.
+    line_numbers: bool,
     diff_toolbar_rect: Option<egui::Rect>, // last shown hover-toolbar bounds (flicker guard)
     /// Unspent trackpad scrolling over the toolbar's context-width group, in steps —
     /// see `wheel_steps`. Dropped when the toolbar stops being shown.
@@ -2589,6 +2611,18 @@ struct GitkApp {
     highlight_rx: mpsc::Receiver<HighlightBatch>,
     highlight_priority: Option<Arc<VisibleRange>>, // visible file range (lo, hi) the worker prioritises
     diff_max_chars: usize, // widest diff line (chars); sizes the virtualized h-scroll for off-screen lines
+    /// The displayed diff's line-number column widths — measured once for the whole
+    /// diff rather than per row, so the numbers form a column.
+    ///
+    /// `None` ⇒ not measured yet. Filled by the render on the first frame that
+    /// actually draws a gutter and cleared by `set_diff_content`, which is the only
+    /// invalidation there is: with the checkbox off (the default) the scan never
+    /// runs at all, and ticking it needs no re-measure hook, because "off" and "not
+    /// yet measured" are the same state. `set_diff_content` measuring eagerly was
+    /// an O(lines) UI-thread scan on every install — cache hits and store loads
+    /// included, where there is no build to hide it behind — for a value most
+    /// sessions never read.
+    diff_linenos: Option<LineNoGutter>,
     /// Did the displayed diff fall back to a raw body because a textconv driver
     /// failed? Carried across the display so `stash_current_diff` can hand it back to
     /// `cache_diff`, which is the one caller that reassembles a `DiffData` from parts.
@@ -3256,6 +3290,7 @@ impl GitkApp {
             diff_settings: config_diff_settings(&cfg.diff, diff_context, diff_ignore_ws),
             word_diff,
             file_list: cfg.diff.file_list,
+            line_numbers: cfg.diff.line_numbers,
             diff_toolbar_rect: None,
             diff_context_scroll: 0.0,
             fonts,
@@ -3272,6 +3307,7 @@ impl GitkApp {
             _config_watcher: config_watcher,
             config_error_toast: startup_issue.then(std::time::Instant::now),
             diff_max_chars,
+            diff_linenos: None, // no diff yet, and nothing to measure until one draws
             diff_textconv_failed: false,
             sidebar_cache: SidebarCache::default(),
             file_line_starts: Vec::new(),
@@ -3850,6 +3886,14 @@ impl GitkApp {
         // the worker), so no per-line rescan happens here.
         let (lines, files, max_chars, textconv_failed) = data.into_parts();
         self.diff_max_chars = max_chars;
+        // Drop the previous diff's gutter widths; the render re-measures on the
+        // first frame that needs them, so a session with line numbers off never
+        // pays for the scan. Not a `DiffData` field for the same reason: it would
+        // have to cross `into_parts`/`from_parts` AND the store's byte layout to
+        // carry a value the display can re-derive, and only sometimes wants.
+        // `resync_file_layout` may reorder these lines afterwards; a re-lay moves
+        // rows without changing any number, so a measurement still holds.
+        self.diff_linenos = None;
         self.diff_textconv_failed = textconv_failed;
         self.diff_lines = lines;
         self.diff_files = files;
@@ -5955,6 +5999,10 @@ impl GitkApp {
                             {
                                 ui.ctx().request_repaint();
                             }
+                            // Likewise render-only, and with nothing to fill in
+                            // afterwards: the widths were measured when the diff
+                            // installed, so the next frame simply draws them.
+                            ui.checkbox(&mut self.line_numbers, "Line numbers");
                         });
                     });
                 });
@@ -6590,6 +6638,11 @@ impl GitkApp {
                 // re-lay them here for a layout-only change.
                 let layout_changed = self.file_list != cfg.diff.file_list;
                 self.file_list = cfg.diff.file_list;
+                // Render-only too, and cheaper still: the gutter needs neither a
+                // rebuild nor a re-lay — the widths were measured when the diff
+                // installed and the next frame reads this field. Config wins over
+                // the toolbar checkbox here, as it does for the detection toggles.
+                self.line_numbers = cfg.diff.line_numbers;
                 if reload_diff {
                     self.load_selected_diff();
                 } else if layout_changed {
@@ -7165,9 +7218,24 @@ impl eframe::App for GitkApp {
                     // previous diff on screen is transient, so don't consume
                     // diff_scroll_to (leave it for the incoming diff) or jump the old
                     // diff to a pending target.
+                    // The gutter, or a zero-width one when it is switched off — one
+                    // value read by both the width below and every row, so the space
+                    // reserved and the space drawn cannot disagree. Measured here, on
+                    // the first frame that draws one, and held until the next install
+                    // clears it: the scan costs nothing to a reader who never ticks
+                    // the box, and ticking it needs no hook of its own.
+                    let linenos = if self.line_numbers {
+                        let measured = self
+                            .diff_linenos
+                            .unwrap_or_else(|| LineNoGutter::measure(&self.diff_lines));
+                        self.diff_linenos = Some(measured);
+                        measured
+                    } else {
+                        LineNoGutter::default()
+                    };
                     let diff_view = DiffView {
                         n_lines: self.diff_lines.len(),
-                        content_chars: self.diff_max_chars,
+                        content_chars: self.diff_max_chars + linenos.chars(),
                         scroll_target: if diff_load_elapsed.is_some() {
                             None
                         } else {
@@ -7225,6 +7293,7 @@ impl eframe::App for GitkApp {
                                 &lines[i],
                                 render_palette,
                                 &font_id,
+                                linenos,
                                 word_diff,
                                 syntax,
                             );
@@ -7929,12 +7998,62 @@ mod tests {
         let palette = hl.palette().clone();
         let fid = egui::FontId::monospace(13.0);
         let bg = |text: &str, kind| {
-            diff_row_job(&DiffLine::new(text, kind), &palette, &fid, false, true).1
+            diff_row_job(
+                &DiffLine::new(text, kind),
+                &palette,
+                &fid,
+                LineNoGutter::default(),
+                false,
+                true,
+            )
+            .1
         };
         assert_eq!(bg("+x", LineKind::Add), Some(palette.added_bg));
         assert_eq!(bg("-x", LineKind::Del), Some(palette.deleted_bg));
         assert_eq!(bg("x", LineKind::Context), None);
         assert_eq!(bg("@@ -1 +1 @@", LineKind::Hunk), None);
+    }
+
+    /// The gutter is prepended by the ROW builder, ahead of the structural early
+    /// return: a hunk or file header belongs to the patch and keeps the column
+    /// (blank), so it lines up with the code beneath it rather than sitting a
+    /// gutter-width to its left. The commit message above the first file takes
+    /// none — turning line numbers on must not indent the message.
+    #[test]
+    fn diff_row_job_puts_every_patch_row_in_one_line_number_column() {
+        let hl = highlight::test_highlighter();
+        let palette = hl.palette().clone();
+        let fid = egui::FontId::monospace(13.0);
+        let n = std::num::NonZeroU32::new;
+        let lines = vec![
+            DiffLine::new("commit abc", LineKind::Meta),
+            DiffLine::new("@@ -9,2 +9,2 @@", LineKind::Hunk),
+            DiffLine::with_linenos("ctx", LineKind::Context, n(9), n(9)),
+            DiffLine::with_linenos("-old", LineKind::Del, n(10), None),
+            DiffLine::with_linenos("+new", LineKind::Add, None, n(100)),
+        ];
+        let g = LineNoGutter::measure(&lines);
+        let row = |i: usize, g| {
+            diff_row_job(&lines[i], &palette, &fid, g, false, true)
+                .0
+                .text
+        };
+
+        assert_eq!(row(0, g), "commit abc", "the message keeps column 0");
+        for (i, want) in [
+            (1, "       "),
+            (2, " 9   9 "),
+            (3, "10     "),
+            (4, "   100 "),
+        ] {
+            let text = row(i, g);
+            assert_eq!(&text[..g.chars()], want, "row {i} gutter");
+        }
+
+        // Switched off, the same rows render exactly as they did before the gutter
+        // existed — the zero-width default writes nothing, for every kind.
+        assert_eq!(row(1, LineNoGutter::default()), "@@ -9,2 +9,2 @@");
+        assert_eq!(row(2, LineNoGutter::default()), " ctx");
     }
 
     #[test]

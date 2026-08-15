@@ -341,6 +341,100 @@ impl DiffLine {
     }
 }
 
+/// The line-number gutter's shape for one diff: the digits each side needs.
+///
+/// Measured ONCE per diff (`measure`, where the diff installs) and applied to
+/// every row, so the numbers stand in a column rather than each file — or each
+/// row — sizing its own. That is the rule the commit list's `MetaCols` follows,
+/// for the same reason: a width taken from each row's own text makes every column
+/// left of the widest field step in and out as the list scrolls.
+///
+/// The default is zero-width, which is exactly what "the gutter is off" renders
+/// as — `chars` is 0 and `write` emits nothing — so no caller needs a second
+/// is-it-on test beside the one that picks the value.
+///
+/// Nothing here is a diff SETTING: the numbers come from data every built diff
+/// already carries (`DiffLine::old_lineno`/`new_lineno`, recorded for the scroll
+/// anchor and encoded in the persistent store), so turning the gutter on changes
+/// no diff, no cache key and no stored entry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LineNoGutter {
+    old: usize,
+    new: usize,
+}
+
+impl LineNoGutter {
+    /// The widest number on each side of `lines`. A side no row carries — a
+    /// commit that only adds files has no pre-image number anywhere — gets no
+    /// column at all rather than a zero-width one with a separator after it.
+    ///
+    /// ONE pass for both sides: this runs on the UI thread at every install,
+    /// including the cache hits and store loads that had no build to hide behind.
+    pub fn measure(lines: &[DiffLine]) -> Self {
+        let (mut old, mut new) = (0, 0);
+        for l in lines {
+            if let Some(n) = l.old_lineno {
+                old = old.max(n.get());
+            }
+            if let Some(n) = l.new_lineno {
+                new = new.max(n.get());
+            }
+        }
+        Self {
+            old: Self::digits(old),
+            new: Self::digits(new),
+        }
+    }
+
+    /// Decimal digits in `n` — and none at all for 0, which is how "no row
+    /// carries this side" reaches `side_chars` as "no column".
+    const fn digits(n: u32) -> usize {
+        if n == 0 { 0 } else { n.ilog10() as usize + 1 }
+    }
+
+    /// The rendered width in characters. Every patch row gets exactly this many
+    /// from `write`, so it is what the pane adds to its content width — an
+    /// over-estimate for the header rows above the first file, which take none,
+    /// and harmless there: it only ever leaves the horizontal scroll longer than
+    /// the widest line, never shorter than it.
+    pub const fn chars(self) -> usize {
+        Self::side_chars(self.old) + Self::side_chars(self.new)
+    }
+
+    /// One side's contribution: its digits plus the space after them, and nothing
+    /// at all when that side has no column. Shared by `chars` and `write` so the
+    /// promised width and the drawn one cannot drift.
+    const fn side_chars(digits: usize) -> usize {
+        if digits == 0 { 0 } else { digits + 1 }
+    }
+
+    /// Append `line`'s gutter text: its two numbers right-aligned in their
+    /// columns, blank where the row has none (an addition has no pre-image
+    /// number, a hunk header has neither). Emits either nothing — for a row above
+    /// the first file — or exactly `chars()` characters.
+    pub fn write(self, line: &DiffLine, out: &mut String) {
+        if !line.kind.in_patch() {
+            return;
+        }
+        Self::write_side(out, line.old_lineno, self.old);
+        Self::write_side(out, line.new_lineno, self.new);
+    }
+
+    fn write_side(out: &mut String, n: Option<NonZeroU32>, digits: usize) {
+        if digits == 0 {
+            return;
+        }
+        match n {
+            // Writing into a `String` is infallible.
+            Some(n) => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "{:>digits$} ", n.get());
+            }
+            None => out.extend(std::iter::repeat_n(' ', Self::side_chars(digits))),
+        }
+    }
+}
+
 /// Max body length (bytes) for which word-diff is computed; above this the LCS
 /// table grows too large and the highlight isn't readable anyway.
 pub const MAX_WORD_DIFF_LINE: usize = 2048;
@@ -432,6 +526,19 @@ impl LineKind {
     /// highlight; structural lines (hunk/file headers, stats) are not.
     pub const fn is_code(self) -> bool {
         matches!(self, Self::Add | Self::Del | Self::Context)
+    }
+
+    /// Rows belonging to a file's patch — the ones the line-number gutter
+    /// reserves its column on, whether or not they have a number to put in it (a
+    /// hunk header has none, git's EOF marker has none, both sit inside a patch).
+    /// The commit message, the diffstat block and the blanks between them are
+    /// above the first file and keep column 0, so turning the gutter on does not
+    /// indent the message by the width of a line number.
+    pub const fn in_patch(self) -> bool {
+        matches!(
+            self,
+            Self::Add | Self::Del | Self::Context | Self::Hunk | Self::FileMeta | Self::FileName
+        )
     }
 }
 
@@ -2412,6 +2519,85 @@ pub mod tests {
             .find(|l| l.text.starts_with("Binary files"))
             .expect("the binary marker row is in the patch");
         assert_eq!((bin.old_lineno, bin.new_lineno), (None, None));
+    }
+
+    /// A hand-built patch: three files' worth of shapes in one list, so the
+    /// gutter's widths are asked of a whole diff rather than of one file.
+    fn gutter_rows() -> Vec<DiffLine> {
+        let n = std::num::NonZeroU32::new;
+        vec![
+            DiffLine::new("commit abc", LineKind::Meta),
+            DiffLine::new("", LineKind::Blank),
+            DiffLine::new("diff --git a/f b/f", LineKind::FileMeta),
+            DiffLine::new("@@ -8,3 +8,3 @@", LineKind::Hunk),
+            DiffLine::with_linenos("ctx", LineKind::Context, n(9), n(9)),
+            DiffLine::with_linenos("-old", LineKind::Del, n(10), None),
+            DiffLine::with_linenos("+new", LineKind::Add, None, n(100)),
+            // git's EOF marker: Context, but carrying neither number.
+            DiffLine::new("\\ No newline at end of file", LineKind::Context),
+        ]
+    }
+
+    /// One width per SIDE per diff, taken from the widest number anywhere in it —
+    /// not per file and not per row, or the column steps in and out as the pane
+    /// scrolls past a file with more digits than the one above it.
+    #[test]
+    fn the_line_number_gutter_is_measured_over_the_whole_diff() {
+        let g = LineNoGutter::measure(&gutter_rows());
+        // Two digits on the old side (10), three on the new (100), each plus the
+        // space that separates it from what follows.
+        assert_eq!(g.chars(), 3 + 4);
+
+        let mut out = String::new();
+        g.write(&gutter_rows()[4], &mut out);
+        assert_eq!(out, " 9   9 ", "a context row states both sides");
+    }
+
+    /// Each side is skipped whole when no row carries it — a commit that only adds
+    /// files has no pre-image number anywhere, and a zero-width column would still
+    /// leave its separating space behind.
+    #[test]
+    fn a_side_no_row_carries_gets_no_column_at_all() {
+        let n = std::num::NonZeroU32::new;
+        let rows = vec![
+            DiffLine::with_linenos("+one", LineKind::Add, None, n(1)),
+            DiffLine::with_linenos("+two", LineKind::Add, None, n(2)),
+        ];
+        let g = LineNoGutter::measure(&rows);
+        assert_eq!(g.chars(), 2);
+        let mut out = String::new();
+        g.write(&rows[0], &mut out);
+        assert_eq!(out, "1 ");
+
+        // An empty diff has no gutter at all, which is also what the feature being
+        // switched off renders as — the default value, asserted here so the render
+        // needs no separate is-it-on branch.
+        assert_eq!(LineNoGutter::measure(&[]), LineNoGutter::default());
+        assert_eq!(LineNoGutter::default().chars(), 0);
+    }
+
+    /// `chars` is what the pane reserves and `write` is what fills it. If the two
+    /// drift the numbers stop lining up with each other, so every row of the patch
+    /// gets exactly the promised width — the rows with no number to show (a hunk
+    /// header, a file header, git's EOF marker) included, since those are what a
+    /// blanked column is for. The rows ABOVE the first file get none, which is why
+    /// this asserts on `in_patch` rather than on every row.
+    #[test]
+    fn every_patch_row_writes_exactly_the_width_the_gutter_promises() {
+        let rows = gutter_rows();
+        let g = LineNoGutter::measure(&rows);
+        for l in &rows {
+            let mut out = String::new();
+            g.write(l, &mut out);
+            let want = if l.kind.in_patch() { g.chars() } else { 0 };
+            assert_eq!(
+                out.chars().count(),
+                want,
+                "wrong gutter width for {:?} row {:?}",
+                l.kind,
+                l.text
+            );
+        }
     }
 
     /// The column and the file-list sidebar must never show different numbers for the
