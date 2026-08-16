@@ -7397,29 +7397,40 @@ impl GitkApp {
 static SHUTDOWN_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 impl Drop for GitkApp {
-    /// Time the teardown of the app's own state, because nothing else does and it is
-    /// not always free: a large diff is millions of `DiffLine`s, each holding an
-    /// `Arc<String>`, and freeing them one at a time is real work. eframe drops the
-    /// app inside its event loop after the last frame, so a slow exit otherwise
-    /// produces no output at all — which is exactly what a reader closing the window
-    /// on a huge diff sees.
+    /// Hand the app's two largest fields to the OS instead of freeing them line by
+    /// line.
     ///
-    /// The two big fields are dropped EXPLICITLY, in order, so the log attributes the
-    /// time rather than reporting one total for everything the struct holds.
+    /// Freeing them is real work and buys nothing: a large diff is millions of
+    /// `DiffLine`s each holding an `Arc<String>`, and the allocator walks every one of
+    /// them to hand the memory back to a process that is about to stop existing.
+    /// Measured on a 76.5M-line diff: **3.24s of a 3.44s exit**, with the window
+    /// already gone — the reader sees gitkay linger after they closed it, and eframe
+    /// drops the app inside its event loop after the last frame, so nothing even
+    /// logged it. The kernel reclaims the whole address space in one operation
+    /// moments later regardless.
+    ///
+    /// Nothing is skipped but the deallocation: these hold plain memory — `Arc`s,
+    /// `Vec`s, `String`s — and no destructor with an effect anyone could observe. The
+    /// rest of the struct still drops normally, which matters: dropping the channel
+    /// senders is how the worker threads learn to stop.
+    ///
+    /// The cost of the trick is that a leak checker now reports this memory as leaked
+    /// at exit. That is what it is: the leak is deliberate, bounded by the process
+    /// lifetime, and confined to these two fields.
     fn drop(&mut self) {
+        let t = std::time::Instant::now();
         let displayed = self.diff_lines.len();
         let cached = self.diff_cache.weight();
-        let t = std::time::Instant::now();
-        drop(std::mem::take(&mut self.diff_lines));
-        let shown = t.elapsed();
-        let t = std::time::Instant::now();
-        // No `clear`: dropping every entry is what `retain_keys` does with a
-        // predicate that keeps nothing, and the cache needs no method for a use
-        // that exists once.
-        self.diff_cache.retain_keys(|_| false);
+        std::mem::forget(std::mem::take(&mut self.diff_lines));
+        // `replace` rather than `take`: the cache has no `Default`, and a throwaway
+        // with a zero budget allocates nothing.
+        std::mem::forget(std::mem::replace(&mut self.diff_cache, DiffCache::new(0)));
+        // Still timed, and still reporting the sizes: the numbers say how much was in
+        // flight at exit, and the duration is what would regress if someone put the
+        // freeing back.
         log::debug!(
-            "shutdown: dropped the displayed diff ({displayed} lines) in {shown:?}, \
-             the diff cache ({cached} lines) in {:?}",
+            "shutdown: abandoned {displayed} displayed + {cached} cached diff lines \
+             to the OS in {:?}",
             t.elapsed()
         );
     }
