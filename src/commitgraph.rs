@@ -9,10 +9,10 @@
 //! query through `git log --topo-order` goes from **29.5s to 0.020s** once it
 //! exists, in 34MB.
 //!
-//! libgit2 cannot be made to use it. `revwalk.c` never mentions the commit-graph,
-//! and the measurement agrees: with the file present the same walk took 45.3s
-//! against 45.1s without. Neither `git2` nor `libgit2-sys` expose any commit-graph
-//! API either, so the format is read here.
+//! libgit2 cannot be made to use it for that. Its revwalk does read the file (see the
+//! last section), but the file makes no difference to how it orders: with the graph
+//! present the same walk took 45.3s against 45.1s without. Neither `git2` nor
+//! `libgit2-sys` exposes any commit-graph API either, so the format is read here.
 //!
 //! ## What a generation number buys
 //!
@@ -22,35 +22,57 @@
 //! establish without traversing the whole DAG, and the reason
 //! `provisional_commits` is an approximation today.
 //!
+//! ## The second question: which paths a commit changed
+//!
+//! `BIDX`/`BDAT` hold the **changed-path Bloom filters**, present only when the graph
+//! was written with `--changed-paths` (`git gc` writes neither). They answer "did this
+//! commit touch this path?" with "definitely not" or "maybe", off a few bits, where the
+//! path filter otherwise compares trees — see `ChangedPaths`, and `history::PathBloom`
+//! for what asks. The filter is computed against a commit's FIRST parent, which is
+//! exactly the question gitkay's path filter asks.
+//!
 //! ## What is deliberately NOT parsed
 //!
-//! Only `OIDF` (fanout), `OIDL` (the sorted oid list) and `CDAT` (commit data) are
-//! read, because the only question asked of this file is "what is this commit's
-//! generation number?" — git2 already supplies parents, trees and timestamps, and
-//! reading them twice could only introduce a disagreement. That leaves out `EDGE`
-//! (octopus parents), `GDA2` (corrected commit dates), and `BIDX`/`BDAT` (the
-//! changed-path Bloom filters, which would separately accelerate a path filter and
-//! are a different feature).
+//! `EDGE` (a third and further parent) and `GDA2` (corrected commit dates) are not
+//! read: git2 already supplies parents, trees and timestamps, and reading them twice
+//! could only introduce a disagreement.
 //!
-//! It also means the **split chain needs no position arithmetic**: a commit lives in
+//! That also means the **split chain needs no position arithmetic**: a commit lives in
 //! exactly one layer, so a lookup asks each layer in turn and the first hit wins. The
 //! global-position mapping that a parent-reading implementation would need does not
-//! arise.
+//! arise, and the Bloom chunks are per-layer for the same reason.
 //!
 //! ## Reading strategy
 //!
-//! `pread` against an open file, never a full read and never an mmap. The kernel's
-//! graph is 88MB and a walk asks about a few thousand commits, so slurping it would
-//! cost more memory than the answers are worth, and an mmap would cost a dependency
-//! (`memmap2`) to save syscalls that do not show up in a profile: the fanout narrows
-//! a lookup to the commits sharing a first byte (~1/256 of the file), so a lookup is
-//! ~13 probes of 20 bytes plus one 4-byte read.
+//! Two, because the two questions are asked at completely different rates.
+//!
+//! A generation lookup is `pread` against an open file, never a full read and never an
+//! mmap. The kernel's graph is 88MB and a walk asks about a few thousand commits, so
+//! slurping it would cost more memory than the answers are worth, and an mmap would
+//! cost a dependency (`memmap2`) to save syscalls that do not show up in a profile: the
+//! fanout narrows a lookup to the commits sharing a first byte (~1/256 of the file), so
+//! a lookup is ~13 probes of 20 bytes plus one 4-byte read.
+//!
+//! A path filter asks **once per commit examined**, which on a cold pathspec is every
+//! commit in the repository, and there those ~13 probes ARE the cost of the feature —
+//! measured at ~13.5µs a commit against the ~10µs tree comparison they were meant to
+//! replace, i.e. a loss. So `ChangedPaths` loads the oid list and the filter index into
+//! memory for as long as a filtered walk runs; see there for the size.
 //!
 //! Every read is bounds-checked against the chunk it belongs to and every failure
 //! answers `None`. A commit-graph is a *cache* — a corrupt or truncated one must
 //! degrade to "no generation numbers available", never to a panic or a wrong answer,
 //! because a wrong generation would silently break the graph layout it is meant to
-//! guarantee.
+//! guarantee, and a wrong Bloom answer would drop commits from a filtered view.
+//!
+//! ## libgit2 reads this file too
+//!
+//! Not for ORDERING — that measurement stands, 45.1s without the file and 45.3s with —
+//! but its revwalk does take parents from it. Measured while building the test
+//! fixtures: a hand-written graph whose parent columns said "no parent" truncated
+//! `git2`'s own walk to a single commit. Nothing in this module depends on that, but
+//! any fixture written for it must describe the commits truthfully, or the walk a test
+//! compares against is the one that is wrong.
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -64,6 +86,23 @@ const VERSION: u8 = 1;
 const CHUNK_OID_FANOUT: &[u8; 4] = b"OIDF";
 const CHUNK_OID_LOOKUP: &[u8; 4] = b"OIDL";
 const CHUNK_COMMIT_DATA: &[u8; 4] = b"CDAT";
+const CHUNK_BLOOM_INDEX: &[u8; 4] = b"BIDX";
+const CHUNK_BLOOM_DATA: &[u8; 4] = b"BDAT";
+
+/// `BDAT` opens with three 4-byte settings — hash version, hash count, bits per entry
+/// — and the filters follow them.
+const BDAT_HEADER: u64 = 12;
+
+/// The largest single filter this reader will load. git sizes one at
+/// `bits_per_entry` (10) bits per changed path and stops at `max_changed_paths` (512),
+/// so a real filter is ≤ 640 bytes; the cap is here because the length comes out of the
+/// file's own index, and a corrupt one must not turn into an allocation.
+const MAX_BLOOM_BYTES: u64 = 64 * 1024;
+
+/// The two seeds git hashes a path with, and the double-hashing scheme
+/// (`hash_i = hash0 + i * hash1`) they feed — `fill_bloom_key` in `bloom.c`.
+const BLOOM_SEED_0: u32 = 0x293a_e76f;
+const BLOOM_SEED_1: u32 = 0x7e64_6e2c;
 
 /// Bytes of `CDAT` after the tree oid: two 4-byte parent positions, then the
 /// packed generation + commit time.
@@ -71,6 +110,25 @@ const CDAT_AFTER_TREE: usize = 16;
 /// Where the packed `generation << 2 | time_high` sits inside a `CDAT` record,
 /// measured from the end of the tree oid.
 const CDAT_GENERATION_AT: usize = 8;
+
+/// One layer's changed-path Bloom filters: where they are, and how they were hashed.
+///
+/// Present only when the graph was written with `--changed-paths`, which is not what
+/// `git gc` does — so this is `None` far more often than not, and every caller has to
+/// degrade to asking the repository itself.
+struct Bloom {
+    /// `BIDX`: one 4-byte CUMULATIVE end offset per commit, in the same order `OIDL`
+    /// uses. A commit's filter is the bytes between its predecessor's end and its own,
+    /// so a zero-length span means "no filter was computed for this commit".
+    index: u64,
+    /// Where the filters themselves start — past `BDAT`'s settings header.
+    data: u64,
+    data_end: u64,
+    /// 1 hashes each byte as a SIGNED char (git's original, and its known bug: a path
+    /// with a byte over 0x7f hashes differently on ARM than on x86), 2 as unsigned.
+    hash_version: u32,
+    num_hashes: u32,
+}
 
 /// One commit-graph file. A repository has either exactly one of these or a chain
 /// of them (see `CommitGraph::open`).
@@ -86,6 +144,7 @@ struct Layer {
     /// File offsets of the two chunks a lookup reads.
     oid_lookup: u64,
     commit_data: u64,
+    bloom: Option<Bloom>,
 }
 
 impl Layer {
@@ -167,6 +226,13 @@ impl Layer {
         if data_end.checked_sub(commit_data)? < need {
             return None;
         }
+        // The Bloom chunks are optional in every sense: absent unless the graph was
+        // written with `--changed-paths`, and refused here rather than trusted if
+        // anything about them does not add up. `None` costs a caller only the diff it
+        // was going to do anyway, where a wrong answer silently drops commits from a
+        // filtered view.
+        let bloom = Self::open_bloom(&file, &find, commits, size);
+
         Some(Self {
             file,
             hash_len,
@@ -174,6 +240,49 @@ impl Layer {
             commits,
             oid_lookup,
             commit_data,
+            bloom,
+        })
+    }
+
+    /// `BIDX`/`BDAT`, when the file carries them and they describe this layer's commit
+    /// count. Every failure is a `None` — the filters are an optimisation, and half of
+    /// one is worse than none.
+    fn open_bloom(
+        file: &File,
+        find: &impl Fn(&[u8; 4]) -> Option<(u64, u64)>,
+        commits: u32,
+        size: u64,
+    ) -> Option<Bloom> {
+        let (index, index_end) = find(CHUNK_BLOOM_INDEX)?;
+        let (data, data_end) = find(CHUNK_BLOOM_DATA)?;
+        if index_end > size || data_end > size {
+            return None;
+        }
+        // One 4-byte cumulative offset per commit, and a settings header before the
+        // filters.
+        if index_end.checked_sub(index)? < u64::from(commits) * 4
+            || data_end.checked_sub(data)? < BDAT_HEADER
+        {
+            return None;
+        }
+        let mut header = [0u8; BDAT_HEADER as usize];
+        file.read_exact_at(&mut header, data).ok()?;
+        let word =
+            |i: usize| u32::from_be_bytes(header[i * 4..i * 4 + 4].try_into().unwrap_or_default());
+        let (hash_version, num_hashes) = (word(0), word(1));
+        // Two hash versions exist and they differ in one byte's signedness; a third
+        // would hash paths some way this code does not know, and guessing is exactly
+        // the wrong-but-plausible answer this whole reader avoids. `num_hashes` is
+        // bounded because it is a loop count read out of the file.
+        if !(1..=2).contains(&hash_version) || num_hashes == 0 || num_hashes > 64 {
+            return None;
+        }
+        Some(Bloom {
+            index,
+            data: data + BDAT_HEADER,
+            data_end,
+            hash_version,
+            num_hashes,
         })
     }
 
@@ -224,6 +333,158 @@ impl Layer {
         let generation = u32::from_be_bytes(buf) >> 2;
         (generation != 0).then_some(generation)
     }
+}
+
+/// The two 32-bit hashes git derives a Bloom key from — `fill_bloom_key`, which then
+/// expands them to `num_hashes` bit positions as `hash0 + i * hash1`. Keeping the pair
+/// rather than the expansion is what lets one key serve layers written with different
+/// `num_hashes`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct BloomKey(u32, u32);
+
+/// One pathspec entry's keys: the path itself, then every ancestor directory.
+///
+/// git stores a changed file's path AND each of its leading directories in the filter,
+/// so a directory pathspec answers directly; the ancestors are then queried too, which
+/// only lowers the false-positive rate — a filter holding `a/b/c.txt` holds `a/b` and
+/// `a` as well, so a miss on any of them means the path itself cannot be there.
+pub struct PathKeys {
+    keys: Vec<BloomKey>,
+}
+
+impl PathKeys {
+    /// Keys for `path` under a graph's `hash_version`, or `None` when this path cannot
+    /// be hashed the way the file was written.
+    ///
+    /// The refusal that matters is **version 1 with a byte over 0x7f**: git's original
+    /// hash reads each byte as a `char`, whose signedness is the compiler's choice, so
+    /// such a filter says different things depending on the machine that wrote it. A
+    /// path we cannot hash unambiguously is one we decline to answer for — the diff
+    /// below is always there to ask.
+    pub fn for_path(path: &str, hash_version: u32) -> Option<Self> {
+        let path = path.trim_end_matches('/');
+        if path.is_empty() {
+            return None;
+        }
+        let signed = match hash_version {
+            1 if path.is_ascii() => true,
+            2 => false,
+            _ => return None,
+        };
+        let key = |s: &str| {
+            BloomKey(
+                murmur3(BLOOM_SEED_0, s.as_bytes(), signed),
+                murmur3(BLOOM_SEED_1, s.as_bytes(), signed),
+            )
+        };
+        let mut keys = vec![key(path)];
+        keys.extend(
+            path.match_indices('/')
+                .filter(|(at, _)| *at > 0)
+                .map(|(at, _)| key(&path[..at])),
+        );
+        Some(Self { keys })
+    }
+}
+
+/// git's murmur3-32 over `data`, seeded — `murmur3_seeded_v{1,2}` in `bloom.c`, whose
+/// only difference is `signed`: version 1 sign-extends each byte (on any platform whose
+/// `char` is signed, which is where the filters in the wild were written), version 2
+/// does not.
+fn murmur3(seed: u32, data: &[u8], signed: bool) -> u32 {
+    const C1: u32 = 0xcc9e_2d51;
+    const C2: u32 = 0x1b87_3593;
+    let byte = |b: u8| -> u32 {
+        if signed {
+            // Sign-extended through i8 and back, which is what `(uint32_t)(char)b` does
+            // where `char` is signed.
+            b as i8 as i32 as u32
+        } else {
+            u32::from(b)
+        }
+    };
+    let mut h = seed;
+    let mut chunks = data.chunks_exact(4);
+    for c in &mut chunks {
+        let mut k = byte(c[0]) | (byte(c[1]) << 8) | (byte(c[2]) << 16) | (byte(c[3]) << 24);
+        k = k.wrapping_mul(C1).rotate_left(15).wrapping_mul(C2);
+        h ^= k;
+        h = h.rotate_left(13).wrapping_mul(5).wrapping_add(0xe654_6b64);
+    }
+    let tail = chunks.remainder();
+    if !tail.is_empty() {
+        let mut k = 0u32;
+        for (i, &b) in tail.iter().enumerate() {
+            k ^= byte(b) << (8 * i);
+        }
+        k = k.wrapping_mul(C1).rotate_left(15).wrapping_mul(C2);
+        h ^= k;
+    }
+    h ^= data.len() as u32;
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85eb_ca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2_ae35);
+    h ^= h >> 16;
+    h
+}
+
+/// How many bits git gives a filter per path it records (`bits_per_entry`, and its
+/// default 10). Written into `BDAT`'s header, but a READER never needs it: a filter's
+/// length is what decides the modulus, and the length is in the index. Only the fixture
+/// writer below has a use for it.
+#[cfg(test)]
+const BLOOM_BITS_PER_ENTRY: usize = 10;
+
+/// The filter bytes git would write for a commit that changed `paths` — every path and
+/// each of its leading directories, sized as `bloom.c` sizes one.
+///
+/// The fixture side of `definitely_unchanged`, `#[cfg(test)]` because nothing in gitkay
+/// WRITES a commit-graph. It lives here, beside the reader, so both suites describe the
+/// layout once: the `commitgraph` tests build files by hand, and `test_repo` builds them
+/// from a real repository's diffs.
+#[cfg(test)]
+pub fn bloom_filter_bytes(paths: &[String], num_hashes: u32, hash_version: u32) -> Vec<u8> {
+    let mut recorded: Vec<String> = Vec::new();
+    for path in paths {
+        let mut at: Option<&str> = Some(path.as_str());
+        while let Some(p) = at {
+            if !p.is_empty() && !recorded.iter().any(|r| r == p) {
+                recorded.push(p.to_string());
+            }
+            at = p.rsplit_once('/').map(|(head, _)| head);
+        }
+    }
+    let bits = recorded.len() * BLOOM_BITS_PER_ENTRY;
+    let len = bits.div_ceil(8).max(1);
+    let mut out = vec![0u8; len];
+    let modulus = len as u64 * 8;
+    for path in &recorded {
+        let keys = PathKeys::for_path(path, hash_version).expect("a fixture path");
+        // Only the path's OWN key is added: `for_path` also yields the ancestors, and
+        // those are recorded above as paths in their own right, exactly as git does.
+        let key = keys.keys[0];
+        for i in 0..num_hashes {
+            let h = key.0.wrapping_add(i.wrapping_mul(key.1));
+            let pos = u64::from(h) % modulus;
+            out[(pos / 8) as usize] |= 1 << (pos % 8);
+        }
+    }
+    out
+}
+
+/// Whether every one of `key`'s bits is set in `filter` — git's `bloom_filter_contains`,
+/// with the filter's bytes as its words.
+fn bloom_contains(filter: &[u8], key: BloomKey, num_hashes: u32) -> bool {
+    let bits = filter.len() as u64 * 8;
+    if bits == 0 {
+        return false;
+    }
+    (0..num_hashes).all(|i| {
+        let h = key.0.wrapping_add(i.wrapping_mul(key.1));
+        let pos = u64::from(h) % bits;
+        filter[(pos / 8) as usize] & (1 << (pos % 8)) != 0
+    })
 }
 
 /// A repository's commit-graph: one file, or a chain of them.
@@ -295,10 +556,171 @@ impl CommitGraph {
     }
 }
 
+/// The changed-path filters, loaded for QUERYING — one layer's oid list and filter
+/// index each, held in memory.
+///
+/// A second reading mode, deliberately, and the reason is the access pattern rather
+/// than taste. `generation` is asked a few thousand times by a walk, so it pays ~13
+/// `pread`s a lookup to keep the file on disk; a path filter asks once per commit
+/// EXAMINED, which on a cold pathspec is every commit in the repository, and there the
+/// binary search is the cost of the feature — measured at ~13.5µs a commit against the
+/// ~10µs tree lookup it was meant to replace, i.e. a loss. In memory the same search is
+/// a few hundred nanoseconds.
+///
+/// The price is `hash_len + 4` bytes a commit while a filtered walk runs: 35MB on a
+/// 1.47M-commit kernel clone, against the 1.79GB that walk's sorted alternative peaks
+/// at. The filters themselves stay on disk, read one at a time — they are the part
+/// nothing looks at twice.
+pub struct ChangedPaths<'a> {
+    layers: Vec<LoadedLayer<'a>>,
+    hash_version: u32,
+}
+
+struct LoadedLayer<'a> {
+    file: &'a File,
+    hash_len: usize,
+    fanout: [u32; 256],
+    /// `OIDL` verbatim: the sorted oids, `hash_len` bytes each.
+    oids: Vec<u8>,
+    /// `BIDX`: each commit's cumulative filter end.
+    index: Vec<u32>,
+    /// Where the filters start, and end.
+    data: u64,
+    data_end: u64,
+    num_hashes: u32,
+}
+
+impl<'a> ChangedPaths<'a> {
+    /// Load `graph`'s filters, or `None` when it has none — the usual case, since only
+    /// `git commit-graph write --changed-paths` writes them — or when its layers
+    /// disagree about the hash, which git does not write and a reader must not average
+    /// over.
+    pub fn open(graph: &'a CommitGraph) -> Option<Self> {
+        let mut version: Option<u32> = None;
+        let mut layers = Vec::with_capacity(graph.layers.len());
+        for layer in &graph.layers {
+            let bloom = layer.bloom.as_ref()?;
+            if *version.get_or_insert(bloom.hash_version) != bloom.hash_version {
+                return None;
+            }
+            let mut oids = vec![0u8; layer.commits as usize * layer.hash_len];
+            layer.file.read_exact_at(&mut oids, layer.oid_lookup).ok()?;
+            let mut raw = vec![0u8; layer.commits as usize * 4];
+            layer.file.read_exact_at(&mut raw, bloom.index).ok()?;
+            layers.push(LoadedLayer {
+                file: &layer.file,
+                hash_len: layer.hash_len,
+                fanout: layer.fanout,
+                oids,
+                index: raw
+                    .chunks_exact(4)
+                    .map(|c| u32::from_be_bytes(c.try_into().unwrap_or_default()))
+                    .collect(),
+                data: bloom.data,
+                data_end: bloom.data_end,
+                num_hashes: bloom.num_hashes,
+            });
+        }
+        Some(Self {
+            layers,
+            hash_version: version?,
+        })
+    }
+
+    /// Which murmur variant these filters were written with — what `PathKeys::for_path`
+    /// needs, and the one thing a caller must ask before building a key.
+    pub const fn hash_version(&self) -> u32 {
+        self.hash_version
+    }
+
+    /// Whether this commit's changed-path filter rules the path OUT.
+    ///
+    /// **One direction only, and that asymmetry is the whole safety of the feature.**
+    /// A Bloom filter answers "definitely not" or "maybe", so `true` here is a fact —
+    /// the commit did not touch the path — and everything else is `false`, meaning ask
+    /// the repository. A missing filter, a filter git marked too large, a commit
+    /// written since the graph: all of them are `false`, so the only way to drop a
+    /// commit wrongly is for the hash itself to be wrong, which is what this module's
+    /// oracle test is for.
+    ///
+    /// The filter is the commit's diff against its FIRST parent (`bloom.c` diffs
+    /// exactly that, and the empty tree for a root), which is the same question
+    /// `history::commit_touches_paths` asks.
+    pub fn definitely_unchanged(&self, oid: git2::Oid, keys: &PathKeys) -> bool {
+        let bytes = oid.as_bytes();
+        let Some((layer, pos)) = self
+            .layers
+            .iter()
+            .find_map(|l| l.position(bytes).map(|pos| (l, pos)))
+        else {
+            return false;
+        };
+        let Some(filter) = layer.filter(pos) else {
+            return false;
+        };
+        // A miss on the path OR on any of its ancestor directories rules it out; git
+        // stores every ancestor of a changed path, so a filter holding the path holds
+        // them too.
+        keys.keys
+            .iter()
+            .any(|&key| !bloom_contains(&filter, key, layer.num_hashes))
+    }
+}
+
+impl LoadedLayer<'_> {
+    /// `Layer::position`, over the oid list in memory.
+    fn position(&self, oid: &[u8]) -> Option<u32> {
+        let first = *oid.first()? as usize;
+        let mut lo = if first == 0 {
+            0
+        } else {
+            self.fanout[first - 1]
+        };
+        let mut hi = self.fanout[first];
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let at = mid as usize * self.hash_len;
+            match self.oids.get(at..at + self.hash_len)?.cmp(oid) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Some(mid),
+            }
+        }
+        None
+    }
+
+    /// This commit's filter bytes, or `None` for the zero-length span git records for a
+    /// commit whose filter was never computed.
+    fn filter(&self, pos: u32) -> Option<Vec<u8>> {
+        let end = u64::from(*self.index.get(pos as usize)?);
+        let start = if pos == 0 {
+            0
+        } else {
+            u64::from(*self.index.get(pos as usize - 1)?)
+        };
+        let len = end.checked_sub(start)?;
+        if len == 0 || len > MAX_BLOOM_BYTES || self.data + end > self.data_end {
+            return None;
+        }
+        let mut out = vec![0u8; len as usize];
+        self.file.read_exact_at(&mut out, self.data + start).ok()?;
+        Some(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    /// The changed-path half of a fixture: the settings `BDAT` states, and one filter
+    /// per commit that has one. A commit missing from the map gets a zero-length span,
+    /// which is how git records one whose filter was never computed.
+    struct BloomFixture {
+        hash_version: u32,
+        num_hashes: u32,
+        filters: std::collections::HashMap<git2::Oid, Vec<u8>>,
+    }
 
     /// Build a commit-graph file from `(oid, generation)` pairs, in git's own
     /// layout: header, chunk table of contents, then OIDF/OIDL/CDAT.
@@ -309,6 +731,12 @@ mod tests {
     /// zeroed generation, a truncated chunk) which are exactly the ones the
     /// reader has to refuse.
     fn write_graph(path: &Path, entries: &[(git2::Oid, u32)]) {
+        write_graph_inner(path, entries, None);
+    }
+
+    /// `write_graph`, plus the optional `BIDX`/`BDAT` pair that only
+    /// `git commit-graph write --changed-paths` produces.
+    fn write_graph_inner(path: &Path, entries: &[(git2::Oid, u32)], bloom: Option<&BloomFixture>) {
         let mut sorted = entries.to_vec();
         sorted.sort_by_key(|(oid, _)| *oid);
         let n = sorted.len() as u32;
@@ -335,23 +763,49 @@ mod tests {
             cdat.extend_from_slice(&0u32.to_be_bytes()); // commit time, unread
         }
 
-        let mut out = vec![b'C', b'G', b'P', b'H', VERSION, 1, 3, 0];
-        let toc_len = 4 * 12;
-        let mut at = out.len() as u64 + toc_len as u64;
-        for (id, chunk) in [
-            (CHUNK_OID_FANOUT, &oidf),
-            (CHUNK_OID_LOOKUP, &oidl),
-            (CHUNK_COMMIT_DATA, &cdat),
-        ] {
-            out.extend_from_slice(id);
+        // BIDX holds the CUMULATIVE end offset of each commit's filter, in OIDL order;
+        // BDAT the settings header followed by the filters themselves.
+        let (mut bidx, mut bdat) = (Vec::new(), Vec::new());
+        if let Some(b) = bloom {
+            for word in [b.hash_version, b.num_hashes, BLOOM_BITS_PER_ENTRY as u32] {
+                bdat.extend_from_slice(&word.to_be_bytes());
+            }
+            for (oid, _) in &sorted {
+                if let Some(filter) = b.filters.get(oid) {
+                    bdat.extend_from_slice(filter);
+                }
+                let end = (bdat.len() - BDAT_HEADER as usize) as u32;
+                bidx.extend_from_slice(&end.to_be_bytes());
+            }
+        }
+
+        let chunks: Vec<(&[u8; 4], &Vec<u8>)> = if bloom.is_some() {
+            vec![
+                (CHUNK_OID_FANOUT, &oidf),
+                (CHUNK_OID_LOOKUP, &oidl),
+                (CHUNK_COMMIT_DATA, &cdat),
+                (CHUNK_BLOOM_INDEX, &bidx),
+                (CHUNK_BLOOM_DATA, &bdat),
+            ]
+        } else {
+            vec![
+                (CHUNK_OID_FANOUT, &oidf),
+                (CHUNK_OID_LOOKUP, &oidl),
+                (CHUNK_COMMIT_DATA, &cdat),
+            ]
+        };
+        let mut out = vec![b'C', b'G', b'P', b'H', VERSION, 1, chunks.len() as u8, 0];
+        let mut at = out.len() as u64 + (chunks.len() as u64 + 1) * 12;
+        for (id, chunk) in &chunks {
+            out.extend_from_slice(*id);
             out.extend_from_slice(&at.to_be_bytes());
             at += chunk.len() as u64;
         }
         out.extend_from_slice(&[0u8; 4]); // terminating entry: id 0, end offset
         out.extend_from_slice(&at.to_be_bytes());
-        out.extend_from_slice(&oidf);
-        out.extend_from_slice(&oidl);
-        out.extend_from_slice(&cdat);
+        for (_, chunk) in &chunks {
+            out.extend_from_slice(chunk);
+        }
         assert_eq!(n, fanout[255]);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::File::create(path)
@@ -494,6 +948,180 @@ mod tests {
         // everything.
         std::fs::write(graphs.join("commit-graph-chain"), "aa11\n").unwrap();
         assert!(CommitGraph::open(&info).is_some());
+    }
+
+    /// The hash is the one thing here that cannot be checked against gitkay's own
+    /// fixtures — a writer and a reader sharing a wrong hash agree perfectly — so it is
+    /// pinned against values computed by a SEPARATE implementation, written from the
+    /// published algorithm rather than from this port.
+    ///
+    /// The first block is murmur3-32's own published vectors at seed 0, which say the
+    /// port is murmur3 at all; the second is git's two Bloom seeds over paths, which is
+    /// what `fill_bloom_key` feeds. Beyond this the check that matters is a real
+    /// repository's own filters, and that one cannot live in a suite that depends on no
+    /// `git` binary: it was run by hand over 15,719 commits of a repository whose graph
+    /// git wrote with `--changed-paths`, asserting no commit was ruled out for a path it
+    /// really changed.
+    #[test]
+    fn the_path_hash_matches_an_independent_murmur3() {
+        for (input, want) in [
+            ("", 0x0000_0000u32),
+            ("a", 0x3c25_69b2),
+            ("abc", 0xb3dd_93fa),
+            ("Hello, world!", 0xc036_3e43),
+            ("The quick brown fox jumps over the lazy dog", 0x2e4f_f723),
+        ] {
+            assert_eq!(
+                murmur3(0, input.as_bytes(), false),
+                want,
+                "murmur3 {input:?}"
+            );
+        }
+        for (path, want) in [
+            ("a/b.txt", (0x5e51_4f85u32, 0xc3ce_b2c2u32)),
+            ("a", (0x8fc5_291a, 0xf720_b3be)),
+            ("src", (0xe7ca_a49a, 0x9737_bd9d)),
+            ("src/main.rs", (0xc679_f386, 0x492e_5467)),
+        ] {
+            let keys = PathKeys::for_path(path, 2).expect("an ascii path");
+            assert_eq!(
+                (keys.keys[0].0, keys.keys[0].1),
+                want,
+                "bloom key for {path:?}"
+            );
+        }
+    }
+
+    /// A path's keys are the path itself and every ancestor DIRECTORY, which is what
+    /// git records for each changed file — so a filter can answer for `dir/sub` as well
+    /// as for the file under it. Order matters only in that the path's own key is
+    /// first, which is what the fixture writer adds.
+    #[test]
+    fn a_paths_keys_are_the_path_and_its_ancestors() {
+        let keys = PathKeys::for_path("a/b/c.txt", 2).unwrap();
+        let want: Vec<BloomKey> = ["a/b/c.txt", "a", "a/b"]
+            .iter()
+            .map(|p| PathKeys::for_path(p, 2).unwrap().keys[0])
+            .collect();
+        assert_eq!(keys.keys, want);
+        // A trailing slash is not part of the name git hashed.
+        assert_eq!(
+            PathKeys::for_path("src/", 2).unwrap().keys,
+            PathKeys::for_path("src", 2).unwrap().keys
+        );
+        assert!(PathKeys::for_path("", 2).is_none());
+        assert!(PathKeys::for_path("/", 2).is_none());
+    }
+
+    /// Version 1 hashes each byte as a `char`, whose signedness is the compiler's
+    /// choice — so a filter written for a path with a byte over 0x7f says different
+    /// things on x86 and on ARM. Such a path is declined rather than guessed at; an
+    /// ASCII one is unambiguous and still answered, and version 2 fixed the bug and
+    /// answers for anything.
+    #[test]
+    fn version_one_declines_a_path_it_cannot_hash_unambiguously() {
+        assert!(PathKeys::for_path("src/main.rs", 1).is_some());
+        assert!(PathKeys::for_path("src/café.rs", 1).is_none());
+        assert!(PathKeys::for_path("src/café.rs", 2).is_some());
+        // An unknown version is not a version to guess at.
+        assert!(PathKeys::for_path("src/main.rs", 3).is_none());
+        // And the two versions really do differ once a byte is over 0x7f, which is what
+        // makes the refusal above necessary rather than cautious.
+        let high = "é".as_bytes();
+        assert_ne!(
+            murmur3(BLOOM_SEED_0, high, true),
+            murmur3(BLOOM_SEED_0, high, false)
+        );
+    }
+
+    /// The whole point, over a file built the way git builds one: a commit is ruled out
+    /// for a path it did not change, and never for one it did.
+    #[test]
+    fn a_changed_path_filter_rules_out_the_paths_a_commit_did_not_touch() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = dir.path().join("objects").join("info");
+        let changed = |paths: &[&str]| {
+            bloom_filter_bytes(
+                &paths.iter().map(|p| (*p).to_string()).collect::<Vec<_>>(),
+                7,
+                2,
+            )
+        };
+        let filters = std::collections::HashMap::from([
+            (oid(1), changed(&["a/b.txt"])),
+            (oid(2), changed(&["c.txt", "d/e/f.txt"])),
+        ]);
+        write_graph_inner(
+            &info.join("commit-graph"),
+            &[(oid(1), 1), (oid(2), 2), (oid(3), 3)],
+            Some(&BloomFixture {
+                hash_version: 2,
+                num_hashes: 7,
+                filters,
+            }),
+        );
+        let g = CommitGraph::open(&info).unwrap();
+        let g = ChangedPaths::open(&g).expect("filters");
+        assert_eq!(g.hash_version(), 2);
+        let keys = |p: &str| PathKeys::for_path(p, 2).unwrap();
+
+        // What the commit changed is never ruled out — the direction that would drop a
+        // commit from a filtered view.
+        assert!(!g.definitely_unchanged(oid(1), &keys("a/b.txt")));
+        assert!(!g.definitely_unchanged(oid(1), &keys("a")));
+        assert!(!g.definitely_unchanged(oid(2), &keys("d/e/f.txt")));
+        assert!(!g.definitely_unchanged(oid(2), &keys("d/e")));
+        // What it did not is.
+        assert!(g.definitely_unchanged(oid(1), &keys("c.txt")));
+        assert!(g.definitely_unchanged(oid(2), &keys("a/b.txt")));
+        assert!(g.definitely_unchanged(oid(1), &keys("nowhere/at/all.txt")));
+        // A commit with no filter, and a commit the graph has never heard of, are both
+        // "ask the repository" rather than "unchanged".
+        assert!(!g.definitely_unchanged(oid(3), &keys("a/b.txt")));
+        assert!(!g.definitely_unchanged(oid(99), &keys("a/b.txt")));
+    }
+
+    /// git marks a commit that changed more paths than it will record with a single
+    /// 0xFF byte, which answers "maybe" for everything by construction — so the reader
+    /// needs no special case, and this is what says so.
+    #[test]
+    fn a_filter_git_marked_too_large_rules_nothing_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = dir.path().join("objects").join("info");
+        write_graph_inner(
+            &info.join("commit-graph"),
+            &[(oid(1), 1)],
+            Some(&BloomFixture {
+                hash_version: 2,
+                num_hashes: 7,
+                filters: std::collections::HashMap::from([(oid(1), vec![0xFFu8])]),
+            }),
+        );
+        let g = CommitGraph::open(&info).unwrap();
+        let g = ChangedPaths::open(&g).expect("filters");
+        assert!(!g.definitely_unchanged(oid(1), &PathKeys::for_path("any/path", 2).unwrap()));
+    }
+
+    /// A graph with no `BIDX`/`BDAT` — what `git gc` writes, so the usual case — has no
+    /// version to hash against, and a settings header naming a hash this code does not
+    /// know is refused rather than read as version 1.
+    #[test]
+    fn a_graph_without_usable_filters_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = dir.path().join("objects").join("info");
+        write_graph(&info.join("commit-graph"), &[(oid(1), 1)]);
+        assert!(ChangedPaths::open(&CommitGraph::open(&info).unwrap()).is_none());
+
+        write_graph_inner(
+            &info.join("commit-graph"),
+            &[(oid(1), 1)],
+            Some(&BloomFixture {
+                hash_version: 9,
+                num_hashes: 7,
+                filters: std::collections::HashMap::new(),
+            }),
+        );
+        assert!(ChangedPaths::open(&CommitGraph::open(&info).unwrap()).is_none());
     }
 
     /// Generation numbers are only useful if the strict-parent-below-child property

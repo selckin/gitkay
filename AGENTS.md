@@ -301,8 +301,11 @@ holds less than the scope asked for. git2-facing and egui-free, the same shape
 drawn". See **Startup & timing** for why the walk needs three strategies rather
 than one),
 `src/commitgraph.rs` (reading git's commit-graph file — the generation numbers
-libgit2 will not give us; only `OIDF`/`OIDL`/`CDAT`, by `pread`, refusing anything
-malformed rather than guessing),
+libgit2 will not give us, and the changed-path Bloom filters a path filter asks:
+`OIDF`/`OIDL`/`CDAT` by `pread` for the first, `BIDX`/`BDAT` through `ChangedPaths`
+(which loads the oid list and filter index into memory, because that question is
+asked once per commit examined rather than a few thousand times) for the second,
+refusing anything malformed rather than guessing),
 `src/topo.rs` (the lazy topological walk those numbers make possible — see
 **The commit order**),
 `src/graph.rs` (the commit graph's lane/pipe layout: `CommitInfo`s in, per-row
@@ -366,8 +369,14 @@ The big picture, ahead of the detail sections below:
   two shapes. gitkay's rule is the one that matches the DIFF PANE: every row in a
   filtered view has a non-empty diff under that pathspec, and no row is listed whose
   pane would be blank. The lazy driver is **bounded** (`LAZY_FILTER_SHARE`) because a
-  filter, unlike every other scope, need not stop early — see there for the four
-  measurements that set the share, and for the one case it deliberately makes slower
+  filter, unlike every other scope, need not stop early — see there for the five
+  measurements that set the share, and for the one case it deliberately makes slower.
+  Both drivers consult the **changed-path Bloom filters** when the repo has them
+  (`PathBloom` → `commitgraph::ChangedPaths`), which is what turns the per-commit tree
+  comparison into a few bits: on that clone, 190,618 of 191,485 commits ruled out and
+  the touch test down from 7.0s to 1.2s. Its keys are built once, so `--follow` (whose
+  path moves) and a glob (which git never hashed) decline; a graph without `BIDX`/`BDAT`
+  — what `git gc` writes — declines too
 - `load_commits_tail()` — incremental extension for the plain (no path filter,
   non-reflog) scope: re-runs the same deterministic walk (`history_revwalk` is the
   single walk config — both walks must order identically for the resume to be sound),
@@ -402,10 +411,14 @@ The invariants:
   the row limit. Do not "simplify" the deferred install back to a blocking `recv()`.
   The lazy walk is fast, but it does not cover every scope and needs a file the repo
   may not have, so the deferral protects the case that still happens.
-- **libgit2 cannot be made lazy, and a commit-graph does not help it.** `revwalk.c`
-  never reads the file: measured 45.1s without it and 45.3s with it, on the same repo
-  and query. Nothing in `git2` exposes it either. That is why `commitgraph.rs` parses
-  it and `topo.rs` walks with it, rather than either being a flag passed to libgit2.
+- **libgit2 cannot be made lazy, and a commit-graph does not help it ORDER.** Measured
+  45.1s without the file and 45.3s with it, on the same repo and query. Nothing in
+  `git2` exposes the format either. That is why `commitgraph.rs` parses it and
+  `topo.rs` walks with it, rather than either being a flag passed to libgit2. **It does
+  read the file for parents**, though — a hand-written test fixture whose parent columns
+  said "no parent" truncated `git2`'s own revwalk to one commit — so a fixture graph
+  must describe its commits truthfully or the walk a test compares against is the wrong
+  one (`test_repo::write_graph_of` fills every column from the real commit).
 - **gitkay does not write a commit-graph, and keeps no generation cache of its own** —
   it says the file is absent and names the command (`commit_graph_advice`, a second
   `warn` line under `note_slow_history_walk`'s latch). That is a measurement, not a
@@ -1269,7 +1282,16 @@ claiming, and `warm_disposition`'s precedence),
 on no `git` binary: both on-disk shapes, a zeroed generation refused as the
 pre-2.19 marker it is, a chunk whose claimed end is past the real end of the file,
 and a chain naming anything but a hash — the file names the files to open and a
-repository is untrusted input), `topo` (the walk: a brute-force topological oracle,
+repository is untrusted input; then the changed-path filters, where the hazard is that
+a writer and a reader sharing a WRONG hash agree perfectly, so the hash is pinned
+against vectors from a separate implementation — murmur3's own published ones, and
+git's two Bloom seeds over paths — and the rest asserts what a filter must never do:
+rule out a path the commit changed, or read a "too large" filter as anything but
+"maybe". **The check those cannot make is against git's own filters**, which needs a
+`git` binary and so cannot live here: it was run by hand over two repositories whose
+graphs git wrote with `--changed-paths` (13,424 and 4,336 commits, both hash versions),
+asserting across 223,910 changed paths that not one was ruled out — re-run that, not
+just the suite, before trusting a change to the hashing), `topo` (the walk: a brute-force topological oracle,
 the merge-grouping property a reader actually sees, a deliberately stale graph, the
 ancestry-closure guard, and `--first-parent`; each of the three mechanisms was
 demonstrated to fail a specific test when removed — and the parity that matters most
@@ -1410,7 +1432,13 @@ does (the failure-to-read guards need them), `write_attributes` to change a fixe
 commit's diff without touching the commit (libgit2 reads `.gitattributes` from the
 working tree — the diff store's key depends on it), `set_config`/`write_driver` plus
 `driver_script` to stand up a whole textconv fixture (a `[diff "<name>"]` section, the
-`.gitattributes` line that selects it, and a `/bin/sh` script to run), and
+`.gitattributes` line that selects it, and a `/bin/sh` script to run),
+`write_commit_graph` / `write_commit_graph_exact` /
+`write_commit_graph_with_changed_paths` to put a commit-graph beside a real repository
+— every column filled from the real commit, because **libgit2 reads this file** and a
+fixture that lies about a commit's parents corrupts `git2`'s own revwalk (measured:
+truncated to one commit), and `_exact` deliberately writes an ancestry-UNCLOSED file,
+which is a shape no walk can be trusted over, its own included — and
 `read_file`/`index_blob`
 to assert on the worktree vs. the index separately. Add fixtures there rather than
 re-rolling them per module.

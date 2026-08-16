@@ -726,29 +726,32 @@ struct FilteredWalk {
 /// pathspec nothing has touched lately — a file deleted years ago, or a typo — is
 /// satisfied only by the end of history.
 ///
-/// That matters because the two walks cost different amounts per commit. On a
-/// 1.465M-commit kernel clone the lazy walk is ~105µs a commit (30.0s for 293k)
-/// against the sorted one's ~39µs (a 49–60s ordering pass over the whole repository,
-/// plus its own iteration), since it reads every commit through `find_commit` where
-/// libgit2's pass has already parsed the pack once. Both then pay the same touch test
-/// per commit examined (~90µs on that clone's trees, ~4µs on a shallow one), which is
-/// what puts the crossover at roughly **0.7 of the repository** rather than at 0.4.
+/// The shape of the comparison is a fixed cost against a per-commit one. The sorted
+/// walk pays libgit2's ordering pass over the WHOLE repository before it yields
+/// anything — 50s on a 1.465M-commit kernel clone — and then ~79µs a commit examined;
+/// the lazy walk pays nothing up front and ~129µs a commit, since it reads each one
+/// through `find_commit` where that pass has already parsed the pack once. Those put
+/// the break-even at roughly **0.85 of the repository**, and a graph carrying
+/// changed-path filters moves it to 0.84 rather than anywhere new — the filters take
+/// work off both sides.
 ///
-/// A fifth sits below that with room to spare, and the measurements either side of it
-/// are what chose it — 200 rows on that clone, lazy against sorted:
+/// So the budget is not the break-even; it is where the LOSS is still acceptable when
+/// the walk turns out not to answer at all. A third of the repository, measured on that
+/// clone with no changed-path filters:
 ///
-/// | pathspec | commits walked | lazy | sorted |
-/// |---|---|---|---|
-/// | `MAINTAINERS` | 1.9k | **3.2s** | 52s |
-/// | `kernel/sched/core.c` | 51k | **11.4s** | 60s |
-/// | `Documentation/process/coding-style.rst` | 191k | **37s** | 84s |
-/// | a mistyped path | all of it | 223s | **163s** |
+/// | pathspec | rows | commits walked | lazy | sorted |
+/// |---|---|---|---|---|
+/// | `MAINTAINERS` | 200 | 8.4k | **4.7s** | 50.7s |
+/// | `kernel/sched/core.c` | 200 | 51k | **11.9s** | 59.1s |
+/// | `Documentation/process/coding-style.rst` | 100 | 191k | **29.9s** | 71.5s |
+/// | the same file | 200 | 525k | over budget | 106.9s |
+/// | a mistyped path | 200 | all of it | 232s | **166s** |
 ///
-/// The last row is the whole cost of being wrong, and it is bounded by this constant:
-/// the give-up is what the reader pays extra, and it only ever lands on a query that
-/// was going to take minutes anyway. A tenth would have kept that 60s and given up the
-/// 47s on the row above it, which is the trade this is making in the other direction.
-const LAZY_FILTER_SHARE: usize = 5;
+/// The last row is the whole cost of being wrong: the give-up is ~38% on top of a query
+/// that was going to take minutes either way. The row above it is the cost of being too
+/// cautious — a fifth would have refused that one too, and a half would have caught it
+/// for another ~30s on the mistyped path. Both are defensible; this is the middle.
+const LAZY_FILTER_SHARE: usize = 3;
 
 /// The floor under that budget. A repository small enough to reach it answers in
 /// milliseconds either way, so this decides nothing about speed; what it decides is
@@ -757,6 +760,58 @@ const LAZY_FILTER_SHARE: usize = 5;
 /// on a 2.2k-commit repository), for the reason the table above gives: the sorted
 /// walk's per-commit cost is what a small repository makes negligible.
 const MIN_LAZY_FILTER_WALK: usize = 1_000;
+
+/// The commit-graph's changed-path Bloom filters, ready to answer for one scope's
+/// pathspec — the test `commit_touches_paths` costs ~90µs a commit on a large
+/// repository's trees, answered from a few bits instead.
+///
+/// `None` from `of` wherever the filters cannot be trusted to answer the question being
+/// asked, and each of those is a real restriction rather than caution:
+///
+/// - **`--follow`** changes the path as the walk descends, and these keys are built
+///   once.
+/// - **A glob** is not a path git hashed; the filters hold exact paths and their
+///   ancestor directories, so only what `literal_pathspec` accepts can be looked up —
+///   the same predicate that decides whether a tree lookup can stand in for a diff.
+/// - **A graph with no `BIDX`/`BDAT`**, which is the usual case: `git gc` writes
+///   neither, only `git commit-graph write --changed-paths` does.
+struct PathBloom<'a> {
+    filters: crate::commitgraph::ChangedPaths<'a>,
+    keys: Vec<crate::commitgraph::PathKeys>,
+}
+
+impl<'a> PathBloom<'a> {
+    fn of(graph: &'a crate::commitgraph::CommitGraph, scope: &cli::Scope) -> Option<Self> {
+        if scope.follow
+            || scope.paths.is_empty()
+            || !scope.paths.iter().all(|p| literal_pathspec(p))
+        {
+            return None;
+        }
+        let t = std::time::Instant::now();
+        let filters = crate::commitgraph::ChangedPaths::open(graph)?;
+        let version = filters.hash_version();
+        let keys = scope
+            .paths
+            .iter()
+            .map(|p| crate::commitgraph::PathKeys::for_path(p, version))
+            .collect::<Option<Vec<_>>>()?;
+        log::debug!(
+            "perf: load_commits: changed-path filters loaded (hash version {version}) {:?}",
+            t.elapsed()
+        );
+        Some(Self { filters, keys })
+    }
+
+    /// Whether this commit can be dropped without diffing it: the filter must rule out
+    /// EVERY path in the spec, since the scope keeps a commit that touches any one of
+    /// them.
+    fn definitely_unchanged(&self, oid: git2::Oid) -> bool {
+        self.keys
+            .iter()
+            .all(|k| self.filters.definitely_unchanged(oid, k))
+    }
+}
 
 /// The path filter itself, over whatever walk supplies the oids.
 ///
@@ -782,6 +837,7 @@ fn filtered_walk(
     max: usize,
     ref_map: &std::collections::HashMap<git2::Oid, Vec<(String, RefKind)>>,
     label: &str,
+    bloom: Option<&PathBloom<'_>>,
     oids: impl Iterator<Item = Result<git2::Oid, Declined>>,
 ) -> Option<FilteredWalk> {
     // 1. Walk newest→oldest, recording every commit's parents; keep the ones that
@@ -803,11 +859,12 @@ fn filtered_walk(
         std::time::Duration::ZERO,
         std::time::Duration::ZERO,
     );
-    // How many touch tests ran, and how many of those had to be a whole diff
-    // because a lookup could not stand in (see `commit_touches_paths`). A glob
-    // is 60× the cost of a literal path, and that is worth saying rather than
+    // How many touch tests ran, how many of those had to be a whole diff because a
+    // lookup could not stand in (see `commit_touches_paths`), and how many commits the
+    // changed-path filters answered for outright. A glob is 60× the cost of a literal
+    // path and a Bloom hit is ~1/20th of one, and that is worth saying rather than
     // leaving inside one large `path test` number.
-    let (mut tested, mut diffed) = (0usize, 0usize);
+    let (mut tested, mut diffed, mut ruled_out) = (0usize, 0usize, 0usize);
     // Time to the FIRST oid, which is not iteration: the sorted walk orders the whole
     // history inside that first `next()`, and the lazy one expands its frontier down to
     // the tip's generation. The two are worth separating from what follows because they
@@ -829,13 +886,26 @@ fn filtered_walk(
         };
         let parents: Vec<git2::Oid> = commit_parents(&commit, scope.first_parent);
         walked.push((oid, parents.clone()));
-        let test = timed(&mut touch, || {
-            follow_path.as_ref().map_or_else(
-                || commit_touches_paths(repo, &commit, &scope.paths),
-                |p| commit_touches_paths(repo, &commit, std::slice::from_ref(p)),
-            )
+        // The commit still had to be READ, for the parents the rewrite chains through;
+        // what the filter saves is the tree comparison, which is the expensive half.
+        let ruled = timed(&mut touch, || {
+            bloom.is_some_and(|b| b.definitely_unchanged(oid))
         });
-        tested += 1;
+        ruled_out += usize::from(ruled);
+        let test = if ruled {
+            Touch {
+                touched: false,
+                by_diff: false,
+            }
+        } else {
+            tested += 1;
+            timed(&mut touch, || {
+                follow_path.as_ref().map_or_else(
+                    || commit_touches_paths(repo, &commit, &scope.paths),
+                    |p| commit_touches_paths(repo, &commit, std::slice::from_ref(p)),
+                )
+            })
+        };
         diffed += usize::from(test.by_diff);
         if test.touched {
             kept_set.insert(oid);
@@ -889,8 +959,9 @@ fn filtered_walk(
     }
     log::debug!(
         "perf: load_commits: {label} path filter over {} commits — first oid {start:?}, \
-         iterate {iterate:?}, find_commit {find:?}, path test ({diffed}/{tested} by diff) \
-         {touch:?}, build ({} rows) {build:?}, rename trace {trace:?}, parent rewrite {:?}",
+         iterate {iterate:?}, find_commit {find:?}, path test ({diffed}/{tested} by diff, \
+         {ruled_out} ruled out by changed-path filters) {touch:?}, build ({} rows) {build:?}, \
+         rename trace {trace:?}, parent rewrite {:?}",
         walked.len(),
         kept.len(),
         t_rewrite.elapsed()
@@ -953,6 +1024,7 @@ fn lazy_filtered_walk_bounded(
     budget: usize,
 ) -> Option<FilteredWalk> {
     let tips = topo_tips(repo, scope)?;
+    let bloom = PathBloom::of(graph, scope);
     let mut walk = crate::topo::TopoWalk::new(repo, graph, &tips, scope.first_parent);
     let mut taken = 0usize;
     let t = std::time::Instant::now();
@@ -962,6 +1034,7 @@ fn lazy_filtered_walk_bounded(
         max,
         ref_map,
         "lazy",
+        bloom.as_ref(),
         std::iter::from_fn(|| {
             if taken >= budget {
                 log::debug!(
@@ -992,6 +1065,11 @@ fn lazy_filtered_walk_bounded(
 /// whenever the lazy one is unavailable or gave up. `None` only when the repository
 /// cannot produce a revwalk at all — the filter itself always answers here, the sorted
 /// walk having nothing to decline with.
+///
+/// It opens a commit-graph of its own, for the changed-path filters alone. Those are a
+/// separate question from how the walk is ORDERED — and this is the walk that runs when
+/// a pathspec is too cold to walk lazily, which is exactly the run that examines every
+/// commit in the repository and so has the most to save.
 fn sorted_filtered_walk(
     repo: &Repository,
     scope: &cli::Scope,
@@ -1004,12 +1082,15 @@ fn sorted_filtered_walk(
         "perf: load_commits: path filter revwalk setup {:?}",
         t.elapsed()
     );
+    let graph = crate::commitgraph::CommitGraph::for_repo(repo);
+    let bloom = graph.as_ref().and_then(|g| PathBloom::of(g, scope));
     filtered_walk(
         repo,
         scope,
         max,
         ref_map,
         "sorted",
+        bloom.as_ref(),
         revwalk.flatten().map(Ok),
     )
 }
@@ -3147,11 +3228,100 @@ mod tests {
         );
     }
 
+    /// A commit-graph written with `--changed-paths` answers the filter's question from
+    /// a few bits instead of a tree comparison — and must answer it the SAME WAY. This
+    /// is the safety property of the whole feature: the rows do not move, only the cost.
+    #[test]
+    fn changed_path_filters_keep_the_filtered_rows_identical() {
+        let (dir, repo) = temp_repo();
+        let a1 = commit_file(&repo, "src/a.txt", "1", "a-1");
+        commit_file(&repo, "other/b.txt", "1", "b-only");
+        let a2 = commit_file(&repo, "src/a.txt", "2", "a-2");
+        commit_file(&repo, "other/b.txt", "2", "b-only-again");
+        let tip = commit_file(&repo, "src/deep/c.txt", "1", "c under src");
+        let ref_map = build_ref_map(&repo);
+
+        // Without filters first, as the answer everything else must match.
+        write_commit_graph(&repo, &[tip]);
+        let repo = open_repo(dir.path());
+        let rows = |scope: &cli::Scope, repo: &Repository| -> Vec<git2::Oid> {
+            sorted_filtered_walk(repo, scope, 100, &ref_map)
+                .expect("the sorted filter")
+                .kept
+                .iter()
+                .map(|c| c.oid)
+                .collect()
+        };
+        let file = cli::Scope {
+            paths: vec!["src/a.txt".to_string()],
+            ..Default::default()
+        };
+        let dir_scope = cli::Scope {
+            paths: vec!["src".to_string()],
+            ..Default::default()
+        };
+        let graph = crate::commitgraph::CommitGraph::for_repo(&repo).unwrap();
+        assert!(
+            PathBloom::of(&graph, &file).is_none(),
+            "a graph without BIDX/BDAT — what `git gc` writes — has nothing to offer"
+        );
+        let (want_file, want_dir) = (rows(&file, &repo), rows(&dir_scope, &repo));
+        assert_eq!(want_file, vec![a2, a1]);
+        assert_eq!(want_dir.len(), 3, "the directory catches c under src too");
+
+        // Now with them.
+        write_commit_graph_with_changed_paths(&repo, &[tip]);
+        let repo = open_repo(dir.path());
+        let graph = crate::commitgraph::CommitGraph::for_repo(&repo).unwrap();
+        assert!(
+            PathBloom::of(&graph, &file).is_some(),
+            "the filters should now be in use"
+        );
+        assert_eq!(rows(&file, &repo), want_file);
+        assert_eq!(rows(&dir_scope, &repo), want_dir);
+        // And the lazy driver, which builds its own.
+        assert_eq!(
+            lazy_filtered_walk(&repo, &file, 100, &ref_map)
+                .expect("the lazy filter")
+                .kept
+                .iter()
+                .map(|c| c.oid)
+                .collect::<Vec<_>>(),
+            want_file
+        );
+    }
+
+    /// The filters answer for exact paths git hashed, so a scope they cannot be asked
+    /// about keeps diffing — and each refusal is a real restriction rather than caution.
+    #[test]
+    fn the_changed_path_filters_decline_the_scopes_they_cannot_answer() {
+        let (dir, repo) = temp_repo();
+        let tip = commit_file(&repo, "src/a.txt", "1", "a-1");
+        write_commit_graph_with_changed_paths(&repo, &[tip]);
+        let repo = open_repo(dir.path());
+        let graph = crate::commitgraph::CommitGraph::for_repo(&repo).unwrap();
+        let with = |f: fn(&mut cli::Scope)| {
+            let mut s = cli::Scope {
+                paths: vec!["src/a.txt".to_string()],
+                ..Default::default()
+            };
+            f(&mut s);
+            s
+        };
+        assert!(PathBloom::of(&graph, &with(|_| {})).is_some());
+        // A glob is not a path git hashed.
+        assert!(PathBloom::of(&graph, &with(|s| s.paths = vec!["src/*.txt".into()])).is_none());
+        // `--follow` changes the path as the walk descends; these keys are built once.
+        assert!(PathBloom::of(&graph, &with(|s| s.follow = true)).is_none());
+        // No pathspec, nothing to ask about.
+        assert!(PathBloom::of(&graph, &with(|s| s.paths.clear())).is_none());
+    }
+
     /// A pathspec nothing near the tip touches — a file deleted years ago, or a typo —
     /// is what the budget exists for: the lazy walk would traverse the whole repository
     /// at more per commit than the sorted one costs, so past a share of it (see
     /// `LAZY_FILTER_SHARE`) the sorted walk answers for less. Measured on a kernel
-    /// clone, a mistyped path costs 163s sorted and 223s with the lazy attempt in front
+    /// clone, a mistyped path costs 166s sorted and 232s with the lazy attempt in front
     /// of it.
     #[test]
     fn a_cold_pathspec_gives_the_lazy_filter_up_rather_than_walking_everything() {
@@ -3194,42 +3364,39 @@ mod tests {
     /// ordinary run and no fixture ever takes.
     #[test]
     fn the_lazy_filter_budget_is_a_share_of_the_repository_with_a_floor() {
-        assert_eq!(lazy_filter_budget(1_465_141), 293_028);
-        assert_eq!(lazy_filter_budget(50_000), 10_000);
-        assert_eq!(lazy_filter_budget(5_000), MIN_LAZY_FILTER_WALK);
+        assert_eq!(lazy_filter_budget(1_465_141), 488_380);
+        assert_eq!(lazy_filter_budget(50_000), 16_666);
+        assert_eq!(lazy_filter_budget(2_000), MIN_LAZY_FILTER_WALK);
         assert_eq!(lazy_filter_budget(0), MIN_LAZY_FILTER_WALK);
     }
 
     /// A commit-graph that is not closed under ancestry makes the walk decline
-    /// mid-pass, and a path filter must abandon the whole pass rather than keep the
-    /// prefix it had: a truncated topological order is indistinguishable from a complete
-    /// one and would be drawn as though it were.
+    /// mid-pass, and the filter must abandon the whole pass rather than keep the prefix
+    /// it had: a truncated topological order is indistinguishable from a complete one
+    /// and would be drawn as though it were.
+    ///
+    /// What this deliberately does NOT assert is that the loader then answers correctly
+    /// — that half belongs to the budget test above, and cannot be checked here.
+    /// **libgit2 reads the commit-graph in its own revwalk** (measured: a fixture whose
+    /// parent columns said "no parent" truncated `git2`'s walk to one commit), so a file
+    /// git would never write misleads the fallback as much as the lazy walk. That is
+    /// reality rather than a fixture artifact: a repository holding such a file has no
+    /// walk to trust.
     #[test]
-    fn a_walk_that_declines_mid_filter_falls_back_whole() {
+    fn a_walk_that_declines_mid_filter_gives_up_whole() {
         let (dir, repo) = temp_repo();
         let a = commit_file(&repo, "a.txt", "1", "a-1");
-        let b = commit_file(&repo, "b.txt", "1", "b-only");
+        commit_file(&repo, "b.txt", "1", "b-only");
         let c = commit_file(&repo, "a.txt", "2", "a-2");
-        // A hole: `b` is missing while its parent `a` is present, which is the shape
-        // `TopoWalk` refuses.
+        // A hole: the middle commit is missing while its own parent is present, which is
+        // the shape `TopoWalk` refuses.
         write_commit_graph_exact(&repo, &[c, a]);
         let repo = open_repo(dir.path());
         let scope = cli::Scope {
             paths: vec!["a.txt".to_string()],
             ..Default::default()
         };
-        let ref_map = build_ref_map(&repo);
-        assert!(lazy_filtered_walk(&repo, &scope, 100, &ref_map).is_none());
-        let _ = b;
-        // The rows are still right, and their parents still rewritten across the
-        // dropped commit — the sorted walk answered.
-        let got = load_commits(&repo, 100, &scope);
-        let real: Vec<&CommitInfo> = got.iter().filter(|c| is_real_commit(c.oid)).collect();
-        assert_eq!(
-            real.iter().map(|c| c.summary.as_str()).collect::<Vec<_>>(),
-            vec!["a-2", "a-1"]
-        );
-        assert_eq!(real[0].parents, vec![a]);
+        assert!(lazy_filtered_walk(&repo, &scope, 100, &build_ref_map(&repo)).is_none());
     }
 
     #[test]
