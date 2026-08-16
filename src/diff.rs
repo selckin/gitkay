@@ -267,7 +267,28 @@ pub fn pathspec_opts(paths: &[String]) -> DiffOptions {
 /// track the row count and index `i` has to mean row `i` in both. That is what this type
 /// is for — one place that allocates the slots, one that moves them (`order_files`), and
 /// no caller that can write past the end.
-pub struct PerRow<T>(Vec<Option<T>>);
+///
+/// **Slots are allocated a CHUNK at a time, on the first write into that chunk**, which
+/// is not a refinement but the point of the whole layout. One slot per row of a
+/// 76.5M-line diff is 1.84GB and, measured, **1.17s to allocate and initialise** —
+/// whether by `collect`, `vec![None; n]` or `resize_with`, none of which reach
+/// `alloc_zeroed` for an `Option<Vec<_>>`. Paid eagerly that was a second of frozen
+/// frame per install, for rows nothing would ever write: with word diff off nothing
+/// writes an emphasis slot at all, and a pass that stops at `HIGHLIGHT_LINE_BUDGET`
+/// writes at most that many span slots however long the diff is. Chunked, a blank is a
+/// vector of empty vectors (18,694 of them for that diff, 450KB) and the memory follows
+/// what was actually computed.
+pub struct PerRow<T> {
+    rows: usize,
+    /// One entry per chunk; an EMPTY inner vector means nothing in that chunk has been
+    /// written, and allocates nothing.
+    chunks: Vec<Vec<Option<T>>>,
+}
+
+/// Rows per `PerRow` chunk. 4096 slots is 96KB for a span chunk — small enough that a
+/// viewport's worth of rows touches one or two, large enough that the chunk vector
+/// itself stays trivial at any diff size.
+const PER_ROW_CHUNK: usize = 4096;
 
 /// Per-row syntax spans. Unset ⇒ not highlighted yet; set ⇒ highlighted, possibly to no
 /// tokens at all. Rides with `DiffData`, because the LRU deliberately preserves a diff's
@@ -281,42 +302,68 @@ pub type RowSpans = PerRow<Vec<highlight::Span>>;
 pub type RowEmphasis = PerRow<Vec<std::ops::Range<usize>>>;
 
 impl<T> PerRow<T> {
-    /// Slots for `rows` rows, none of them computed.
+    /// Room for `rows` rows, none of them computed — and nothing allocated for them
+    /// until something is.
     pub fn blank(rows: usize) -> Self {
-        Self(std::iter::repeat_with(|| None).take(rows).collect())
+        Self {
+            rows,
+            chunks: std::iter::repeat_with(Vec::new)
+                .take(rows.div_ceil(PER_ROW_CHUNK))
+                .collect(),
+        }
     }
 
-    /// How many rows there are slots for — which must be the diff's row count, and is
+    /// How many rows there are room for — which must be the diff's row count, and is
     /// what `from_parts` checks. Not `len`, because the question is about the rows and
     /// not about this collection.
     pub const fn rows(&self) -> usize {
-        self.0.len()
+        self.rows
     }
 
     /// This row's value, or `None` when it has not been computed (or the row is past
     /// the end — a stale index names no row rather than panicking, which is what the
     /// arriving-batch path has always done).
     pub fn get(&self, row: usize) -> Option<&T> {
-        self.0.get(row).and_then(Option::as_ref)
+        self.chunks
+            .get(row / PER_ROW_CHUNK)?
+            .get(row % PER_ROW_CHUNK)?
+            .as_ref()
     }
 
     pub fn is_set(&self, row: usize) -> bool {
-        self.0.get(row).is_some_and(Option::is_some)
+        self.get(row).is_some()
     }
 
-    /// Record this row's value. A row past the end is dropped: highlight batches are
-    /// computed against a snapshot of the diff and can outlive it.
+    /// Record this row's value, allocating its chunk if this is the first write into
+    /// that chunk. A row past the end is dropped: highlight batches are computed
+    /// against a snapshot of the diff and can outlive it.
     pub fn set(&mut self, row: usize, value: T) {
-        if let Some(slot) = self.0.get_mut(row) {
-            *slot = Some(value);
+        if row >= self.rows {
+            return;
         }
+        // In range: `chunks` has a `rows.div_ceil(PER_ROW_CHUNK)` entry for every row.
+        let chunk = &mut self.chunks[row / PER_ROW_CHUNK];
+        if chunk.is_empty() {
+            chunk.resize_with(PER_ROW_CHUNK, || None);
+        }
+        chunk[row % PER_ROW_CHUNK] = Some(value);
     }
 
-    /// Back to "nothing computed", keeping the slots — a theme change invalidates every
-    /// span without changing a single row.
+    /// Remove this row's value and return it — the re-lay's half of `set`, so a
+    /// permutation moves what was computed rather than copying it.
+    pub fn take(&mut self, row: usize) -> Option<T> {
+        self.chunks
+            .get_mut(row / PER_ROW_CHUNK)?
+            .get_mut(row % PER_ROW_CHUNK)?
+            .take()
+    }
+
+    /// Back to "nothing computed", keeping the room — a theme change invalidates every
+    /// span without changing a single row. The chunks go with them: what a re-highlight
+    /// wants back is the memory, not the empty slots.
     pub fn clear(&mut self) {
-        for slot in &mut self.0 {
-            *slot = None;
+        for chunk in &mut self.chunks {
+            *chunk = Vec::new();
         }
     }
 }
@@ -325,7 +372,7 @@ impl<T> Default for PerRow<T> {
     /// No rows at all — paired with an empty diff. Spelled out rather than derived
     /// because `T` need not be `Default`, and it is what `std::mem::take` needs.
     fn default() -> Self {
-        Self(Vec::new())
+        Self::blank(0)
     }
 }
 
@@ -2311,32 +2358,33 @@ pub fn order_files(
     // 9.8ms against 7.5ms over a 100k-line diff. What is left is the second buffer
     // itself, which is the price of moving blocks around at all.
     let mut src: Vec<Option<DiffLine>> = std::mem::take(lines).into_iter().map(Some).collect();
-    let mut src_spans = std::mem::take(&mut spans.0);
+    let mut src_spans = std::mem::replace(spans, RowSpans::blank(src.len()));
     let mut out: Vec<DiffLine> = Vec::with_capacity(src.len());
-    let mut out_spans: Vec<Option<Vec<highlight::Span>>> = Vec::with_capacity(src.len());
     let mut start: Vec<Option<usize>> = vec![None; n];
     // A row and its spans move TOGETHER, in one loop, because they are no longer one
     // value: leave the spans behind and the pane paints one file's colours onto
-    // another file's text.
-    let mut move_rows = |out: &mut Vec<DiffLine>,
-                         out_spans: &mut Vec<Option<Vec<highlight::Span>>>,
-                         r: std::ops::Range<usize>| {
-        for k in r {
-            if let Some(line) = src[k].take() {
-                out.push(line);
-                out_spans.push(src_spans.get_mut(k).and_then(Option::take));
+    // another file's text. Only rows that HAVE spans reach `set`, so re-laying a diff
+    // nobody has coloured allocates no slots at all.
+    let mut move_rows =
+        |out: &mut Vec<DiffLine>, spans: &mut RowSpans, r: std::ops::Range<usize>| {
+            for k in r {
+                if let Some(line) = src[k].take() {
+                    let to = out.len();
+                    out.push(line);
+                    if let Some(computed) = src_spans.take(k) {
+                        spans.set(to, computed);
+                    }
+                }
             }
-        }
-    };
-    move_rows(&mut out, &mut out_spans, 0..head);
+        };
+    move_rows(&mut out, spans, 0..head);
     for &i in order {
         if let Some((s, e)) = span[i] {
             start[i] = Some(out.len());
-            move_rows(&mut out, &mut out_spans, s..e);
+            move_rows(&mut out, spans, s..e);
         }
     }
     *lines = out;
-    spans.0 = out_spans;
 
     let mut ranked: Vec<(usize, FileEntry)> = std::mem::take(files)
         .into_iter()
@@ -3337,6 +3385,53 @@ pub mod tests {
         assert_eq!(file_index_at_line_opt(&starts, 5), Some(1)); // src/b.rs
         assert_eq!(file_index_at_line_opt(&starts, 7), Some(2)); // Cargo.toml
         assert_eq!(file_index_at_line_opt(&starts, 1), None); // head region
+    }
+
+    /// The chunk arithmetic, at the boundaries it can be wrong at — which is the whole
+    /// of what the chunked layout adds, since every read and write now goes through two
+    /// indexes instead of one.
+    #[test]
+    fn per_row_addresses_every_row_across_its_chunk_boundaries() {
+        let rows = PER_ROW_CHUNK * 2 + 5;
+        let mut p: PerRow<usize> = PerRow::blank(rows);
+        assert_eq!(p.rows(), rows);
+
+        // Either side of both boundaries, and the last row there is room for.
+        let probes = [
+            0,
+            PER_ROW_CHUNK - 1,
+            PER_ROW_CHUNK,
+            PER_ROW_CHUNK + 1,
+            PER_ROW_CHUNK * 2,
+            rows - 1,
+        ];
+        for row in probes {
+            assert!(!p.is_set(row), "row {row} starts unset");
+            p.set(row, row);
+        }
+        for row in probes {
+            assert_eq!(p.get(row), Some(&row), "row {row} reads back");
+        }
+        // A neighbour inside a materialized chunk stays unset — a chunk allocated for
+        // one row must not read as computed for the rest of it.
+        assert!(!p.is_set(1));
+        assert!(!p.is_set(PER_ROW_CHUNK + 2));
+
+        // Past the end: dropped rather than panicking or growing (a highlight batch is
+        // computed against a snapshot of the diff and can outlive it).
+        p.set(rows, 999);
+        p.set(usize::MAX, 999);
+        assert!(!p.is_set(rows));
+        assert_eq!(p.rows(), rows);
+
+        // `take` removes what `set` wrote — the re-lay's half of the pair.
+        assert_eq!(p.take(PER_ROW_CHUNK), Some(PER_ROW_CHUNK));
+        assert!(!p.is_set(PER_ROW_CHUNK));
+
+        // And `clear` unsets everything while keeping the room.
+        p.clear();
+        assert!(probes.iter().all(|&row| !p.is_set(row)));
+        assert_eq!(p.rows(), rows);
     }
 
     /// A row's spans move with the row. This used to be structural — the spans were a

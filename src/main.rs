@@ -347,6 +347,10 @@ const DIFF_LOAD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis
 /// copy detection) crosses the threshold and shows the placeholder.
 const DIFF_PLACEHOLDER_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// How slow a diff install has to be before it says what it spent the time on. Below
+/// this it is a normal frame and the line would be noise; above it, the reader felt it.
+const DIFF_INSTALL_SLOW: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// The most rows one highlight pass will colour.
 ///
 /// A bound on the WORK, not on the diff — which is the whole of the difference. This
@@ -4170,15 +4174,27 @@ impl GitkApp {
         // viewport, and `ensure_visible_word_emphasis` refills the window on the next
         // frame. Sized here against the incoming rows, which is the one place it can be
         // — every other writer indexes it.
+        let t_swap = std::time::Instant::now();
         self.diff_emphasis = diff::RowEmphasis::blank(lines.len());
+        let rows = lines.len();
         self.diff_lines = lines;
         self.diff_spans = spans;
         self.diff_files = files;
         self.current_diff_key = key;
         self.diff_content_stale = false;
         self.diff_top_line.store(0, Ordering::Relaxed);
+        let swap = t_swap.elapsed();
+        let t_layout = std::time::Instant::now();
         self.resync_file_layout();
+        let layout = t_layout.elapsed();
         self.invalidate_diff_highlight();
+        // Attributed, because this is the frame the reader feels on a large diff and
+        // its two halves fail differently: the swap is per-ROW work (dropping the
+        // outgoing diff, sizing the new one's slots) and the layout is the re-lay,
+        // which is O(lines) only when the file order actually moves.
+        if swap + layout > DIFF_INSTALL_SLOW {
+            log::debug!("perf: diff install {rows} lines: swap {swap:?}, layout {layout:?}");
+        }
     }
 
     /// Clear the diff pane to empty (no current diff, no file rows). Callers that want
@@ -4691,7 +4707,20 @@ impl GitkApp {
         // side that has them. It costs nothing new — the same scan already ran here as
         // `diff_fully_highlighted`, and it now answers with the file list instead of a
         // bool the worker had to rediscover.
+        let t_pending = std::time::Instant::now();
         let pending = pending_files(&self.diff_lines, &self.diff_spans, &self.diff_files);
+        let scan = t_pending.elapsed();
+        if scan > DIFF_INSTALL_SLOW {
+            // Bounded by the FILES on an uncoloured diff (each stops at its first
+            // uncoloured code row) and by the lines on a coloured one, so a slow scan
+            // here says which of the two the diff is — worth knowing before blaming the
+            // install beside it.
+            log::debug!(
+                "perf: pending-file scan {scan:?} over {} lines, {} files",
+                self.diff_lines.len(),
+                self.diff_files.len()
+            );
+        }
         if pending.is_empty() {
             self.highlight_priority = None;
             return;
