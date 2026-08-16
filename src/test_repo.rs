@@ -450,9 +450,30 @@ fn a_temp_repo_starts_on_a_branch_the_test_chose() {
 /// real repository, since `git fetch` does not update the file — by naming tips that
 /// leave later commits out of it.
 pub fn write_commit_graph(repo: &git2::Repository, covering: &[git2::Oid]) {
+    write_graph_of(repo, reachable_from(repo, covering), false);
+}
+
+/// Write a commit-graph holding EXACTLY `oids` — which lets a test build a file that
+/// is not closed under ancestry, the one shape `write_commit_graph` cannot produce
+/// and the one whose soundness guard needs testing. git never writes such a file;
+/// a corrupt or hand-edited one is what this stands in for.
+pub fn write_commit_graph_exact(repo: &git2::Repository, oids: &[git2::Oid]) {
+    write_graph_of(repo, oids.to_vec(), false);
+}
+
+/// `write_commit_graph`, plus the changed-path Bloom filters that only
+/// `git commit-graph write --changed-paths` produces — each commit's diff against its
+/// FIRST parent, which is what `bloom.c` records and what gitkay's path filter asks
+/// about.
+pub fn write_commit_graph_with_changed_paths(repo: &git2::Repository, covering: &[git2::Oid]) {
+    write_graph_of(repo, reachable_from(repo, covering), true);
+}
+
+/// Every commit reachable from `tips`.
+fn reachable_from(repo: &git2::Repository, tips: &[git2::Oid]) -> Vec<git2::Oid> {
     let mut order: Vec<git2::Oid> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut stack: Vec<git2::Oid> = covering.to_vec();
+    let mut stack: Vec<git2::Oid> = tips.to_vec();
     while let Some(oid) = stack.pop() {
         if !seen.insert(oid) {
             continue;
@@ -462,18 +483,39 @@ pub fn write_commit_graph(repo: &git2::Repository, covering: &[git2::Oid]) {
             stack.push(p);
         }
     }
-    write_graph_of(repo, order);
+    order
 }
 
-/// Write a commit-graph holding EXACTLY `oids` — which lets a test build a file that
-/// is not closed under ancestry, the one shape `write_commit_graph` cannot produce
-/// and the one whose soundness guard needs testing. git never writes such a file;
-/// a corrupt or hand-edited one is what this stands in for.
-pub fn write_commit_graph_exact(repo: &git2::Repository, oids: &[git2::Oid]) {
-    write_graph_of(repo, oids.to_vec());
+/// The paths a commit changed against its first parent, as git computes them for a
+/// filter: an added, deleted or modified file counts under both of its names.
+fn changed_paths(repo: &git2::Repository, oid: git2::Oid) -> Vec<String> {
+    let commit = repo.find_commit(oid).unwrap();
+    let tree = commit.tree().unwrap();
+    let parent = commit.parent(0).ok().and_then(|p| p.tree().ok());
+    let diff = repo
+        .diff_tree_to_tree(parent.as_ref(), Some(&tree), None)
+        .unwrap();
+    let mut paths: Vec<String> = Vec::new();
+    for delta in diff.deltas() {
+        for file in [delta.old_file(), delta.new_file()] {
+            if let Some(p) = file.path().and_then(|p| p.to_str()) {
+                paths.push(p.to_string());
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
-fn write_graph_of(repo: &git2::Repository, mut order: Vec<git2::Oid>) {
+/// How many bit positions a fixture's filters use, matching git's default.
+const NUM_HASHES: u32 = 7;
+
+/// What `CDAT` puts in a parent column when there is no parent to name — a commit's
+/// second slot on an ordinary commit, and its first on a root.
+const GRAPH_PARENT_NONE: u32 = 0x7000_0000;
+
+fn write_graph_of(repo: &git2::Repository, mut order: Vec<git2::Oid>, changed_path_filters: bool) {
     let present: std::collections::HashSet<git2::Oid> = order.iter().copied().collect();
     // Topological level, resolved by repeated relaxation — the set is tiny and this
     // needs no ordering of its own to be correct.
@@ -511,28 +553,104 @@ fn write_graph_of(repo: &git2::Repository, mut order: Vec<git2::Oid>) {
     for v in fanout {
         oidf.extend_from_slice(&v.to_be_bytes());
     }
+    // Every column filled with the commit's REAL tree, parents and time, not the
+    // placeholders this once wrote for the ones `commitgraph` does not read.
+    //
+    // **libgit2 reads this file**, which was measured the hard way: a fixture whose
+    // parent columns said "no parent" truncated `git2`'s own revwalk to a single commit
+    // and emptied a path filter that the same repository answered correctly without a
+    // graph. A fixture that lies about a commit's shape therefore corrupts the very walk
+    // a test is comparing against — and it does so silently, since nothing in the API
+    // says the graph was consulted. The trailer below is what should keep libgit2 off
+    // it; these values are what keep the fixture honest if it ever reads it anyway.
+    let position: std::collections::HashMap<git2::Oid, u32> = order
+        .iter()
+        .enumerate()
+        .map(|(i, &oid)| (oid, i as u32))
+        .collect();
     let (mut oidl, mut cdat) = (Vec::new(), Vec::new());
     for oid in &order {
+        let commit = repo.find_commit(*oid).unwrap();
+        let parents: Vec<u32> = commit
+            .parent_ids()
+            .map(|p| position.get(&p).copied().unwrap_or(GRAPH_PARENT_NONE))
+            .collect();
+        // A third parent lives in the EDGE chunk, which this writer does not emit —
+        // better to refuse the fixture than to describe an octopus merge wrongly.
+        assert!(
+            parents.len() <= 2,
+            "an octopus merge needs the EDGE chunk this fixture writer has no support for"
+        );
+        let time = commit.time().seconds() as u64;
         oidl.extend_from_slice(oid.as_bytes());
-        cdat.extend_from_slice(&[0u8; 20]); // tree oid: unread
-        cdat.extend_from_slice(&0x7000_0000u32.to_be_bytes()); // parents: unread
-        cdat.extend_from_slice(&0x7000_0000u32.to_be_bytes());
-        cdat.extend_from_slice(&(generation[oid] << 2).to_be_bytes());
-        cdat.extend_from_slice(&0u32.to_be_bytes()); // commit time: unread
+        cdat.extend_from_slice(commit.tree_id().as_bytes());
+        cdat.extend_from_slice(
+            &parents
+                .first()
+                .copied()
+                .unwrap_or(GRAPH_PARENT_NONE)
+                .to_be_bytes(),
+        );
+        cdat.extend_from_slice(
+            &parents
+                .get(1)
+                .copied()
+                .unwrap_or(GRAPH_PARENT_NONE)
+                .to_be_bytes(),
+        );
+        // The generation shares its word with the top two bits of the commit time.
+        cdat.extend_from_slice(
+            &((generation[oid] << 2) | ((time >> 32) as u32 & 0x3)).to_be_bytes(),
+        );
+        cdat.extend_from_slice(&(time as u32).to_be_bytes());
     }
 
-    let mut out = vec![b'C', b'G', b'P', b'H', 1, 1, 3, 0];
-    let mut at = out.len() as u64 + 4 * 12;
-    for (id, chunk) in [(b"OIDF", &oidf), (b"OIDL", &oidl), (b"CDAT", &cdat)] {
-        out.extend_from_slice(id);
+    // BIDX/BDAT, in the same commit order: git's settings header (hash version 2, 7
+    // hashes, 10 bits per entry) then each commit's filter, indexed by cumulative end.
+    let (mut bidx, mut bdat) = (Vec::new(), Vec::new());
+    if changed_path_filters {
+        for word in [2u32, NUM_HASHES, 10] {
+            bdat.extend_from_slice(&word.to_be_bytes());
+        }
+        for oid in &order {
+            let paths = changed_paths(repo, *oid);
+            bdat.extend_from_slice(&crate::commitgraph::bloom_filter_bytes(
+                &paths, NUM_HASHES, 2,
+            ));
+            bidx.extend_from_slice(&((bdat.len() - 12) as u32).to_be_bytes());
+        }
+    }
+
+    let chunks: Vec<(&[u8; 4], &Vec<u8>)> = if changed_path_filters {
+        vec![
+            (b"OIDF", &oidf),
+            (b"OIDL", &oidl),
+            (b"CDAT", &cdat),
+            (b"BIDX", &bidx),
+            (b"BDAT", &bdat),
+        ]
+    } else {
+        vec![(b"OIDF", &oidf), (b"OIDL", &oidl), (b"CDAT", &cdat)]
+    };
+    let mut out = vec![b'C', b'G', b'P', b'H', 1, 1, chunks.len() as u8, 0];
+    let mut at = out.len() as u64 + (chunks.len() as u64 + 1) * 12;
+    for (id, chunk) in &chunks {
+        out.extend_from_slice(*id);
         out.extend_from_slice(&at.to_be_bytes());
         at += chunk.len() as u64;
     }
     out.extend_from_slice(&[0u8; 4]);
     out.extend_from_slice(&at.to_be_bytes());
-    out.extend_from_slice(&oidf);
-    out.extend_from_slice(&oidl);
-    out.extend_from_slice(&cdat);
+    for (_, chunk) in &chunks {
+        out.extend_from_slice(chunk);
+    }
+    // git closes the file with a SHA-1 of everything before it, and libgit2 CHECKS it.
+    // Zeroes fail that check, which is what keeps a fixture from reaching libgit2's own
+    // walks — computing the real one would take a SHA-1 implementation this crate does
+    // not have (git2 exposes only object hashing, which prepends a type header).
+    // `commitgraph` reads chunk offsets and never the trailer, so its own reader is
+    // unaffected either way.
+    out.extend_from_slice(&[0u8; 20]);
 
     let info = repo.commondir().join("objects").join("info");
     std::fs::create_dir_all(&info).unwrap();
