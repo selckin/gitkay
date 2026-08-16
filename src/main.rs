@@ -7339,6 +7339,40 @@ impl GitkApp {
     }
 }
 
+/// When the window closed, so the pieces of teardown after it can be attributed.
+/// A static because the two ends live in different owners: `on_exit` is called on
+/// the app, and by the time `run_native` returns the app is gone.
+static SHUTDOWN_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+impl Drop for GitkApp {
+    /// Time the teardown of the app's own state, because nothing else does and it is
+    /// not always free: a large diff is millions of `DiffLine`s, each holding an
+    /// `Arc<String>`, and freeing them one at a time is real work. eframe drops the
+    /// app inside its event loop after the last frame, so a slow exit otherwise
+    /// produces no output at all — which is exactly what a reader closing the window
+    /// on a huge diff sees.
+    ///
+    /// The two big fields are dropped EXPLICITLY, in order, so the log attributes the
+    /// time rather than reporting one total for everything the struct holds.
+    fn drop(&mut self) {
+        let displayed = self.diff_lines.len();
+        let cached = self.diff_cache.weight();
+        let t = std::time::Instant::now();
+        drop(std::mem::take(&mut self.diff_lines));
+        let shown = t.elapsed();
+        let t = std::time::Instant::now();
+        // No `clear`: dropping every entry is what `retain_keys` does with a
+        // predicate that keeps nothing, and the cache needs no method for a use
+        // that exists once.
+        self.diff_cache.retain_keys(|_| false);
+        log::debug!(
+            "shutdown: dropped the displayed diff ({displayed} lines) in {shown:?}, \
+             the diff cache ({cached} lines) in {:?}",
+            t.elapsed()
+        );
+    }
+}
+
 impl eframe::App for GitkApp {
     // Persist only the diff-panel splitter height (below), not the whole egui
     // memory blob — persisting the blob would also restore scroll positions.
@@ -7356,6 +7390,13 @@ impl eframe::App for GitkApp {
         ToolbarDiffSettings::of(self.diff_settings).save(storage);
         eframe::set_value(storage, "word_diff", &self.word_diff);
         eframe::set_value(storage, "line_numbers", &self.line_numbers);
+    }
+
+    /// eframe calls this after `save`, before dropping us — the last point the app
+    /// can say anything about its own shutdown.
+    fn on_exit(&mut self) {
+        let _ = SHUTDOWN_AT.set(std::time::Instant::now());
+        log::debug!("shutdown: window closed, tearing down");
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -8011,7 +8052,7 @@ fn main() -> eframe::Result {
     // match window rules on app_id, and so eframe uses a stable storage dir for
     // the persisted layout regardless of which repo is open. (egui-winit 0.31
     // applies app_id only on Wayland; it does NOT set the X11 WM_CLASS.)
-    eframe::run_native(
+    let result = eframe::run_native(
         "gitkay",
         options,
         Box::new(move |cc| {
@@ -8037,7 +8078,15 @@ fn main() -> eframe::Result {
             );
             Ok(Box::new(app) as Box<dyn eframe::App>)
         }),
-    )
+    );
+    // Everything after `on_exit` that is not the app's own state: eframe's final
+    // save, the app drop (timed by `Drop for GitkApp`), and winit/glow tearing the
+    // window down. Nothing else reports on this stretch, and on a huge diff a reader
+    // sees it as the window lingering after they asked it to close.
+    if let Some(t) = SHUTDOWN_AT.get() {
+        log::debug!("shutdown: exited {:?} after the window closed", t.elapsed());
+    }
+    result
 }
 
 #[cfg(test)]
