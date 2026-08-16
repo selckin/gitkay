@@ -61,6 +61,26 @@
 //! than assumed: a known commit with an unknown parent means the file is not
 //! ancestor-closed, and the walk declines instead of emitting a parent above its own
 //! children — the one corruption its caller could not detect.
+//!
+//! ## More than one tip
+//!
+//! `--all` seeds hundreds of them, and one tip is routinely an ancestor of another —
+//! every tag on a commit the current branch descends from. git filters those out
+//! before it starts, by computing indegrees down to the lowest tip's generation; that
+//! is a whole-history pass on a repository with an old tag, and it is exactly the pass
+//! this walk exists to avoid.
+//!
+//! So a tip goes on the stack unconditionally and is filtered at the moment it is
+//! POPPED, by the indegree the floor has just made final: above 1 means some child has
+//! not emitted yet, so the tip is not a starting point at all and is dropped — its last
+//! child's emission pushes it back at the right time. The emitted sequence is the same
+//! either way, because the stack order is not disturbed by dropping an entry that could
+//! not have been emitted there.
+//!
+//! What the tips DO decide is how much gets expanded before row one: the walk only
+//! ever looks at the top of the stack, so a tip there that cannot be emitted yet holds
+//! everything up until its generation is cleared. The newest tip on top is what keeps
+//! that from costing anything — see `history::topo_tips`.
 
 use std::collections::{BinaryHeap, HashMap};
 
@@ -124,8 +144,12 @@ impl<'a> TopoWalk<'a> {
         };
         // Seeded in reverse so the FIRST tip ends up on top of the LIFO stack and is
         // emitted first, matching `git log`'s treatment of the order its tips were
-        // given in.
-        for &tip in tips.iter().rev() {
+        // given in. Deduped forward, so a repository naming one commit twice (a tag on
+        // a branch tip, under `--all`) keeps that commit at its FIRST position, which
+        // is the one git keeps.
+        let mut seen = std::collections::HashSet::new();
+        let unique: Vec<git2::Oid> = tips.iter().copied().filter(|o| seen.insert(*o)).collect();
+        for &tip in unique.iter().rev() {
             walk.discover(tip);
             walk.ready.push(tip);
         }
@@ -203,6 +227,15 @@ impl<'a> TopoWalk<'a> {
                 && self.safe_to_emit(top)
             {
                 self.ready.pop();
+                // The floor has just made this indegree final, which is the first
+                // moment it can be read. Above 1 means a child of this commit has not
+                // emitted, so it is not ready after all — a seeded tip that turned out
+                // to be another tip's ancestor. Drop it; the child's emission pushes it
+                // back. Every entry pushed by that route arrives at exactly 1 and, being
+                // safe to emit, can gain no further child, so this filters tips alone.
+                if self.indegree.get(&top) != Some(&1) {
+                    continue;
+                }
                 if !self.emitted.insert(top) {
                     continue;
                 }
@@ -260,15 +293,20 @@ mod tests {
         commit_file, commit_merge, temp_repo, write_commit_graph, write_commit_graph_exact,
     };
 
-    /// Every commit reachable from `tip`, in a topological order produced the slow,
+    /// Every commit reachable from `tips`, in a topological order produced the slow,
     /// obvious way: full indegrees over the whole DAG, then Kahn's with a LIFO
-    /// queue. This is `git log --graph`'s algorithm without the laziness, so it is
-    /// the oracle the lazy walk has to agree with — the laziness being the only
-    /// thing under test.
-    fn brute_force(repo: &git2::Repository, tip: git2::Oid) -> Vec<git2::Oid> {
+    /// queue seeded with the tips that are not one another's ancestors. This is
+    /// `git log --graph`'s algorithm without the laziness — `init_topo_walk` down to
+    /// generation zero — so it is the oracle the lazy walk has to agree with, the
+    /// laziness being the only thing under test.
+    fn brute_force(repo: &git2::Repository, tips: &[git2::Oid]) -> Vec<git2::Oid> {
         let mut indegree: HashMap<git2::Oid, u32> = HashMap::new();
-        let mut stack = vec![tip];
-        indegree.insert(tip, 1);
+        let mut stack = Vec::new();
+        for &tip in tips {
+            if indegree.insert(tip, 1).is_none() {
+                stack.push(tip);
+            }
+        }
         while let Some(oid) = stack.pop() {
             for p in repo.find_commit(oid).unwrap().parent_ids() {
                 let fresh = !indegree.contains_key(&p);
@@ -278,7 +316,14 @@ mod tests {
                 }
             }
         }
-        let mut ready = vec![tip];
+        // Reversed, so the FIRST tip is on top of the stack — git's own
+        // `prio_queue_reverse` over the tips it kept.
+        let mut ready: Vec<git2::Oid> = tips
+            .iter()
+            .copied()
+            .filter(|t| indegree[t] == 1)
+            .rev()
+            .collect();
         let mut out = Vec::new();
         let mut done = std::collections::HashSet::new();
         while let Some(oid) = ready.pop() {
@@ -326,8 +371,59 @@ mod tests {
         let graph = CommitGraph::for_repo(&repo).expect("the graph just written");
         let mut walk = TopoWalk::new(&repo, &graph, &[tip], false);
         let got = walk.take(1000).expect("a complete walk");
-        assert_eq!(got, brute_force(&repo, tip));
+        assert_eq!(got, brute_force(&repo, &[tip]));
         assert!(got.len() >= 6, "the fixture should have real depth");
+    }
+
+    /// `--all` seeds every branch and tag, and the walk has to reproduce git's order
+    /// over the lot of them — including the two tips that are the same commit, which
+    /// git keeps once.
+    #[test]
+    fn several_tips_are_walked_in_gits_own_order() {
+        let (_dir, repo) = temp_repo();
+        let (tip, topic) = two_merges(&repo);
+        write_commit_graph(&repo, &[tip]);
+        let graph = CommitGraph::for_repo(&repo).unwrap();
+        let tips = [tip, topic, tip];
+        let got = TopoWalk::new(&repo, &graph, &tips, false)
+            .take(1000)
+            .expect("a complete walk");
+        assert_eq!(got, brute_force(&repo, &[tip, topic]));
+        assert_eq!(
+            got.iter().collect::<std::collections::HashSet<_>>().len(),
+            got.len(),
+            "a commit named twice is still emitted once"
+        );
+    }
+
+    /// A tip that is another tip's ancestor — every tag on a commit the checked-out
+    /// branch descends from, so the ordinary state of `--all`. It is not a starting
+    /// point, and emitting it from the stack position it was seeded at draws it above
+    /// its own children.
+    ///
+    /// The ancestor is seeded FIRST here, which is what makes the test bite: tips
+    /// arrive newest-committer-date first, and a tag on an amended or rebased commit
+    /// routinely carries a newer date than the branch tip that descends from it. Remove
+    /// the indegree filter in `next` and the root is emitted first, ahead of the entire
+    /// history that leads down to it.
+    #[test]
+    fn a_tip_that_is_another_tips_ancestor_waits_for_its_children() {
+        let (_dir, repo) = temp_repo();
+        let (tip, _) = two_merges(&repo);
+        // The oldest commit in the fixture: reachable from every other one, so it can
+        // only be emitted last.
+        let root = brute_force(&repo, &[tip]).pop().unwrap();
+        write_commit_graph(&repo, &[tip]);
+        let graph = CommitGraph::for_repo(&repo).unwrap();
+        let got = TopoWalk::new(&repo, &graph, &[root, tip], false)
+            .take(1000)
+            .expect("a complete walk");
+        assert_eq!(got, brute_force(&repo, &[root, tip]));
+        assert_eq!(
+            got.last(),
+            Some(&root),
+            "the ancestor tip belongs at the bottom: {got:?}"
+        );
     }
 
     /// The property a reader actually sees, and the whole reason for the change: a
@@ -378,7 +474,7 @@ mod tests {
 
         let mut walk = TopoWalk::new(&repo, &graph, &[tip], false);
         let got = walk.take(1000).expect("a complete walk");
-        assert_eq!(got, brute_force(&repo, tip));
+        assert_eq!(got, brute_force(&repo, &[tip]));
         assert_eq!(got[0], tip);
         assert_eq!(got[1], extra);
     }
