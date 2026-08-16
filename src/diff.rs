@@ -20,6 +20,7 @@ use convert::{
 };
 
 use crate::datefmt::format_commit_time;
+use crate::diffstat;
 use crate::highlight;
 use crate::textconv::{self, Textconv};
 use crate::word_diff;
@@ -564,6 +565,12 @@ impl LineNoGutter {
     }
 }
 
+/// Terminal width the diffstat block's bars are scaled into — libgit2's `to_buf`
+/// argument, kept at the 80 this always passed. Not the pane's width: the block is a
+/// fixed piece of text inside a horizontally scrolling diff, so re-scaling it as the
+/// window resized would reflow rows the reader is looking at.
+const STAT_WIDTH: usize = 80;
+
 /// Max body length (bytes) for which word-diff is computed; above this the LCS
 /// table grows too large and the highlight isn't readable anyway.
 pub const MAX_WORD_DIFF_LINE: usize = 2048;
@@ -934,11 +941,12 @@ pub enum DiffPhase {
     /// Building the git2 diff: the tree walk, then rename/copy detection.
     #[default]
     Preparing,
-    /// `Diff::stats` — which reads every blob to count its lines. Named rather than
-    /// folded into a neighbour because it is silent and, on a large commit, a real
-    /// share of the wait.
-    Summarising,
     /// Generating the patch, delta by delta. The one phase with a denominator.
+    ///
+    /// There used to be a `Summarising` phase between these two, for the `Diff::stats`
+    /// pass — silent, and on a large commit a real share of the wait. That pass is
+    /// gone (see `diffstat`), so the phase went with it rather than staying as a state
+    /// nothing can reach.
     Patching,
 }
 
@@ -946,7 +954,6 @@ impl DiffPhase {
     const fn code(self) -> u8 {
         match self {
             Self::Preparing => 0,
-            Self::Summarising => 1,
             Self::Patching => 2,
         }
     }
@@ -955,7 +962,6 @@ impl DiffPhase {
     /// and resolves to the phase that claims the least.
     const fn of_code(code: u8) -> Self {
         match code {
-            1 => Self::Summarising,
             2 => Self::Patching,
             _ => Self::Preparing,
         }
@@ -1369,28 +1375,25 @@ fn append_diff_body(
     }
     let driver_at = |i: usize| drivers.get(i).filter(|d| d.any());
 
-    // Stats — the diffstat block (per-file list + summary) plus its trailing
-    // blank, suppressed when show_stats is off.
+    // Stats — the diffstat block (per-file list + summary) plus its trailing blank,
+    // suppressed when show_stats is off.
     //
-    // Deliberately libgit2's own, i.e. the RAW numbers, even for a driven file:
-    // `git show --stat -p` prints exactly that — `Bin 13 -> 20 bytes` above a
-    // textual converted patch — because git's `diff_flush_stat` never consults the
-    // driver either. Converting it would mean reimplementing git's stat formatter
-    // beside the git2 pipeline. So this block can disagree with the sidebar beside
-    // it, which is accepted: it matches the tool it imitates, against a column whose
-    // contract is internal consistency.
-    if settings.show_stats {
-        // Reads every blob to count its lines, and says nothing while it does.
-        env.phase(DiffPhase::Summarising);
-        if let Ok(stats) = diff.stats()
-            && let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80)
-        {
-            for l in s.as_str().unwrap_or("").lines() {
-                lines.push(DiffLine::new(l, LineKind::Stat));
-            }
-        }
+    // RESERVED here and written after the patch pass, because the block is drawn above
+    // the patch but counts what that pass finds. It used to come from `Diff::stats`,
+    // which is a whole second generation of every patch — 960ms beside the 1.0s the
+    // pass we keep costs, i.e. 38% of every build, thrown away for a few rows. The
+    // counts are already accumulating in `files`; only the formatting was ever bought
+    // with that pass, and `diffstat` is the port of it.
+    //
+    // One row per delta plus the summary, which is what libgit2 prints and what
+    // `diffstat::block` returns — so the reservation is exact and every
+    // `diff_line_idx` the print records below is already correct.
+    let stats_at = settings.show_stats.then(|| {
+        let at = lines.len();
+        lines.resize_with(at + files.len() + 1, || DiffLine::new("", LineKind::Stat));
         lines.push(DiffLine::new("", LineKind::Blank));
-    }
+        at
+    });
 
     // Patch — track which delta we're in.
     let mut current_file_idx: Option<usize> = None;
@@ -1526,6 +1529,39 @@ fn append_diff_body(
         // nested inside: this is the other exit that could not set the flag.
         log::warn!("gitkay: error rendering diff patch: {e}");
         failed = true;
+    }
+
+    // Now the counts are final, so the reserved rows can be written. BEFORE the sweep
+    // below, which reorders `files` — the block is in delta order, as libgit2's is, and
+    // `diff.get_delta(i)` (the binary sizes) is indexed the same way. A swept file is
+    // the one case that misses its counts here, and it is a driven file, whose row this
+    // block already renders differently from libgit2 on purpose.
+    if let Some(at) = stats_at {
+        let entries: Vec<diffstat::StatFile<'_>> = files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| diffstat::StatFile {
+                old_path: f.old_path.as_deref(),
+                new_path: &f.path,
+                insertions: f.additions,
+                deletions: f.deletions,
+                // The sizes are libgit2's, read off the delta the pass just generated
+                // — they are filled in as the blob is loaded, so they are only there
+                // to be read after the print.
+                binary: f.is_binary.then(|| {
+                    diff.get_delta(i)
+                        .map_or((0, 0), |d| (d.old_file().size(), d.new_file().size()))
+                }),
+            })
+            .collect();
+        for (row, text) in diffstat::block(&entries, STAT_WIDTH)
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(slot) = lines.get_mut(at + row) {
+                *slot = DiffLine::new(text, LineKind::Stat);
+            }
+        }
     }
 
     // The sweep. A delta whose hunks are ALL suppressed by `ignore_ws` never flushes
@@ -2509,6 +2545,202 @@ pub mod tests {
     use crate::diff::convert::tests::{commit_two_zips, driven_repo};
 
     use crate::test_repo::file_entry as fe;
+
+    /// The stat block this build writes is byte-for-byte what libgit2 would have
+    /// written — over a commit carrying every shape the formatter branches on.
+    ///
+    /// This is the test that justifies not calling `Diff::stats` at all: it keeps
+    /// libgit2 as the ORACLE while `diffstat` is the implementation, so the port is
+    /// checked against the thing it replaced rather than against its own idea of the
+    /// format. `everything_repo` is deliberately the fixture — a modify, an add, a
+    /// delete, a rename, a binary change and a mode-only change — because each of
+    /// those takes a different branch through the row builder.
+    #[test]
+    fn the_stat_block_is_what_libgit2_would_have_printed() {
+        let (_d, repo, oid) = everything_repo();
+        assert_stat_block_matches_libgit2(&repo, oid);
+    }
+
+    /// The same oracle over the shapes `everything_repo` does not reach, each of which
+    /// is a branch of the formatter that would otherwise go unchecked: counts large
+    /// enough to force the bar to SCALE (and with it the `max(minus, 1)` quirk), a path
+    /// long enough to squeeze the bar to its floor, a rename that shares a directory
+    /// and one that shares none.
+    #[test]
+    fn the_stat_block_matches_libgit2_on_scaling_and_long_paths() {
+        use crate::test_repo::{commit_index, rename_file, stage, temp_repo, write_file};
+        let (_d, repo) = temp_repo();
+        let deep = "a/very/deeply/nested/directory/that/is/quite/long/indeed.txt";
+        write_file(&repo, deep, "x\n");
+        write_file(&repo, "src/pkg/old.rs", "one\ntwo\n");
+        // A copy source has to be MODIFIED in the same commit for plain `-C` to take
+        // it (see `is_rename_source`), so this one is edited below as well as copied.
+        write_file(&repo, "src/pkg/dup.rs", "alpha\nbeta\ngamma\n");
+        write_file(&repo, "top.txt", "keep\n");
+        write_file(&repo, "gone.txt", "delete me\n");
+        for p in [
+            deep,
+            "src/pkg/old.rs",
+            "src/pkg/dup.rs",
+            "top.txt",
+            "gone.txt",
+        ] {
+            stage(&repo, p);
+        }
+        commit_index(&repo, &mut repo.index().unwrap(), "base");
+
+        // A big add, so every other file's bar is scaled against it.
+        let mut big = String::new();
+        for i in 0..900 {
+            use std::fmt::Write as _;
+            let _ = writeln!(big, "line {i}");
+        }
+        write_file(&repo, "big.txt", &big);
+        write_file(&repo, deep, "x\ny\nz\n");
+        rename_file(&repo, "src/pkg/old.rs", "src/pkg/new.rs");
+        rename_file(&repo, "top.txt", "moved/deeper/top.txt");
+        write_file(&repo, "src/pkg/dup.rs", "alpha\nBETA\ngamma\n");
+        write_file(&repo, "src/pkg/dup_copy.rs", "alpha\nbeta\ngamma\n");
+        std::fs::remove_file(repo.workdir().unwrap().join("gone.txt")).unwrap();
+        let mut index = repo.index().unwrap();
+        for p in [
+            "big.txt",
+            deep,
+            "src/pkg/new.rs",
+            "src/pkg/dup.rs",
+            "src/pkg/dup_copy.rs",
+            "moved/deeper/top.txt",
+        ] {
+            index.add_path(std::path::Path::new(p)).unwrap();
+        }
+        for p in ["src/pkg/old.rs", "top.txt", "gone.txt"] {
+            index.remove_path(std::path::Path::new(p)).unwrap();
+        }
+        let oid = commit_index(&repo, &mut index, "everything wide");
+
+        assert_stat_block_matches_libgit2(&repo, oid);
+
+        // Control: the fixture really does produce a COPY under `-C`, and a rename
+        // under `-M`. Without this the oracle above could agree with libgit2 by both
+        // sides finding neither, leaving the `old => new` branch unexercised.
+        let s = DiffSettings {
+            show_stats: true,
+            detect_renames: true,
+            detect_copies: true,
+            ..base_settings()
+        };
+        let data = diff_of(&repo, oid, s, None);
+        let statuses: Vec<git2::Delta> = data.files.iter().map(|f| f.status).collect();
+        assert!(
+            statuses.contains(&git2::Delta::Copied),
+            "the fixture must exercise a copy: {statuses:?}"
+        );
+        assert!(
+            statuses.contains(&git2::Delta::Renamed),
+            "and a rename: {statuses:?}"
+        );
+        let block: Vec<String> = data
+            .lines
+            .iter()
+            .filter(|l| l.kind == LineKind::Stat)
+            .map(|l| l.text.to_string())
+            .collect();
+        assert!(
+            block.iter().filter(|r| r.contains(" => ")).count() >= 2,
+            "both the copy and the rename print their old path: {block:#?}"
+        );
+        // The one that shares a directory prints it once, in braces.
+        assert!(
+            block.iter().any(|r| r.contains("src/pkg/{")),
+            "a same-directory rename or copy collapses its common prefix: {block:#?}"
+        );
+    }
+
+    /// Both stat-block oracles: the rows this build writes must be the rows
+    /// `Diff::stats` would have written — under every combination of the two detection
+    /// settings, because each decides whether a delta carries a DIFFERENT old path and
+    /// so takes the `old => new` branch of the formatter. A copy is that branch too:
+    /// libgit2 compares the paths and never asks which status produced them, and
+    /// `FileEntry::old_path` is set for `Copied` exactly as it is for `Renamed`.
+    fn assert_stat_block_matches_libgit2(repo: &Repository, oid: git2::Oid) {
+        for (detect_renames, detect_copies) in
+            [(false, false), (true, false), (true, true), (false, true)]
+        {
+            let s = DiffSettings {
+                show_stats: true,
+                detect_renames,
+                detect_copies,
+                ..base_settings()
+            };
+            let scope = RowScope::new(DiffSource::Commit(oid));
+            // The oracle: the pass this build no longer runs.
+            let diff = scoped_diff(repo, s, &scope.paths, |r, o| {
+                commit_parent_diff(r, &r.find_commit(oid)?, Some(o))
+            })
+            .expect("the fixture diffs");
+            let buf = diff
+                .stats()
+                .expect("stats")
+                .to_buf(git2::DiffStatsFormat::FULL, STAT_WIDTH)
+                .expect("formats");
+            let want: Vec<&str> = buf.as_str().expect("utf-8").lines().collect();
+
+            let data = diff_of(repo, oid, s, None);
+            let got: Vec<String> = data
+                .lines
+                .iter()
+                .filter(|l| l.kind == LineKind::Stat)
+                .map(|l| l.text.to_string())
+                .collect();
+
+            assert_eq!(got, want, "renames={detect_renames} copies={detect_copies}");
+            // ...and the block really is above the patch, where git draws it.
+            let first_stat = data
+                .lines
+                .iter()
+                .position(|l| l.kind == LineKind::Stat)
+                .expect("a stat block");
+            let first_patch = data
+                .lines
+                .iter()
+                .position(|l| l.kind == LineKind::FileMeta)
+                .expect("a patch");
+            assert!(
+                first_stat < first_patch,
+                "the block is drawn above the patch"
+            );
+        }
+    }
+
+    /// The reserved rows are exactly filled: one per delta plus the summary, with no
+    /// blank left over. A reservation that did not match `diffstat::block`'s output
+    /// would leave an empty row in the middle of the block (or drop the summary), and
+    /// every `diff_line_idx` recorded during the patch pass rests on the count being
+    /// right before the pass runs.
+    #[test]
+    fn the_stat_block_fills_every_row_it_reserved() {
+        let (_d, repo, oid) = everything_repo();
+        let s = DiffSettings {
+            show_stats: true,
+            ..base_settings()
+        };
+        let data = diff_of(&repo, oid, s, None);
+        let stat: Vec<&DiffLine> = data
+            .lines
+            .iter()
+            .filter(|l| l.kind == LineKind::Stat)
+            .collect();
+        assert_eq!(stat.len(), data.files.len() + 1);
+        assert!(
+            stat.iter().all(|l| !l.text.is_empty()),
+            "every reserved row was written"
+        );
+        // And each file's recorded patch position still points at its own header.
+        for f in data.files.iter() {
+            let at = f.diff_line_idx.expect("every fixture file has a body");
+            assert_eq!(data.lines[at].kind, LineKind::FileMeta, "{}", f.path);
+        }
+    }
 
     /// One commit carrying every shape the two counters could disagree on: a
     /// modify, an add, a delete, a rename, a binary change and a mode-only
