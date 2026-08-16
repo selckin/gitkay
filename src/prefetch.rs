@@ -1256,6 +1256,29 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
         && let Ok(measured) = diff::measured_row_diff(repo, &job.scope, job.settings, tc)
     {
         let cost = measured.cost;
+        // An entry in the store IS this row's diff, and its counts are exactly what
+        // `cache_diff` would harvest off the pane — `entry_key` folds in the WHOLE
+        // `DiffSettings` plus the driver fingerprint, so a hit is strictly stronger
+        // than `stats_harvestable`'s rule and the column still cannot disagree.
+        //
+        // Consulted in both branches below rather than instead of them, because the
+        // cheap probe above is what routes this row's DIFF to the heavy lane and that
+        // decision must be made whether or not the numbers came off disk.
+        //
+        // Measured: a miss is ~6-8µs (a key hash and an ENOENT) against a job that
+        // starts at ~2ms and reaches hundreds of ms, and a hit is ~2× a recompute on a
+        // text-heavy diff — a floor, not the point, since the store only holds diffs
+        // that took longer than `min_build_ms` to build. The point is the branch below:
+        // a deferred row used to show a file count and a BLANK `+`/`-` until something
+        // else happened to load its diff, which on a large repo can be never.
+        //
+        // Always a miss for the virtual rows — `entry_key` refuses their sources — so
+        // the `Withheld` arm further down is untouched.
+        let stored = || {
+            crate::store_of(&ctx.deps.store)
+                .and_then(|s| s.load(&job.scope, job.settings))
+                .map(|d| diff::stats_from_data(&d))
+        };
         // `driven` joins the byte threshold rather than replacing it, and it is what
         // keeps a SUBPROCESS off this path: a three-file zip behind `bsdtar` is a few
         // KB and several hundred milliseconds, which no byte cap can see coming. The
@@ -1273,12 +1296,22 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
         // oid never expires.
         if is_real_commit(oid) && ctx.limits.too_costly(&cost) {
             log::debug!("stats: defer {oid} — {}", ctx.limits.defer_reason(&cost));
-            // Send the file count NOW, so the row shows something rather than staying
-            // blank. Deliberately counted off the pipeline's own diff and not from
+            // Complete numbers if an earlier run already paid for this row's diff — the
+            // deferral's promise is that the row's own diff will supply them, and
+            // nothing guarantees anything ever builds it: on a large repo the warm band
+            // spends its line budget long before reaching such a row, so the `+`/`-`
+            // stayed blank for the session.
+            //
+            // Otherwise the file count NOW, so the row shows something rather than
+            // nothing. Deliberately counted off the pipeline's own diff and not from
             // `cost.deltas`: the measurement is taken before `detect_similar`, so it
             // counts a rename as two files where the pane shows one, and a column that
             // disagrees with the pane is the exact drift the shared pipeline prevents.
-            send_stats(ctx, job, measured.stats(StatsWant::FilesOnly).ok());
+            send_stats(
+                ctx,
+                job,
+                stored().or_else(|| measured.stats(StatsWant::FilesOnly).ok()),
+            );
             // And then STOP. The line counts cost the same blob reads the diff does, and
             // this row's diff goes to the heavy lane — `cache_diff` takes the column off
             // it for free when it lands. Computing them here as well would pay ~11s twice
@@ -1322,23 +1355,34 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
         } else {
             job.want
         };
-        // Under the cap: finish off the diff already in hand rather than building a
-        // second one. This is the ordinary path on an ordinary repo, where the guard
-        // never fires — so before, measuring cost anything at all.
-        let stats = measured
-            .stats(want)
-            .inspect_err(|e| log::debug!("stats: {oid} failed: {e}"))
-            .ok()
-            .map(|stats| {
-                if withheld {
-                    CommitStats {
-                        lines: diff::LineStats::Withheld,
-                        ..stats
+        // Under the cap: the store if it has this row, else finish off the diff already
+        // in hand rather than building a second one. This is the ordinary path on an
+        // ordinary repo, where the guard never fires — so before, measuring cost
+        // anything at all. `stats(FilesAndLines)` is `Diff::stats()`, a full pass over
+        // every changed blob, which is the pass a stored entry has already paid for.
+        //
+        // `withheld` sits INSIDE the fallback, not over the result: it means "the counts
+        // this arm would compute are libgit2's RAW ones", and a stored entry's are the
+        // CONVERTED ones the pane shows. The two are unreachable together today — a
+        // driven virtual row never keys into the store and a driven real one deferred
+        // above — but an arrangement where `Withheld` could overwrite real counts would
+        // look accidental rather than safe.
+        let stats = stored().or_else(|| {
+            measured
+                .stats(want)
+                .inspect_err(|e| log::debug!("stats: {oid} failed: {e}"))
+                .ok()
+                .map(|stats| {
+                    if withheld {
+                        CommitStats {
+                            lines: diff::LineStats::Withheld,
+                            ..stats
+                        }
+                    } else {
+                        stats
                     }
-                } else {
-                    stats
-                }
-            });
+                })
+        });
         log::debug!("stats: done {oid} ({:?}) in {:?}", job.want, t.elapsed());
         send_stats(ctx, job, stats);
         return Outcome::Stats { oid, costly: None };
@@ -2365,6 +2409,167 @@ mod tests {
             LineStats::Counted(0, 0),
             "a binary change has no lines, but they were computed rather than deferred"
         );
+    }
+
+    /// A store with this repo's context, so a stats job can find an entry in it.
+    fn deps_with_store(repo: &Repository) -> (tempfile::TempDir, DiffDeps) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = crate::diff_store::DiffStore::at(
+            dir.path().to_path_buf(),
+            crate::diff_store::StoreContext::of(repo).expect("hashable"),
+            std::time::Duration::ZERO,
+        );
+        let deps = DiffDeps::default();
+        assert!(deps.store.set(store).is_ok());
+        (dir, deps)
+    }
+
+    /// A DEFERRED row whose diff is already in the store answers in full.
+    ///
+    /// The deferral's premise is that the row's own diff will supply the line counts,
+    /// and nothing guarantees anything ever builds it — on a large repo the warm band
+    /// spends its line budget long before reaching such a row, so the `+`/`-` stayed
+    /// blank for the session while the answer sat on disk. Both halves are asserted:
+    /// the numbers arrive, AND the row is still recorded as costly, because that is a
+    /// fact about building its diff and is unaffected by where the counts came from.
+    #[test]
+    fn a_deferred_stats_row_takes_its_counts_from_the_store() {
+        use crate::test_repo::commit_file;
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", "a\nb\nc\n", "one");
+        let oid = commit_file(&repo, "f.txt", "a\nB\nc\nd\n", "two");
+        let scope = RowScope::new(DiffSource::Commit(oid));
+        let settings = probe_settings();
+
+        let (_dir, deps) = deps_with_store(&repo);
+        let data = diff::get_diff_data(&repo, &scope, settings, diff::BuildEnv::of(None));
+        let want = diff::stats_from_data(&data);
+        assert!(
+            crate::store_of(&deps.store)
+                .expect("a store")
+                .save(&scope, settings, &data),
+            "control: the fixture's diff must actually be stored"
+        );
+
+        let (stats_tx, stats_rx) = mpsc::channel();
+        let worker = WorkerCtx {
+            id: 0,
+            // Zero, so every row is over the byte threshold and defers.
+            limits: Limits {
+                max_blob_bytes: 0,
+                max_entry_lines: usize::MAX,
+            },
+            coord: mpsc::channel().0,
+            tx: mpsc::channel().0,
+            stats_tx,
+            ctx: egui::Context::default(),
+            deps,
+        };
+        let job = StatsJob {
+            scope,
+            settings,
+            want: StatsWant::FilesAndLines,
+            epoch: 1,
+        };
+
+        let outcome = run_stats_job(&worker, &repo, &job);
+        assert!(
+            matches!(
+                outcome,
+                Outcome::Stats {
+                    costly: Some(_),
+                    ..
+                }
+            ),
+            "the row is still costly to BUILD, whatever answered its counts"
+        );
+        let sent = stats_rx.recv().expect("exactly one result").stats.unwrap();
+        assert_eq!(
+            sent, want,
+            "the stored diff's own counts, not a file count alone"
+        );
+        assert!(
+            matches!(sent.lines, LineStats::Counted(2, 1)),
+            "control: this fixture really has lines to count, got {:?}",
+            sent.lines
+        );
+    }
+
+    /// The same entry spares the ordinary path its `Diff::stats()` — a full pass over
+    /// every changed blob — and must produce exactly what that pass would.
+    ///
+    /// The two agree by construction, so agreement alone cannot show the store was
+    /// consulted at all. The blob one side needs is therefore REMOVED from the odb
+    /// first: a recompute can no longer answer, and only a store hit can. That is not a
+    /// contrivance for the test's sake — `build_or_load` serves the pane from the same
+    /// entry, so a column answering here is a column agreeing with what is on screen.
+    #[test]
+    fn an_ordinary_stats_row_prefers_the_store_and_agrees_with_it() {
+        use crate::test_repo::{commit_file, remove_loose_object};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", "a\nb\nc\n", "one");
+        let oid = commit_file(&repo, "f.txt", "a\nB\nc\nd\n", "two");
+        let scope = RowScope::new(DiffSource::Commit(oid));
+        let settings = probe_settings();
+
+        let (_dir, deps) = deps_with_store(&repo);
+        let data = diff::get_diff_data(&repo, &scope, settings, diff::BuildEnv::of(None));
+        let want = diff::stats_from_data(&data);
+        assert!(
+            crate::store_of(&deps.store)
+                .expect("a store")
+                .save(&scope, settings, &data)
+        );
+        // The oracle, taken while the odb can still answer.
+        assert_eq!(
+            diff::commit_stats(&repo, &scope, settings, StatsWant::FilesAndLines).unwrap(),
+            want,
+            "control: the stored counts are the ones the pass would compute"
+        );
+
+        let blob = repo
+            .find_commit(oid)
+            .unwrap()
+            .tree()
+            .unwrap()
+            .get_path(std::path::Path::new("f.txt"))
+            .unwrap()
+            .id();
+        let workdir = repo.workdir().unwrap().to_path_buf();
+        drop(repo);
+        remove_loose_object(&workdir, blob);
+        let repo = crate::test_repo::open_repo(&workdir);
+
+        let (stats_tx, stats_rx) = mpsc::channel();
+        let worker = WorkerCtx {
+            id: 0,
+            limits: Limits {
+                max_blob_bytes: u64::MAX,
+                max_entry_lines: usize::MAX,
+            },
+            coord: mpsc::channel().0,
+            tx: mpsc::channel().0,
+            stats_tx,
+            ctx: egui::Context::default(),
+            deps,
+        };
+        let outcome = run_stats_job(
+            &worker,
+            &repo,
+            &StatsJob {
+                scope,
+                settings,
+                want: StatsWant::FilesAndLines,
+                epoch: 1,
+            },
+        );
+        assert!(matches!(outcome, Outcome::Stats { costly: None, .. }));
+        let sent = stats_rx
+            .recv()
+            .unwrap()
+            .stats
+            .expect("the store answers where the odb no longer can");
+        assert_eq!(sent, want);
     }
 
     /// LOAD-BEARING. The uncommitted row is DRIVEN too, and its column may not
