@@ -24,6 +24,7 @@ mod diff;
 mod diff_cache;
 mod diff_highlight;
 mod diff_store;
+mod diffstat;
 mod graph;
 mod highlight;
 mod history;
@@ -3239,7 +3240,6 @@ fn loading_diff_text(elapsed: std::time::Duration, report: Option<&DiffProgressR
             s.push(' ');
             match r.phase {
                 DiffPhase::Preparing => s.push_str("comparing trees"),
-                DiffPhase::Summarising => s.push_str("counting lines"),
                 // A zero total is a diff with no deltas, which cannot be slow — but it
                 // would read as "0/0 files", so say what is happening instead.
                 DiffPhase::Patching if r.files_total == 0 => s.push_str("generating the patch"),
@@ -10620,11 +10620,6 @@ mod tests {
         assert_eq!(
             loading_diff_text(quick, Some(&r)),
             "Loading diff… comparing trees"
-        );
-        let r = progress_at(DiffPhase::Summarising, 0, 0, "");
-        assert_eq!(
-            loading_diff_text(quick, Some(&r)),
-            "Loading diff… counting lines"
         );
         let r = progress_at(DiffPhase::Patching, 0, 0, "");
         assert_eq!(

@@ -226,6 +226,10 @@ write layer: `ApplyAction`/`ApplyRequest`/`ApplyError`, the
 role→FontId map), `src/highlight.rs` (syntect highlighter, theme/palette
 resolution, grammar selection, per-line tokenization — no diff knowledge; the
 diff-side orchestration is `src/diff_highlight.rs`), `src/diff_cache.rs` (line-budget LRU cache),
+`src/diffstat.rs` (the `--stat` block above a patch, formatted from the counts the
+build already has — a port of libgit2's own formatter, which exists so `Diff::stats`
+(a whole second pass over every blob, 38% of a build) never runs; see **Diffstat
+block**),
 `src/diff_store.rs` (the persistent layer below that cache: a hand-rolled binary
 codec for a diff's structure, key derivation, atomic load/save under its own
 `MAX_ENTRY_BYTES` — an entry the budget could never keep is refused before it is
@@ -672,9 +676,11 @@ The invariants:
 - **Diff-load progress**: past `DIFF_PLACEHOLDER_DELAY` a commit switch blanks the
   pane, and what it blanks to says what the build is doing rather than only that it is
   doing something — `loading_diff_text` (pure), fed by a `diff::DiffProgress` the
-  running build writes into. Three phases (`DiffPhase`), which is as fine as an honest
+  running build writes into. Two phases (`DiffPhase`), which is as fine as an honest
   report gets: each is one libgit2 call or loop, and only the patch pass has a
-  denominator (`Loading diff… 143/2310 files · src/…/Foo.java (11.5s)`).
+  denominator (`Loading diff… 143/2310 files · src/…/Foo.java (11.5s)`). There was a
+  third, `Summarising`, for the `Diff::stats` pass — it went when that pass did (see
+  **Diffstat**) rather than staying as a state nothing can reach.
   **The counter and the clock cover opposite shapes and both are needed**: a commit
   touching thousands of files advances the counter, while a three-line patch inside a
   265MB blob sits on `1/1` for eleven seconds — there the file NAME says where the time
@@ -695,6 +701,33 @@ The invariants:
   `Option`**, so "a diff is loading" stays one answer; `inflight_loads` maps each
   running key to its handle so a bounce-back adopts the worker AND its progress
   instead of resetting the display to "comparing trees".
+- **Diffstat block** (`src/diffstat.rs`): the `--stat` summary drawn above the patch,
+  formatted from counts the build already has instead of asked of libgit2. `Diff::stats`
+  is a COMPLETE second pass — it regenerates every patch, takes its line counts and
+  throws it away — measured at **960ms beside the 1.0s the patch pass itself costs**, so
+  **38% of every diff build** went on a few summary rows. `push_patch_line` is already
+  accumulating those counts per file; the only thing that pass ever bought was the
+  FORMATTING, and that is what the module is: a port of libgit2's `diff_stats.c` under
+  `GIT_DIFF_STATS_FULL`, **quirks included** — a file with no deletions still gets one
+  `-` on a scaled bar, because each run of the bar is `max(n, 1)`. Renames and copies
+  take the same branch as each other and as libgit2's, which compares the two paths and
+  never asks which status produced them (`FileEntry::old_path` is set for `Copied`
+  exactly as for `Renamed`): `dir/{old => new}` when they share a directory, `old => new`
+  when they do not.
+  **libgit2 stays the ORACLE though it is no longer the implementation**: the tests
+  assert the block this build writes is byte-for-byte `Diff::stats().to_buf()`, over
+  fixtures covering a modify/add/delete/rename/copy/binary/mode-change, bar scaling, a
+  path long enough to squeeze the bar to its floor, and all four rename/copy settings —
+  with a control asserting the fixture really produces a copy, since two sides agreeing
+  that nothing is a copy would pass while testing nothing.
+  The block is **reserved before the patch pass and written after it**: it is drawn
+  above the patch but counts what that pass finds, so `files.len() + 1` rows (exactly
+  what the formatter returns) are pushed as placeholders, keeping every `diff_line_idx`
+  the pass records correct, and filled in afterwards. Two divergences from libgit2 are
+  deliberate: a **textconv-driven** file is counted from its converted patch (so the
+  block now agrees with the sidebar, where the old path documented the disagreement and
+  accepted it), and a swept driven file — the rare delta whose header never printed —
+  misses its counts, being reordered out of delta order after the block is written.
 - **Bottom panel**: diff view (left, syntax-highlighted) + file list sidebar
   (right, dynamic width). **Both read in the same order, and it is the sidebar's**
   — one decision made once in `build_file_rows`, whose grouped layout is not the
