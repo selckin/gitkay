@@ -168,11 +168,119 @@ pub fn warn_bad_rev(rev: &str, result: &Result<git2::Oid, git2::Error>) {
     }
 }
 
+/// Whether a commit touches a pathspec, and what answering it cost.
+///
+/// The second half is diagnostics, not logic: a glob costs ~215µs a commit where a
+/// literal path costs ~3.6µs, and a walk 60× slower than it needs to be should say
+/// which of the two it did rather than leave the reader with one large number — the
+/// lesson `WalkCost` records, applied inside the term that dominated it.
+pub struct Touch {
+    pub touched: bool,
+    /// The tree-lookup fast path did not apply, so this answer cost a whole
+    /// commit-vs-parent diff.
+    pub by_diff: bool,
+}
+
+/// Can this pathspec be answered by a tree lookup rather than a diff?
+///
+/// Deliberately narrow. libgit2 matches a pathspec with `wildmatch` over the paths a
+/// tree walk yields; a lookup RESOLVES a path. The two agree on a plain relative path
+/// naming a file or a directory, and this rejects everything where they need not:
+///
+/// - wildcards (`*`, `?`, `[`) and `\`, fnmatch's escape — the whole point of a glob;
+/// - any empty component, which covers three shapes at once: the empty spec (which
+///   reaches here from `gitkay -- .` at the repo root and means "everything" to the
+///   matcher while `get_path("")` means nothing), a trailing `/` (which `Path`
+///   normalizes away, so `src/` would answer for the whole subtree, while `wildmatch`
+///   does not match `src/foo` against `src/`), and a leading or doubled one;
+/// - `.` and `..` components, which a `Path` lookup resolves and a byte matcher does
+///   not.
+///
+/// Case is NOT among them, and that is a property of the diff rather than an
+/// assumption: `git_diff_tree_to_tree` builds its iterators with
+/// `GIT_ITERATOR_DONT_IGNORE_CASE` unless the caller passes `GIT_DIFF_IGNORE_CASE`,
+/// which `pathspec_opts` does not — so a tree-to-tree pathspec match is exact
+/// regardless of `core.ignorecase`, exactly as a lookup is.
+/// `the_two_touch_tests_agree_on_a_case_differing_path` pins that, and is what fails
+/// if `pathspec_opts` ever gains the flag.
+///
+/// Anything rejected here still gets the right answer, one diff at a time.
+fn literal_pathspec(p: &str) -> bool {
+    !p.contains(['*', '?', '[', '\\'])
+        && p.split('/').all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
+/// The entry at `path`, or `None` when the tree has none there.
+///
+/// `Err` is NOT folded into `None`, and that is the whole reason this is spelled out:
+/// "no such path" and "this tree could not be read" would otherwise both answer
+/// "unchanged", and an unreadable object would silently drop a commit from a filtered
+/// view — the same rule the write layer states as `path_present`.
+///
+/// `filemode_raw`, not `filemode`: libgit2's tree iterator yields `tree_entry->attr`
+/// verbatim (`iterator.c`), so the diff this stands in for compares RAW modes.
+/// `filemode` normalizes, which would fold a legacy `0100664` into `0100644` and report
+/// a mode-only commit as untouched.
+fn tree_entry_at(
+    tree: &git2::Tree<'_>,
+    path: &std::path::Path,
+) -> Result<Option<(git2::Oid, i32)>, git2::Error> {
+    match tree.get_path(path) {
+        Ok(e) => Ok(Some((e.id(), e.filemode_raw()))),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The fast path: does the entry at any of `paths` differ from the first parent's?
+///
+/// The parent is resolved exactly as `commit_parent_diff` resolves it, `.ok()`s
+/// included — a root commit, or a parent or parent tree that cannot be loaded, is
+/// diffed against the EMPTY tree there, so every present path counts as an add. This
+/// mirrors that, flaws and all: it is an optimisation, never a second definition of
+/// "touches".
+fn entry_touches_any(commit: &git2::Commit<'_>, paths: &[String]) -> Result<bool, git2::Error> {
+    let tree = commit.tree()?;
+    let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+    for p in paths {
+        let path = std::path::Path::new(p);
+        let before = match &parent_tree {
+            Some(t) => tree_entry_at(t, path)?,
+            None => None,
+        };
+        if tree_entry_at(&tree, path)? != before {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Whether `commit`'s diff against its first parent (or the empty tree for a root
 /// commit) touches any of `paths`. Used for the `-- <path>` commit filter.
-pub fn commit_touches_paths(repo: &Repository, commit: &git2::Commit, paths: &[String]) -> bool {
+///
+/// **This runs once per WALKED commit, not once per kept one** — the whole history —
+/// so it is the cost of a path filter, and it was measured at 94% of one: 3.6s of a
+/// 3.83s walk over 16,754 commits to keep 32 rows. The diff below is ~215µs a commit
+/// almost regardless of repo size (measured at 220µs on a 318-commit repo and 215µs on
+/// the 16,754-commit one), which says the cost is the per-diff machinery rather than
+/// the trees; the tree lookup that replaces it is ~3.6µs, a 62× saving, and the two
+/// were verified to agree on every commit of a real history.
+///
+/// The diff is still the answer for a pathspec a lookup cannot stand in for
+/// (`literal_pathspec`) and for a tree it could not read.
+pub fn commit_touches_paths(repo: &Repository, commit: &git2::Commit, paths: &[String]) -> Touch {
+    if !paths.is_empty() && paths.iter().all(|p| literal_pathspec(p)) {
+        // A read failure falls THROUGH to the diff rather than answering: the diff may
+        // well fail too, and if it does it says so below.
+        if let Ok(touched) = entry_touches_any(commit, paths) {
+            return Touch {
+                touched,
+                by_diff: false,
+            };
+        }
+    }
     let mut opts = pathspec_opts(paths);
-    match commit_parent_diff(repo, commit, Some(&mut opts)) {
+    let touched = match commit_parent_diff(repo, commit, Some(&mut opts)) {
         Ok(d) => d.deltas().len() > 0,
         Err(e) => {
             // Treat as "doesn't touch the path" but say so: otherwise a transient
@@ -180,6 +288,10 @@ pub fn commit_touches_paths(repo: &Repository, commit: &git2::Commit, paths: &[S
             log::warn!("gitkay: cannot diff {} for path filter: {e}", commit.id());
             false
         }
+    };
+    Touch {
+        touched,
+        by_diff: true,
     }
 }
 
@@ -616,6 +728,11 @@ pub fn load_commits_inner(repo: &Repository, max: usize, scope: &cli::Scope) -> 
                 std::time::Duration::ZERO,
                 std::time::Duration::ZERO,
             );
+            // How many touch tests ran, and how many of those had to be a whole diff
+            // because a lookup could not stand in (see `commit_touches_paths`). A glob
+            // is 60× the cost of a literal path, and that is worth saying rather than
+            // leaving inside one large `path test` number.
+            let (mut tested, mut diffed) = (0usize, 0usize);
             for oid in revwalk.flatten() {
                 if prepared.is_none() {
                     prepared = Some(t_walk.elapsed());
@@ -628,13 +745,15 @@ pub fn load_commits_inner(repo: &Repository, max: usize, scope: &cli::Scope) -> 
                 };
                 let parents: Vec<git2::Oid> = commit_parents(&commit, scope.first_parent);
                 walked.push((oid, parents.clone()));
-                let touched = timed(&mut touch, || {
+                let test = timed(&mut touch, || {
                     follow_path.as_ref().map_or_else(
                         || commit_touches_paths(repo, &commit, &scope.paths),
                         |p| commit_touches_paths(repo, &commit, std::slice::from_ref(p)),
                     )
                 });
-                if touched {
+                tested += 1;
+                diffed += usize::from(test.by_diff);
+                if test.touched {
                     kept_set.insert(oid);
                     let mut info = timed(&mut build, || {
                         build_commit_info(oid, &commit, parents, &ref_map)
@@ -689,8 +808,9 @@ pub fn load_commits_inner(repo: &Repository, max: usize, scope: &cli::Scope) -> 
             real = kept;
             log::debug!(
                 "perf: load_commits: path filter over {walked_len} commits — setup {setup:?}, \
-                 sort {sort:?}, iterate {iterate:?}, find_commit {find:?}, path test {touch:?}, \
-                 build ({} rows) {build:?}, rename trace {trace:?}, parent rewrite {:?}",
+                 sort {sort:?}, iterate {iterate:?}, find_commit {find:?}, \
+                 path test ({diffed}/{tested} by diff) {touch:?}, build ({} rows) {build:?}, \
+                 rename trace {trace:?}, parent rewrite {:?}",
                 real.len(),
                 t_rewrite.elapsed()
             );
@@ -2023,6 +2143,139 @@ mod tests {
             all.contains(&"on-side".to_string()),
             "--all must show all branches"
         );
+    }
+
+    /// The diff is the oracle for the tree-lookup fast path, and this is the test that
+    /// makes the substitution safe: over one commit carrying every shape the two could
+    /// disagree on, both must answer identically for every path, and the fast path must
+    /// actually have been taken.
+    ///
+    /// The failure mode being guarded is a silent one — a commit missing from a
+    /// filtered view, which nobody notices — so the shapes are enumerated rather than
+    /// sampled: a plain modify, an add, a delete, both sides of a rename, a MODE-ONLY
+    /// change (which is why the comparison carries `filemode_raw`), a binary blob, a
+    /// path in neither side, and the root commit, whose parent is the empty tree.
+    #[test]
+    fn the_tree_lookup_touch_test_agrees_with_the_diff_it_replaces() {
+        let (_d, repo, _) = crate::diff::tests::everything_repo();
+        let probes = [
+            "text.txt", // modified
+            "added.txt",
+            "gone.txt",   // deleted
+            "old.txt",    // the rename's old side
+            "new.txt",    // ...and its new side
+            "mode.sh",    // mode-only: same blob, different filemode
+            "bin.dat",    // binary
+            "absent.txt", // in neither side
+        ];
+        let oids: Vec<git2::Oid> = {
+            let mut rw = repo.revwalk().unwrap();
+            rw.set_sorting(Sort::TIME | Sort::TOPOLOGICAL).unwrap();
+            rw.push_head().unwrap();
+            rw.flatten().collect()
+        };
+        assert!(oids.len() >= 2, "control: a root commit and a child");
+
+        let mut any_touched = false;
+        for oid in oids {
+            let commit = repo.find_commit(oid).unwrap();
+            for p in probes {
+                let paths = vec![p.to_string()];
+                let fast = commit_touches_paths(&repo, &commit, &paths);
+                let by_diff = {
+                    let mut opts = crate::diff::pathspec_opts(&paths);
+                    crate::diff::commit_parent_diff(&repo, &commit, Some(&mut opts))
+                        .map(|d| d.deltas().len() > 0)
+                        .unwrap()
+                };
+                assert!(!fast.by_diff, "{p} at {oid} should take the fast path");
+                assert_eq!(fast.touched, by_diff, "{p} at {oid}");
+                any_touched |= by_diff;
+            }
+        }
+        assert!(any_touched, "control: the fixture must touch something");
+    }
+
+    /// A directory pathspec answers for everything under it, which is the property that
+    /// makes the lookup viable at all: the tree oid at that path covers the subtree, so
+    /// one entry comparison stands in for a diff that would walk it.
+    #[test]
+    fn a_directory_pathspec_answers_for_its_whole_subtree() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "src/deep/f.txt", "1", "seed");
+        let inside = commit_file(&repo, "src/deep/f.txt", "2", "edit inside");
+        let outside = commit_file(&repo, "top.txt", "1", "edit outside");
+
+        let dir = vec!["src".to_string()];
+        for (oid, want) in [(inside, true), (outside, false)] {
+            let commit = repo.find_commit(oid).unwrap();
+            let fast = commit_touches_paths(&repo, &commit, &dir);
+            let mut opts = crate::diff::pathspec_opts(&dir);
+            let by_diff = crate::diff::commit_parent_diff(&repo, &commit, Some(&mut opts))
+                .map(|d| d.deltas().len() > 0)
+                .unwrap();
+            assert!(!fast.by_diff);
+            assert_eq!(fast.touched, want, "{oid}");
+            assert_eq!(by_diff, want, "control: the diff agrees at {oid}");
+        }
+    }
+
+    /// A glob is not a lookup, and must still be answered — by the diff, and correctly.
+    /// `by_diff` is asserted because it is what the walk's perf line reports: a filter
+    /// paying 60× has to be able to say so.
+    #[test]
+    fn a_glob_pathspec_falls_back_to_the_diff_and_still_answers() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.txt", "1", "one");
+        let head = commit_file(&repo, "b.md", "1", "two");
+        let commit = repo.find_commit(head).unwrap();
+
+        let hit = commit_touches_paths(&repo, &commit, &["*.md".to_string()]);
+        assert!(hit.touched && hit.by_diff);
+        let miss = commit_touches_paths(&repo, &commit, &["*.txt".to_string()]);
+        assert!(!miss.touched && miss.by_diff);
+    }
+
+    /// A tree-to-tree pathspec match is case-SENSITIVE whatever `core.ignorecase` says
+    /// — `git_diff_tree_to_tree` builds its iterators with `GIT_ITERATOR_DONT_IGNORE_CASE`
+    /// unless the caller passes `GIT_DIFF_IGNORE_CASE`, and `pathspec_opts` does not —
+    /// which is what lets the lookup, always exact, stand in for it. This is the test
+    /// that fails if `pathspec_opts` ever gains that flag.
+    #[test]
+    fn the_two_touch_tests_agree_on_a_case_differing_path() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "seed.txt", "1", "seed");
+        let head = commit_file(&repo, "Foo.txt", "1", "add Foo.txt");
+        let commit = repo.find_commit(head).unwrap();
+
+        let paths = vec!["foo.txt".to_string()];
+        let fast = commit_touches_paths(&repo, &commit, &paths);
+        let mut opts = crate::diff::pathspec_opts(&paths);
+        let by_diff = crate::diff::commit_parent_diff(&repo, &commit, Some(&mut opts))
+            .map(|d| d.deltas().len() > 0)
+            .unwrap();
+        assert!(!fast.by_diff);
+        assert_eq!(fast.touched, by_diff);
+        assert!(
+            !by_diff,
+            "control: the diff must be case-sensitive here, or the lookup cannot stand in"
+        );
+    }
+
+    /// What the fast path may be asked, spelled out — every rejection is a shape where
+    /// a `Path` lookup and libgit2's byte matcher need not agree.
+    #[test]
+    fn only_a_plain_relative_path_takes_the_lookup() {
+        for ok in ["a.txt", "src/diff.rs", "src", "a-b_c.d", "dir/sub/f"] {
+            assert!(literal_pathspec(ok), "{ok}");
+        }
+        for no in [
+            "", "*.rs", "src/*", "a?b", "a[bc]", "a\\b", // globs and the escape
+            "src/", // Path normalizes the trailing slash away; wildmatch does not
+            "/abs", "a//b", ".", "..", "./a", "a/../b",
+        ] {
+            assert!(!literal_pathspec(no), "{no}");
+        }
     }
 
     #[test]

@@ -2870,7 +2870,10 @@ pub mod tests {
     /// One commit carrying every shape the two counters could disagree on: a
     /// modify, an add, a delete, a rename, a binary change and a mode-only
     /// change. Returns the repo and that commit's oid.
-    fn everything_repo() -> (tempfile::TempDir, Repository, git2::Oid) {
+    ///
+    /// `pub` because `history`'s suite wants the same shapes to check its tree-lookup
+    /// touch test against the diff — a second fixture would be one that drifts.
+    pub fn everything_repo() -> (tempfile::TempDir, Repository, git2::Oid) {
         use crate::test_repo::{commit_index, stage, temp_repo, write_file};
         let (d, repo) = temp_repo();
         write_file(&repo, "text.txt", "one\ntwo\nthree\n");
