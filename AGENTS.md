@@ -194,7 +194,10 @@ and the wiring. Those modules: `src/diff.rs` (the diff **data** layer: `DiffLine
 `DiffData` / `FileEntry` / `DiffSettings`, `PerRow` and its two aliases
 `RowSpans`/`RowEmphasis` — what the DISPLAY derives per row, held BESIDE the rows
 rather than inside them, which is what lets the row array be shared with the highlight
-worker instead of copied for it — `CommitKind` + the sentinel oids,
+worker instead of copied for it, and CHUNKED (a chunk of slots is allocated on the
+first write into it, so what is allocated follows what was computed rather than how
+long the diff is — one slot per row is 1.84GB and a measured 1.17s on a 76.5M-line
+diff) — `CommitKind` + the sentinel oids,
 `DiffSource` + `RowScope` (what a row's diff is taken over, and the pathspec —
 the one value every diff entry point receives),
 `BuildEnv` (what a build MAY use, as opposed to what it is over: the textconv
