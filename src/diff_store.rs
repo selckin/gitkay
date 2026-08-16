@@ -278,7 +278,9 @@ fn decode(bytes: &[u8]) -> Option<DiffData> {
     let mut lines = Vec::with_capacity(n_lines);
     for _ in 0..n_lines {
         let kind = kind_from_tag(r.u8()?)?;
-        let text = Arc::new(r.string()?);
+        // Into the `Arc` directly: `DiffLine::text` owns its bytes inline, so the
+        // decoded `String` would otherwise be copied and dropped a line later.
+        let text = Arc::<str>::from(r.string()?);
         let old_lineno = NonZeroU32::new(r.u32()?);
         let new_lineno = NonZeroU32::new(r.u32()?);
         lines.push(DiffLine {
@@ -1015,7 +1017,7 @@ mod tests {
 
     fn line(text: &str, kind: LineKind, old: u32, new: u32) -> DiffLine {
         DiffLine {
-            text: Arc::new(text.to_string()),
+            text: Arc::from(text),
             kind,
             old_lineno: NonZeroU32::new(old),
             new_lineno: NonZeroU32::new(new),

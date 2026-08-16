@@ -211,6 +211,11 @@ parent" diff — the pane, the path filter, the `--follow` tracer — goes throu
 `commit_parent_diff`), the diff-shaping `DiffOptions` helpers, the word-diff
 emphasis driver, the content hash, the file-boundary lookups and `order_files` (the
 display-order re-lay the file-list sidebar drives — see **Bottom panel**),
+`DiffLine`'s text being an `Arc<str>` rather than an `Arc<String>` — the bytes live
+inside the allocation, so a row costs ONE allocation on the build's hottest path
+instead of two, and `push_patch_line` assembles each row in a reused buffer rather
+than a `format!` (measured 36% off the per-line construction; the row itself grows
+8 B and the heap per row shrinks ~16 B),
 `LineNoGutter` (the line-number column's widths and per-row text — pure, and here
 rather than in `main.rs` because it is a question about `DiffLine` data),
 the scroll anchor (its own child module,

@@ -10055,7 +10055,7 @@ mod tests {
         let body = data
             .lines
             .iter()
-            .map(|l| l.text.as_str())
+            .map(|l| &*l.text)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
