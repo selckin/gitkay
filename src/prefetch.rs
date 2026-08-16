@@ -1336,6 +1336,34 @@ fn worker(ctx: &WorkerCtx, repo: &Repository, jobs: &mpsc::Receiver<Job>) {
 /// comment at that return for why it does not ask to be finished later.
 fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome {
     let oid = job.scope.source.oid();
+    // **The store FIRST, ahead of the probe.** An entry there is this row's whole diff,
+    // and its counts are exactly what `cache_diff` would harvest off the pane —
+    // `entry_key` folds in the whole `DiffSettings` plus the driver fingerprint, so a
+    // hit is strictly stronger than `stats_harvestable`'s rule and the column cannot
+    // disagree with the pane. Always a miss for the virtual rows, whose sources
+    // `entry_key` refuses.
+    //
+    // This used to sit INSIDE the probe below, on the argument that the probe is cheap
+    // and is what routes the row's diff to the heavy lane. The probe is not cheap: it
+    // runs the whole `scoped_diff` pipeline, and with rename/copy detection on a wide
+    // commit that is **10.2 seconds** — measured, 1317 deltas — paid before asking a
+    // question the answer to which was already on disk. A miss costs ~6-8µs.
+    //
+    // Losing the routing costs nothing, and self-corrects if it ever would: a row whose
+    // diff is in the store is LOADED rather than built, so it does not want the heavy
+    // lane; and if the entry is pruned before the warm, `warm_row` probes it itself
+    // (`target.probed` being `None`) and defers it there.
+    if job.want == StatsWant::FilesAndLines
+        && let Some(store) = crate::store_of(&ctx.deps.store)
+        && let Some(data) = store.load(&job.scope, job.settings)
+    {
+        log::debug!(
+            "stats: {oid} from the diff store ({} files)",
+            data.files.len()
+        );
+        send_stats(ctx, job, Some(diff::stats_from_data(&data)));
+        return Outcome::Stats { oid, costly: None };
+    }
     // `FilesAndLines` calls `diff.stats()`, which loads blob content — the same bytes
     // the diff reads. Unguarded, that had eight workers spend 24 seconds computing this
     // column on a repo of 265MB blobs, and (because stats outrank diffs) blocking every
@@ -1353,29 +1381,6 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
         && let Ok(measured) = diff::measured_row_diff(repo, &job.scope, job.settings, tc)
     {
         let cost = measured.cost;
-        // An entry in the store IS this row's diff, and its counts are exactly what
-        // `cache_diff` would harvest off the pane — `entry_key` folds in the WHOLE
-        // `DiffSettings` plus the driver fingerprint, so a hit is strictly stronger
-        // than `stats_harvestable`'s rule and the column still cannot disagree.
-        //
-        // Consulted in both branches below rather than instead of them, because the
-        // cheap probe above is what routes this row's DIFF to the heavy lane and that
-        // decision must be made whether or not the numbers came off disk.
-        //
-        // Measured: a miss is ~6-8µs (a key hash and an ENOENT) against a job that
-        // starts at ~2ms and reaches hundreds of ms, and a hit is ~2× a recompute on a
-        // text-heavy diff — a floor, not the point, since the store only holds diffs
-        // that took longer than `min_build_ms` to build. The point is the branch below:
-        // a deferred row used to show a file count and a BLANK `+`/`-` until something
-        // else happened to load its diff, which on a large repo can be never.
-        //
-        // Always a miss for the virtual rows — `entry_key` refuses their sources — so
-        // the `Withheld` arm further down is untouched.
-        let stored = || {
-            crate::store_of(&ctx.deps.store)
-                .and_then(|s| s.load(&job.scope, job.settings))
-                .map(|d| diff::stats_from_data(&d))
-        };
         // `driven` joins the byte threshold rather than replacing it, and it is what
         // keeps a SUBPROCESS off this path: a three-file zip behind `bsdtar` is a few
         // KB and several hundred milliseconds, which no byte cap can see coming. The
@@ -1404,11 +1409,7 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
             // `cost.deltas`: the measurement is taken before `detect_similar`, so it
             // counts a rename as two files where the pane shows one, and a column that
             // disagrees with the pane is the exact drift the shared pipeline prevents.
-            send_stats(
-                ctx,
-                job,
-                stored().or_else(|| measured.stats(StatsWant::FilesOnly).ok()),
-            );
+            send_stats(ctx, job, measured.stats(StatsWant::FilesOnly).ok());
             // And then STOP. The line counts cost the same blob reads the diff does, and
             // this row's diff goes to the heavy lane — `cache_diff` takes the column off
             // it for free when it lands. Computing them here as well would pay ~11s twice
@@ -1464,22 +1465,20 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
         // driven virtual row never keys into the store and a driven real one deferred
         // above — but an arrangement where `Withheld` could overwrite real counts would
         // look accidental rather than safe.
-        let stats = stored().or_else(|| {
-            measured
-                .stats(want)
-                .inspect_err(|e| log::debug!("stats: {oid} failed: {e}"))
-                .ok()
-                .map(|stats| {
-                    if withheld {
-                        CommitStats {
-                            lines: diff::LineStats::Withheld,
-                            ..stats
-                        }
-                    } else {
-                        stats
+        let stats = measured
+            .stats(want)
+            .inspect_err(|e| log::debug!("stats: {oid} failed: {e}"))
+            .ok()
+            .map(|stats| {
+                if withheld {
+                    CommitStats {
+                        lines: diff::LineStats::Withheld,
+                        ..stats
                     }
-                })
-        });
+                } else {
+                    stats
+                }
+            });
         log::debug!("stats: done {oid} ({:?}) in {:?}", job.want, t.elapsed());
         send_stats(ctx, job, stats);
         return Outcome::Stats { oid, costly: None };
@@ -2805,16 +2804,24 @@ mod tests {
         (dir, deps)
     }
 
-    /// A DEFERRED row whose diff is already in the store answers in full.
+    /// A row whose diff is in the store answers from it WITHOUT running the probe.
     ///
-    /// The deferral's premise is that the row's own diff will supply the line counts,
-    /// and nothing guarantees anything ever builds it — on a large repo the warm band
-    /// spends its line budget long before reaching such a row, so the `+`/`-` stayed
-    /// blank for the session while the answer sat on disk. Both halves are asserted:
-    /// the numbers arrive, AND the row is still recorded as costly, because that is a
-    /// fact about building its diff and is unaffected by where the counts came from.
+    /// Two claims, and the second is the one with teeth. The numbers arrive in full —
+    /// the deferral's premise is that the row's own diff will supply the line counts,
+    /// and nothing guarantees anything ever builds it, so on a large repo the `+`/`-`
+    /// stayed blank for the session while the answer sat on disk. And nothing is
+    /// measured: `costly` is `None` even though these limits would defer every row,
+    /// which is only observable if the store was consulted BEFORE `measured_row_diff`.
+    /// That ordering is the point — the probe runs a whole `scoped_diff`, measured at
+    /// 10.2s on a 1317-delta commit with rename detection on, to answer a question the
+    /// store had already answered.
+    ///
+    /// Losing the cost measurement is safe and self-correcting: a stored row is loaded
+    /// rather than built, and if the entry is pruned before the warm, `warm_row` probes
+    /// it itself and defers it to the heavy lane then
+    /// (`the_heavy_lane_returns_results_through_the_real_pool` drives that path).
     #[test]
-    fn a_deferred_stats_row_takes_its_counts_from_the_store() {
+    fn a_stats_row_answers_from_the_store_without_probing() {
         use crate::test_repo::commit_file;
         let (_d, repo) = temp_repo();
         commit_file(&repo, "f.txt", "a\nb\nc\n", "one");
@@ -2856,14 +2863,9 @@ mod tests {
 
         let outcome = run_stats_job(&worker, &repo, &job);
         assert!(
-            matches!(
-                outcome,
-                Outcome::Stats {
-                    costly: Some(_),
-                    ..
-                }
-            ),
-            "the row is still costly to BUILD, whatever answered its counts"
+            matches!(outcome, Outcome::Stats { costly: None, .. }),
+            "a store hit must not have run the probe — these limits defer every row, so \
+             `Some` here means `measured_row_diff` ran before the store was asked"
         );
         let sent = stats_rx.recv().expect("exactly one result").stats.unwrap();
         assert_eq!(
