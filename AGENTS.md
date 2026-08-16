@@ -300,6 +300,11 @@ holds less than the scope asked for. git2-facing and egui-free, the same shape
 `diff.rs` has: everything here answers "which rows are there", never "how are they
 drawn". See **Startup & timing** for why the walk needs three strategies rather
 than one),
+`src/commitgraph.rs` (reading git's commit-graph file — the generation numbers
+libgit2 will not give us; only `OIDF`/`OIDL`/`CDAT`, by `pread`, refusing anything
+malformed rather than guessing),
+`src/topo.rs` (the lazy topological walk those numbers make possible — see
+**The commit order**),
 `src/graph.rs` (the commit graph's lane/pipe layout: `CommitInfo`s in, per-row
 node columns and line segments out — pure and egui-free, a row's colour being an
 INDEX the renderer resolves, which is what lets its suite run on fake oids with no
@@ -340,7 +345,12 @@ The big picture, ahead of the detail sections below:
   syntax-highlight asynchronously off the UI thread.
 
 ### Data Layer (`src/history.rs` + `src/diff.rs`)
-- `load_commits()` — revwalk via `git2`, topological + time order, precomputed ref map
+- `load_commits()` — **two walks, one order**. The plain scope goes through
+  `topo::TopoWalk` when the repo has a commit-graph (`history::topo_available`):
+  generation numbers make a lazy topological walk exact, so 200 rows off a
+  1.47M-commit kernel clone cost 1.0s instead of 45s. Every other scope, and every
+  repo without the file, falls back to the `git2` revwalk. Both produce `git log
+  --graph`'s order — see **The commit order** below. Precomputed ref map either way
 - `load_commits_tail()` — incremental extension for the plain (no path filter,
   non-reflog) scope: re-runs the same deterministic walk (`history_revwalk` is the
   single walk config — both walks must order identically for the resume to be sound),
@@ -369,15 +379,30 @@ The invariants:
 - **No IO runs inline in `GitkApp::new`** — window creation blocks until the creator
   returns. Everything expensive is prefetched on a thread or deferred to a later frame
   (`pending_fonts` / `apply_pending_history` / `StartupDiff`).
-- **The history walk is not cheap and must never be awaited.** *Any* sorted libgit2
-  revwalk parses the whole history before yielding row one — 1.6s on a 67k-commit repo,
-  regardless of the row limit. Do not "simplify" the deferred install back to a blocking
-  `recv()`.
+- **The FALLBACK history walk is not cheap and must never be awaited.** *Any* sorted
+  libgit2 revwalk parses the whole history before yielding row one — 1.6s on a
+  67k-commit repo, **45s and 1.79GB of peak RSS on a 1.47M-commit one**, regardless of
+  the row limit. Do not "simplify" the deferred install back to a blocking `recv()`.
+  The lazy walk is fast, but it does not cover every scope and needs a file the repo
+  may not have, so the deferral protects the case that still happens.
+- **libgit2 cannot be made lazy, and a commit-graph does not help it.** `revwalk.c`
+  never reads the file: measured 45.1s without it and 45.3s with it, on the same repo
+  and query. Nothing in `git2` exposes it either. That is why `commitgraph.rs` parses
+  it and `topo.rs` walks with it, rather than either being a flag passed to libgit2.
 - **`Sort::NONE` is WRONG — do not retry it.** ~150× faster and emits *parents before
   children* on git.git past row 252, which breaks the graph layout invariant. Test any
   ordering change against git.git at 700+ rows, checking parent-before-child.
-- **The provisional walk is an approximation.** `history_is_provisional` blocks the
-  scroll extension until the real walk lands; it is deliberately unmarked in the UI.
+- **The provisional walk is an approximation, and is SKIPPED when the lazy walk is
+  available.** `history_is_provisional` blocks the scroll extension until the real walk
+  lands; it is deliberately unmarked in the UI. Its whole purpose is covering an
+  intolerably slow walk, so racing one that is both exact and fast could only
+  reintroduce the reshuffle it exists to avoid — the quick thread returns without
+  sending, which the deadline already handles.
+- **A scroll extension must come from the same walk as the prefix it extends.** Not an
+  optimisation: resuming a topological prefix from a date-ordered walk would splice two
+  orderings and draw a parent above its own child. `load_commits_tail` picks its walk
+  the same way `load_commits` does, and the anchor check is a second line, not the
+  first.
 - **Speculative work stands down until the first diff is on screen**
   (`awaiting_first_diff`) — and that predicate must ask `StartupDiff` too, not just
   `diff_load_started_at`: the first frame paints the list before dispatching any diff.
@@ -406,6 +431,39 @@ The invariants:
   crate version. That list has been wrong three times — extend it, don't trust it.
 - **Every diff-load worker exit reports a `DiffLoadResult`** — success, failure,
   supersession or panic. The loading state and `inflight_loads` both depend on it.
+
+### The commit order
+
+**Both walks show `git log --graph`'s order, which is `--topo-order`, not date
+order.** The distinction is visible and was wrong here until recently: date order
+stacks a maintainer's merges together and pushes what they merged hundreds of rows
+below, where topological order shows each merge followed by the commits it brought
+in.
+
+The evidence is git itself, and any change here owes the same: on a 1.47M-commit
+kernel clone gitkay's old `TIME | TOPOLOGICAL` matched `git rev-list --date-order`
+exactly, and shared only **82 of the first 120 commits** with `--topo-order`.
+
+Two implementations produce it and they must not disagree:
+
+- `history_revwalk` sets **`Sort::TOPOLOGICAL` alone**. Adding `Sort::TIME` is what
+  produced date order. Verified against `git rev-list --topo-order` on five
+  repositories, including the two where the sortings actually differ — so the
+  agreement is not an artifact of linear history.
+- `topo::TopoWalk` is Kahn's algorithm with a **LIFO** ready-queue, which is git's.
+  The stack is the whole distinction: a merge pushes parent 1 then parent 2, so
+  parent 2 pops first and the walk descends into the merged branch. A date-ordered
+  queue in the same algorithm gives `--date-order` back.
+
+**Speed may depend on a cache file; order may not.** A `git gc` writing a
+commit-graph in the background must change how fast the list appears and nothing
+about what it says.
+
+`topo_scope` is deliberately narrow — the plain current-branch scope only. Nothing
+about `--all`, a range or a path filter is beyond the walk; what is missing is the
+VERIFICATION, since the order was checked against git for a single tip. Widening it
+owes an oracle run against `git rev-list --topo-order` for that scope, not an
+argument.
 
 ### Graph Layout (`src/graph.rs`)
 - **Pipes**: `Vec<Option<(Oid, color_index)>>` — fixed column slots, `None` = empty
@@ -1153,6 +1211,16 @@ protocol rather than by reaching into its fields: the heavy lane's two admission
 bounds and the stampede a whole dispatch would otherwise commit, the deferral round
 trip, the conversion charge that keeps a driven row from being admitted as free, stats
 claiming, and `warm_disposition`'s precedence),
+`commitgraph` (the file format, over fixtures this suite writes itself so it depends
+on no `git` binary: both on-disk shapes, a zeroed generation refused as the
+pre-2.19 marker it is, a chunk whose claimed end is past the real end of the file,
+and a chain naming anything but a hash — the file names the files to open and a
+repository is untrusted input), `topo` (the walk: a brute-force topological oracle,
+the merge-grouping property a reader actually sees, a deliberately stale graph, the
+ancestry-closure guard, and `--first-parent`; each of the three mechanisms was
+demonstrated to fail a specific test when removed — and the parity that matters most
+is not in the suite at all, being a comparison against `git rev-list --topo-order`
+itself on the kernel, which is what any change here should re-run),
 `history` (the walk over real temp repos: the tail extension against a full walk,
 the provisional walk's agreement with the real one and the two orderings that break
 it, the path filter's parent rewriting, `--first-parent`, `--follow`, the reflog and
