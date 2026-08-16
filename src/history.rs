@@ -1027,6 +1027,35 @@ pub fn topo_window(rows: Vec<(i64, CommitInfo)>) -> Vec<CommitInfo> {
     out
 }
 
+/// What `scope_notice` found: the sentence, and whether it reports a FAILURE.
+///
+/// The two are drawn differently — see `GitkApp::show_scope_notice_bar`. gitkay being
+/// unable to do what the scope asked (a range whose endpoints would not resolve)
+/// deserves the warning colour; a path filter that matched nothing is gitkay doing
+/// exactly what it was told, and painting that yellow teaches the reader to read the
+/// colour as decoration.
+#[derive(PartialEq, Eq, Debug)]
+pub struct ScopeNotice {
+    pub text: String,
+    pub failed: bool,
+}
+
+impl ScopeNotice {
+    /// A scope that worked and selects nothing.
+    const fn empty(text: String) -> Self {
+        Self {
+            text,
+            failed: false,
+        }
+    }
+
+    /// A scope gitkay could not carry out. The details are in the log — every such
+    /// case is reported where it happened, with the git error the reader needs.
+    const fn failed(text: String) -> Self {
+        Self { text, failed: true }
+    }
+}
+
 /// Why the view shows less than the command line asked for, phrased for the reader —
 /// `None` when it shows exactly what was asked.
 ///
@@ -1046,7 +1075,7 @@ pub fn topo_window(rows: Vec<(i64, CommitInfo)>) -> Vec<CommitInfo> {
 /// Note the paths are named as gitkay resolved them (repo-root-relative, rewritten
 /// from the run directory by `cli::token_to_pathspec`), which is the pathspec that
 /// actually matched nothing and may not be what was typed.
-pub fn scope_notice(scope: &cli::Scope, commits: &[CommitInfo]) -> Option<String> {
+pub fn scope_notice(scope: &cli::Scope, commits: &[CommitInfo]) -> Option<ScopeNotice> {
     let quoted = |xs: &[String]| {
         xs.iter()
             .map(|x| format!("'{x}'"))
@@ -1056,19 +1085,21 @@ pub fn scope_notice(scope: &cli::Scope, commits: &[CommitInfo]) -> Option<String
     if scope.reflog {
         // Every reflog failure — unknown ref, unreadable log, a ref that simply has
         // no entries — ends in an empty list, so one message covers them all. Its
-        // detail is in the log lines `load_reflog` writes on the way.
+        // detail is in the log lines `load_reflog` writes on the way. Not marked
+        // failed for that same reason: the two cannot be told apart from here, and
+        // "there are no entries" is the half that is certainly true.
         return commits.is_empty().then(|| {
-            format!(
+            ScopeNotice::empty(format!(
                 "No reflog entries for {} — unknown ref, or its reflog is empty.",
                 scope.revs.first().map_or("HEAD", String::as_str)
-            )
+            ))
         });
     }
     // REAL commits, not rows: a path filter still shows the working-tree rows when the
     // edits touch it, and a range scope shows its own row — neither means the walk
     // selected anything.
     if !commits.iter().any(|c| is_real_commit(c.oid)) {
-        return Some(if !scope.paths.is_empty() {
+        return Some(ScopeNotice::empty(if !scope.paths.is_empty() {
             let within = if scope.revs.is_empty() {
                 String::new()
             } else {
@@ -1084,7 +1115,7 @@ pub fn scope_notice(scope: &cli::Scope, commits: &[CommitInfo]) -> Option<String
             // walks to nothing while other branches are full, so this names the branch
             // rather than the repository.
             "No commits to show — the current branch has none yet.".to_string()
-        });
+        }));
     }
     // Every lone-range scope gets a combined row, `--combined` or not (the flag only
     // decides whether the window OPENS on it), so this asks `combined_range` rather
@@ -1096,10 +1127,10 @@ pub fn scope_notice(scope: &cli::Scope, commits: &[CommitInfo]) -> Option<String
             .iter()
             .any(|c| diff::CommitKind::of(c.oid) == diff::CommitKind::Range)
     {
-        return Some(format!(
+        return Some(ScopeNotice::failed(format!(
             "The combined row for '{}' is missing — its endpoints could not be resolved (see the terminal).",
             range.token
-        ));
+        )));
     }
     None
 }
@@ -2101,7 +2132,11 @@ mod tests {
             ..Default::default()
         };
         let notice = scope_notice(&sc, &load_commits(&repo, 100, &sc)).expect("reported");
-        assert!(notice.contains("'sub/nope.txt'"), "{notice}");
+        assert!(
+            !notice.failed,
+            "the scope worked; it simply selects nothing"
+        );
+        assert!(notice.text.contains("'sub/nope.txt'"), "{}", notice.text);
     }
 
     /// A range whose walk is empty leaves the range row and nothing else, so the row
@@ -2126,7 +2161,7 @@ mod tests {
             "control: the range row itself is still there"
         );
         let notice = scope_notice(&sc, &got).expect("reported");
-        assert!(notice.contains(&token), "{notice}");
+        assert!(notice.text.contains(&token), "{}", notice.text);
     }
 
     /// `range_ends` refusing an endpoint yields a list that looks entirely normal —
@@ -2153,7 +2188,11 @@ mod tests {
             "control: the commit list itself is unaffected"
         );
         let notice = scope_notice(&sc, &got).expect("reported");
-        assert!(notice.contains(&token), "{notice}");
+        assert!(notice.text.contains(&token), "{}", notice.text);
+        assert!(
+            notice.failed,
+            "gitkay could not do what the scope asked — the one case that warns"
+        );
     }
 
     /// Every reflog failure — a typo'd ref, an unreadable log, a ref with no entries —
@@ -2171,7 +2210,7 @@ mod tests {
             ..Default::default()
         };
         let notice = scope_notice(&sc, &load_reflog(&repo, 100, &sc)).expect("reported");
-        assert!(notice.contains("no-such-ref"), "{notice}");
+        assert!(notice.text.contains("no-such-ref"), "{}", notice.text);
     }
 
     /// A repo with no commits at all reaches the same blank window by a route the
@@ -2183,7 +2222,11 @@ mod tests {
         let (_d, repo) = temp_repo();
         let sc = cli::Scope::default();
         let notice = scope_notice(&sc, &load_commits(&repo, 100, &sc)).expect("reported");
-        assert!(notice.contains("current branch"), "{notice}");
+        assert!(
+            !notice.failed,
+            "the scope worked; it simply selects nothing"
+        );
+        assert!(notice.text.contains("current branch"), "{}", notice.text);
     }
 
     #[test]
