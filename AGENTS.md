@@ -373,7 +373,11 @@ The invariants:
 - **The heavy lane is separate threads, admitted against memory**, with two bounds that
   fail differently: our own commitments against a budget fixed at startup (stops a
   stampede), and one row's need against a live reading (notices a busy machine). Do not
-  swap those pairings — each has already been a bug.
+  swap those pairings — each has already been a bug. **A row that does not RUN must
+  still log**: everything that runs logs twice and everything that waited logged
+  nothing, so a commit left cold — and its stats cell left blank — was indistinguishable
+  from one never queued. `report_outstanding` (queue depth, on change) plus a line for
+  each way `next_heavy` declines.
 - **A diff's cost tracks bytes read, not changed lines** — a 3-line patch inside a 265MB
   file is ~11s. Rows are probed (`diff::probe_row_cost`) before being built, and a
   driven row (textconv) is costly whatever its size. **Rename detection reads those

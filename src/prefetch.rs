@@ -642,6 +642,10 @@ struct Coordinator {
     idle: Vec<usize>,
     /// Heavy-lane workers with no row right now.
     heavy_idle: Vec<usize>,
+    /// The last `(ready, deferred)` depth reported, so the queue line below is emitted
+    /// on a CHANGE rather than on every worker completion — `dispatch` runs once per
+    /// report, and a band of 25 would otherwise log 25 times saying the same thing.
+    reported_outstanding: (usize, usize),
     /// Bytes each outstanding heavy row is expected to hold, by worker id. Summed by
     /// `heavy_fits` into what the lane has committed, and keyed by worker so a finishing
     /// row releases exactly what it reserved.
@@ -878,10 +882,36 @@ impl Coordinator {
         }
         while let Some(&id) = self.idle.last() {
             let Some(job) = self.next_pool_job() else {
-                return;
+                break;
             };
             self.idle.pop();
             self.send(id, job);
+        }
+        self.report_outstanding();
+    }
+
+    /// What the band still owes, once per CHANGE rather than once per dispatch —
+    /// `dispatch` runs on every worker report, so a band of 25 would otherwise say the
+    /// same thing 25 times.
+    ///
+    /// It exists because a queued row is invisible: everything that RUNS logs twice,
+    /// and a row that waits logged nothing at all. A row can sit on `deferred`
+    /// indefinitely — the heavy lane declines on memory, and a later band replaces both
+    /// queues wholesale — so a commit left cold, whose stats cell then stays blank,
+    /// produced no line saying so. Reported AFTER the hand-out, so it is what is still
+    /// owed rather than what was owed a moment ago.
+    fn report_outstanding(&mut self) {
+        let outstanding = (self.ready.len(), self.deferred.len());
+        if outstanding == self.reported_outstanding {
+            return;
+        }
+        self.reported_outstanding = outstanding;
+        if outstanding != (0, 0) {
+            log::debug!(
+                "prefetch: {} rows queued, {} waiting on the heavy lane",
+                outstanding.0,
+                outstanding.1
+            );
         }
     }
 
@@ -902,13 +932,30 @@ impl Coordinator {
         loop {
             let need = self.deferred.front().map(Self::heavy_need)?;
             if !self.heavy_fits(need, usable) {
+                // The lane is loaded and this row does not fit yet. Said out loud
+                // because it is otherwise indistinguishable from the row never having
+                // been queued: a row that RUNS logs twice, and a row that waits logged
+                // nothing at all, so a band that quietly kept one commit cold left no
+                // trace of which of the two had happened.
+                log::debug!(
+                    "prefetch: heavy lane full — {} waiting on {need} bytes, {} rows behind it",
+                    self.deferred
+                        .front()
+                        .map_or_else(|| "?".to_string(), |t| t.key.oid.to_string()),
+                    self.deferred.len().saturating_sub(1)
+                );
                 return None;
             }
             let target = self.deferred.pop_front()?;
             let id = *self.heavy_idle.last()?;
+            let oid = target.key.oid;
             if let Some(job) = self.claim_warm(id, target) {
                 return Some((job, need));
             }
+            // Dropped, not requeued — the foreground diff-load holds this key and its
+            // result will be cached, so rebuilding it here is duplicate work. Logged
+            // because dropping is the one outcome that looks identical to a bug.
+            log::debug!("prefetch: heavy row {oid} left to the foreground load");
         }
     }
 
@@ -1131,6 +1178,7 @@ pub fn spawn_prefetch_pool(
         unconverted: HashSet::new(),
         idle: (0..mailboxes.len()).collect(),
         heavy_idle: (mailboxes.len()..mailboxes.len() + heavy.len()).collect(),
+        reported_outstanding: (0, 0),
         heavy_outstanding: HashMap::new(),
         heavy_budget,
         busy_stats: HashSet::new(),
@@ -1753,6 +1801,7 @@ mod tests {
                 unconverted: HashSet::new(),
                 idle: (0..workers).collect(),
                 heavy_idle: (workers..workers + heavy.len()).collect(),
+                reported_outstanding: (0, 0),
                 heavy_outstanding: HashMap::new(),
                 heavy_budget: None,
                 busy_stats: HashSet::new(),
@@ -1767,6 +1816,62 @@ mod tests {
             },
             rxs,
         )
+    }
+
+    /// A row the STATS path measured costly must actually reach the heavy lane, not
+    /// merely be filed on it.
+    ///
+    /// The tests around this one assert `take_band`'s queues and stop there, so
+    /// "filed under `deferred`" was covered and "handed to a heavy worker" was not —
+    /// and those are different claims: `next_heavy` can decline on memory, and it pops
+    /// a target before `claim_warm` can refuse it. A row that reaches neither lane is
+    /// invisible, since every path that DOES run logs.
+    #[test]
+    fn a_row_the_stats_path_measured_is_dispatched_to_the_heavy_lane() {
+        for stats_first in [true, false] {
+            let (mut coord, rxs) = test_coord_n(2, 2);
+            // `note_settings` latches on the first submission of either kind; without
+            // this the band's own call reads as a textconv CHANGE and clears `measured`,
+            // which is the app's real order and not an incidental detail.
+            coord.run_msg(CoordMsg::SubmitStats(VecDeque::new()));
+            let measured = CoordMsg::Done(
+                0,
+                Outcome::Stats {
+                    oid: oid(1),
+                    costly: Some(cost(20_221_004)),
+                },
+            );
+            let band = CoordMsg::Submit {
+                targets: [heavy_target(1), heavy_target(2)].into_iter().collect(),
+                hl: None,
+            };
+            // Both orders: the stats worker's report races the band submission, and
+            // neither may lose the row.
+            if stats_first {
+                coord.run_msg(measured);
+                coord.run_msg(band);
+            } else {
+                coord.run_msg(band);
+                coord.run_msg(measured);
+            }
+
+            let warmed: Vec<git2::Oid> = rxs
+                .iter()
+                .flat_map(|rx| rx.try_iter().collect::<Vec<_>>())
+                .filter_map(|job| match job {
+                    Job::Warm { target, .. } => Some(target.key.oid),
+                    Job::Stats(_) => None,
+                })
+                .collect();
+            assert!(
+                warmed.contains(&oid(1)),
+                "stats_first={stats_first}: the measured row was filed and never handed \
+                 out; left {} deferred, {} ready",
+                coord.deferred.len(),
+                coord.ready.len()
+            );
+            assert!(warmed.contains(&oid(2)), "stats_first={stats_first}");
+        }
     }
 
     /// A bare warm target for one oid.
