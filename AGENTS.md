@@ -390,6 +390,19 @@ The invariants:
   never reads the file: measured 45.1s without it and 45.3s with it, on the same repo
   and query. Nothing in `git2` exposes it either. That is why `commitgraph.rs` parses
   it and `topo.rs` walks with it, rather than either being a flag passed to libgit2.
+- **gitkay does not write a commit-graph, and keeps no generation cache of its own** —
+  it says the file is absent and names the command (`commit_graph_advice`, a second
+  `warn` line under `note_slow_history_walk`'s latch). That is a measurement, not a
+  preference: traversing the kernel's history through `git2` to compute generations
+  costs **62.8s** against the 45s walk it would replace, because `find_commit` parses
+  every commit object out of the pack — the exact cost the format exists to eliminate,
+  and what lets `git commit-graph write --reachable` do the same job in 35s. So a cache
+  would make the FIRST open of a graph-less repository slower than doing nothing, and
+  only pay from the second launch — which is when one `git` command would also have
+  paid, faster, and to every other tool's benefit. The advice is gated on the scope
+  actually walking lazily (`topo_scope`) as well as on the file being absent: naming a
+  fix for a scope that would ignore it is a false promise, which is why the line did
+  not exist before the lazy walk did.
 - **`Sort::NONE` is WRONG — do not retry it.** ~150× faster and emits *parents before
   children* on git.git past row 252, which breaks the graph layout invariant. Test any
   ordering change against git.git at 700+ rows, checking parent-before-child.

@@ -959,7 +959,13 @@ pub fn load_commits_inner(repo: &Repository, max: usize, scope: &cli::Scope) -> 
         real.len(),
         t.elapsed()
     );
-    note_slow_history_walk(t.elapsed(), real.len(), WalkCost::of(scope, walked_commits));
+    note_slow_history_walk(
+        repo,
+        scope,
+        t.elapsed(),
+        real.len(),
+        WalkCost::of(scope, walked_commits),
+    );
 
     // Join the probes now — their half-second ran alongside the walk above — and put
     // the rows they decide at the top, ahead of the real commits.
@@ -1281,6 +1287,29 @@ fn slow_walk_message(elapsed: std::time::Duration, rows: usize, cost: WalkCost) 
     }
 }
 
+/// The one thing the reader can DO about the sentence above, when there is one:
+/// `None` unless this scope would walk with generation numbers and this repository has
+/// none to offer.
+///
+/// **Both halves of that gate are load-bearing.** Advising the fix for a scope that
+/// would ignore the file is a false promise — which is what this advice would have been
+/// everywhere before the lazy walk existed, and is the whole reason it was not written
+/// then. And a graph that exists but does not cover HEAD is the ordinary state after
+/// any fetch, which the walk handles: `for_repo(..).is_some()` is the test, not
+/// coverage.
+///
+/// The number is what makes it worth acting on, and it is gitkay's own rather than
+/// git's: the same 200 rows off a 1.47M-commit kernel clone take 45s through the sorted
+/// revwalk and 1.0s once a commit-graph is there to walk lazily.
+pub fn commit_graph_advice(repo: &Repository, scope: &cli::Scope) -> Option<&'static str> {
+    let missing = crate::commitgraph::CommitGraph::for_repo(repo).is_none();
+    (topo_scope(scope) && missing).then_some(
+        "this repository has no commit-graph, which is what a walk needs to be lazy: \
+         `git commit-graph write --reachable` writes one (35s for 88MB on a 1.47M-commit \
+         clone) and took the same walk there from 45s to 1.0s",
+    )
+}
+
 /// Explain a slow history walk, once per process.
 ///
 /// `warn`, so it shows on a plain run: the delay is visible and otherwise
@@ -1295,11 +1324,25 @@ fn slow_walk_message(elapsed: std::time::Duration, rows: usize, cost: WalkCost) 
 ///
 /// **The why-clause is `WalkCost`'s, not a constant** — see there for what a single
 /// phrasing got wrong.
-pub fn note_slow_history_walk(elapsed: std::time::Duration, rows: usize, cost: WalkCost) {
+///
+/// `commit_graph_advice` is a SECOND line rather than a clause inside that one: it is a
+/// different claim — not what happened, but what the reader can do — and it is asked
+/// for only past the latch, since opening the graph costs ~100µs and every fast walk
+/// would otherwise pay it to answer a question nobody is going to be shown.
+pub fn note_slow_history_walk(
+    repo: &Repository,
+    scope: &cli::Scope,
+    elapsed: std::time::Duration,
+    rows: usize,
+    cost: WalkCost,
+) {
     if !should_note_slow_walk(elapsed, &SLOW_WALK_REPORTED) {
         return;
     }
     log::warn!("{}", slow_walk_message(elapsed, rows, cost));
+    if let Some(advice) = commit_graph_advice(repo, scope) {
+        log::warn!("{advice}");
+    }
 }
 
 /// How long the real walk gets before the provisional one is shown instead.
@@ -2335,6 +2378,53 @@ mod tests {
             !plain.contains("may have changed"),
             "nothing was on screen to change: {plain}"
         );
+    }
+
+    /// The second line names a fix, so it may only appear where the fix works: this
+    /// repository has no commit-graph AND this scope would walk with one. Advising it
+    /// for a scope that ignores the file is the false promise the advice was withheld
+    /// for until the lazy walk existed.
+    #[test]
+    fn the_commit_graph_advice_is_only_given_where_writing_one_would_help() {
+        let (dir, repo) = temp_repo();
+        let tip = merged_history(&repo).3;
+        let plain = cli::Scope::default();
+
+        let advice = commit_graph_advice(&repo, &plain).expect("no graph, a scope that wants one");
+        assert!(
+            advice.contains("git commit-graph write --reachable"),
+            "{advice}"
+        );
+        assert!(advice.contains("45s"), "the number is the point: {advice}");
+        // `--all` walks lazily too, so it is worth advising there.
+        assert!(commit_graph_advice(&repo, &scope(true, &[])).is_some());
+        // A scope that falls back to the sorted walk whatever the repository holds.
+        assert_eq!(
+            commit_graph_advice(&repo, &scope(false, &["HEAD"])),
+            None,
+            "a scope that would ignore the file must not be told to write one"
+        );
+
+        write_commit_graph(&repo, &[tip]);
+        let repo = open_repo(dir.path());
+        assert_eq!(
+            commit_graph_advice(&repo, &plain),
+            None,
+            "there is one now, and nothing to advise"
+        );
+    }
+
+    /// A graph that does not cover the newest commits is the ordinary state after any
+    /// fetch, and the walk handles it — so it is not a missing one and must not be
+    /// reported as such.
+    #[test]
+    fn a_stale_commit_graph_is_not_a_missing_one() {
+        let (dir, repo) = temp_repo();
+        let old = merged_history(&repo).3;
+        write_commit_graph(&repo, &[old]);
+        commit_file(&repo, "later.txt", "1", "after the graph was written");
+        let repo = open_repo(dir.path());
+        assert_eq!(commit_graph_advice(&repo, &cli::Scope::default()), None);
     }
 
     /// Which sentence a walk gets is decided by what it did, not by re-reading the
