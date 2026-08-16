@@ -51,8 +51,8 @@ use diff_store::DiffStore;
 use graph::{GraphLayoutState, GraphRow, layout_graph_rows};
 use highlight::{DiffBg, Highlighter};
 use history::{
-    CommitInfo, HistoryWalk, PROVISIONAL_HISTORY_DELAY, RefKind, diff_paths_for, load_history,
-    provisional_commits, provisional_scope, scope_notice,
+    CommitInfo, HistoryWalk, PROVISIONAL_HISTORY_DELAY, RefKind, ScopeNotice, diff_paths_for,
+    load_history, provisional_commits, provisional_scope, scope_notice,
 };
 use prefetch::{
     InflightClaim, InflightKeys, PoolHandle, PrefetchBudget, PrefetchTarget, WarmDisposition,
@@ -2616,7 +2616,7 @@ struct GitkApp {
     /// deliberately not dismissible: it states what is on screen right now, so the
     /// reload that finds commits clears it and nothing can silence a claim that is
     /// still true.
-    scope_notice: Option<String>,
+    scope_notice: Option<ScopeNotice>,
     search_text: String,
     search_matches: Vec<usize>,
     search_cursor: usize,
@@ -3070,6 +3070,24 @@ fn make_git_watcher(
         }
     }
     (watcher, degraded)
+}
+
+/// A scope notice's colour. Only a FAILURE gets the warning colour: a path filter
+/// that matches nothing is gitkay doing exactly what it was told, and painting that
+/// yellow teaches the reader to read the colour as decoration.
+const fn notice_color(notice: &ScopeNotice) -> egui::Color32 {
+    if notice.failed { YELLOW } else { TEXT }
+}
+
+/// The bar form's band, matching `notice_color`. A bar with no fill reads as a commit
+/// row that failed to draw; the empty-state form has no band at all, having a whole
+/// panel of space to be distinct in.
+fn notice_tint(notice: &ScopeNotice) -> egui::Color32 {
+    if notice.failed {
+        tinted(YELLOW, 40)
+    } else {
+        SURFACE0
+    }
 }
 
 fn show_toast(
@@ -4899,8 +4917,8 @@ impl GitkApp {
     fn refresh_scope_notice(&mut self) {
         let notice = scope_notice(&self.scope, &self.commits);
         if notice != self.scope_notice {
-            if let Some(text) = &notice {
-                log::warn!("{text}");
+            if let Some(n) = &notice {
+                log::warn!("{}", n.text);
             }
             self.scope_notice = notice;
         }
@@ -5775,24 +5793,31 @@ impl GitkApp {
         self.select_loaded(clicked_idx);
     }
 
-    /// The scope notice: a tinted bar at the top of the commit list saying why it
-    /// shows less than the command line asked for (`history::scope_notice`), or
-    /// nothing at all when it shows what was asked.
+    /// The scope notice takes one of two forms, and which one is decided by whether
+    /// there are rows to sit above — not by the notice itself.
     ///
-    /// In the list panel and IN THE FLOW, not an overlay like `show_apply_status`:
-    /// this is a statement about the rows, so it belongs above them, and it must
-    /// never cover a row whose absence it is explaining. Nor a toast — the situation
-    /// it reports lasts as long as the view does, and a message that fades leaves a
-    /// blank window with no explanation for whoever looks a minute later.
+    /// With rows (a path filter matching nothing but the working tree; a lone range
+    /// whose combined row was refused) it is a bar at the top of the list, IN THE
+    /// FLOW rather than an overlay like `show_apply_status`: it must never cover a
+    /// row whose absence it is explaining. With no rows at all there is nothing to
+    /// cover and nothing to sit above, so it becomes a centred empty state
+    /// (`show_empty_scope_notice`) — a strip along the top of a window that is
+    /// otherwise entirely blank reads as "still loading", which is the one thing
+    /// this must not say.
     ///
-    /// Wraps rather than eliding: a narrow window would otherwise cut the message
-    /// off mid-sentence, and the reader can't scroll a bar to see the rest.
-    fn show_scope_notice(&self, ui: &mut egui::Ui) {
-        let Some(text) = &self.scope_notice else {
+    /// Neither fades: the situation lasts as long as the view does, and a message
+    /// that expires leaves a blank window with no explanation for whoever looks a
+    /// minute later.
+    fn show_scope_notice_bar(&self, ui: &mut egui::Ui) {
+        let Some(notice) = self
+            .scope_notice
+            .as_ref()
+            .filter(|_| !self.commits.is_empty())
+        else {
             return;
         };
         egui::Frame::NONE
-            .fill(tinted(YELLOW, 24))
+            .fill(notice_tint(notice))
             .inner_margin(egui::Margin::symmetric(6, 3))
             .show(ui, |ui| {
                 // A Frame sizes to its content, so without this the tint stops at the
@@ -5800,12 +5825,75 @@ impl GitkApp {
                 ui.set_min_width(ui.available_width());
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(text)
+                        egui::RichText::new(&notice.text)
                             .font(self.fonts.font_id(Role::Ui))
-                            .color(YELLOW),
+                            .color(notice_color(notice)),
                     )
                     .wrap(),
                 );
+            });
+    }
+
+    /// The empty-list form: the notice centred in the commit panel, over the space
+    /// it is explaining, with the scope gitkay resolved under it.
+    ///
+    /// That second line is the actionable half. It is the same string the window
+    /// title carries (`cli::scope_title_suffix`), and it says which token became a
+    /// revision and which a path — and, for a path, what it was rewritten to
+    /// relative to the repo root, which is what actually matched nothing and need
+    /// not be what was typed.
+    ///
+    /// An `Area` because the panel's space is already spoken for by the (empty)
+    /// scroll area: this paints over it rather than competing with it for layout.
+    /// Non-interactable, so it cannot eat scroll input the way an egui tooltip does
+    /// — moot while the list is empty, but the list is what decides that, and it can
+    /// fill in under a running reload.
+    fn show_empty_scope_notice(&self, panel: egui::Rect, ctx: &egui::Context) {
+        let Some(notice) = self
+            .scope_notice
+            .as_ref()
+            .filter(|_| self.commits.is_empty())
+        else {
+            return;
+        };
+        let font = self.fonts.font_id(Role::Ui);
+        let color = notice_color(notice);
+        let scope = cli::scope_title_suffix(&self.scope);
+        egui::Area::new(egui::Id::new("scope_notice"))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .fixed_pos(panel.center())
+            .pivot(egui::Align2::CENTER_CENTER)
+            .show(ctx, |ui| {
+                // A bare `Area` reports a tiny available width, which a wrapping label
+                // shreds into one word per line. Stating the width fixes that AND
+                // keeps a long path from painting out over the diff pane, which an
+                // Area is not clipped to.
+                ui.set_max_width((panel.width() - 32.0).max(FILE_LIST_MIN_W));
+                ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&notice.text)
+                                .font(font.clone())
+                                .color(color),
+                        )
+                        .wrap(),
+                    );
+                    // Empty for the default scope — the one case with no command line
+                    // to report back, and the one where an empty list is about the
+                    // repo rather than about what was asked for.
+                    if !scope.is_empty() {
+                        ui.add_space(6.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("scope: {scope}"))
+                                    .font(font)
+                                    .color(SUBTEXT),
+                            )
+                            .wrap(),
+                        );
+                    }
+                });
             });
     }
 
@@ -5840,7 +5928,7 @@ impl GitkApp {
             .min_size(120.0)
             .default_size(saved_commit_h)
             .show(ui, |ui| {
-                self.show_scope_notice(ui);
+                self.show_scope_notice_bar(ui);
                 let num_commits = self.commits.len();
                 // Reflog rows are parentless, so the graph is just a column of
                 // disconnected dots — drop it and reclaim the width for the text.
@@ -6028,6 +6116,9 @@ impl GitkApp {
             &mut self.commit_panel_height,
             commit_panel.response.rect.height(),
         );
+        // Over the panel, once it has one: an empty list leaves the whole rect free,
+        // and the message belongs in the space it is explaining.
+        self.show_empty_scope_notice(commit_panel.response.rect, ctx);
         // After the panel has rendered, so `commit_view_range` is this frame's.
         // Not while the first diff is still loading — see `awaiting_first_diff`.
         if !self.awaiting_first_diff() {

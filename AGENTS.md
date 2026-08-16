@@ -358,9 +358,9 @@ The invariants:
 ### UI (egui immediate mode)
 - **Top panel**: search bar (SHA/author/message/ref), Enter cycles matches, any keypress focuses search, graph auto-scrolls to match. A changed keystroke selects and centers its match instantly but defers the diff load behind `DIFF_LOAD_DEBOUNCE` (120ms of input pause), so typing a word doesn't spawn a diff worker per keystroke; Enter/arrow match-cycling and clicks load immediately, and any direct `load_selected_diff` cancels the pending debounced load. That timer is **one mechanism, not the search bar's own** — the toolbar's context wheel arms it too (`defer_diff_load`), because supersession drops a stale result but never cancels a running build: with the foreground workers free, a burst starts several complete `get_diff_data` runs on the one path deliberately unguarded by `probe_row_cost`, then refuses to cache any of them
 - **Central panel**: commit graph + list (`show_commit_list`), virtualized with egui `show_rows` (same mechanism as the diff pane). Lazy loading: 200 initial, +500 on scroll-near-bottom — computed on a `gitkay-history-load` worker (never the frame loop), appended incrementally via `load_commits_tail` in the common plain scope, full background rebuild otherwise. The debounced git-watcher reload takes the same worker path. `history_epoch` supersedes stale results; both land in `drain_history_results`. An append installs through `append_commits` — O(tail), not O(history): the graph layout **resumes** from the stored `GraphLayoutState` (pipes + colour counter) and the lookup maps / search matches extend in place, leaving selection and scroll untouched. The resume is unsound when a previously out-of-scope merge parent lands in the tail (its already-laid-out merge row would gain a diagonal only a relayout can add) — `deferred_parents` tracks those and forces a full `resync_commits` then; `layout_resume_matches_full_layout` pins the parity. A rebuild arrives with its `DerivedHistory` already computed on the worker (`rebuild_load`), so the frame loop only installs it and restores the selection (`install_derived` + `finish_resync`)
-- **Scope notice**: a tinted bar at the top of the commit list saying why the view
-  holds less than the command line asked for — `history::scope_notice`, pure, one
-  phrasing for both the log line and the bar (`refresh_scope_notice` writes both, and
+- **Scope notice**: why the view holds less than the command line asked for —
+  `history::scope_notice`, pure, one phrasing for both the log line and the screen
+  (`refresh_scope_notice` writes both, and
   logs only on a CHANGE so a watcher reload doesn't repeat it). An *invalid* command
   line never gets here: `cli::classify`/`cli::validate` report to the terminal and
   exit before a window exists. What does is a scope that parsed, resolved and then
@@ -376,10 +376,24 @@ The invariants:
   dismissible**: it states what is on screen right now, so nothing can silence a claim
   that is still true. Recomputed at the two places a whole real list is installed
   (`install_startup_history`, the `Rebuild` arm of `drain_history_results`); an append
-  can't reach one, since every case is about rows being ABSENT. Drawn in the flow at
-  the top of the list panel rather than as an overlay like `show_apply_status` — it
-  must never cover a row whose absence it is explaining — and it wraps rather than
-  eliding, a bar being unscrollable.
+  can't reach one, since every case is about rows being ABSENT.
+  It **takes one of two forms, decided by whether there are rows to sit above** —
+  which is `commits.is_empty()`, not "did the walk find anything": a path filter can
+  leave the working-tree rows behind while selecting no commit at all. With rows it is
+  a bar at the top of the list, in the flow rather than an overlay like
+  `show_apply_status`, since it must never cover a row whose absence it is explaining.
+  With none it is a centred empty state over the panel (`show_empty_scope_notice`, a
+  non-interactable `Area` — the panel's space is already spoken for by the empty
+  scroll area) carrying a second dim line, `cli::scope_title_suffix`: the same string
+  the window title holds, and the actionable half, since it says which token became a
+  revision and which a path, and what a path was rewritten to. A strip along the top
+  of an otherwise blank window reads as "still loading", which is the one thing this
+  must not say. Both wrap rather than elide, neither being scrollable.
+  **Only a FAILURE is drawn in the warning colour** (`ScopeNotice::failed`, today just
+  the refused combined row): a path filter that matches nothing is gitkay doing exactly
+  what it was told, and painting that yellow teaches the reader to read the colour as
+  decoration. That severity is a property of the notice; where it is drawn is a
+  property of the list — they coincide today and must not be collapsed.
 - **Commit-list stats column**: each row's files-changed / `+`/`-` counts, from
   `diff::commit_stats` — the same `scoped_diff` prologue the pane's own
   `build_diff_data` runs (options, builder, rename post-pass), so the column can
