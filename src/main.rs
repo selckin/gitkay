@@ -46,7 +46,7 @@ use diff::{
 use diff_cache::DiffCache;
 use diff_highlight::{
     HighlightBatch, HighlightJob, band_warmable, diff_fully_highlighted, highlight_diff,
-    highlight_diff_until, highlight_scan_stale, highlight_worker, spawn_prewarm,
+    highlight_diff_until, highlight_scan_stale, highlight_worker, pending_files, spawn_prewarm,
 };
 use diff_store::DiffStore;
 use graph::{GraphLayoutState, GraphRow, layout_graph_rows};
@@ -2218,6 +2218,19 @@ fn append_body(
     }
 }
 
+/// What the display has derived for one row: its syntax spans and its word-diff
+/// emphasis, each empty when nothing has been computed for that row — which renders
+/// identically to "computed to nothing", so the render never has to tell them apart.
+///
+/// One value rather than two parameters because they are looked up together, on the
+/// same row index, in the two `PerRow`s beside the diff — and because they answer one
+/// question between them: how is this row coloured beyond its kind?
+#[derive(Clone, Copy)]
+struct RowStyle<'a> {
+    spans: &'a [highlight::Span],
+    emphasis: &'a [std::ops::Range<usize>],
+}
+
 /// Build the `LayoutJob` for one diff row plus its optional background tint. With
 /// `syntax` on, code lines render their token spans over the theme foreground, an
 /// accent +/-/space gutter (synthesized from `kind`, so context and changed lines
@@ -2236,6 +2249,7 @@ fn append_body(
 /// modes and for every kind.
 fn diff_row_job(
     line: &DiffLine,
+    row: RowStyle<'_>,
     palette: &highlight::DiffPalette,
     font_id: &egui::FontId,
     linenos: LineNoGutter,
@@ -2301,22 +2315,15 @@ fn diff_row_job(
             LineKind::Del => palette.deleted_bg,
             _ => palette.added_bg,
         };
-        // Spans hold byte ranges into body(); a None/empty span set renders plain.
-        (
-            palette.foreground,
-            line.spans.as_deref().unwrap_or(&[]),
-            tint,
-        )
+        // Spans hold byte ranges into body(); an empty span set renders plain, which
+        // is what a row nobody has tokenized yet looks like.
+        (palette.foreground, row.spans, tint)
     } else {
         (kind_color(line.kind, palette), &[], palette.background)
     };
-    // With the toggle off — or the lazy pass not yet over this line (None) —
-    // render un-emphasized; the per-frame viewport pass fills visible lines in.
-    let emphasis: &[std::ops::Range<usize>] = if word_diff {
-        line.emphasis.as_deref().unwrap_or(&[])
-    } else {
-        &[]
-    };
+    // With the toggle off — or the lazy pass not yet over this line — render
+    // un-emphasized; the per-frame viewport pass fills visible lines in.
+    let emphasis: &[std::ops::Range<usize>] = if word_diff { row.emphasis } else { &[] };
     let emph_bg = (!emphasis.is_empty()).then(|| emphasis_bg(line.kind, palette, backdrop));
     append_body(
         &mut job,
@@ -2612,8 +2619,21 @@ struct GitkApp {
     selected: Option<usize>,
     startup_diff: StartupDiff, // one-time: defer the first diff off the window-creation path
 
-    diff_lines: Vec<DiffLine>,
-    diff_files: Vec<FileEntry>,
+    /// The displayed diff's rows and file entries — SHARED, not owned: the highlight
+    /// worker holds the same allocations, so handing it a diff costs two refcount bumps
+    /// rather than a copy of every row (12.0s on the frame loop, at 76.5M lines). They
+    /// are immutable while displayed; `resync_file_layout`'s re-lay is the one writer,
+    /// through `Arc::make_mut`.
+    diff_lines: Arc<Vec<DiffLine>>,
+    diff_files: Arc<Vec<FileEntry>>,
+    /// The rows' syntax spans, indexed alongside `diff_lines`. Filled by the highlight
+    /// worker's batches, carried into the cache with the diff (a revisit keeps its
+    /// colour) and dropped by the store (an entry on disk is theme-independent).
+    diff_spans: diff::RowSpans,
+    /// The rows' word-diff emphasis, indexed alongside `diff_lines`. Owned here alone
+    /// and dropped with the displayed diff: `ensure_visible_word_emphasis` fills one
+    /// window at a time, so what is dropped refills in the frame it is next needed.
+    diff_emphasis: diff::RowEmphasis,
     file_rows: Vec<FileListRow>, // cached file-list rows; rebuilt when diff_files or file_list changes
     diff_scroll_to: Option<usize>,
     /// Per-commit scroll positions, remembered for the session so re-selecting a
@@ -3391,8 +3411,8 @@ impl GitkApp {
         // load_selected_diff on the StartupDiff::NeedsLoad pass. With no commits
         // there's nothing to load, so go straight to Done — and the install below
         // re-decides it for the list it brings.
-        let diff_lines: Vec<DiffLine> = Vec::new();
-        let diff_files: Vec<FileEntry> = Vec::new();
+        let diff_lines: Arc<Vec<DiffLine>> = Arc::default();
+        let diff_files: Arc<Vec<FileEntry>> = Arc::default();
         let current_diff_key: Option<DiffCacheKey> = None;
 
         // Watch .git for changes — refs, HEAD, index (see make_git_watcher).
@@ -3486,6 +3506,10 @@ impl GitkApp {
             startup_diff: StartupDiff::Done,
             diff_lines,
             diff_files,
+            // Both are sized against the rows wherever a diff installs; with no rows
+            // yet, both are empty.
+            diff_spans: diff::RowSpans::default(),
+            diff_emphasis: diff::RowEmphasis::default(),
             // Empty like diff_files — the deferred startup load rebuilds them together.
             file_rows: Vec::new(),
             diff_scroll_to: None,
@@ -3914,6 +3938,11 @@ impl GitkApp {
             // would simply not get.
             let data = DiffData::from_parts(
                 std::mem::take(&mut self.diff_lines),
+                // The spans go back with the rows, which is what makes a revisit
+                // restore a diff's colour rather than re-tokenize it. The emphasis
+                // does not: it is one viewport's worth of LCS, refilled on the frame
+                // the diff is next drawn.
+                std::mem::take(&mut self.diff_spans),
                 std::mem::take(&mut self.diff_files),
                 self.diff_max_chars,
                 self.diff_textconv_failed,
@@ -3952,11 +3981,12 @@ impl GitkApp {
         let visible = self.diff_visible_rows.load(Ordering::Relaxed).max(50);
         let around = |center: usize| center.saturating_sub(visible)..center + 2 * visible;
         emphasize_rows(
-            &mut self.diff_lines,
+            &self.diff_lines,
+            &mut self.diff_emphasis,
             around(self.diff_top_line.load(Ordering::Relaxed)),
         );
         if let Some(target) = self.diff_scroll_to {
-            emphasize_rows(&mut self.diff_lines, around(target));
+            emphasize_rows(&self.diff_lines, &mut self.diff_emphasis, around(target));
         }
     }
 
@@ -4111,7 +4141,7 @@ impl GitkApp {
         // field added to `DiffData` a compile error here rather than a value silently
         // dropped at the display boundary. `max_chars` is precomputed at build time (on
         // the worker), so no per-line rescan happens here.
-        let (lines, files, max_chars, textconv_failed) = data.into_parts();
+        let (lines, spans, files, max_chars, textconv_failed) = data.into_parts();
         self.diff_max_chars = max_chars;
         // Drop the previous diff's gutter widths; the render re-measures on the
         // first frame that needs them, so a session with line numbers off never
@@ -4122,7 +4152,13 @@ impl GitkApp {
         // rows without changing any number, so a measurement still holds.
         self.diff_linenos = None;
         self.diff_textconv_failed = textconv_failed;
+        // Emphasis is not part of a diff and is not carried across one: it is per
+        // viewport, and `ensure_visible_word_emphasis` refills the window on the next
+        // frame. Sized here against the incoming rows, which is the one place it can be
+        // — every other writer indexes it.
+        self.diff_emphasis = diff::RowEmphasis::blank(lines.len());
         self.diff_lines = lines;
+        self.diff_spans = spans;
         self.diff_files = files;
         self.current_diff_key = key;
         self.diff_content_stale = false;
@@ -4626,12 +4662,18 @@ impl GitkApp {
             self.highlight_priority = None;
             return;
         }
-        // Cache hit: a diff restored from the cache (or warmed by prefetch) already
-        // carries its spans, so there's nothing to tokenize. Skip before cloning
-        // the diff for a worker that would scan every line and colour nothing —
-        // paid on every revisit of a cached commit. (The clone itself is cheap
-        // now — line text is Arc-shared — but the worker's scan isn't.)
-        if diff_fully_highlighted(&self.diff_lines, &self.diff_files) {
+        // Which files still hold an uncoloured code line — and, in passing, whether any
+        // do. A diff restored from the cache (or warmed by prefetch) already carries its
+        // spans and yields an empty list, so there is nothing to spawn for; that is the
+        // common path on every revisit of a cached commit.
+        //
+        // Computed HERE rather than in the worker, which is where it used to live: the
+        // spans it is derived from no longer travel with the rows, and this is the one
+        // side that has them. It costs nothing new — the same scan already ran here as
+        // `diff_fully_highlighted`, and it now answers with the file list instead of a
+        // bool the worker had to rediscover.
+        let pending = pending_files(&self.diff_lines, &self.diff_spans, &self.diff_files);
+        if pending.is_empty() {
             self.highlight_priority = None;
             return;
         }
@@ -4680,26 +4722,22 @@ impl GitkApp {
         });
         priority.store(VisibleRange::window(&self.file_line_starts, rows));
         self.highlight_priority = Some(Arc::clone(&priority));
-        // The hand-off, timed: the worker reads the diff but must not race the UI
-        // writing spans into it, so it gets a copy — and a copy is O(lines) of struct
-        // moves and `Arc` bumps on the FRAME LOOP. Cheap for an ordinary diff (the
-        // text itself is shared), and the one thing here that grows without bound.
-        let t_clone = std::time::Instant::now();
+        // The hand-off: two refcount bumps and the pending list, whatever the diff's
+        // size. The worker reads the rows while the UI writes spans, and those spans
+        // live BESIDE the rows rather than inside them, so there is nothing to race and
+        // nothing to copy. This used to hand over a clone of the whole diff — 12.02s of
+        // a 12.07s frame at 76.5M lines, with the window already painted.
         let job = HighlightJob {
             hl: Arc::clone(hl),
-            lines: self.diff_lines.clone(),
-            files: self.diff_files.clone(),
+            lines: Arc::clone(&self.diff_lines),
+            files: Arc::clone(&self.diff_files),
+            pending,
             generation,
             current_gen: self.diff_generation.clone(),
             priority,
             tx: self.highlight_tx.clone(),
             ctx: ctx.clone(),
         };
-        log::debug!(
-            "perf: highlight hand-off: copied {} lines in {:?}",
-            job.lines.len(),
-            t_clone.elapsed()
-        );
         // `Builder::spawn` returns Err on thread exhaustion (vs `spawn`, which
         // panics). On failure, highlight synchronously so the diff still gets
         // coloured rather than staying plain forever.
@@ -4713,7 +4751,7 @@ impl GitkApp {
         {
             log::warn!("highlight thread spawn failed; highlighting on the UI thread");
             self.highlight_priority = None;
-            highlight_diff(&mut self.diff_lines, &self.diff_files, hl);
+            highlight_diff(&self.diff_lines, &mut self.diff_spans, &self.diff_files, hl);
         }
     }
 
@@ -5265,7 +5303,12 @@ impl GitkApp {
                 FileListRow::Header { .. } => None,
             })
             .collect();
-        if diff::order_files(&mut self.diff_lines, &mut self.diff_files, &order) {
+        if diff::order_files(
+            &mut self.diff_lines,
+            &mut self.diff_spans,
+            &mut self.diff_files,
+            &order,
+        ) {
             for (k, idx) in self
                 .file_rows
                 .iter_mut()
@@ -5286,10 +5329,14 @@ impl GitkApp {
             // with a worker already running is the layout-only config reload
             // (`[diff] file_list` changed and nothing else), and it is exactly the
             // path a caller-side rule would be forgotten on. Nothing already
-            // applied is lost — those spans moved with their rows — so the worker
-            // `ensure_diff_highlighted` restarts next frame re-tokenizes only what
-            // `pending_files` still lists.
+            // applied is lost — `order_files` moves each row's spans with it — so the
+            // worker `ensure_diff_highlighted` restarts next frame re-tokenizes only
+            // what `pending_files` still lists.
             self.invalidate_diff_highlight();
+            // The emphasis is dropped rather than moved, being the cheap half: it
+            // covers one viewport and `ensure_visible_word_emphasis` refills it on the
+            // next frame, where the spans it sits beside cost seconds to recompute.
+            self.diff_emphasis = diff::RowEmphasis::blank(self.diff_lines.len());
         }
         self.file_line_starts = file_line_starts(&self.diff_files);
         // New rows ⇒ the per-row galleys no longer correspond; rebuild lazily.
@@ -6999,9 +7046,10 @@ impl GitkApp {
                     // file (the skip-done filter would otherwise keep the old
                     // theme's colours), preserving the invariant that a `Some`
                     // spans value always reflects the current (theme, enabled).
-                    for line in &mut self.diff_lines {
-                        line.spans = None;
-                    }
+                    // One vector, not a write through every row: the rows are
+                    // shared with a worker that may still be reading them, and
+                    // none of them says anything about colour any more.
+                    self.diff_spans.clear();
                     // Re-key the live diff so its eventual stash lands under the
                     // new theme/enabled, not the old key. Rebuilt through
                     // diff_cache_key (settings are still the pre-reload ones the
@@ -7121,14 +7169,11 @@ impl GitkApp {
                     // `diff_fully_highlighted` would then skip re-doing, and that
                     // would get cached under the new key. Blank them exactly like
                     // `handle_config_reload`'s own re-highlight reset does for the
-                    // live diff (`for line in &mut self.diff_lines { line.spans =
-                    // None; }`) so the post-install pass recolours from scratch —
-                    // same mechanism, applied to the arriving result instead of
-                    // the field.
+                    // live diff (`self.diff_spans.clear()`) so the post-install pass
+                    // recolours from scratch — same mechanism, applied to the arriving
+                    // result instead of the field.
                     if key.theme != fresh.theme || key.enabled != fresh.enabled {
-                        for line in &mut data.lines {
-                            line.spans = None;
-                        }
+                        data.spans.clear();
                     }
                     self.install_preferring_cache(fresh, data);
                 }
@@ -7185,9 +7230,9 @@ impl GitkApp {
         while let Ok(batch) = self.highlight_rx.try_recv() {
             if self.diff_generation.is_current(batch.generation) {
                 for (i, spans) in batch.lines {
-                    if let Some(line) = self.diff_lines.get_mut(i) {
-                        line.spans = Some(spans);
-                    }
+                    // `set` drops a row past the end, which is what `get_mut` did here
+                    // before: a batch is computed against a snapshot and can outlive it.
+                    self.diff_spans.set(i, spans);
                 }
                 applied_highlight = true;
             }
@@ -7275,7 +7320,7 @@ impl GitkApp {
         if highlight_scan_stale(self.highlight_scan, generation, applied_highlight) {
             self.highlight_scan = Some((
                 generation,
-                diff_fully_highlighted(&self.diff_lines, &self.diff_files),
+                diff_fully_highlighted(&self.diff_lines, &self.diff_spans, &self.diff_files),
             ));
         }
         self.highlight_scan.is_some_and(|(_, answer)| answer)
@@ -7412,7 +7457,7 @@ impl GitkApp {
 static SHUTDOWN_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 impl Drop for GitkApp {
-    /// Hand the app's two largest fields to the OS instead of freeing them line by
+    /// Hand the app's largest fields to the OS instead of freeing them line by
     /// line.
     ///
     /// Freeing them is real work and buys nothing: a large diff is millions of
@@ -7431,12 +7476,19 @@ impl Drop for GitkApp {
     ///
     /// The cost of the trick is that a leak checker now reports this memory as leaked
     /// at exit. That is what it is: the leak is deliberate, bounded by the process
-    /// lifetime, and confined to these two fields.
+    /// lifetime, and confined to these fields.
     fn drop(&mut self) {
         let t = std::time::Instant::now();
         let displayed = self.diff_lines.len();
         let cached = self.diff_cache.weight();
+        // Forgetting the `Arc` is what abandons the rows: a live highlight worker may
+        // hold the other reference, and dropping ours would just leave the freeing to
+        // whichever side lost the race.
         std::mem::forget(std::mem::take(&mut self.diff_lines));
+        // The spans are now the bigger half of a coloured diff — a `Vec` per code line,
+        // ~24 B a span — and they left `DiffLine`, so they need abandoning by name
+        // rather than riding along inside the rows.
+        std::mem::forget(std::mem::take(&mut self.diff_spans));
         // `replace` rather than `take`: the cache has no `Default`, and a throwaway
         // with a zero budget allocates nothing.
         std::mem::forget(std::mem::replace(&mut self.diff_cache, DiffCache::new(0)));
@@ -7756,6 +7808,8 @@ impl eframe::App for GitkApp {
                     };
                     let font_id = self.fonts.font_id(Role::Diff);
                     let lines = &self.diff_lines;
+                    let spans = &self.diff_spans;
+                    let emphasis = &self.diff_emphasis;
                     let starts = &self.file_line_starts;
                     let priority = self.highlight_priority.as_ref();
                     let word_diff = self.word_diff;
@@ -7781,6 +7835,10 @@ impl eframe::App for GitkApp {
                         |i| {
                             let (job, row_bg) = diff_row_job(
                                 &lines[i],
+                                RowStyle {
+                                    spans: spans.slice(i),
+                                    emphasis: emphasis.slice(i),
+                                },
                                 render_palette,
                                 &font_id,
                                 linenos,
@@ -8177,8 +8235,8 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::{LineStats, oid_staged, oid_uncommitted};
-    use crate::diff_highlight::{file_fully_highlighted, pending_files, pick_file};
+    use crate::diff::{LineStats, RowSpans, oid_staged, oid_uncommitted};
+    use crate::diff_highlight::{file_fully_highlighted, pick_file};
     use crate::history::load_commits;
     use crate::test_repo::{commit_file, commit_index, commit_rename, rename_file, temp_repo};
 
@@ -8499,6 +8557,10 @@ mod tests {
         let bg = |text: &str, kind| {
             diff_row_job(
                 &DiffLine::new(text, kind),
+                RowStyle {
+                    spans: &[],
+                    emphasis: &[],
+                },
                 &palette,
                 &fid,
                 LineNoGutter::default(),
@@ -8532,8 +8594,12 @@ mod tests {
             DiffLine::with_linenos("+new", LineKind::Add, None, n(100)),
         ];
         let g = LineNoGutter::measure(&lines);
+        let plain = RowStyle {
+            spans: &[],
+            emphasis: &[],
+        };
         let row = |i: usize, g| {
-            diff_row_job(&lines[i], &palette, &fid, g, false, true)
+            diff_row_job(&lines[i], plain, &palette, &fid, g, false, true)
                 .0
                 .text
         };
@@ -8559,7 +8625,7 @@ mod tests {
         // sit one column left of the changed ones, beside a column of numbers
         // that lines up perfectly.
         let flat = |i: usize| {
-            diff_row_job(&lines[i], &palette, &fid, g, false, false)
+            diff_row_job(&lines[i], plain, &palette, &fid, g, false, false)
                 .0
                 .text
         };
@@ -8600,27 +8666,35 @@ mod tests {
     #[test]
     fn file_fully_highlighted_predicate() {
         let span = || (egui::Color32::WHITE, 0..1);
-        let mut highlighted = DiffLine::new("+a", LineKind::Add);
-        highlighted.spans = Some(vec![span()]);
-        let mut blank_done = DiffLine::new("+", LineKind::Add);
-        blank_done.spans = Some(vec![]); // highlighted, produced no tokens
-        let not_yet = DiffLine::new("+b", LineKind::Add); // spans None
 
         // Structural-only range is vacuously done.
         let structural = vec![DiffLine::new("@@ -1 +1 @@", LineKind::Hunk)];
-        assert!(file_fully_highlighted(&structural, 0, 1));
+        assert!(file_fully_highlighted(
+            &structural,
+            &RowSpans::blank(1),
+            0,
+            1
+        ));
 
-        // All code lines Some (incl. a blank Some(empty)); structural ignored.
+        // All code lines set (incl. one set to no tokens at all); structural ignored.
         let done = vec![
-            highlighted.clone(),
-            blank_done,
+            DiffLine::new("+a", LineKind::Add),
+            DiffLine::new("+", LineKind::Add),
             DiffLine::new("@@ -1 +1 @@", LineKind::Hunk),
         ];
-        assert!(file_fully_highlighted(&done, 0, 3));
+        let mut spans = RowSpans::blank(3);
+        spans.set(0, vec![span()]);
+        spans.set(1, Vec::new()); // highlighted, produced no tokens
+        assert!(file_fully_highlighted(&done, &spans, 0, 3));
 
-        // One code line still None ⇒ not done.
-        let partial = vec![highlighted, not_yet];
-        assert!(!file_fully_highlighted(&partial, 0, 2));
+        // One code line still unset ⇒ not done.
+        let partial = vec![
+            DiffLine::new("+a", LineKind::Add),
+            DiffLine::new("+b", LineKind::Add),
+        ];
+        let mut spans = RowSpans::blank(2);
+        spans.set(0, vec![span()]);
+        assert!(!file_fully_highlighted(&partial, &spans, 0, 2));
     }
 
     /// The memo keeps the O(lines) scan off the frame loop. The case that matters is a
@@ -8669,28 +8743,27 @@ mod tests {
     #[test]
     fn diff_fully_highlighted_ignores_untokenized_header_lines() {
         let span = || (egui::Color32::WHITE, 0..1);
-        let mut a0 = DiffLine::new("+a", LineKind::Add);
-        a0.spans = Some(vec![span()]);
-        let mut a1 = DiffLine::new(" b", LineKind::Context);
-        a1.spans = Some(vec![span()]);
         let lines = vec![
             DiffLine::new("commit abc", LineKind::Meta), // 0 header (structural)
             // 1: a `Context` line outside any file range (as a no-patch/binary
-            // file's placeholder would be) — is_code, but never tokenized (None).
+            // file's placeholder would be) — is_code, but never tokenized.
             DiffLine::new("Binary files differ", LineKind::Context),
-            a0, // 2 file code (Some)
-            a1, // 3 file code (Some)
+            DiffLine::new("+a", LineKind::Add),     // 2 file code
+            DiffLine::new(" b", LineKind::Context), // 3 file code
         ];
         let files = vec![fe("x.rs", Some(2))]; // file's range starts at index 2
-        // The untokenized Context line (index 1) is None but outside any file
+        let mut spans = RowSpans::blank(lines.len());
+        spans.set(2, vec![span()]);
+        spans.set(3, vec![span()]);
+        // The untokenized Context line (index 1) is unset but outside any file
         // range, so the diff still counts as fully highlighted. This is the bug
         // that made the prefetch trigger never fire with file_fully_highlighted(0,len).
-        assert!(diff_fully_highlighted(&lines, &files));
+        assert!(diff_fully_highlighted(&lines, &spans, &files));
 
-        // A None code line *inside* the file range ⇒ not done.
-        let mut partial = lines;
-        partial[3].spans = None;
-        assert!(!diff_fully_highlighted(&partial, &files));
+        // An unset code line *inside* the file range ⇒ not done.
+        let mut partial = RowSpans::blank(lines.len());
+        partial.set(2, vec![span()]);
+        assert!(!diff_fully_highlighted(&lines, &partial, &files));
     }
 
     #[test]
@@ -8698,24 +8771,21 @@ mod tests {
         // file A starts at line 1 [1,3): both code lines Some ⇒ done.
         // file B starts at line 3 [3,5): one code line None ⇒ pending.
         let span = || (egui::Color32::WHITE, 0..1);
-        let mut a0 = DiffLine::new("+a0", LineKind::Add);
-        a0.spans = Some(vec![span()]);
-        let mut a1 = DiffLine::new("+a1", LineKind::Add);
-        a1.spans = Some(vec![span()]);
-        let mut b0 = DiffLine::new("+b0", LineKind::Add);
-        b0.spans = Some(vec![span()]);
-        let b1 = DiffLine::new("+b1", LineKind::Add); // None ⇒ B not done
-
         let lines = vec![
             DiffLine::new("diff --git", LineKind::FileMeta), // 0 (pre-file header)
-            a0,
-            a1, // file A: [1,3)
-            b0,
-            b1, // file B: [3,5)
+            DiffLine::new("+a0", LineKind::Add),
+            DiffLine::new("+a1", LineKind::Add), // file A: [1,3)
+            DiffLine::new("+b0", LineKind::Add),
+            DiffLine::new("+b1", LineKind::Add), // file B: [3,5)
         ];
         let files = vec![fe("a.rs", Some(1)), fe("b.rs", Some(3))];
+        let mut spans = RowSpans::blank(lines.len());
+        for row in [1, 2, 3] {
+            spans.set(row, vec![span()]);
+        }
+        // Row 4 is left unset ⇒ file B is not done.
 
-        let pending: Vec<usize> = pending_files(&lines, &files)
+        let pending: Vec<usize> = pending_files(&lines, &spans, &files)
             .into_iter()
             .map(|(fi, _, _)| fi)
             .collect();
@@ -10274,7 +10344,7 @@ mod tests {
             ("README.md", 2),
             ("docs/guide.md", 2),
         ];
-        let (mut lines, mut entries) = diff::tests::paned(1, &blocks);
+        let (mut spans, mut lines, mut entries) = diff::tests::paned(1, &blocks);
 
         let order = |entries: &[diff::FileEntry]| {
             let paths: Vec<(&str, Option<&str>)> =
@@ -10288,7 +10358,12 @@ mod tests {
                 .collect::<Vec<usize>>()
         };
         let sidebar = order(&entries);
-        assert!(diff::order_files(&mut lines, &mut entries, &sidebar));
+        assert!(diff::order_files(
+            &mut lines,
+            &mut spans,
+            &mut entries,
+            &sidebar
+        ));
 
         // Grouped order: docs/ then src/…/acme/ (Bar before Foo), root file last.
         let paths: Vec<&str> = entries.iter().map(|f| f.path.as_str()).collect();
@@ -10302,7 +10377,7 @@ mod tests {
             ]
         );
         // Each entry's recorded start really is where its own rows now sit.
-        for f in &entries {
+        for f in entries.iter() {
             let start = f.diff_line_idx.expect("every fixture file has a body");
             assert!(
                 lines[start].text.starts_with(&f.path),
@@ -10314,7 +10389,12 @@ mod tests {
         // Re-deriving over the laid-out entries is the identity — what makes the
         // install-time call free on a cache hit and in the two flat layouts.
         let again = order(&entries);
-        assert!(!diff::order_files(&mut lines, &mut entries, &again));
+        assert!(!diff::order_files(
+            &mut lines,
+            &mut spans,
+            &mut entries,
+            &again
+        ));
     }
 
     #[test]
