@@ -1,0 +1,497 @@
+//! Soft wrapping in the diff pane (the toolbar's "Soft wrap"): how many visual rows each
+//! logical line takes, which line a visual row belongs to, and which slice of that
+//! line one row draws.
+//!
+//! Pure — no egui, no git2 — so every mapping below is unit-testable against a
+//! brute-force layout, which is what the feature's risk actually is: the wrapping
+//! is easy and the eleven sites that address rows in LINE space are not.
+//!
+//! ## The pane slices lines itself rather than letting egui wrap them
+//!
+//! egui can wrap a `LayoutJob`, but it lays the whole job out first — one glyph
+//! per character, for every character, before a single row is culled. The
+//! 8.3M-character minified line that crashed the renderer would become ~40,000
+//! galley rows and 8.3M glyphs on the frame it came on screen: the same unbounded
+//! cost `MAX_ROW_RENDER_CHARS` was added to avoid, arriving through layout instead
+//! of tessellation, and cached in the galley cache afterwards. Slicing here makes
+//! one visual row one small `LayoutJob` of at most `cols` characters, so layout,
+//! tessellation and memory all follow the viewport.
+//!
+//! It also makes the row count EXACT instead of predicted. Every visual row is
+//! exactly one `row_h` tall, so the pane keeps `show_rows` — egui's uniform-height
+//! virtualization — rather than moving to `show_viewport` and reserving a height
+//! that a word-wrapping layouter might not agree with. A prediction that came out
+//! one row short would overlap the row below it, every frame, with nothing to
+//! notice it.
+//!
+//! The cost is that lines break mid-word. For a diff that is the right trade: it
+//! preserves column alignment (the reason the pane is monospace at all), it is
+//! what `fold -w` does, and the alternative — matching egui's word breaker well
+//! enough to predict its row count — is a reimplementation that would drift on the
+//! next upgrade.
+//!
+//! ## Widths are counted in BYTES
+//!
+//! `content.len()`, never `chars().count()`. In UTF-8 a character's byte length is
+//! never less than the columns it occupies in a monospace font — 1 byte ⇒ 1
+//! column, 2 ⇒ 1, 3 ⇒ 2 (CJK), 4 ⇒ 2 (emoji) — so a slice of `n` bytes never
+//! occupies more than `n` columns. Byte wrapping can therefore only break EARLY,
+//! never overflow the pane, which is the safe direction: the failure mode is a
+//! short-looking row in a non-ASCII file, not text running under the scrollbar.
+//!
+//! What it buys is that the whole index is built without reading a single
+//! character: one `len()` comparison per line decides whether that line wraps, and
+//! a slice boundary is arithmetic plus at most three bytes of walking back to a
+//! character boundary. On an all-ASCII diff — including the minified one this
+//! exists for — bytes and columns are the same number anyway.
+
+use std::ops::Range;
+
+use super::{DiffLine, LineKind, LineNoGutter};
+
+/// The narrowest content column count a row is wrapped at, whatever the pane's
+/// width. A pane dragged down to a few columns would otherwise turn one long line
+/// into millions of visual rows — the scroll range, not the layout, being what
+/// breaks. Text past the pane's right edge is clipped, as it is without wrapping.
+const MIN_BODY_COLS: usize = 16;
+
+/// How many wrapped lines one index will track before giving up and behaving as
+/// though wrapping were off.
+///
+/// An entry is 24 bytes, so this is a 24MB ceiling on a diff whose lines are
+/// *mostly* longer than the window — the shape a repo of minified sources has. The
+/// refusal is logged and is not silent in any other sense either: the pane falls
+/// back to the horizontal-scroll rendering, which is exactly what `wrap = false`
+/// draws, rather than to something half-wrapped.
+const MAX_WRAPPED_LINES: usize = 1_000_000;
+
+/// One logical line that occupies more than one visual row.
+///
+/// `first_row` is a running total rather than something derived at query time, so
+/// both directions of the mapping are one binary search over this list and no
+/// prefix-sum array sits beside it that could disagree.
+#[derive(Clone, Copy, Debug)]
+struct Tall {
+    line: usize,
+    first_row: usize,
+    rows: usize,
+}
+
+/// Which slice of a logical line one visual row draws, and whether that row is the
+/// line's first — the row that carries the line-number gutter and the `+`/`-`
+/// marker, where a continuation gets blanks of the same width so the bodies line up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RowSlice {
+    /// Byte range into `DiffLine::rendered()`, on character boundaries.
+    pub range: Range<usize>,
+    pub first: bool,
+}
+
+impl RowSlice {
+    /// The whole line as one row — what a pane with no index draws, and what an
+    /// inactive one answers, so both are exactly the pre-wrapping rendering.
+    pub fn whole(line: &DiffLine) -> Self {
+        Self {
+            range: 0..line.rendered().len(),
+            first: true,
+        }
+    }
+}
+
+/// Where every logical line of one diff sits in visual-row space, for one pane
+/// width and one gutter width.
+///
+/// Sparse on purpose: only the lines that wrap are stored, because in every
+/// ordinary diff none of them do and the mapping is then the identity. A prefix sum
+/// over all lines would be 4 bytes × 76.5M = 306MB to describe a diff in which
+/// nothing wraps at all.
+#[derive(Debug)]
+pub struct WrapIndex {
+    /// False when this index refused the diff (see `MAX_WRAPPED_LINES`). Every
+    /// mapping below is then the identity, so the pane renders as it does with
+    /// wrapping off — the ONE thing the flag still decides is that the horizontal
+    /// scroll comes back, since rows are no longer cut to the window.
+    active: bool,
+    cols: usize,
+    gutter: LineNoGutter,
+    n_lines: usize,
+    total_rows: usize,
+    tall: Vec<Tall>,
+}
+
+impl WrapIndex {
+    /// Measure `lines` against a pane `cols` columns wide with `gutter`'s
+    /// line-number columns in front of each patch row.
+    ///
+    /// One `len()` comparison per line in the common case, so this is cheap enough
+    /// to redo whenever the pane's width changes. It is still O(lines): on a diff
+    /// of tens of millions of rows it is tens of milliseconds, which is why the
+    /// caller only builds one when wrapping is actually switched on.
+    pub fn build(lines: &[DiffLine], cols: usize, gutter: LineNoGutter) -> Self {
+        let mut tall: Vec<Tall> = Vec::new();
+        let mut total_rows: usize = 0;
+        for (line, l) in lines.iter().enumerate() {
+            let width = body_cols(l.kind, cols, gutter);
+            let len = l.rendered().len();
+            if len <= width {
+                total_rows += 1;
+                continue;
+            }
+            if tall.len() >= MAX_WRAPPED_LINES {
+                log::warn!(
+                    "wrap: {} of {} lines are wider than the pane ({cols} columns) — over the \
+                     {MAX_WRAPPED_LINES}-line index cap, so this diff renders unwrapped",
+                    tall.len(),
+                    lines.len(),
+                );
+                return Self::inactive(lines.len(), cols, gutter);
+            }
+            let rows = len.div_ceil(width);
+            tall.push(Tall {
+                line,
+                first_row: total_rows,
+                rows,
+            });
+            total_rows += rows;
+        }
+        Self {
+            active: true,
+            cols,
+            gutter,
+            n_lines: lines.len(),
+            total_rows,
+            tall,
+        }
+    }
+
+    /// An index that maps every line to itself — the shape a refused build takes,
+    /// so "we gave up" needs no second code path anywhere above this module.
+    const fn inactive(n_lines: usize, cols: usize, gutter: LineNoGutter) -> Self {
+        Self {
+            active: false,
+            cols,
+            gutter,
+            n_lines,
+            total_rows: n_lines,
+            tall: Vec::new(),
+        }
+    }
+
+    /// Whether this index is wrapping anything — false only for a refused build.
+    /// The pane reads it to decide whether the horizontal scroll is needed.
+    pub const fn active(&self) -> bool {
+        self.active
+    }
+
+    /// Whether this index still describes the diff and pane it is asked about. The
+    /// three inputs a rebuild depends on, compared in one place so a caller cannot
+    /// check two of them: the line count (a new diff), the width (a resize or a
+    /// font change), and the gutter (the line-number toggle).
+    ///
+    /// A different diff with the same line count is NOT caught here — the caller
+    /// drops the index where content is installed, for the same reason it drops
+    /// the gutter measurement there.
+    pub fn covers(&self, n_lines: usize, cols: usize, gutter: LineNoGutter) -> bool {
+        self.n_lines == n_lines && self.cols == cols && self.gutter == gutter
+    }
+
+    /// Total visual rows in the diff — what the virtualized pane scrolls over.
+    pub const fn total_rows(&self) -> usize {
+        self.total_rows
+    }
+
+    /// The visual row a logical line starts on. Out-of-range lines map past the
+    /// end, which is what a clamped scroll target wants.
+    pub fn row_of_line(&self, line: usize) -> usize {
+        let i = self.tall.partition_point(|t| t.line < line);
+        // No wrapped line at or before it ⇒ rows and lines have not diverged yet.
+        i.checked_sub(1).map_or(line, |k| {
+            let t = self.tall[k];
+            t.first_row + t.rows + (line - t.line - 1)
+        })
+    }
+
+    /// The logical line a visual row belongs to, and which of that line's rows it
+    /// is (0 for a line that does not wrap).
+    pub fn line_of_row(&self, row: usize) -> (usize, usize) {
+        let i = self.tall.partition_point(|t| t.first_row <= row);
+        let Some(t) = i.checked_sub(1).map(|k| self.tall[k]) else {
+            return (row, 0);
+        };
+        if row < t.first_row + t.rows {
+            (t.line, row - t.first_row)
+        } else {
+            (t.line + 1 + (row - t.first_row - t.rows), 0)
+        }
+    }
+
+    /// The logical lines a range of visual rows covers, as a half-open range.
+    /// Empty in, empty out.
+    pub fn lines_of_rows(&self, rows: Range<usize>) -> Range<usize> {
+        if rows.start >= rows.end {
+            return 0..0;
+        }
+        let lo = self.line_of_row(rows.start).0.min(self.n_lines);
+        let hi = (self.line_of_row(rows.end - 1).0 + 1).min(self.n_lines);
+        lo..hi.max(lo)
+    }
+
+    /// Which slice of `line` the `sub`-th of its visual rows draws.
+    ///
+    /// The boundaries are floored to character boundaries, and consecutive rows
+    /// therefore tile the line exactly: row `k`'s end and row `k+1`'s start are the
+    /// same expression.
+    pub fn slice(&self, line: &DiffLine, sub: usize) -> RowSlice {
+        if !self.active {
+            return RowSlice::whole(line);
+        }
+        let content = line.rendered();
+        let width = body_cols(line.kind, self.cols, self.gutter);
+        let start = floor_boundary(content, sub.saturating_mul(width));
+        let end = floor_boundary(content, sub.saturating_add(1).saturating_mul(width));
+        RowSlice {
+            range: start..end,
+            first: sub == 0,
+        }
+    }
+}
+
+/// The columns one row's own text gets: the pane's width less what is drawn in
+/// front of it — the line-number gutter on every row inside a patch, and the
+/// one-character `+`/`-` marker column on every code row.
+///
+/// Subtracting them is what makes a wrapped code line align under itself: a
+/// continuation row draws blanks in both, so its body starts in the same column as
+/// the first row's.
+fn body_cols(kind: LineKind, cols: usize, gutter: LineNoGutter) -> usize {
+    let prefix = if kind.in_patch() { gutter.chars() } else { 0 } + usize::from(kind.is_code());
+    cols.saturating_sub(prefix).max(MIN_BODY_COLS)
+}
+
+/// The largest character boundary of `s` at or before byte `i` — `str`'s own
+/// `floor_char_boundary`, which is still unstable. At most three steps back, since
+/// a UTF-8 sequence is at most four bytes.
+const fn floor_boundary(s: &str, i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    let mut i = i;
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(text: &str, kind: LineKind) -> DiffLine {
+        DiffLine::new(text, kind)
+    }
+
+    /// A diff of context rows, `n` bytes each as given.
+    fn ctx_lines(widths: &[usize]) -> Vec<DiffLine> {
+        widths
+            .iter()
+            .map(|&w| line(&"x".repeat(w), LineKind::Context))
+            .collect()
+    }
+
+    /// Rows per line, computed the obvious slow way, for the mappings to be
+    /// checked against.
+    fn brute_force(lines: &[DiffLine], cols: usize, gutter: LineNoGutter) -> Vec<usize> {
+        lines
+            .iter()
+            .map(|l| {
+                let w = body_cols(l.kind, cols, gutter);
+                l.rendered().len().div_ceil(w).max(1)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_diff_that_fits_the_pane_is_the_identity() {
+        let lines = ctx_lines(&[0, 10, 40, 79]);
+        let idx = WrapIndex::build(&lines, 100, LineNoGutter::default());
+        assert!(idx.active());
+        assert_eq!(idx.total_rows(), 4);
+        for l in 0..4 {
+            assert_eq!(idx.row_of_line(l), l);
+            assert_eq!(idx.line_of_row(l), (l, 0));
+        }
+    }
+
+    #[test]
+    fn a_line_exactly_as_wide_as_the_pane_takes_one_row_and_one_byte_more_takes_two() {
+        // A context row: no gutter, one marker column, so the body gets 99 of 100.
+        let lines = ctx_lines(&[99, 100]);
+        let idx = WrapIndex::build(&lines, 100, LineNoGutter::default());
+        assert_eq!(idx.row_of_line(0), 0);
+        assert_eq!(idx.row_of_line(1), 1); // the 99-byte line took one row
+        assert_eq!(idx.total_rows(), 3); // and the 100-byte one took two
+        assert_eq!(idx.line_of_row(1), (1, 0));
+        assert_eq!(idx.line_of_row(2), (1, 1));
+    }
+
+    #[test]
+    fn the_two_mappings_agree_with_a_brute_force_layout() {
+        // Deterministic pseudo-random widths, straddling the wrap boundary in both
+        // directions, with runs of tall lines and runs of short ones.
+        let mut seed: u64 = 0x5eed_1234;
+        let widths: Vec<usize> = (0..500)
+            .map(|_| {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                ((seed >> 33) % 400) as usize
+            })
+            .collect();
+        let lines = ctx_lines(&widths);
+        for cols in [20, 47, 100] {
+            let idx = WrapIndex::build(&lines, cols, LineNoGutter::default());
+            let rows = brute_force(&lines, cols, LineNoGutter::default());
+            let mut row = 0;
+            for (l, &n) in rows.iter().enumerate() {
+                assert_eq!(idx.row_of_line(l), row, "row_of_line({l}) at cols={cols}");
+                for sub in 0..n {
+                    assert_eq!(
+                        idx.line_of_row(row + sub),
+                        (l, sub),
+                        "line_of_row({}) at cols={cols}",
+                        row + sub
+                    );
+                }
+                row += n;
+            }
+            assert_eq!(idx.total_rows(), row);
+        }
+    }
+
+    #[test]
+    fn the_slices_of_a_line_tile_it_exactly() {
+        let lines = vec![line(&"abcdefghij".repeat(30), LineKind::Context)];
+        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default());
+        let rows = idx.total_rows();
+        assert!(rows > 1);
+        let mut at = 0;
+        for sub in 0..rows {
+            let s = idx.slice(&lines[0], sub);
+            assert_eq!(
+                s.range.start,
+                at,
+                "row {sub} starts where {} ended",
+                sub - 1
+            );
+            assert_eq!(s.first, sub == 0);
+            at = s.range.end;
+        }
+        assert_eq!(
+            at,
+            lines[0].rendered().len(),
+            "the last row reaches the end"
+        );
+    }
+
+    #[test]
+    fn a_multibyte_line_slices_on_character_boundaries() {
+        // Three bytes a character, so every boundary lands mid-character before
+        // being floored.
+        let text = "日".repeat(60);
+        let lines = vec![line(&text, LineKind::Context)];
+        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default());
+        let mut at = 0;
+        for sub in 0..idx.total_rows() {
+            let s = idx.slice(&lines[0], sub);
+            assert_eq!(s.range.start, at);
+            // The slice must be indexable — the whole point of flooring.
+            let _ = &lines[0].rendered()[s.range.clone()];
+            at = s.range.end;
+        }
+        assert_eq!(at, text.len());
+    }
+
+    #[test]
+    fn the_gutter_and_the_marker_narrow_a_code_rows_column_but_not_a_headers() {
+        let g = LineNoGutter::measure(&[DiffLine::with_linenos(
+            " x",
+            LineKind::Context,
+            std::num::NonZeroU32::new(1000),
+            std::num::NonZeroU32::new(1000),
+        )]);
+        // Four digits and a space on each side.
+        assert_eq!(g.chars(), 10);
+        assert_eq!(body_cols(LineKind::Context, 100, g), 89); // 10 gutter + 1 marker
+        assert_eq!(body_cols(LineKind::Hunk, 100, g), 90); // gutter, no marker
+        assert_eq!(body_cols(LineKind::Meta, 100, g), 100); // above the first file
+    }
+
+    #[test]
+    fn a_pane_squeezed_to_nothing_still_wraps_at_a_floor() {
+        let lines = ctx_lines(&[1000]);
+        let idx = WrapIndex::build(&lines, 0, LineNoGutter::default());
+        assert_eq!(idx.total_rows(), 1000_usize.div_ceil(MIN_BODY_COLS));
+    }
+
+    #[test]
+    fn an_empty_line_still_takes_one_row() {
+        let lines = ctx_lines(&[0, 0]);
+        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default());
+        assert_eq!(idx.total_rows(), 2);
+        assert_eq!(
+            idx.slice(&lines[0], 0),
+            RowSlice {
+                range: 0..0,
+                first: true
+            }
+        );
+    }
+
+    #[test]
+    fn too_many_wrapped_lines_falls_back_to_the_identity() {
+        // One line over the cap is enough to prove the shape; the cap itself is a
+        // memory ceiling, not a behaviour.
+        let lines = ctx_lines(&vec![200; MAX_WRAPPED_LINES + 1]);
+        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default());
+        assert!(!idx.active());
+        assert_eq!(idx.total_rows(), lines.len());
+        assert_eq!(idx.row_of_line(12_345), 12_345);
+        assert_eq!(idx.line_of_row(12_345), (12_345, 0));
+        // And an inactive index hands back whole lines, not slices.
+        assert_eq!(
+            idx.slice(&lines[0], 0),
+            RowSlice {
+                range: 0..200,
+                first: true
+            }
+        );
+    }
+
+    #[test]
+    fn covers_asks_about_all_three_inputs() {
+        let lines = ctx_lines(&[10, 10]);
+        let g = LineNoGutter::default();
+        let idx = WrapIndex::build(&lines, 40, g);
+        assert!(idx.covers(2, 40, g));
+        assert!(!idx.covers(3, 40, g));
+        assert!(!idx.covers(2, 41, g));
+        let other = LineNoGutter::measure(&[DiffLine::with_linenos(
+            " x",
+            LineKind::Context,
+            None,
+            std::num::NonZeroU32::new(7),
+        )]);
+        assert!(!idx.covers(2, 40, other));
+    }
+
+    #[test]
+    fn lines_of_rows_covers_the_window() {
+        let lines = ctx_lines(&[10, 300, 10, 10]);
+        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default());
+        // Line 1 wraps to rows 1..=8 (300 bytes over 39 columns).
+        let n = 300_usize.div_ceil(39);
+        assert_eq!(idx.row_of_line(2), 1 + n);
+        assert_eq!(idx.lines_of_rows(0..2), 0..2);
+        assert_eq!(idx.lines_of_rows(2..4), 1..2);
+        assert_eq!(idx.lines_of_rows(0..idx.total_rows()), 0..4);
+        assert_eq!(idx.lines_of_rows(3..3), 0..0);
+    }
+}

@@ -12,12 +12,14 @@ use std::sync::Arc;
 
 mod anchor;
 mod convert;
+mod wrap;
 
 pub use anchor::{AnchorSide, DiffAnchor, anchor_hint, capture_anchor, resolve_anchor};
 use convert::{
     ConvertCtx, DEFAULT_PREFIXES, DeltaDrivers, DeltaModes, HeaderOf, Substitution, delta_modes,
     delta_path, emit_converted, header_prefixes, modes_from_header, move_to_end, side_path_bytes,
 };
+pub use wrap::{RowSlice, WrapIndex};
 
 use crate::datefmt::format_commit_time;
 use crate::diffstat;
@@ -455,6 +457,22 @@ impl DiffLine {
         }
     }
 
+    /// The text a row actually DRAWS, after the line-number gutter and the `+`/`-`
+    /// marker column that `diff_row_job` synthesizes in front of it: a code row's
+    /// body, and the whole line for every structural row (which has no marker
+    /// column).
+    ///
+    /// The one place that rule lives. `diff_row_job` appends this and `wrap`
+    /// measures and slices it, so a line can never be wrapped at a width it is not
+    /// drawn at — a mismatch there would put a row's tail in the row below it.
+    pub fn rendered(&self) -> &str {
+        if self.kind.is_code() {
+            self.body()
+        } else {
+            &self.text
+        }
+    }
+
     /// This row's number on `side`, or `None` when it has none there.
     pub const fn lineno_on(&self, side: AnchorSide) -> Option<NonZeroU32> {
         match side {
@@ -555,6 +573,21 @@ impl LineNoGutter {
         }
         Self::write_side(out, line.old_lineno, self.old);
         Self::write_side(out, line.new_lineno, self.new);
+    }
+
+    /// The gutter as spaces, for a wrapped line's continuation row: the numbers
+    /// belong to the LINE, not to each visual row it takes, so a continuation
+    /// reserves the column and leaves it empty.
+    ///
+    /// Emits exactly what `write` would emit for the same line — nothing above
+    /// the first file, `chars()` characters inside a patch — because both ask
+    /// `in_patch` and both size from `chars`. A blank of the wrong width would
+    /// step the wrapped body out of the column its first row set.
+    pub fn blank(self, line: &DiffLine, out: &mut String) {
+        if !line.kind.in_patch() {
+            return;
+        }
+        out.extend(std::iter::repeat_n(' ', self.chars()));
     }
 
     fn write_side(out: &mut String, n: Option<NonZeroU32>, digits: usize) {
