@@ -874,6 +874,16 @@ impl Coordinator {
             };
             self.heavy_idle.pop();
             self.heavy_outstanding.insert(id, need);
+            // The hand-off itself, because the heavy lane is where a row disappears.
+            // Cheap by construction — heavy rows are the exception, and on an ordinary
+            // repo this never fires — and it is what separates "never dispatched" from
+            // "dispatched and never came back", which the `done` line alone cannot.
+            if let Job::Warm { target, .. } = &job {
+                log::debug!(
+                    "prefetch: heavy worker {id} <- {} ({need} bytes expected)",
+                    target.key.oid
+                );
+            }
             if !self.send(id, job) {
                 // Its thread is gone; it is already off `heavy_idle`, so it is simply
                 // never used again.
@@ -1083,6 +1093,19 @@ impl Coordinator {
             },
             None => job,
         };
+        // A worker leaving service is permanent — it is already off its idle list and is
+        // never used again — and it used to be entirely silent, which is the worst
+        // possible combination for the one symptom it produces: a row that is dispatched,
+        // never reported, and never mentioned again. `warn`, because losing a worker for
+        // the session is not routine, and it names what was lost with it.
+        log::warn!(
+            "prefetch: worker {id} is gone; it will not be used again, and the {} it was \
+             handed is dropped",
+            match &unsent {
+                Job::Stats(job) => format!("stats row {}", job.scope.source.oid()),
+                Job::Warm { target, .. } => format!("diff for {}", target.key.oid),
+            }
+        );
         if let Job::Stats(job) = unsent {
             self.busy_stats.remove(&job.scope.source.oid());
         }
@@ -1872,6 +1895,67 @@ mod tests {
             );
             assert!(warmed.contains(&oid(2)), "stats_first={stats_first}");
         }
+    }
+
+    /// The heavy lane, end to end through the REAL threads.
+    ///
+    /// Everything above builds a `Coordinator` by hand, so the whole of `spawn_prefetch_pool`
+    /// — the id each worker is spawned with, the split between `mailboxes` and `heavy`, and
+    /// `send`'s `id - mailboxes.len()` arithmetic — was untested. Those are three places a
+    /// heavy job can be posted to a mailbox nobody is reading, and the symptom is a row that
+    /// is dispatched, never reported, and never mentioned again.
+    ///
+    /// `max_blob_bytes: 0` makes every row too costly, so the first pass defers each one and
+    /// the heavy lane is the only way any result can come back at all.
+    #[test]
+    fn the_heavy_lane_returns_results_through_the_real_pool() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (dir, repo) = temp_repo();
+        commit_file(&repo, "f.txt", "a\n", "one");
+        let oid = commit_file(&repo, "f.txt", "a\nb\n", "two");
+        let path = repo.workdir().unwrap().to_string_lossy().into_owned();
+        drop(repo);
+
+        let (tx, rx) = mpsc::channel();
+        let (stats_tx, _stats_rx) = mpsc::channel();
+        let pool = spawn_prefetch_pool(
+            &path,
+            PrefetchBudget {
+                limits: Limits {
+                    max_blob_bytes: 0,
+                    max_entry_lines: usize::MAX,
+                },
+                line_budget: usize::MAX,
+            },
+            Arc::default(),
+            &tx,
+            &stats_tx,
+            &egui::Context::default(),
+            &DiffDeps::default(),
+        );
+        let scope = RowScope::new(DiffSource::Commit(oid));
+        let mut band = VecDeque::new();
+        band.push_back(PrefetchTarget {
+            probed: None,
+            key: DiffCacheKey {
+                oid,
+                settings: probe_settings(),
+                theme: highlight::DEFAULT_THEME,
+                enabled: true,
+                content: 0,
+                drivers: 0,
+                languages: 0,
+            },
+            scope,
+            depth: WarmDepth::DiffOnly,
+        });
+        pool.submit(band, None);
+
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the heavy lane must report; a job posted to an unread mailbox never does");
+        assert_eq!(got.key.oid, oid);
+        drop(dir);
     }
 
     /// A bare warm target for one oid.
