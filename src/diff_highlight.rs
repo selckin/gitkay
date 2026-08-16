@@ -25,8 +25,8 @@ use std::sync::{Arc, mpsc};
 use crate::diff::{DiffLine, FileEntry, RowSpans, file_line_ranges};
 use crate::highlight::{self, DiffBg, HighlightLines, Highlighter};
 use crate::{
-    Epoch, HIGHLIGHT_CHUNK, HIGHLIGHT_LINE_BUDGET, MAX_TREE_DEPTH, MAX_TREE_ENTRIES,
-    MAX_WARM_LANGS, PREHIGHLIGHT_CHUNK, VisibleRange, config, spawn_guarded,
+    Epoch, HIGHLIGHT_CHUNK, HIGHLIGHT_LINE_BUDGET, HIGHLIGHT_TIME_BUDGET, MAX_TREE_DEPTH,
+    MAX_TREE_ENTRIES, MAX_WARM_LANGS, PREHIGHLIGHT_CHUNK, VisibleRange, config, spawn_guarded,
 };
 
 /// What a highlight worker sends back. Both are tagged with the generation they were
@@ -451,16 +451,18 @@ fn highlight_pass(job: HighlightJob) {
                 }
             }
             pos = chunk_end;
-            // Out of budget. Checked at a chunk boundary like everything else here, and
-            // it stops the pass rather than the file: what has been sent stays, and the
-            // reader keeps the colour around wherever `pick_file` had reached — which is
-            // where they are looking, that being the whole point of the ordering.
-            if coloured >= HIGHLIGHT_LINE_BUDGET {
+            // Out of budget, on either bound. Checked at a chunk boundary like
+            // everything else here, and it stops the pass rather than the file: what has
+            // been sent stays, and the reader keeps the colour around wherever
+            // `pick_file` had reached — which is where they are looking, that being the
+            // whole point of the ordering.
+            let out_of_lines = coloured >= HIGHLIGHT_LINE_BUDGET;
+            let spent = started.elapsed();
+            if out_of_lines || spent >= HIGHLIGHT_TIME_BUDGET {
                 log::debug!(
-                    "highlight: gen {generation} stopped at the {HIGHLIGHT_LINE_BUDGET}-line \
-                     budget after {:?}; {} of {total_lines} lines left plain",
-                    started.elapsed(),
-                    total_lines.saturating_sub(coloured)
+                    "highlight: gen {generation} stopped on the {} budget after {spent:?}: \
+                     {coloured} lines coloured, {total_lines} in the diff",
+                    if out_of_lines { "line" } else { "time" }
                 );
                 return;
             }

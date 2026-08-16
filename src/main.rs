@@ -351,6 +351,21 @@ const DIFF_PLACEHOLDER_DELAY: std::time::Duration = std::time::Duration::from_mi
 /// this it is a normal frame and the line would be noise; above it, the reader felt it.
 const DIFF_INSTALL_SLOW: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// The longest one highlight pass will spend colouring.
+///
+/// The line budget below bounds the MEMORY a pass can commit to; this bounds its
+/// appetite for a core, and the two are not interchangeable because the cost of a line
+/// varies by more than twenty times. Measured on the 76.5M-line repo: 2M lines of
+/// `.oml`/xml/csv data took **140s** at ~70µs a line, where plain text runs at ~3µs and
+/// would have spent under seven seconds on the same 2M. A pass that long is also
+/// felt elsewhere — `band_warmable` holds the prefetch band back for as long as the
+/// foreground diff is colouring, deliberately, so the band sat idle for those 140s.
+///
+/// Twenty seconds is longer than any diff a person reads end to end needs (a
+/// 300k-line one is under a second of plain text, and a few seconds of real grammar)
+/// and short enough that neither the core nor the band is held for minutes.
+const HIGHLIGHT_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// The most rows one highlight pass will colour.
 ///
 /// A bound on the WORK, not on the diff — which is the whole of the difference. This

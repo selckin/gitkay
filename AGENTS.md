@@ -238,8 +238,10 @@ the runner and its watchdog, and reading git's own `cachetextconv` notes cache �
 one place gitkay runs an external program, and it writes nothing to the repo; see
 **Textconv**),
 `src/diff_highlight.rs` (applying a `Highlighter` to a built diff — which rows, in
-what order, on which thread, and how many of them one pass will colour
-(`HIGHLIGHT_LINE_BUDGET`). The worker SHARES the rows with the UI — two `Arc` clones
+what order, on which thread, and how much of them one pass will colour before it
+stops (`HIGHLIGHT_LINE_BUDGET` bounds the memory it commits to, `HIGHLIGHT_TIME_BUDGET`
+its appetite for a core — a line costs 3µs or 70µs depending on the grammar, so neither
+bound stands in for the other). The worker SHARES the rows with the UI — two `Arc` clones
 and the pending-file list — where it used to be handed a copy of the whole diff, which
 measured 12.0s on the frame loop at 76.5M lines; and it REPORTS its own end
 (`HighlightMsg::Settled`, from a drop guard, so a superseded or panicking pass says so
