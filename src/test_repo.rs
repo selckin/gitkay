@@ -436,3 +436,105 @@ fn a_temp_repo_starts_on_a_branch_the_test_chose() {
     let head = repo.head().unwrap();
     assert_eq!(head.name().unwrap(), "refs/heads/master");
 }
+
+/// Write a commit-graph for every commit reachable from `tips`, in git's own file
+/// format, so a test can exercise the generation-number walk without a `git` binary.
+///
+/// Generations are computed here rather than read from anywhere: the topological
+/// level is `1` for a root and `1 + max(parents)` otherwise, which is the definition
+/// `commitgraph` relies on, so a fixture that got it wrong would be testing the walk
+/// against a lie. Only the chunks `commitgraph` reads are emitted — the tree oid and
+/// parent columns of `CDAT` are filled with placeholders, since nothing reads them.
+///
+/// `covering` lets a test write a DELIBERATELY stale graph — the ordinary state of a
+/// real repository, since `git fetch` does not update the file — by naming tips that
+/// leave later commits out of it.
+pub fn write_commit_graph(repo: &git2::Repository, covering: &[git2::Oid]) {
+    let mut order: Vec<git2::Oid> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut stack: Vec<git2::Oid> = covering.to_vec();
+    while let Some(oid) = stack.pop() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        order.push(oid);
+        for p in repo.find_commit(oid).unwrap().parent_ids() {
+            stack.push(p);
+        }
+    }
+    write_graph_of(repo, order);
+}
+
+/// Write a commit-graph holding EXACTLY `oids` — which lets a test build a file that
+/// is not closed under ancestry, the one shape `write_commit_graph` cannot produce
+/// and the one whose soundness guard needs testing. git never writes such a file;
+/// a corrupt or hand-edited one is what this stands in for.
+pub fn write_commit_graph_exact(repo: &git2::Repository, oids: &[git2::Oid]) {
+    write_graph_of(repo, oids.to_vec());
+}
+
+fn write_graph_of(repo: &git2::Repository, mut order: Vec<git2::Oid>) {
+    let present: std::collections::HashSet<git2::Oid> = order.iter().copied().collect();
+    // Topological level, resolved by repeated relaxation — the set is tiny and this
+    // needs no ordering of its own to be correct.
+    let mut generation: std::collections::HashMap<git2::Oid, u32> =
+        order.iter().map(|&o| (o, 0u32)).collect();
+    loop {
+        let mut moved = false;
+        for &oid in &order {
+            let parents: Vec<git2::Oid> = repo.find_commit(oid).unwrap().parent_ids().collect();
+            let want = parents
+                .iter()
+                .filter(|p| present.contains(p))
+                .map(|p| generation.get(p).copied().unwrap_or(0))
+                .max()
+                .unwrap_or(0)
+                + 1;
+            if generation[&oid] < want {
+                generation.insert(oid, want);
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+
+    order.sort_unstable();
+    let mut fanout = [0u32; 256];
+    for oid in &order {
+        for slot in &mut fanout[oid.as_bytes()[0] as usize..] {
+            *slot += 1;
+        }
+    }
+    let mut oidf = Vec::new();
+    for v in fanout {
+        oidf.extend_from_slice(&v.to_be_bytes());
+    }
+    let (mut oidl, mut cdat) = (Vec::new(), Vec::new());
+    for oid in &order {
+        oidl.extend_from_slice(oid.as_bytes());
+        cdat.extend_from_slice(&[0u8; 20]); // tree oid: unread
+        cdat.extend_from_slice(&0x7000_0000u32.to_be_bytes()); // parents: unread
+        cdat.extend_from_slice(&0x7000_0000u32.to_be_bytes());
+        cdat.extend_from_slice(&(generation[oid] << 2).to_be_bytes());
+        cdat.extend_from_slice(&0u32.to_be_bytes()); // commit time: unread
+    }
+
+    let mut out = vec![b'C', b'G', b'P', b'H', 1, 1, 3, 0];
+    let mut at = out.len() as u64 + 4 * 12;
+    for (id, chunk) in [(b"OIDF", &oidf), (b"OIDL", &oidl), (b"CDAT", &cdat)] {
+        out.extend_from_slice(id);
+        out.extend_from_slice(&at.to_be_bytes());
+        at += chunk.len() as u64;
+    }
+    out.extend_from_slice(&[0u8; 4]);
+    out.extend_from_slice(&at.to_be_bytes());
+    out.extend_from_slice(&oidf);
+    out.extend_from_slice(&oidl);
+    out.extend_from_slice(&cdat);
+
+    let info = repo.commondir().join("objects").join("info");
+    std::fs::create_dir_all(&info).unwrap();
+    std::fs::write(info.join("commit-graph"), out).unwrap();
+}

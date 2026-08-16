@@ -40,6 +40,8 @@ mod prefetch;
 #[cfg(test)]
 mod test_repo;
 mod textconv;
+#[allow(dead_code)]
+mod topo;
 mod word_diff;
 mod workers;
 use config::{FileListLayout, Fonts, Role};
