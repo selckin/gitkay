@@ -5244,7 +5244,9 @@ impl GitkApp {
     /// list beside it can never disagree in any layout. `file_line_starts` is derived
     /// from the positions that re-lay produces, so leaving it to the caller would let
     /// a layout-only config reload (which reaches here and nothing else) point every
-    /// jump, hunk click and page-step at the wrong file.
+    /// jump, hunk click and page-step at the wrong file. A re-lay that genuinely
+    /// moves rows invalidates the highlight generation for the same reason — see
+    /// the comment at that branch.
     fn resync_file_layout(&mut self) {
         let files: Vec<(&str, Option<&str>)> = self
             .diff_files
@@ -5275,6 +5277,19 @@ impl GitkApp {
             {
                 *idx = k;
             }
+            // The rows MOVED, so a highlight worker started before this one is now
+            // sending `(row index, spans)` batches that name positions in the
+            // pre-permutation order — the drain would apply one file's colours to
+            // another file's text. Bump the generation here, at the permutation
+            // itself, rather than at the callers: `set_diff_content` invalidates
+            // immediately afterwards anyway, so the one path that reaches a re-lay
+            // with a worker already running is the layout-only config reload
+            // (`[diff] file_list` changed and nothing else), and it is exactly the
+            // path a caller-side rule would be forgotten on. Nothing already
+            // applied is lost — those spans moved with their rows — so the worker
+            // `ensure_diff_highlighted` restarts next frame re-tokenizes only what
+            // `pending_files` still lists.
+            self.invalidate_diff_highlight();
         }
         self.file_line_starts = file_line_starts(&self.diff_files);
         // New rows ⇒ the per-row galleys no longer correspond; rebuild lazily.

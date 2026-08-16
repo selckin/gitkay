@@ -694,6 +694,14 @@ The invariants:
   so the k-th file row IS `diff_files[k]`. `files`' own order is the pane's order
   — the textconv sweep's `move_to_end` and `resolve_anchor`'s rung 4 both rest on
   that — which is why the entries move with the lines rather than only the lines.
+  **A re-lay that genuinely moves rows also invalidates the highlight generation**,
+  and at the permutation rather than at its callers: a highlight worker names its
+  results by ROW INDEX, so an in-flight batch computed before the move would paint
+  one file's colours onto another file's text. `set_diff_content` invalidates right
+  afterwards anyway, so the only path this covers is the layout-only config reload
+  — the one a caller-side rule would be forgotten on. Nothing already applied is
+  lost: those spans moved with their rows, so the restarted worker re-tokenizes
+  only what `pending_files` still lists.
   Deliberately NOT part of the diff build: the order a diff is read in changes no
   diff data, so `[diff] file_list` stays out of `DiffSettings` and out of both
   cache keys. That works because `order_files` is **idempotent** — the order
