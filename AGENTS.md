@@ -376,7 +376,13 @@ The invariants:
   swap those pairings — each has already been a bug.
 - **A diff's cost tracks bytes read, not changed lines** — a 3-line patch inside a 265MB
   file is ~11s. Rows are probed (`diff::probe_row_cost`) before being built, and a
-  driven row (textconv) is costly whatever its size.
+  driven row (textconv) is costly whatever its size. **Rename detection reads those
+  bytes a SECOND time**: `find_similar` hashes blob content to score add/delete pairs,
+  which roughly doubles the build on a commit made of them (~25ms/MB; four 128MB files
+  measured 12.8s) and costs ~300ns on a commit that only modifies files. So the
+  dimension is `total_blob_bytes`, not `deltas` — an earlier version of this file
+  guessed the opposite from `rename_limit`, which bounds the file count and not the
+  bytes. `scoped_diff` logs the split past `SLOW_DETECT_SIMILAR`.
 - **A commit oid does NOT determine its diff.** The persistent store's `StoreContext`
   folds in the git dir, an attributes fingerprint, the diff-affecting config and the
   crate version. That list has been wrong three times — extend it, don't trust it.
