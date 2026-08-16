@@ -366,17 +366,45 @@ pub struct Highlighter {
     reported: Arc<Mutex<HashSet<String>>>,
 }
 
-/// Normalize `[diff.languages]` keys so the lookup is a plain `get`: an extension is
-/// matched lower-cased and without a leading dot, whichever way it was written.
+/// Extensions gitkay maps for you, because syntect has the grammar and simply does not
+/// claim the suffix.
+///
+/// This is NOT a place to guess. An entry earns its way in only when the mapping is
+/// unambiguous — `.mjs` and `.cjs` are JavaScript by specification, not by convention —
+/// so a reader never has to discover that gitkay decided their file was something it is
+/// not. The config overrides any of them (`config_languages`), and an extension syntect
+/// already claims never reaches this table at all: `syntax_for_ext` consults the map
+/// first, so a default here would silently outrank the built-in lookup.
+///
+/// **`.pem` is deliberately absent.** It was reported alongside these two, and plain
+/// text is the CORRECT rendering for a base64 block — no grammar improves it. Mapping
+/// it to a real one would colour it wrongly, and mapping it to plain text would make
+/// `has_grammar` answer true for something that is plain text, which is exactly the
+/// confusion that predicate exists to prevent (see `warm_row`'s `PlainText` label).
+const DEFAULT_LANGUAGES: &[(&str, &str)] = &[
+    // ES modules and CommonJS. syntect's JavaScript grammar claims `.js` but neither of
+    // these, so every ESM-era repo reports them as a config gap the reader then has to
+    // close by hand.
+    ("mjs", "js"),
+    ("cjs", "js"),
+];
+
+/// `DEFAULT_LANGUAGES` with the reader's `[diff.languages]` laid over it, keys
+/// normalized so the lookup is a plain `get`: an extension is matched lower-cased and
+/// without a leading dot, whichever way it was written.
+///
+/// The config wins on a collision, which is the whole point of the defaults being
+/// defaults — a repo where `.mjs` is something else says so and is believed.
 fn normalize_languages(languages: &LanguageMap) -> LanguageMap {
-    languages
+    DEFAULT_LANGUAGES
         .iter()
-        .map(|(ext, syntax)| {
+        .map(|(ext, syntax)| ((*ext).to_owned(), (*syntax).to_owned()))
+        .chain(languages.iter().map(|(ext, syntax)| {
             (
                 ext.trim_start_matches('.').to_ascii_lowercase(),
                 syntax.clone(),
             )
-        })
+        }))
         .collect()
 }
 
@@ -577,31 +605,82 @@ impl Highlighter {
         code: &str,
         buf: &mut String,
     ) -> Vec<Span> {
+        // Only the head of a very long line is tokenized; the tail gets one flat span
+        // (see `MAX_TOKENIZE_CHARS`), which is also what keeps "the spans cover the
+        // whole body" true — `append_body`'s span path emits ONLY the spans, so a body
+        // whose tail no span covers would not be drawn at all.
+        let (head, tail) = split_for_tokenizing(code, MAX_TOKENIZE_CHARS);
         // syntect needs a trailing newline; it returns each token as a `&str`
         // slice of the buffer, so a token's byte offset within it equals its
         // offset within `code` (the '\n' is appended last). We record that range
         // rather than copying the text — the range indexes into `code`, which is
         // exactly `DiffLine::body()` at render time.
         buf.clear();
-        buf.push_str(code);
+        buf.push_str(head);
         buf.push('\n');
         let base = buf.as_ptr() as usize;
-        let code_len = code.len();
-        state.highlight_line(buf, &self.syntaxes).map_or_else(
+        let head_len = head.len();
+        let mut spans = state.highlight_line(buf, &self.syntaxes).map_or_else(
             // A grammar hiccup must never drop the line: render it plain.
-            |_| vec![(self.palette.foreground, 0..code_len)],
+            |_| vec![(self.palette.foreground, 0..head_len)],
             |ranges| {
                 ranges
                     .into_iter()
                     .filter_map(|(style, text)| {
                         let start = text.as_ptr() as usize - base;
-                        let end = (start + text.len()).min(code_len); // drop the trailing '\n'
+                        let end = (start + text.len()).min(head_len); // drop the trailing '\n'
                         (start < end).then(|| (syn_to_egui(style.foreground), start..end))
                     })
                     .collect()
             },
-        )
+        );
+        if tail {
+            spans.push((self.palette.foreground, head_len..code.len()));
+        }
+        spans
     }
+}
+
+/// How much of one line is handed to syntect.
+///
+/// **syntect's cost is per character and its rate is a property of the grammar**, so a
+/// line long enough makes any wall-clock budget meaningless: the highlight passes check
+/// their deadline between CHUNKS of lines (16 and 256), never inside one, so a single
+/// multi-megabyte line runs to completion whatever the budget says. Measured on a repo
+/// of minified sources: ~750ms for one line, a 1.5s speculative budget overrunning to
+/// **13.5s** and a 20s foreground budget to **25.4s**.
+///
+/// 20,000 characters holds a line to roughly 2ms at the ~90ns/char those measurements
+/// imply, so the worst chunk costs ~30ms (prefetch, 16 lines) or ~0.5s (foreground,
+/// 256) and both budgets hold tightly — which was the whole point, and is the argument
+/// for a smaller bound rather than a generous one. Under soft wrapping it is still ~100
+/// wrapped rows of a single line at a typical width; a reader scrolling further than
+/// that into one line is scrolling through minified noise.
+///
+/// **Deliberately not `MAX_ROW_RENDER_CHARS`**, though today that would be tighter and
+/// still correct. That cap is about the VERTEX count of an unwrapped row and is
+/// expected to loosen or disappear when soft wrapping lands (`docs/plans/soft-wrap.md`),
+/// at which point a whole long line does get drawn — a tokenizing bound has to stand on
+/// its own cost argument, and this one does.
+///
+/// The tail is not left blank: it takes a single flat span in the foreground colour,
+/// which is what an untokenized row renders as anyway. What is lost is colour past
+/// 100,000 characters of one line, in exchange for a bound that makes every budget above
+/// it mean something.
+pub const MAX_TOKENIZE_CHARS: usize = 20_000;
+
+/// `code` split into the part syntect sees and whether anything was held back.
+///
+/// By CHARACTERS, so a multi-byte one is never split — a byte cut would panic on the
+/// slice, which would be this bound crashing the pass it exists to bound.
+///
+/// `max` is a parameter so the boundary cases are testable without feeding syntect
+/// `MAX_TOKENIZE_CHARS` of anything: the arithmetic is what goes wrong here, and
+/// proving it should not cost seconds of tokenizing per assertion.
+fn split_for_tokenizing(code: &str, max: usize) -> (&str, bool) {
+    code.char_indices()
+        .nth(max)
+        .map_or((code, false), |(at, _)| (&code[..at], true))
 }
 
 #[cfg(test)]
@@ -776,6 +855,116 @@ mod tests {
             None,
             "the rebuilt highlighter shares what was already reported"
         );
+    }
+
+    /// The built-in mappings resolve to real grammars, and the reader can override them.
+    ///
+    /// Both halves matter. A default naming a syntax the set does not have would be a
+    /// silent no-op — `syntax_for_ext` falls through to the built-in lookup — so it
+    /// would look configured and do nothing. And a default that could not be overridden
+    /// would be gitkay deciding what a repo's files are.
+    #[test]
+    fn the_default_language_mappings_resolve_and_can_be_overridden() {
+        let hl = test_highlighter();
+        // Named explicitly as well as looped: an emptied table would satisfy the loop
+        // vacuously, which is exactly the regression worth catching.
+        for ext in ["mjs", "cjs"] {
+            assert!(hl.has_grammar(&format!("src/index.{ext}")), ".{ext}");
+        }
+        for (ext, _) in DEFAULT_LANGUAGES {
+            assert!(
+                hl.has_syntax(ext),
+                ".{ext} must map to a grammar the syntax set actually has"
+            );
+            assert!(hl.has_grammar(&format!("src/index.{ext}")));
+        }
+        // Really JavaScript, not the plain-text fallback: a keyword and a string are
+        // more than one token, and the spans cover the line exactly.
+        let mut state = hl.new_file_state("src/index.mjs");
+        let code = "export const x = \"hi\";";
+        let spans = hl.tokenize_line(&mut state, code, &mut String::new());
+        assert!(spans.len() >= 2, "expected JS tokens, got {spans:?}");
+        let joined: String = spans.iter().map(|(_, r)| &code[r.start..r.end]).collect();
+        assert_eq!(joined, code);
+
+        // The config wins, which is what makes these defaults rather than decisions.
+        let overridden = test_highlighter_with(&[("mjs", "xml")]);
+        let mut state = overridden.new_file_state("src/index.mjs");
+        let xml = "<a href=\"b\">";
+        let spans = overridden.tokenize_line(&mut state, xml, &mut String::new());
+        assert!(spans.len() >= 2, "expected XML tokens, got {spans:?}");
+    }
+
+    /// A default must never outrank a grammar syntect already claims: `syntax_for_ext`
+    /// consults the map FIRST, so an entry for an extension the syntax set knows would
+    /// silently replace the right grammar with whatever the table said.
+    #[test]
+    fn no_default_mapping_shadows_a_grammar_syntect_already_has() {
+        let bare = Highlighter::new(DEFAULT_THEME, FIXED_DEFAULT_BANDS, &LanguageMap::new());
+        for (ext, _) in DEFAULT_LANGUAGES {
+            // Asked of a highlighter whose map is the defaults themselves, so this is
+            // the built-in lookup answering, not the table.
+            assert!(
+                bare.syntaxes.find_syntax_by_extension(ext).is_none(),
+                ".{ext} is claimed by syntect — the default mapping is shadowing it"
+            );
+        }
+    }
+
+    /// One line is tokenized in bounded time, whatever its length.
+    ///
+    /// The highlight passes check their deadline between CHUNKS of lines, never inside
+    /// one, so a single multi-megabyte line runs to completion whatever the budget says
+    /// — measured, a 1.5s speculative budget overrunning to 13.5s and a 20s foreground
+    /// budget to 25.4s. The tail must still be COVERED by a span, because
+    /// `append_body`'s span path emits only the spans: a body whose tail no span reaches
+    /// would not be drawn at all.
+    #[test]
+    fn a_very_long_line_is_tokenized_up_to_a_bound_and_covered_past_it() {
+        let hl = test_highlighter();
+        let mut state = hl.new_file_state("a.rs");
+        let code = format!("let x = \"{}\";", "y".repeat(MAX_TOKENIZE_CHARS + 500));
+        let spans = hl.tokenize_line(&mut state, &code, &mut String::new());
+
+        // Contiguous from 0 to the end of the line: every byte is covered exactly once.
+        let mut at = 0;
+        for (_, r) in &spans {
+            assert_eq!(r.start, at, "gap or overlap before {r:?}");
+            at = r.end;
+        }
+        assert_eq!(at, code.len(), "the spans must reach the end of the body");
+        // ...and everything past the cut is ONE flat span, not thousands of tokens.
+        // ASCII here, so the cut byte and the cut character coincide.
+        let past: Vec<_> = spans
+            .iter()
+            .filter(|(_, r)| r.start >= MAX_TOKENIZE_CHARS)
+            .collect();
+        assert_eq!(past.len(), 1, "the tail should be one span, got {past:?}");
+        assert_eq!(past[0].1, MAX_TOKENIZE_CHARS..code.len());
+    }
+
+    /// The split's arithmetic, at a cap small enough to assert cheaply.
+    ///
+    /// A byte cut would panic on the slice — this guard crashing the pass it exists to
+    /// bound — so the multi-byte case is the one that matters. The exact-fit boundary
+    /// is the other: `nth(max)` asks for the character AFTER the last one kept, so a
+    /// line of exactly `max` characters must come back whole.
+    #[test]
+    fn the_tokenize_split_cuts_on_a_character_boundary() {
+        assert_eq!(split_for_tokenizing("abcdef", 4), ("abcd", true));
+        assert_eq!(
+            split_for_tokenizing("abcd", 4),
+            ("abcd", false),
+            "exact fit"
+        );
+        assert_eq!(split_for_tokenizing("abc", 4), ("abc", false));
+        assert_eq!(split_for_tokenizing("", 4), ("", false));
+        // Three bytes a character: the cut is after four CHARACTERS, twelve bytes.
+        let cjk = "日本語です";
+        let (head, cut) = split_for_tokenizing(cjk, 4);
+        assert!(cut);
+        assert_eq!(head, "日本語で");
+        assert_eq!(head.len(), 12, "a byte-index cut would land mid-character");
     }
 
     /// `[diff.languages]` gives a repo's own suffix a real grammar. Accepted by syntax
