@@ -1766,6 +1766,72 @@ fn append_diff_body(
     failed || lookup_failed || resolved.is_some_and(|r| r.failed)
 }
 
+/// Where a build's bytes were: the total across every delta, and the largest single
+/// one.
+///
+/// **The largest delta is the floor under any parallel patch pass.** That pass is
+/// per-delta and libgit2 emits a delta's rows only once it has computed the whole patch
+/// (measured: the first line of a 900k-line single-file diff arrives at 1.000s of a
+/// 1.07s print), so one file cannot be split across threads however many there are —
+/// and `total / max` is the best speedup an unlimited number of them could reach.
+///
+/// It is the number to decide by, and it is not the thread count. On the repo this came
+/// from, commits whose builds take a minute have ceilings of **1.0 to 3.7**: one 435MB
+/// blob against a 1.2GB commit is 1.4, and a single-file 92MB one is exactly 1.0.
+///
+/// Free to compute: `DiffFile::size` is filled in as libgit2 loads each blob, so this
+/// reads back what the pass just did rather than touching the odb again. Which is also
+/// why it must be taken AFTER the print — before it, every size is zero.
+pub struct DeltaBytes {
+    pub total: u64,
+    pub max: u64,
+    pub deltas: usize,
+}
+
+impl DeltaBytes {
+    /// Both sides of each delta, since xdiff needs the pair — that is the unit of work
+    /// a parallel pass would hand to a thread.
+    pub fn of(diff: &git2::Diff<'_>) -> Self {
+        let mut out = Self {
+            total: 0,
+            max: 0,
+            deltas: 0,
+        };
+        for delta in diff.deltas() {
+            let bytes = delta
+                .old_file()
+                .size()
+                .saturating_add(delta.new_file().size());
+            out.total = out.total.saturating_add(bytes);
+            out.max = out.max.max(bytes);
+            out.deltas += 1;
+        }
+        out
+    }
+
+    /// The best speedup a per-delta parallel patch pass could reach here. `1.0` when
+    /// one delta holds everything, which is the case worth knowing before starting.
+    pub fn parallel_ceiling(&self) -> f64 {
+        if self.max == 0 {
+            return 1.0;
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a ratio for a log line; the inputs are byte counts"
+        )]
+        let ceiling = self.total as f64 / self.max as f64;
+        ceiling.max(1.0)
+    }
+}
+
+/// A build slower than this reports where its bytes went.
+///
+/// Well past anything interactive, so an ordinary repo never emits it and the stats
+/// column's eight workers never do. The point is the commit you are actually waiting
+/// on: the pane's build is deliberately unprobed (see `probe_row_cost`), so the one
+/// diff whose cost the reader can feel was the one saying nothing about it.
+const SLOW_BUILD_REPORT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// A settings- and pathspec-scoped git diff, rename/copy-coalesced: `scoped_diff_opts`
 /// → `build` → `measure` → `detect_similar`, the prologue every diff in the app shares.
 ///
@@ -1854,6 +1920,7 @@ pub fn build_diff_data<'r>(
     };
     let mut rows = DiffRows::new(header);
     let mut files = Vec::new();
+    let t = std::time::Instant::now();
     let failed = append_diff_body(
         &mut rows,
         &mut files,
@@ -1863,6 +1930,19 @@ pub fn build_diff_data<'r>(
         settings,
         env,
     );
+    let patched = t.elapsed();
+    if patched >= SLOW_BUILD_REPORT {
+        // After the pass, which is the only time the sizes are there to read.
+        let bytes = DeltaBytes::of(&diff);
+        log::debug!(
+            "perf: {what}: patch pass {patched:?} over {} deltas, {} bytes (largest {}) \
+             — parallel ceiling {:.1}x",
+            bytes.deltas,
+            bytes.total,
+            bytes.max,
+            bytes.parallel_ceiling()
+        );
+    }
     let (lines, max_chars) = rows.finish();
     DiffData {
         textconv_failed: failed,
@@ -2964,6 +3044,69 @@ pub mod tests {
             detect_renames,
             ..base_settings()
         }
+    }
+
+    /// The ceiling is what §1 of the performance plan is gated on, so its arithmetic is
+    /// pinned rather than eyeballed off a log line. It answers "how much could
+    /// parallelising the patch pass across deltas ever buy", and the answer is set by
+    /// the LARGEST delta, not by the thread count.
+    #[test]
+    fn the_parallel_ceiling_is_set_by_the_largest_delta() {
+        let of = |total, max| {
+            DeltaBytes {
+                total,
+                max,
+                deltas: 0,
+            }
+            .parallel_ceiling()
+        };
+        // One file holding everything: threads buy nothing at all, which is the case
+        // worth knowing before starting a project.
+        assert!((of(200, 200) - 1.0).abs() < 1e-9);
+        // Evenly spread over four: four threads could reach 4x.
+        assert!((of(400, 100) - 4.0).abs() < 1e-9);
+        // The real shape from the repo this came from — a 435MB blob (both sides) in a
+        // 2.49GB commit of 16 files. Nowhere near the eight workers available.
+        assert!((of(2_491_331_863, 871_878_346) - 2.857).abs() < 0.001);
+        // An empty diff has no bytes to divide; it must not be a division by zero.
+        assert!((of(0, 0) - 1.0).abs() < 1e-9);
+    }
+
+    /// `DiffFile::size` is only filled in as libgit2 loads each blob, so the summary is
+    /// meaningless before the patch pass and correct after it — which is why
+    /// `build_diff_data` takes it where it does.
+    #[test]
+    fn delta_bytes_are_readable_once_the_patch_pass_has_run() {
+        let (_d, repo, oid) = everything_repo();
+        let scope = RowScope::new(DiffSource::Commit(oid));
+        let s = base_settings();
+        let diff = scoped_diff(&repo, s, &scope.paths, |r, o| {
+            commit_parent_diff(r, &r.find_commit(oid)?, Some(o))
+        })
+        .expect("the fixture diffs");
+
+        assert_eq!(
+            DeltaBytes::of(&diff).total,
+            0,
+            "control: before the pass every size is zero, which is why it is taken after"
+        );
+        let mut rows = DiffRows::new(Vec::new());
+        let mut files = Vec::new();
+        append_diff_body(
+            &mut rows,
+            &mut files,
+            &repo,
+            scope.source,
+            &diff,
+            s,
+            BuildEnv::of(None),
+        );
+
+        let bytes = DeltaBytes::of(&diff);
+        assert_eq!(bytes.deltas, files.len());
+        assert!(bytes.total > 0 && bytes.max > 0);
+        assert!(bytes.max <= bytes.total);
+        assert!(bytes.parallel_ceiling() >= 1.0);
     }
 
     /// `max_chars` sizes the pane's horizontal scroll range, and the build accumulates
