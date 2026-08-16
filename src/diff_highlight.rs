@@ -13,11 +13,11 @@
 //! worker share the row array with the UI instead of being handed a copy of it (see
 //! `PerRow`). Nothing here writes to a `DiffLine`.
 //!
-//! The two predicates are easier to get wrong than they look. `diff_fully_highlighted`
-//! answers vacuously TRUE over an empty pane, which is why `band_warmable` exists;
-//! and a file with no grammar still gets a span on every line from syntect's plain
-//! text fallback, so "highlighted" never means "coloured". See **Diff prefetch** and
-//! the missing-grammar note in AGENTS.md.
+//! `pending_files` is easier to get wrong than it looks: a file with no grammar still
+//! gets a span on every line from syntect's plain text fallback, so "highlighted" never
+//! means "coloured", and a binary file must be excluded from the question entirely
+//! (`highlight_ranges`) rather than merely skipped by the pass that writes spans. See
+//! **Diff prefetch** and the missing-grammar note in AGENTS.md.
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
@@ -25,9 +25,28 @@ use std::sync::{Arc, mpsc};
 use crate::diff::{DiffLine, FileEntry, RowSpans, file_line_ranges};
 use crate::highlight::{self, DiffBg, HighlightLines, Highlighter};
 use crate::{
-    Epoch, HIGHLIGHT_CHUNK, MAX_TREE_DEPTH, MAX_TREE_ENTRIES, MAX_WARM_LANGS, PREHIGHLIGHT_CHUNK,
-    VisibleRange, config, spawn_guarded,
+    Epoch, HIGHLIGHT_CHUNK, HIGHLIGHT_LINE_BUDGET, MAX_TREE_DEPTH, MAX_TREE_ENTRIES,
+    MAX_WARM_LANGS, PREHIGHLIGHT_CHUNK, VisibleRange, config, spawn_guarded,
 };
+
+/// What a highlight worker sends back. Both are tagged with the generation they were
+/// computed for, so a superseded pass's messages are dropped rather than applied.
+pub enum HighlightMsg {
+    /// One chunk's worth of finished spans.
+    Batch(HighlightBatch),
+    /// This pass has ENDED — finished, superseded, out of budget or panicking — and
+    /// nothing more will arrive under this generation.
+    ///
+    /// It is what tells the UI that colouring has settled, which used to be inferred by
+    /// scanning the diff for an uncoloured row (`diff_fully_highlighted`). That
+    /// inference stopped working the moment a pass could deliberately stop short of the
+    /// whole diff: the scan would answer "still colouring" forever, and
+    /// `band_warmable` waits on it, so the prefetch band would stay shut for as long as
+    /// the diff was displayed. Reported rather than inferred, it is also O(1) instead of
+    /// O(lines) — and the memo that existed to keep that scan off the frame loop is gone
+    /// with it.
+    Settled { generation: u64 },
+}
 
 /// One file's worth of finished highlight spans, sent worker → UI. Tagged with
 /// the generation it was computed for so stale results are dropped.
@@ -35,6 +54,28 @@ pub struct HighlightBatch {
     pub generation: u64,
     /// `(line index, spans)` for each code line in the file.
     pub lines: Vec<(usize, Vec<highlight::Span>)>,
+}
+
+/// Reports a pass's end however it ends, including a panic inside syntect — the same
+/// rule the diff-load workers keep ("every exit reports"), and for the same reason: the
+/// UI's `highlight_settled` is what the prefetch band waits on, so a silent exit costs
+/// the band for as long as the diff is displayed.
+struct SettleOnExit {
+    generation: u64,
+    tx: mpsc::Sender<HighlightMsg>,
+    ctx: egui::Context,
+}
+
+impl Drop for SettleOnExit {
+    fn drop(&mut self) {
+        let _ = self.tx.send(HighlightMsg::Settled {
+            generation: self.generation,
+        });
+        // Wake the UI: the per-batch repaints stop with the last batch, so without this
+        // the passive prefetch trigger may never get a frame to fire on once the app
+        // goes idle.
+        self.ctx.request_repaint();
+    }
 }
 
 /// Tokenize lines `[start, end)` into `(line index, spans)` updates, advancing
@@ -89,10 +130,9 @@ pub fn file_order(
 /// **Every** highlight-side consumer derives from this rather than from
 /// `file_line_ranges`, and that is what keeps the skip sound. The marker is a
 /// `LineKind::Context` row, so `is_code()` is true for it, and the file has a
-/// patch body so it IS in `file_line_ranges` — skip it only in the pass that
-/// writes spans and `diff_fully_highlighted` answers false forever, which pins
-/// `band_warmable` shut and turns off the prefetch band for every commit
-/// touching a binary blob.
+/// patch body so it IS in `file_line_ranges` — skip it only in the pass that writes
+/// spans and `pending_files` keeps offering a file every writer skips, so each install
+/// spawns a pass to colour a "Binary files … differ" line as though it were code.
 pub fn highlight_ranges(files: &[FileEntry], total_lines: usize) -> Vec<(usize, usize, usize)> {
     file_line_ranges(files, total_lines)
         .into_iter()
@@ -240,54 +280,15 @@ pub fn file_fully_highlighted(
 /// the same frame as the drains, so the wait ends on the frame the first diff installs.
 ///
 /// Then the usual rule: never compete with the foreground diff's own colouring — the
-/// reader is looking at that, not at a row they might scroll to. `settled` is a closure
-/// so the O(lines) question is not asked when the highlighter answer already decided it.
-pub fn band_warmable(
-    syntax_enabled: bool,
-    have_highlighter: bool,
-    settled: impl FnOnce() -> bool,
-) -> bool {
+/// reader is looking at that, not at a row they might scroll to. `settled` is the UI's
+/// `highlight_settled`, which the running pass reports (`HighlightMsg::Settled`) rather
+/// than anything deriving by scanning the diff — a pass that stops at its budget leaves
+/// rows uncoloured on purpose, and a scan would read that as "still colouring" forever.
+pub const fn band_warmable(syntax_enabled: bool, have_highlighter: bool, settled: bool) -> bool {
     if !syntax_enabled {
         return true;
     }
-    have_highlighter && settled()
-}
-
-/// Must a memoized `diff_fully_highlighted` answer be recomputed?
-///
-/// Two ways, and only two. The generation moved, so the memo describes a different diff
-/// (or a different theme) entirely. Or a highlight batch landed since the memo said
-/// `false` — the one event that turns `false` into `true` in place, spans being added
-/// and never removed within a generation.
-///
-/// Note what is deliberately absent: the caller asking again. Both prefetch triggers
-/// re-ask every frame — the scroll one stays true until a dispatch succeeds — so a rule
-/// that recomputed on demand would put an O(lines) scan back on the frame loop, which is
-/// exactly what it costs on the large diff still being coloured.
-///
-/// Free rather than inline in `diff_highlight_settled` so the regression test drives the
-/// real rule (constructing a `GitkApp` needs a real `eframe::CreationContext`).
-pub const fn highlight_scan_stale(
-    memo: Option<(u64, bool)>,
-    generation: u64,
-    applied_highlight: bool,
-) -> bool {
-    match memo {
-        None => true,
-        Some((scanned, answer)) => scanned != generation || (!answer && applied_highlight),
-    }
-}
-
-/// True when the foreground worker has finished colouring the whole diff: every
-/// code line *inside a tokenizable file range* is highlighted. Only those ranges
-/// are checked — lines outside them (a no-patch file has none at all; a binary
-/// file's marker is `Context` but its file is dropped by `highlight_ranges`) are
-/// never tokenized, so checking the whole `[0, len)` range would never be
-/// satisfied.
-pub fn diff_fully_highlighted(lines: &[DiffLine], spans: &RowSpans, files: &[FileEntry]) -> bool {
-    highlight_ranges(files, lines.len())
-        .iter()
-        .all(|&(_, start, end)| file_fully_highlighted(lines, spans, start, end))
+    have_highlighter && settled
 }
 
 /// File ranges `(file_index, start, end)` that still need highlighting: every
@@ -327,7 +328,7 @@ pub struct HighlightJob {
     pub current_gen: Epoch,
     /// Visible file range (lo, hi) the UI updates each frame.
     pub priority: Arc<VisibleRange>,
-    pub tx: mpsc::Sender<HighlightBatch>,
+    pub tx: mpsc::Sender<HighlightMsg>,
     pub ctx: egui::Context,
 }
 
@@ -366,7 +367,20 @@ pub fn top_extensions(
 /// the file it's tokenizing scrolls out of view while a visible file is pending,
 /// it re-queues the rest and switches — so selecting a file never waits behind a
 /// large off-screen one. It bails as soon as a newer highlight pass supersedes it.
+///
+/// However it ends, it says so: `SettleOnExit` reports the pass's end on the way out of
+/// this function, panic included.
 pub fn highlight_worker(job: HighlightJob) {
+    let _settle = SettleOnExit {
+        generation: job.generation,
+        tx: job.tx.clone(),
+        ctx: job.ctx.clone(),
+    };
+    highlight_pass(job);
+}
+
+/// The pass itself, free to return from anywhere: its caller owns the reporting.
+fn highlight_pass(job: HighlightJob) {
     let HighlightJob {
         hl,
         lines,
@@ -387,6 +401,10 @@ pub fn highlight_worker(job: HighlightJob) {
     let mut first_result = true;
     let started = std::time::Instant::now();
     let total_lines = lines.len();
+    // Rows coloured so far, against `HIGHLIGHT_LINE_BUDGET`. The bound is on the WORK,
+    // not on the diff: every diff is coloured where the reader is looking, and only the
+    // rows beyond the budget go without.
+    let mut coloured = 0usize;
     // `pending` holds only the files with unhighlighted code lines; a fully-cached diff
     // yields an empty list and the worker exits immediately with no work. It arrives on
     // the job because the spans it is derived from live on the UI side now.
@@ -412,12 +430,13 @@ pub fn highlight_worker(job: HighlightJob) {
             let chunk_end = (pos + HIGHLIGHT_CHUNK).min(end);
             let updates = tokenize_range(&hl, &lines, &mut state, pos, chunk_end);
             if !updates.is_empty() {
+                coloured += updates.len();
                 // Receiver gone (app closing) → stop.
                 if tx
-                    .send(HighlightBatch {
+                    .send(HighlightMsg::Batch(HighlightBatch {
                         generation,
                         lines: updates,
-                    })
+                    }))
                     .is_err()
                 {
                     return;
@@ -432,6 +451,19 @@ pub fn highlight_worker(job: HighlightJob) {
                 }
             }
             pos = chunk_end;
+            // Out of budget. Checked at a chunk boundary like everything else here, and
+            // it stops the pass rather than the file: what has been sent stays, and the
+            // reader keeps the colour around wherever `pick_file` had reached — which is
+            // where they are looking, that being the whole point of the ordering.
+            if coloured >= HIGHLIGHT_LINE_BUDGET {
+                log::debug!(
+                    "highlight: gen {generation} stopped at the {HIGHLIGHT_LINE_BUDGET}-line \
+                     budget after {:?}; {} of {total_lines} lines left plain",
+                    started.elapsed(),
+                    total_lines.saturating_sub(coloured)
+                );
+                return;
+            }
             if pos < end {
                 // Cancelled mid-file by a newer diff/theme → stop immediately.
                 if superseded() {
@@ -456,11 +488,6 @@ pub fn highlight_worker(job: HighlightJob) {
         "perf: worker gen {generation} done {:?} ({total_lines} lines)",
         started.elapsed()
     );
-    // Wake the UI once more now that the diff is fully coloured: the per-batch
-    // repaints stop when the last batch is sent, so without this the passive
-    // prefetch trigger (which polls `file_fully_highlighted` in `update`) may
-    // never get a frame to fire on once the app goes idle.
-    ctx.request_repaint();
 }
 
 /// Collect blob (file) names from `tree`, descending into subtrees, until `out`
@@ -648,17 +675,13 @@ mod tests {
 
         // ...and skipping it must not leave the diff looking forever unfinished.
         // git's "Binary files … differ" marker is a `LineKind::Context` row, so
-        // `is_code()` is true for it and the file has a patch body — check the
-        // untokenizable range and the answer is false however complete the pass
-        // was, which pins `band_warmable` shut and disables the prefetch band for
-        // every commit touching a binary blob.
-        assert!(
-            diff_fully_highlighted(lines, &spans, &data.files),
-            "a fully highlighted diff must report as such even with a binary file in it"
-        );
+        // `is_code()` is true for it and the file has a patch body — ask over the
+        // untokenizable range and it reads as pending however complete the pass was,
+        // so every install would spawn another one for it.
         assert!(
             pending_files(lines, &spans, &data.files).is_empty(),
-            "a binary file must never be queued for a highlight pass that skips it"
+            "a binary file must never be queued for a highlight pass that skips it, and a \
+             fully highlighted diff must not report as pending because of one"
         );
     }
 
@@ -748,28 +771,68 @@ mod tests {
     #[test]
     fn a_band_is_not_warmed_before_it_can_be_coloured() {
         assert!(
-            !band_warmable(true, false, || true),
+            !band_warmable(true, false, true),
             "no highlighter yet ⇒ wait, even though nothing is left to colour"
         );
         assert!(
-            band_warmable(true, true, || true),
+            band_warmable(true, true, true),
             "highlighter present and the foreground is settled ⇒ warm"
         );
         assert!(
-            !band_warmable(true, true, || false),
+            !band_warmable(true, true, false),
             "and never while the foreground diff is still colouring"
+        );
+    }
+
+    /// A pass reports its end however it ends — here, superseded before it colours
+    /// anything, which is the exit that sends no batch to infer it from.
+    ///
+    /// `highlight_settled` is a reported fact now rather than a scan of the diff, so a
+    /// silent exit is not a lost frame: the prefetch band waits on that message and
+    /// would stay shut for as long as the diff is displayed. The `SettleOnExit` guard is
+    /// what makes it hold for the panicking exit too, which cannot be provoked here
+    /// without a poisoned syntax set.
+    #[test]
+    fn a_superseded_pass_still_reports_that_it_ended() {
+        let (tx, rx) = mpsc::channel();
+        let current_gen = Epoch::default();
+        let stale = current_gen.bump();
+        current_gen.bump(); // a newer pass has started; `stale` is superseded
+
+        let lines = vec![DiffLine::new("let x = 1;", LineKind::Context)];
+        let files = vec![fe("x.rs", Some(0))];
+        highlight_worker(HighlightJob {
+            hl: Arc::new(highlight::test_highlighter()),
+            pending: pending_files(&lines, &RowSpans::blank(lines.len()), &files),
+            lines: Arc::new(lines),
+            files: Arc::new(files),
+            generation: stale,
+            current_gen,
+            priority: Arc::new(VisibleRange {
+                lo: std::sync::atomic::AtomicUsize::new(0),
+                hi: std::sync::atomic::AtomicUsize::new(0),
+                page_lo: std::sync::atomic::AtomicUsize::new(0),
+                page_hi: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            tx,
+            ctx: egui::Context::default(),
+        });
+
+        let msgs: Vec<HighlightMsg> = rx.try_iter().collect();
+        assert!(
+            matches!(msgs.as_slice(), [HighlightMsg::Settled { generation }] if *generation == stale),
+            "a superseded pass must report its end and colour nothing"
         );
     }
 
     /// With syntax off there is no highlighter to wait for and no colouring to compete
     /// with, so every row warms `DiffOnly` at once — the mode where nothing was
-    /// prefetched at all before. The settled question must not even be asked: with no
-    /// spans ever set it answers false for every non-empty diff, forever.
+    /// prefetched at all before. Neither of the other two facts can hold it back: with
+    /// syntax off no pass is ever started, so `settled` would be answering about a diff
+    /// nobody is colouring.
     #[test]
     fn syntax_off_warms_without_asking_about_colour() {
-        assert!(band_warmable(false, false, || {
-            panic!("must not consult the highlight state with syntax off")
-        }));
+        assert!(band_warmable(false, false, false));
     }
 
     /// The rotation the pre-highlight pass walks: the anchored file, then the
@@ -828,7 +891,6 @@ mod tests {
             "an expired budget must tokenize nothing"
         );
         // And the diff is still in a legal partial state the async pass resumes from.
-        assert!(!diff_fully_highlighted(&lines, &spans, &files));
         assert_eq!(
             pending_files(&lines, &spans, &files).len(),
             1,
@@ -852,7 +914,6 @@ mod tests {
 
         highlight_diff_until(&lines, &mut spans, &files, &hl, None, 0, None);
 
-        assert!(diff_fully_highlighted(&lines, &spans, &files));
         assert!(pending_files(&lines, &spans, &files).is_empty());
     }
 
@@ -914,7 +975,7 @@ mod tests {
             let mut spans = RowSpans::blank(lines.len());
             highlight_diff_until(&lines, &mut spans, &files, &hl, None, first, None);
             assert!(
-                diff_fully_highlighted(&lines, &spans, &files),
+                pending_files(&lines, &spans, &files).is_empty(),
                 "starting at file {first} must still cover both files"
             );
         }
