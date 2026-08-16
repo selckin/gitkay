@@ -265,9 +265,22 @@ const PREFETCH_MAX_ENTRY_DIVISOR: usize = 8;
 /// screenful on demand in milliseconds; on a diff this size the full pass is spending
 /// seconds to pre-colour tens of thousands of rows nobody will scroll to. 10,000 lines
 /// keeps the overwhelming majority of real diffs fully warm — in a measured session
-/// only a handful of rows exceeded it — while capping the worst case at ~1.3s at the
-/// ~0.13ms/line this repo sees under pool contention.
+/// only a handful of rows exceeded it.
+///
+/// **It does NOT cap the time, though this comment used to claim it did** ("~1.3s at
+/// the ~0.13ms/line this repo sees under pool contention"). A 5,310-line commit —
+/// comfortably under this cap — measured `build 418ms + colour 29.6s`, i.e. 5.6ms a
+/// line, 43× the assumed rate. The rate is a property of the GRAMMAR, not of the repo,
+/// so no line count can stand in for a clock. `Limits::highlight_budget` is the actual
+/// bound; this one is what keeps the memory and the pointless work down.
 const PREFETCH_MAX_HIGHLIGHT_LINES: usize = 10_000;
+/// How long a speculative colour pass may run. See `Limits::highlight_budget` for the
+/// measurement that forced it and why a line cap could not.
+///
+/// Generous against every legitimate row observed — the slowest real colour in that
+/// session was 424ms for 4,530 lines — and it restores the ~1.3s worst case the line
+/// cap was aiming at, by bounding the thing that actually varies.
+const PREFETCH_HIGHLIGHT_BUDGET: std::time::Duration = std::time::Duration::from_millis(1_500);
 /// Blob bytes a prefetch will read before postponing the row.
 ///
 /// libgit2 loads both sides of every changed file and runs xdiff over them, so a diff's
