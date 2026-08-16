@@ -60,7 +60,8 @@
 - Renamed/copied files shown git-style — one `dir/{old ⇒ new}` entry instead of a delete + add pair
 - **Word diff** toggle — highlights the exact words that changed within a modified line
 - Optional line numbers beside every patch line — old and new, in columns sized once per diff so they line up across every file in it
-- Hover toolbar on the diff: context-line count (click `±`, or scroll over it), ignore whitespace, rename/copy detection, word diff, line numbers — all remembered across runs
+- Optional soft wrapping — long lines fold to the pane's width, indented under their own line numbers and `+`/`-` marker, with only the visible part of a line ever laid out (an 8-million-character minified line scrolls like any other file)
+- Hover toolbar on the diff: context-line count (click `±`, or scroll over it), ignore whitespace, rename/copy detection, word diff, line numbers, soft wrap — all remembered across runs
 - Highlighting runs in the background, on-screen files first — large diffs never block the UI; diffs are cached and the neighbouring commits prefetched, so stepping through history is instant
 - Click a file to jump to its diff section; the sidebar tracks your position, highlighting the file under the diff view as you scroll
 - Commit header with author, date, full message
@@ -180,6 +181,7 @@ rest is split by concern:
 | `diff.rs` | The diff data layer — building, shaping and looking up diffs; git2-facing and egui-free |
 | `diff/convert.rs` | Rendering a delta a `textconv` driver applies to as readable text |
 | `diff/anchor.rs` | The diff pane's scroll anchor — where the reader was, found again after a rebuild |
+| `diff/wrap.rs` | Soft wrapping — how many visual rows a line takes, and which slice of it each draws |
 | `history.rs` | The commit list — walking history into rows, and the ref map that labels them |
 | `graph.rs` | The commit graph's lane and pipe layout |
 | `apply.rs` | The write layer — stage, unstage and revert, and every guard that decides against writing |
@@ -317,7 +319,8 @@ or `500` cannot make the window unusable.
 | `textconv` | `true` | Run `diff.<driver>.textconv` when `.gitattributes` names a driver for a path, as git does — what turns an archive or a PDF into a readable diff instead of "Binary files … differ" |
 
 **Everything on the diff's hover toolbar is set there, not here** — context width,
-ignore whitespace, rename detection, copy detection, word diff and line numbers.
+ignore whitespace, rename detection, copy detection, word diff, line numbers and
+soft wrap.
 Each is remembered across runs, so the pane reopens the way you left it, and none
 has a config key that could contradict it. There is no third state to reason
 about: what you ticked is what you get.
@@ -330,6 +333,7 @@ about: what you ticked is what you get.
 | Detect copies | off | Show a file copied from another *modified* file as `source → copy` (git `-C`). More expensive than renames |
 | Word diff | off | Highlight the exact words that changed within a modified line |
 | Line numbers | off | Old and new line numbers in a gutter left of the `+`/`-` marker. One column width per diff, so they line up across files; the commit message and diffstat above the first file keep their own margin |
+| Soft wrap | off | Fold long lines to the pane's width instead of scrolling horizontally. A wrapped line is indented under its own line numbers and `+`/`-` marker, and the horizontal scrollbar goes away. Worth a tick in a repo whose sources have lines wider than a window — minified bundles, generated code, long prose |
 
 `textconv` is the one setting that lets gitkay run an external program. The command
 comes from git **config**, never from a file in the repository, so cloning a hostile

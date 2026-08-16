@@ -137,9 +137,10 @@ pub enum FileListLayout {
 /// `[diff]` — diff-pane rendering options.
 ///
 /// Everything the diff's hover toolbar controls is deliberately absent: context
-/// width, ignore-whitespace, rename/copy detection, word diff and line numbers are
-/// set where they are read and persisted across runs (`App::save`), with no key
-/// here to contradict them. What remains is what has no toolbar control.
+/// width, ignore-whitespace, rename/copy detection, word diff, line numbers and
+/// soft wrap are set where they are read and persisted across runs (`App::save`),
+/// with no key here to contradict them. What remains is what has no toolbar
+/// control.
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DiffSection {
@@ -451,10 +452,10 @@ fn default_template() -> String {
          # ui             = {{ size = {ui}, font = \"monospace\" }}   # search bar + diff toolbar\n\
          \n\
          [diff]\n\
-         # Context width, ignore whitespace, rename/copy detection, word diff and\n\
-         # line numbers are not here: they live on the diff's hover toolbar, which\n\
-         # remembers them across runs. Setting them is reading, so they are set\n\
-         # where they are read.\n\
+         # Context width, ignore whitespace, rename/copy detection, word diff,\n\
+         # line numbers and soft wrap are not here: they live on the diff's hover\n\
+         # toolbar, which remembers them across runs. Setting them is reading, so\n\
+         # they are set where they are read.\n\
          # Show the diffstat block (per-file change list + summary) between the\n\
          # commit message and the patch. false = hide it; the file-list sidebar\n\
          # still lists every changed file.\n\

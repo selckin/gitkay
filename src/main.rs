@@ -144,6 +144,84 @@ impl VisibleRange {
     }
 }
 
+/// Where the diff pane is looking, written by the render's `on_visible` closure and
+/// read by everything that acts on the reader's position: the file sidebar's
+/// tracking, the scroll anchor, the word-diff and highlight windows, the page keys.
+///
+/// **Both coordinate systems, deliberately.** Without soft wrapping they are the
+/// same number and one field would do; with it a screenful of *visual rows* can be a
+/// handful of *logical lines*, and the consumers want different ones. Everything
+/// that indexes `diff_lines` — every consumer but one — wants lines; only the Space
+/// page-scroll, which moves the viewport by half a screen, wants rows. Storing one
+/// and deriving the other is what cannot be done: a visual row carries a sub-row
+/// index that `row_of_line` cannot recover, so a Space press from inside a
+/// screens-tall line would jump back to that line's first row instead of advancing.
+///
+/// Atomics rather than fields on `GitkApp` because the render writes them from
+/// inside closures that hold `&self`. `Relaxed` throughout: each is one frame's
+/// observation of a value that moves every frame, and a torn read costs a frame of
+/// staleness — which the readers already tolerate, being a frame behind by
+/// construction.
+#[derive(Default)]
+struct DiffViewport {
+    /// Logical line of the first visible row.
+    top_line: AtomicUsize,
+    /// Visual row at the top of the viewport — equal to `top_line` unless a line
+    /// above it wrapped, and carrying the sub-row when the top row is a
+    /// continuation.
+    top_row: AtomicUsize,
+    /// Visual rows the viewport holds — the true screenful, even where the padding
+    /// rows clamp the real range short.
+    rows: AtomicUsize,
+    /// Logical lines those rows cover. Never more than `rows`, and far fewer when
+    /// one wrapped line fills the screen.
+    ///
+    /// Unlike `rows` this is the REAL count, not the screenful: at the end of a
+    /// diff, where the padding rows clamp the visible range short, it reports the
+    /// lines that are actually there. Every consumer indexes `diff_lines` with it,
+    /// so the honest count is the useful one — a screenful's worth of lines that do
+    /// not exist would only widen a read-ahead window past the end.
+    lines: AtomicUsize,
+}
+
+impl DiffViewport {
+    /// Read one field. Every load goes through here so the ordering is stated once.
+    fn get(field: &AtomicUsize) -> usize {
+        field.load(Ordering::Relaxed)
+    }
+
+    fn top_line(&self) -> usize {
+        Self::get(&self.top_line)
+    }
+
+    fn top_row(&self) -> usize {
+        Self::get(&self.top_row)
+    }
+
+    fn rows(&self) -> usize {
+        Self::get(&self.rows)
+    }
+
+    fn lines(&self) -> usize {
+        Self::get(&self.lines)
+    }
+
+    /// Publish this frame's position.
+    fn store(&self, top_line: usize, top_row: usize, rows: usize, lines: usize) {
+        self.top_line.store(top_line, Ordering::Relaxed);
+        self.top_row.store(top_row, Ordering::Relaxed);
+        self.rows.store(rows, Ordering::Relaxed);
+        self.lines.store(lines, Ordering::Relaxed);
+    }
+
+    /// Put the pane back at the top — what a freshly installed diff needs, since
+    /// the render's closure will not have run for it yet.
+    fn reset_top(&self) {
+        self.top_line.store(0, Ordering::Relaxed);
+        self.top_row.store(0, Ordering::Relaxed);
+    }
+}
+
 // ── Commit data ──────────────────────────────────────────────────────────
 
 /// Total cached diff lines before the LRU starts evicting.
@@ -1282,23 +1360,127 @@ const fn kind_color(kind: LineKind, palette: &highlight::DiffPalette) -> egui::C
     }
 }
 
-/// Layout inputs for `show_virtualized_diff`: total rows, the widest line (sizes the
-/// horizontal scroll), an optional forced scroll line, and the deepest file start the
-/// bottom padding must let reach the top (`None` ⇒ no files ⇒ no padding).
+/// Layout inputs for `show_virtualized_diff`: how many rows there are, the widest
+/// line (sizes the horizontal scroll), an optional forced scroll target, and the
+/// deepest file start the bottom padding must let reach the top (`None` ⇒ no files ⇒
+/// no padding).
+///
+/// **Two coordinate systems meet here and only one crosses the boundary.**
+/// `n_lines`, `scroll_target` and `last_top_anchor` are LINES, because that is what
+/// every caller has; `wrap` is what turns them into the visual rows the `ScrollArea`
+/// scrolls over, and it is passed in rather than consulted globally so the no-wrap
+/// path is literally the `None` arm of each conversion.
 #[derive(Clone, Copy)]
-struct DiffView {
+struct DiffView<'a> {
     n_lines: usize,
+    /// `None` ⇒ no wrapping: rows and lines are the same number and the pane keeps
+    /// its horizontal scroll.
+    wrap: Option<&'a diff::WrapIndex>,
     content_chars: usize,
-    scroll_target: Option<usize>,
+    scroll_target: Option<DiffScrollTo>,
     last_top_anchor: Option<usize>,
     /// Which diff these rows belong to, mixed into each row's widget id so an
     /// open context menu cannot outlive it. See `diff_menu_salt`.
     menu_salt: u64,
 }
 
+/// What the diff render observed about its own viewport this frame, handed to the
+/// caller's `on_visible` so `GitkApp` can publish it (`DiffViewport`).
+///
+/// A struct rather than the two loose values it used to be, because soft wrapping
+/// makes "the visible rows" two different answers and each consumer wants a
+/// specific one. Naming them here is what stops a consumer taking whichever was
+/// nearest: `lines` indexes `diff_lines`, `rows` measures the screen.
+struct VisibleDiff {
+    /// The logical lines on screen — for the highlight worker's file window.
+    lines: std::ops::Range<usize>,
+    /// The line the top row belongs to (a continuation row still names its line).
+    top_line: usize,
+    /// The visual row at the top of the viewport, sub-row included.
+    top_row: usize,
+    /// The viewport's height in visual rows — the true screenful even where the
+    /// bottom-padding rows clamp the real range short.
+    rows: usize,
+}
+
 /// Empty rows kept below the content (diff view and file list) for breathing room, so
 /// the last line/file never sits flush against the bottom edge.
 const BOTTOM_PAD_ROWS: usize = 2;
+
+/// How long a wrap-index build may take before it is worth a log line. It runs on
+/// the frame loop, so this is a frame budget rather than a work budget.
+const WRAP_INDEX_SLOW: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Bring a diff pane's wrap index into line with `wrap`, `lines`, `cols` and
+/// `gutter`, and report whether the row mapping MOVED.
+///
+/// Free and `Option`-shaped rather than a method, so the four transitions can be
+/// unit-tested without a `GitkApp`. They are the whole of this function, and one of
+/// them was wrong: **dropping an index is as much a re-wrap as building one.** The
+/// `ScrollArea`'s offset is measured in visual rows, so the frame after soft wrap is
+/// unticked that offset names a completely different line — an untick with the pane
+/// a few hundred wrapped rows down jumped to another file entirely. Reporting only
+/// the build case looks symmetric and is not: what the caller does with a `true` is
+/// pin the reader's line, and the line needs pinning whenever the mapping under it
+/// changes, in either direction.
+///
+/// `take()` is what makes the drop report exactly ONCE — on the frame the tick was
+/// cleared, when there was still an index to drop — rather than on every frame
+/// thereafter, which would pin the scroll offset permanently and make the pane
+/// unscrollable.
+fn resync_wrap_index(
+    index: &mut Option<diff::WrapIndex>,
+    wrap: bool,
+    lines: &[DiffLine],
+    cols: usize,
+    gutter: LineNoGutter,
+) -> bool {
+    if !wrap {
+        return index.take().is_some();
+    }
+    if index
+        .as_ref()
+        .is_some_and(|w| w.covers(lines.len(), cols, gutter))
+    {
+        return false;
+    }
+    let t = std::time::Instant::now();
+    let built = diff::WrapIndex::build(lines, cols, gutter);
+    let took = t.elapsed();
+    // One `len()` comparison a line, but still O(lines) — and a window resize runs it
+    // every frame of the drag, which is the shape worth seeing in a log before anyone
+    // reaches for a debounce.
+    if took > WRAP_INDEX_SLOW {
+        log::debug!(
+            "perf: wrap index {} lines → {} rows in {took:?} ({cols} cols)",
+            lines.len(),
+            built.total_rows(),
+        );
+    }
+    *index = Some(built);
+    true
+}
+
+/// How many monospace columns the diff pane has for content, for soft wrapping.
+///
+/// The pane's width less what a solid vertical scrollbar takes. Subtracted
+/// unconditionally, though egui only reserves it when a bar is actually needed:
+/// over-subtracting leaves a wrapped line a few points short of the right edge,
+/// while under-subtracting would run it under the bar — and whether the bar is there
+/// depends on the content height, which under wrapping depends on this number, so
+/// asking would be circular.
+///
+/// The same monospace assumption `content_chars` makes, and no stronger: a wrapped
+/// row is measured in BYTES against this, which for UTF-8 is never fewer than the
+/// columns it draws (see `diff::wrap`).
+fn wrap_cols(ui: &egui::Ui, font_id: &egui::FontId) -> usize {
+    let char_w = ui.fonts_mut(|f| f.glyph_width(font_id, ' '));
+    if char_w <= 0.0 {
+        return 0;
+    }
+    let bar = ui.spacing().scroll.allocated_width();
+    ((ui.available_width() - bar) / char_w).floor().max(0.0) as usize
+}
 
 /// What scrolls a scroll area: bar, wheel, and **press-and-drag with a mouse**.
 ///
@@ -1666,33 +1848,48 @@ fn diff_menu_salt(key: Option<&DiffCacheKey>) -> u64 {
     h.finish()
 }
 
-/// Render `n_lines` rows of the diff with row virtualization — only the visible
-/// rows get a `LayoutJob` (diffs can be tens of thousands of lines, all uniform
-/// single-line height). `on_visible` receives the visible (real) row range and the
-/// full viewport height in rows — the range tells the highlight worker which files are
-/// on screen (the flat path ignores it), the height drives the Space page-scroll and is
-/// the true screenful even when bottom-padding rows clamp the real range short.
-/// `build_row` produces each row's job, an optional background tint, and the galley
-/// fallback colour. `row_menu_target` answers "which file does this row act on, if
-/// any" — ONE lookup, so whether a menu is attached and what it acts on cannot
-/// disagree — and `row_menu` draws it. The callbacks keep the scroll/offset/width
-/// scaffold here separate from the row-building policy in the (single) caller.
+/// Render the diff with row virtualization — only the visible rows get a
+/// `LayoutJob` (diffs can be tens of thousands of lines, all uniform
+/// single-line height). `on_visible` receives this frame's position — see
+/// `VisibleDiff` — from which the caller feeds the highlight worker, the file
+/// sidebar and the page keys. `build_row` produces one visual row's job, an optional
+/// background tint, and the galley fallback colour; it is called with a `(line,
+/// sub_row)` pair, so a wrapped line's second row is `(line, 1)`. `row_menu_target`
+/// answers "which file does this row act on, if any" — ONE lookup, so whether a menu
+/// is attached and what it acts on cannot disagree — and `row_menu` draws it. The
+/// callbacks keep the scroll/offset/width scaffold here separate from the
+/// row-building policy in the (single) caller.
+///
+/// **Soft wrapping does not change the virtualization**, which is why it can stay on
+/// `show_rows`: every VISUAL row is exactly one `row_h` tall, wrapped or not, because
+/// the wrap index slices lines at fixed widths rather than asking a layouter where
+/// they broke (`diff::wrap`). What wrapping changes is only the mapping between the
+/// row indices egui scrolls over and the line indices everything above here uses.
 fn show_virtualized_diff(
     ui: &mut egui::Ui,
     font_id: &egui::FontId,
-    view: DiffView,
-    mut on_visible: impl FnMut(std::ops::Range<usize>, usize),
-    mut build_row: impl FnMut(usize) -> (egui::text::LayoutJob, Option<egui::Color32>, egui::Color32),
+    view: DiffView<'_>,
+    mut on_visible: impl FnMut(VisibleDiff),
+    mut build_row: impl FnMut(
+        usize,
+        usize,
+    ) -> (egui::text::LayoutJob, Option<egui::Color32>, egui::Color32),
     row_menu_target: impl Fn(usize) -> Option<usize>,
     mut row_menu: impl FnMut(&mut egui::Ui, usize, usize),
 ) {
     let DiffView {
         n_lines,
+        wrap,
         content_chars,
         scroll_target,
         last_top_anchor,
         menu_salt,
     } = view;
+    // The two conversions, stated once. With no index they are the identity, which
+    // is what makes `wrap = false` provably the pre-existing behaviour.
+    let row_of = |line: usize| wrap.map_or(line, |w| w.row_of_line(line));
+    let line_of = |row: usize| wrap.map_or((row, 0), |w| w.line_of_row(row));
+    let n_rows = wrap.map_or(n_lines, diff::WrapIndex::total_rows);
     let row_h = ui.fonts_mut(|f| f.row_height(font_id));
     let any_menu_open = egui::Popup::is_any_open(ui.ctx());
     // The pointer, read ONCE per frame rather than once per visible row.
@@ -1708,18 +1905,30 @@ fn show_virtualized_diff(
     // highlighted in the file list, which tracks the top line). See diff_pad_rows.
     let viewport_rows = (ui.available_height() / row_h).ceil() as usize;
     // At least BOTTOM_PAD_ROWS empty rows of breathing room, even when the last file
-    // already fills the viewport (diff_pad_rows would be 0).
-    let pad = diff_pad_rows(n_lines, last_top_anchor, viewport_rows).max(BOTTOM_PAD_ROWS);
-    let total_rows = n_lines + pad;
-    let mut scroll = egui::ScrollArea::both()
-        .id_salt("diff_scroll")
-        .auto_shrink([false, false])
-        .scroll_source(SCROLL_SOURCE)
-        .animated(false);
+    // already fills the viewport (diff_pad_rows would be 0). In VISUAL rows on every
+    // term: the anchor is the deepest file's start LINE, and what has to reach the
+    // top of the viewport is the row it starts on.
+    let pad =
+        diff_pad_rows(n_rows, last_top_anchor.map(&row_of), viewport_rows).max(BOTTOM_PAD_ROWS);
+    let total_rows = n_rows + pad;
+    // Wrapping cuts every row to the window, so there is nothing to scroll to
+    // horizontally and offering the dimension would only let the reader lose the
+    // text sideways.
+    let wrapping = wrap.is_some_and(diff::WrapIndex::active);
+    let mut scroll = if wrapping {
+        egui::ScrollArea::vertical()
+    } else {
+        egui::ScrollArea::both()
+    }
+    .id_salt("diff_scroll")
+    .auto_shrink([false, false])
+    .scroll_source(SCROLL_SOURCE)
+    .animated(false);
     // Jump-to-target works even when the row is off-screen (it isn't laid out)
-    // by forcing the scroll offset.
+    // by forcing the scroll offset. A target stated as a line is resolved HERE,
+    // against the index for the content about to be drawn — see `DiffScrollTo`.
     if let Some(t) = scroll_target {
-        scroll = scroll.vertical_scroll_offset(t as f32 * row_h);
+        scroll = scroll.vertical_scroll_offset(t.row(wrap) as f32 * row_h);
     }
     // Size the horizontal scroll to the widest line in the whole diff —
     // virtualization only lays out visible rows, so egui can't otherwise know an
@@ -1734,13 +1943,26 @@ fn show_virtualized_diff(
     let char_w = ui.fonts_mut(|f| f.glyph_width(font_id, ' '));
     let content_w = (content_chars as f32 + 1.0) * char_w;
     scroll.show_rows(ui, row_h, total_rows, |ui, rows| {
-        ui.set_min_width(content_w);
-        // Report only real lines — the padding rows below aren't part of the diff —
+        // …and with wrapping on there is no such width to claim: every row is cut to
+        // the window, so a min width taken from the widest LINE would push content
+        // out past a viewport that no longer scrolls sideways to reach it.
+        let content_w = if wrapping {
+            ui.available_width()
+        } else {
+            ui.set_min_width(content_w);
+            content_w
+        };
+        // Report only real rows — the padding rows below aren't part of the diff —
         // plus the true viewport height (the real range clamps short over padding).
-        let real = rows.start.min(n_lines.saturating_sub(1))..rows.end.min(n_lines);
-        on_visible(real, viewport_rows);
+        let real = rows.start.min(n_rows.saturating_sub(1))..rows.end.min(n_rows);
+        on_visible(VisibleDiff {
+            lines: wrap.map_or_else(|| real.clone(), |w| w.lines_of_rows(real.clone())),
+            top_line: line_of(real.start).0,
+            top_row: real.start,
+            rows: viewport_rows,
+        });
         for i in rows {
-            if i >= n_lines {
+            if i >= n_rows {
                 // Padding row: reserve the height, draw nothing. `allocate_space`,
                 // not `allocate_exact_size` — the latter also registers a widget
                 // and builds a `Response` that nothing here reads, and `pad` can
@@ -1748,7 +1970,8 @@ fn show_virtualized_diff(
                 ui.allocate_space(egui::vec2(content_w, row_h));
                 continue;
             }
-            let (job, row_bg, fallback) = build_row(i);
+            let (line, sub) = line_of(i);
+            let (job, row_bg, fallback) = build_row(line, sub);
             let galley = ui.fonts_mut(|f| f.layout_job(job));
             let width = ui.available_width().max(galley.size().x);
             let (_, rect) = ui.allocate_space(egui::vec2(width, row_h));
@@ -1787,7 +2010,10 @@ fn show_virtualized_diff(
             // transform — gitkay sets none. Were one ever set, the disagreement is a
             // false NEGATIVE: a menu that fails to attach. Never a menu attached to
             // the wrong row, and so never a wrong write.
-            if let Some(file_idx) = row_menu_target(i)
+            // By LINE: a menu acts on a file and a hunk, neither of which a wrapped
+            // line's second row means anything different for. The widget ID below
+            // still keys on the VISUAL row, so two rows of one line are two widgets.
+            if let Some(file_idx) = row_menu_target(line)
                 && (any_menu_open
                     || (pointer.is_some_and(|p| rect.contains(p))
                         && ui.rect_contains_pointer(rect)))
@@ -1802,7 +2028,7 @@ fn show_virtualized_diff(
                     ui.id().with(("diff_row", menu_salt, i)),
                     egui::Sense::CLICK,
                 );
-                resp.context_menu(|ui| row_menu(ui, i, file_idx));
+                resp.context_menu(|ui| row_menu(ui, line, file_idx));
             }
             if let Some(bg) = row_bg {
                 ui.painter().rect_filled(rect, 0.0, bg);
@@ -2251,27 +2477,38 @@ fn clip_row_text(text: &str) -> Option<usize> {
         .map(|(at, _)| at)
 }
 
-/// Spans clipped to a body cut at `at`: those starting past the cut go, and one
-/// STRADDLING it is truncated rather than dropped.
+/// Spans restricted to the byte window one row draws, and rebased to it: those
+/// outside go, and one STRADDLING either edge is truncated rather than dropped.
 ///
 /// Dropping it would be the easy reading of `append_body`, whose `body.get(range)`
 /// answers `None` for an out-of-range span and skips it — but that path emits ONLY the
 /// spans, so a straddler taken out takes visible text with it, leaving a gap at exactly
 /// the place the reader is looking when they scroll to the cut.
-fn clip_spans(spans: &[highlight::Span], at: usize) -> Vec<highlight::Span> {
+///
+/// Two things narrow a window and they compose: the `MAX_ROW_RENDER_CHARS` clip, and
+/// soft wrapping, where a visual row draws one slice of its line.
+fn window_spans(spans: &[highlight::Span], w: &std::ops::Range<usize>) -> Vec<highlight::Span> {
     spans
         .iter()
-        .filter(|(_, r)| r.start < at)
-        .map(|(c, r)| (*c, r.start..r.end.min(at)))
+        .filter(|(_, r)| r.start < w.end && w.start < r.end)
+        .map(|(c, r)| {
+            (
+                *c,
+                r.start.max(w.start) - w.start..r.end.min(w.end) - w.start,
+            )
+        })
         .collect()
 }
 
-/// `clip_spans` for the word-diff emphasis, which is bare ranges over the same body.
-fn clip_ranges(ranges: &[std::ops::Range<usize>], at: usize) -> Vec<std::ops::Range<usize>> {
+/// `window_spans` for the word-diff emphasis, which is bare ranges over the same body.
+fn window_ranges(
+    ranges: &[std::ops::Range<usize>],
+    w: &std::ops::Range<usize>,
+) -> Vec<std::ops::Range<usize>> {
     ranges
         .iter()
-        .filter(|r| r.start < at)
-        .map(|r| r.start..r.end.min(at))
+        .filter(|r| r.start < w.end && w.start < r.end)
+        .map(|r| r.start.max(w.start) - w.start..r.end.min(w.end) - w.start)
         .collect()
 }
 
@@ -2345,17 +2582,24 @@ fn append_body(
     }
 }
 
-/// What the display has derived for one row: its syntax spans and its word-diff
-/// emphasis, each empty when nothing has been computed for that row — which renders
-/// identically to "computed to nothing", so the render never has to tell them apart.
+/// What the display has derived for one VISUAL row: which slice of its line the row
+/// draws, and how that slice is coloured beyond its kind — the line's syntax spans
+/// and its word-diff emphasis, each empty when nothing has been computed for it,
+/// which renders identically to "computed to nothing" so the render never has to
+/// tell them apart.
 ///
-/// One value rather than two parameters because they are looked up together, on the
-/// same row index, in the two `PerRow`s beside the diff — and because they answer one
-/// question between them: how is this row coloured beyond its kind?
+/// One value rather than three parameters because they are looked up together and
+/// answer one question between them: what does this row put on screen? The spans and
+/// emphasis are per LINE (two `PerRow`s beside the diff, on the same index) and the
+/// slice is per row, which is exactly the pairing `diff_row_job` has to reconcile —
+/// `window_spans` cuts the first two to the third.
 #[derive(Clone, Copy)]
 struct RowStyle<'a> {
     spans: &'a [highlight::Span],
     emphasis: &'a [std::ops::Range<usize>],
+    /// The whole line without soft wrapping (`diff::RowSlice::whole`), one window of
+    /// it with.
+    slice: &'a diff::RowSlice,
 }
 
 /// Build the `LayoutJob` for one diff row plus its optional background tint. With
@@ -2374,6 +2618,12 @@ struct RowStyle<'a> {
 /// keeps the column (blank), or every header would sit a gutter-width left of the
 /// code under it. A zero-width gutter (the feature off) writes nothing, in both
 /// modes and for every kind.
+///
+/// `slice` is which part of the line this VISUAL row draws — the whole of it without
+/// soft wrapping, one window of it with. A continuation row (`!slice.first`) draws
+/// spaces in the gutter and marker columns rather than repeating them, so a wrapped
+/// line's text stays in one column: the numbers belong to the line, not to each row
+/// it takes.
 fn diff_row_job(
     line: &DiffLine,
     row: RowStyle<'_>,
@@ -2384,6 +2634,7 @@ fn diff_row_job(
     syntax: bool,
 ) -> (egui::text::LayoutJob, Option<egui::Color32>) {
     use egui::text::{LayoutJob, TextFormat};
+    let slice = row.slice;
     let fmt = |color| TextFormat {
         font_id: font_id.clone(),
         color,
@@ -2395,7 +2646,11 @@ fn diff_row_job(
     // row's: they are not part of the line, and a `+` line whose number was green
     // too would read as content.
     let mut gutter = String::new();
-    linenos.write(line, &mut gutter);
+    if slice.first {
+        linenos.write(line, &mut gutter);
+    } else {
+        linenos.blank(line, &mut gutter);
+    }
     if !gutter.is_empty() {
         job.append(&gutter, 0.0, fmt(palette.dim));
     }
@@ -2404,15 +2659,23 @@ fn diff_row_job(
     // Clipped like any other row: a commit message is a header line, and nothing stops
     // one being a single enormous paragraph.
     if !line.kind.is_code() {
-        let cut = clip_row_text(&line.text);
-        let text = cut.map_or(&*line.text, |at| &line.text[..at]);
-        job.append(text, 0.0, fmt(kind_color(line.kind, palette)));
-        append_clip_marker(&mut job, font_id, palette, &line.text, cut);
+        let whole = line.rendered();
+        let text = whole.get(slice.range.clone()).unwrap_or("");
+        let cut = clip_row_text(text);
+        job.append(
+            cut.map_or(text, |at| &text[..at]),
+            0.0,
+            fmt(kind_color(line.kind, palette)),
+        );
+        append_clip_marker(&mut job, font_id, palette, text, cut);
         return (job, None);
     }
 
-    // Gutter — the +/-/space diff marker.
-    if syntax {
+    // Gutter — the +/-/space diff marker. A continuation row keeps the column and
+    // leaves it empty, for the same reason the line numbers do.
+    if !slice.first {
+        job.append(" ", 0.0, fmt(palette.marker));
+    } else if syntax {
         // Synthesize from `kind` so context lines get a space and share the +/-
         // column; drawn in the accent colour.
         let (glyph, glyph_color) = match line.kind {
@@ -2457,34 +2720,35 @@ fn diff_row_job(
     // un-emphasized; the per-frame viewport pass fills visible lines in.
     let emphasis: &[std::ops::Range<usize>] = if word_diff { row.emphasis } else { &[] };
     let emph_bg = (!emphasis.is_empty()).then(|| emphasis_bg(line.kind, palette, backdrop));
-    // The clip, and with it the spans and emphasis that index into the body — all three
-    // have to be cut together or the ranges outlive the text they point at. The owned
-    // vectors are allocated only on a row that is actually too long, which is none of
-    // them on an ordinary diff.
-    let body = line.body();
-    let cut = clip_row_text(body);
-    // `Cow`, so the ordinary row — every row of every ordinary diff — borrows what it
-    // already has and a clipped one owns the two short vectors it had to rebuild.
-    let (body, spans, emphasis) = cut.map_or_else(
-        || {
-            (
-                body,
-                std::borrow::Cow::Borrowed(spans),
-                std::borrow::Cow::Borrowed(emphasis),
-            )
-        },
-        |at| {
-            (
-                &body[..at],
-                std::borrow::Cow::Owned(clip_spans(spans, at)),
-                std::borrow::Cow::Owned(clip_ranges(emphasis, at)),
-            )
-        },
-    );
+    // The window this row draws, and with it the spans and emphasis that index into
+    // the body — all three have to be cut together or the ranges outlive the text
+    // they point at. Two things narrow it and they compose: the wrap slice, and the
+    // `MAX_ROW_RENDER_CHARS` clip applied to whatever the slice left (which is
+    // therefore a no-op under wrapping, where a slice is a window wide).
+    let whole = line.rendered();
+    let text = whole.get(slice.range.clone()).unwrap_or("");
+    let cut = clip_row_text(text);
+    let window = slice.range.start..slice.range.start + cut.unwrap_or(text.len());
+    // `Cow`, so the ordinary unwrapped row — every row of every ordinary diff —
+    // borrows what it already has, and a sliced or clipped one owns the two short
+    // vectors it had to rebuild.
+    let (body, spans, emphasis) = if window == (0..whole.len()) {
+        (
+            whole,
+            std::borrow::Cow::Borrowed(spans),
+            std::borrow::Cow::Borrowed(emphasis),
+        )
+    } else {
+        (
+            cut.map_or(text, |at| &text[..at]),
+            std::borrow::Cow::Owned(window_spans(spans, &window)),
+            std::borrow::Cow::Owned(window_ranges(emphasis, &window)),
+        )
+    };
     append_body(
         &mut job, font_id, body, &spans, base_color, &emphasis, emph_bg,
     );
-    append_clip_marker(&mut job, font_id, palette, line.body(), cut);
+    append_clip_marker(&mut job, font_id, palette, text, cut);
 
     let row_bg = match line.kind {
         LineKind::Add if syntax => Some(palette.added_bg),
@@ -2713,13 +2977,16 @@ enum StartupDiff {
     Done,
 }
 
-/// Where a commit's diff was left: the diff pane's top row and the file-list
+/// Where a commit's diff was left: the diff pane's top LINE and the file-list
 /// sidebar's scroll offset. Kept per oid in `GitkApp::scroll_memory` (session-only)
 /// so revisiting a commit reopens both views where they were. The diff side is a
-/// row index, not pixels — it survives font-size changes and clamps cleanly when a
-/// settings change reshapes the diff.
+/// line index, not pixels — it survives font-size changes, clamps cleanly when a
+/// settings change reshapes the diff, and means the same thing after a soft-wrap
+/// re-wrap has moved every visual row (which a stored row would not).
 #[derive(Clone, Copy)]
 struct ScrollMemory {
+    /// A LINE of the diff, despite the name it has carried since rows and lines
+    /// were the same number.
     diff_row: usize,
     file_list_y: f32,
 }
@@ -2748,6 +3015,46 @@ impl ScrollPlan {
             Self::Anchor
         } else {
             Self::Restore
+        }
+    }
+}
+
+/// A pending diff-pane scroll target, in whichever coordinate system the asker
+/// actually has one in.
+///
+/// Without soft wrapping the two are the same number. With it they are not, and
+/// which one a request is stated in is a property of the request rather than
+/// something to normalize at the source:
+///
+/// - Everything that names a place in the CONTENT — a file click, a page-by-file
+///   step, a restored position, a resolved anchor — has a line, and must keep it. A
+///   line survives a width change, so a target queued before a resize still means
+///   what it meant; and it is resolved against the index for the content being
+///   drawn, at the `ScrollArea`, rather than against the outgoing diff's.
+/// - The half-screen Space step has a visual row and only a visual row. Rounding it
+///   to a line is not a small loss: half a screen inside a line that is itself
+///   screens tall is a sub-row number `row_of_line` cannot produce, so the step
+///   would land back at that line's first row and the key would do nothing at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DiffScrollTo {
+    Line(usize),
+    Row(usize),
+}
+
+impl DiffScrollTo {
+    /// As a logical line, for the two read-ahead windows that index `diff_lines`.
+    fn line(self, wrap: Option<&diff::WrapIndex>) -> usize {
+        match self {
+            Self::Line(l) => l,
+            Self::Row(r) => wrap.map_or(r, |w| w.line_of_row(r).0),
+        }
+    }
+
+    /// As a visual row, which is what the `ScrollArea`'s offset is measured in.
+    fn row(self, wrap: Option<&diff::WrapIndex>) -> usize {
+        match self {
+            Self::Line(l) => wrap.map_or(l, |w| w.row_of_line(l)),
+            Self::Row(r) => r,
         }
     }
 }
@@ -2786,7 +3093,10 @@ struct GitkApp {
     /// window at a time, so what is dropped refills in the frame it is next needed.
     diff_emphasis: diff::RowEmphasis,
     file_rows: Vec<FileListRow>, // cached file-list rows; rebuilt when diff_files or file_list changes
-    diff_scroll_to: Option<usize>,
+    /// Where the diff pane is being asked to scroll, one-shot: set by whatever
+    /// navigated, consumed by the render. See `DiffScrollTo` for why it is not
+    /// simply a row.
+    diff_scroll_to: Option<DiffScrollTo>,
     /// Per-commit scroll positions, remembered for the session so re-selecting a
     /// commit reopens the diff and file list where they were left (an unvisited
     /// commit opens at the top). Saved by `stash_current_diff` when a displayed
@@ -2815,8 +3125,18 @@ struct GitkApp {
     /// The sidebar's live scroll offset, recorded each frame it renders — what
     /// `stash_current_diff` saves into `scroll_memory` for the outgoing commit.
     file_list_scroll: f32,
-    diff_top_line: Arc<AtomicUsize>, // first visible diff line (set each frame in on_visible) — for page-by-file nav
-    diff_visible_rows: Arc<AtomicUsize>, // visible diff rows (set each frame in on_visible) — for Space page-scroll
+    /// Where the diff pane is, in both coordinate systems — written by the render
+    /// each frame, read by the frame loop on the next one. See `DiffViewport`.
+    diff_viewport: Arc<DiffViewport>,
+    /// Soft-wrap patch lines to the pane width — the toolbar's "Soft wrap", with
+    /// no config key behind it. Render-only, so it is not in `DiffSettings` and
+    /// neither cache is keyed on it.
+    wrap: bool,
+    /// Where each line sits in visual-row space, for the width the pane last had.
+    /// Measured lazily in the render — the first frame that draws a wrapped pane —
+    /// and dropped wherever the content, the width or the gutter moves, exactly as
+    /// `diff_linenos` is. `None` with `wrap` off, which is the identity mapping.
+    diff_wrap: Option<diff::WrapIndex>,
     graph_scroll_to: Option<(usize, Option<egui::Align>)>, // (commit index, alignment) to scroll to in graph view
     repo_path: String,
     scope: cli::Scope, // CLI ref/path scope, set once at startup
@@ -3563,6 +3883,7 @@ impl GitkApp {
         let toolbar_diff = ToolbarDiffSettings::load(cc.storage);
         let word_diff: bool = stored(cc.storage, "word_diff", false);
         let line_numbers: bool = stored(cc.storage, "line_numbers", false);
+        let wrap: bool = stored(cc.storage, "wrap", false);
 
         // The startup diff is deferred to the first frame: empty here, filled by
         // load_selected_diff on the StartupDiff::NeedsLoad pass. With no commits
@@ -3674,8 +3995,9 @@ impl GitkApp {
             file_list_scroll_to: None,
             pending_anchor: None,
             file_list_scroll: 0.0,
-            diff_top_line: Arc::new(AtomicUsize::new(0)),
-            diff_visible_rows: Arc::new(AtomicUsize::new(1)),
+            diff_viewport: Arc::new(DiffViewport::default()),
+            wrap,
+            diff_wrap: None,
             graph_scroll_to: None,
             repo_path,
             scope,
@@ -4015,23 +4337,27 @@ impl GitkApp {
         match plan {
             ScrollPlan::Restore => {
                 let mem = self.scroll_memory.get(&oid);
-                self.diff_scroll_to = Some(mem.map_or(0, |m| m.diff_row));
+                self.diff_scroll_to = Some(DiffScrollTo::Line(mem.map_or(0, |m| m.diff_row)));
                 self.file_list_scroll_to = Some(mem.map_or(0.0, |m| m.file_list_y));
             }
             ScrollPlan::Anchor => {
                 // Safe even while the pane shows the "Loading diff…" placeholder:
-                // the render's closure does not run then, so diff_top_line keeps
+                // the render's closure does not run then, so `diff_viewport` keeps
                 // its last real value and diff_lines still holds the outgoing
                 // content — the two stay mutually consistent, which is all the
                 // anchor needs. Unconditional on every same-oid call, and
                 // consumption clears it, so rapid clicking needs no epoch of its
                 // own: each capture reads what is genuinely on screen at that
                 // moment, and a superseded load's anchor is simply replaced.
+                // Lines, not visual rows, on both counts: the anchor indexes
+                // `diff_lines`, and under soft wrapping a screenful of rows can be
+                // a handful of lines — a centre taken half a screen of ROWS below
+                // the top line would land past the end of the diff.
                 self.pending_anchor = capture_anchor(
                     &self.diff_lines,
                     &self.diff_files,
-                    self.diff_top_line.load(Ordering::Relaxed),
-                    self.diff_visible_rows.load(Ordering::Relaxed),
+                    self.diff_viewport.top_line(),
+                    self.diff_viewport.lines(),
                 )
                 .map(|a| (oid, a));
             }
@@ -4082,7 +4408,9 @@ impl GitkApp {
             self.scroll_memory.insert(
                 key.oid,
                 ScrollMemory {
-                    diff_row: self.diff_top_line.load(Ordering::Relaxed),
+                    // A LINE, which is what makes the memory survive a width change:
+                    // a visual row means nothing once the pane has been re-wrapped.
+                    diff_row: self.diff_viewport.top_line(),
                     file_list_y: self.file_list_scroll,
                 },
             );
@@ -4135,15 +4463,20 @@ impl GitkApp {
         // One viewport of slack each side tolerates the one-frame lag of the
         // stored scroll position and gives read-ahead for free. The floor covers
         // the frames before any diff render has stored a real viewport height.
-        let visible = self.diff_visible_rows.load(Ordering::Relaxed).max(50);
+        // LINES, not visual rows: this window indexes `diff_lines`. Under soft
+        // wrapping the two differ, and the line count is the smaller — which is the
+        // right one here, since a screenful of wrapped rows is a screenful of text
+        // however few lines it came from.
+        let visible = self.diff_viewport.lines().max(50);
         let around = |center: usize| center.saturating_sub(visible)..center + 2 * visible;
         emphasize_rows(
             &self.diff_lines,
             &mut self.diff_emphasis,
-            around(self.diff_top_line.load(Ordering::Relaxed)),
+            around(self.diff_viewport.top_line()),
         );
         if let Some(target) = self.diff_scroll_to {
-            emphasize_rows(&self.diff_lines, &mut self.diff_emphasis, around(target));
+            let line = target.line(self.diff_wrap.as_ref());
+            emphasize_rows(&self.diff_lines, &mut self.diff_emphasis, around(line));
         }
     }
 
@@ -4308,6 +4641,12 @@ impl GitkApp {
         // `resync_file_layout` may reorder these lines afterwards; a re-lay moves
         // rows without changing any number, so a measurement still holds.
         self.diff_linenos = None;
+        // The wrap index goes for the same reason, but NOT for the same reason it
+        // holds across a re-lay: it is indexed BY line, so a permutation invalidates
+        // it (`resync_file_layout` drops it there too). Here it is simply a
+        // different diff — and `WrapIndex::covers` cannot see that, two diffs being
+        // free to have the same line count.
+        self.diff_wrap = None;
         self.diff_textconv_failed = textconv_failed;
         // Emphasis is not part of a diff and is not carried across one: it is per
         // viewport, and `ensure_visible_word_emphasis` refills the window on the next
@@ -4321,7 +4660,7 @@ impl GitkApp {
         self.diff_files = files;
         self.current_diff_key = key;
         self.diff_content_stale = false;
-        self.diff_top_line.store(0, Ordering::Relaxed);
+        self.diff_viewport.reset_top();
         let swap = t_swap.elapsed();
         let t_layout = std::time::Instant::now();
         self.resync_file_layout();
@@ -4386,7 +4725,7 @@ impl GitkApp {
             && anchored == oid
         {
             let row = resolve_anchor(&anchor, &self.diff_lines, &self.diff_files);
-            self.diff_scroll_to = Some(row);
+            self.diff_scroll_to = Some(DiffScrollTo::Line(row));
             // stash_current_diff just wrote the OUTGOING top row into
             // scroll_memory, in the pre-rebuild coordinate system. Left there, it
             // would undo this on the next navigate-away-and-back — the anchor is
@@ -4533,7 +4872,8 @@ impl GitkApp {
             .map(|hl| PreHighlight {
                 hl,
                 anchor: self.pending_anchor.as_ref().map(|(_, a)| a.clone()),
-                visible_rows: self.diff_visible_rows.load(Ordering::Relaxed),
+                // Lines: the pass bounds itself by an index into `data.lines`.
+                visible_rows: self.diff_viewport.lines(),
             });
         let job = DiffLoadJob {
             key,
@@ -4880,10 +5220,13 @@ impl GitkApp {
         // needed is already here: prefer a pending `diff_scroll_to` (a same-oid
         // rebuild's anchor, or a commit switch's restore, so where the view is
         // about to land) over the live top row.
-        let top = self
-            .diff_scroll_to
-            .unwrap_or_else(|| self.diff_top_line.load(Ordering::Relaxed));
-        let rows = top..top + self.diff_visible_rows.load(Ordering::Relaxed).max(1);
+        // Both in LINES — `VisibleRange::window` resolves them through
+        // `file_line_starts`, which is indexed by line.
+        let top = self.diff_scroll_to.map_or_else(
+            || self.diff_viewport.top_line(),
+            |t| t.line(self.diff_wrap.as_ref()),
+        );
+        let rows = top..top + self.diff_viewport.lines().max(1);
         let priority = Arc::new(VisibleRange {
             lo: AtomicUsize::new(0),
             hi: AtomicUsize::new(0),
@@ -5510,10 +5853,38 @@ impl GitkApp {
             // covers one viewport and `ensure_visible_word_emphasis` refills it on the
             // next frame, where the spans it sits beside cost seconds to recompute.
             self.diff_emphasis = diff::RowEmphasis::blank(self.diff_lines.len());
+            // And the wrap index, which names lines by INDEX: the permutation moves a
+            // 5,000-byte line to where a 40-byte one was, so every visual row past
+            // the first moved file would draw the wrong slice of the wrong line.
+            // `WrapIndex::covers` cannot catch it — the line count is unchanged, which
+            // is exactly what a permutation means. The render rebuilds next frame.
+            self.diff_wrap = None;
         }
         self.file_line_starts = file_line_starts(&self.diff_files);
         // New rows ⇒ the per-row galleys no longer correspond; rebuild lazily.
         self.sidebar_cache = SidebarCache::default();
+    }
+
+    /// Bring `diff_wrap` up to date for the pane's current width and gutter, and
+    /// say whether the row mapping MOVED — which the caller turns into a scroll
+    /// target, because a re-wrap moves every visual row below the first line that
+    /// breaks differently and would otherwise scroll the pane out from under
+    /// whoever is dragging the window edge.
+    ///
+    /// Lazy for the same reason `diff_linenos` is: a reader who leaves soft wrap off
+    /// never pays the pass, and ticking it needs no hook of its own — "off" and "not
+    /// measured yet" are the same `None`. The three inputs that invalidate an index
+    /// are compared inside `WrapIndex::covers`; the fourth, a different diff with the
+    /// same line count, is covered by `set_diff_content` and `resync_file_layout`
+    /// dropping the index outright.
+    fn ensure_wrap_index(&mut self, cols: usize, gutter: LineNoGutter) -> bool {
+        resync_wrap_index(
+            &mut self.diff_wrap,
+            self.wrap,
+            &self.diff_lines,
+            cols,
+            gutter,
+        )
     }
 
     /// File-list row height: `FILE_ROW_H` as the floor, growing with the configured
@@ -6650,6 +7021,14 @@ impl GitkApp {
                             // afterwards: the widths were measured when the diff
                             // installed, so the next frame simply draws them.
                             ui.checkbox(&mut self.line_numbers, "Line numbers");
+                            // Also render-only, and also needing nothing here: the
+                            // render's `ensure_wrap_index` builds an index on the
+                            // frame after a tick and drops it on the frame after an
+                            // untick, and reports EITHER as a move — which puts the
+                            // reader back on the line they were reading, so the pane
+                            // does not jump when the row count under it changes by a
+                            // factor of ten.
+                            ui.checkbox(&mut self.wrap, "Soft wrap");
                         });
                     });
                 });
@@ -6727,7 +7106,7 @@ impl GitkApp {
                     // still in the commit header) — highlighted below
                     // with the same accent the commit list uses for the
                     // selected row, so the list tracks the diff view.
-                    let top = self.diff_top_line.load(Ordering::Relaxed);
+                    let top = self.diff_viewport.top_line();
                     let current_file = file_index_at_line_opt(&self.file_line_starts, top);
                     // Shared by every row this frame — the metric
                     // lookup takes the font lock, so don't repeat
@@ -6781,7 +7160,7 @@ impl GitkApp {
                     if let Some(li) = scroll_to
                         && self.diff_load.is_none()
                     {
-                        self.diff_scroll_to = Some(li);
+                        self.diff_scroll_to = Some(DiffScrollTo::Line(li));
                     }
                     if let Some(req) = pending_apply {
                         self.request_apply(req);
@@ -7580,9 +7959,9 @@ impl GitkApp {
             // Step from the live top: the diff's bottom padding lets any file scroll to
             // the top, so `top` always reflects a reachable position (no clamp to work
             // around) and a manual scroll is honoured.
-            let top = self.diff_top_line.load(Ordering::Relaxed);
+            let top = self.diff_viewport.top_line();
             if let Some(line) = next_file_line(&self.file_line_starts, top, page_delta > 0) {
-                self.diff_scroll_to = Some(line);
+                self.diff_scroll_to = Some(DiffScrollTo::Line(line));
             }
         }
 
@@ -7601,16 +7980,23 @@ impl GitkApp {
             0
         };
         if space_dir != 0 && self.diff_scroll_to.is_none() && !self.diff_lines.is_empty() {
-            let top = self.diff_top_line.load(Ordering::Relaxed);
+            // The one movement measured in SCREENFULS rather than in content, so
+            // the only one stated in visual rows: with wrapping on, half a screen
+            // can be half of one line. See `DiffScrollTo`.
+            let top = self.diff_viewport.top_row();
             // Half a viewport per press — enough to advance, little enough to keep
             // context (a full page scrolls away almost everything you were reading).
-            let page = (self.diff_visible_rows.load(Ordering::Relaxed) / 2).max(1);
+            let page = (self.diff_viewport.rows() / 2).max(1);
+            let last = self
+                .diff_wrap
+                .as_ref()
+                .map_or(self.diff_lines.len(), diff::WrapIndex::total_rows);
             let new_top = if space_dir > 0 {
-                (top + page).min(self.diff_lines.len())
+                (top + page).min(last)
             } else {
                 top.saturating_sub(page)
             };
-            self.diff_scroll_to = Some(new_top);
+            self.diff_scroll_to = Some(DiffScrollTo::Row(new_top));
         }
     }
 }
@@ -7684,6 +8070,7 @@ impl eframe::App for GitkApp {
         ToolbarDiffSettings::of(self.diff_settings).save(storage);
         eframe::set_value(storage, "word_diff", &self.word_diff);
         eframe::set_value(storage, "line_numbers", &self.line_numbers);
+        eframe::set_value(storage, "wrap", &self.wrap);
     }
 
     /// eframe calls this after `save`, before dropping us — the last point the app
@@ -7939,8 +8326,24 @@ impl eframe::App for GitkApp {
                     } else {
                         LineNoGutter::default()
                     };
+                    // The wrap index, for the pane's CURRENT width and gutter.
+                    // Measured lazily like the gutter above, and for the same
+                    // reasons: a reader who leaves `[diff] wrap` off pays nothing,
+                    // and turning it on needs no hook of its own — "off" and "not
+                    // measured yet" are one state.
+                    //
+                    // The width is the pane's less what a solid scrollbar takes.
+                    // Subtracted unconditionally, though egui only reserves it when
+                    // the bar is actually needed: over-subtracting leaves a wrapped
+                    // line a few points short of the right edge, while
+                    // under-subtracting would run it under the bar — and the bar's
+                    // presence depends on the content height, which depends on this.
+                    let font_id = self.fonts.font_id(Role::Diff);
+                    let cols = wrap_cols(ui, &font_id);
+                    let rewrapped = self.ensure_wrap_index(cols, linenos);
                     let diff_view = DiffView {
                         n_lines: self.diff_lines.len(),
+                        wrap: self.diff_wrap.as_ref(),
                         // Capped where the rendering is: past `MAX_ROW_RENDER_CHARS`
                         // no row draws anything, so a scroll range sized to an 8M-char
                         // line would be tens of millions of pixels of blank to get
@@ -7948,10 +8351,18 @@ impl eframe::App for GitkApp {
                         // which is what covers the clip marker's own few characters.
                         content_chars: self.diff_max_chars.min(MAX_ROW_RENDER_CHARS)
                             + linenos.chars(),
+                        // A pending target wins; failing that, a re-wrap holds the
+                        // reader's place. Re-wrapping moves every visual row below
+                        // the first line that broke differently, so without this
+                        // dragging the window edge scrolls the pane out from under
+                        // whoever is resizing it. `top_line` is a frame behind,
+                        // which is exactly right: it is the pre-resize position.
                         scroll_target: if diff_load_elapsed.is_some() {
                             None
                         } else {
-                            self.diff_scroll_to.take()
+                            self.diff_scroll_to.take().or_else(|| {
+                                rewrapped.then(|| DiffScrollTo::Line(self.diff_viewport.top_line()))
+                            })
                         },
                         // Deepest file-start line (None ⇒ no files). `file_line_starts`
                         // is sorted by start, so the last entry is the largest — an
@@ -7976,38 +8387,42 @@ impl eframe::App for GitkApp {
                     } else {
                         &self.diff_palette
                     };
-                    let font_id = self.fonts.font_id(Role::Diff);
                     let lines = &self.diff_lines;
                     let spans = &self.diff_spans;
                     let emphasis = &self.diff_emphasis;
                     let starts = &self.file_line_starts;
                     let priority = self.highlight_priority.as_ref();
                     let word_diff = self.word_diff;
-                    let diff_top = Arc::clone(&self.diff_top_line);
-                    let diff_visible = Arc::clone(&self.diff_visible_rows);
+                    let viewport = Arc::clone(&self.diff_viewport);
+                    let wrap = self.diff_wrap.as_ref();
                     show_virtualized_diff(
                         ui,
                         &font_id,
                         diff_view,
-                        |rows, viewport_rows| {
-                            diff_top.store(rows.start, Ordering::Relaxed);
-                            diff_visible.store(viewport_rows, Ordering::Relaxed);
+                        |v| {
+                            viewport.store(v.top_line, v.top_row, v.rows, v.lines.len());
                             // Tell the background worker which files are on screen so it
-                            // tokenizes those first, plus one viewport (in rows)
+                            // tokenizes those first, plus one viewport (in lines)
                             // above/below for read-ahead. No-op with syntax off — there
                             // is no worker, so priority is None.
                             if let Some(p) = priority
-                                && rows.start < rows.end
+                                && v.lines.start < v.lines.end
                             {
-                                p.store(VisibleRange::window(starts, rows));
+                                p.store(VisibleRange::window(starts, v.lines));
                             }
                         },
-                        |i| {
+                        |i, sub| {
+                            let line = &lines[i];
+                            let slice = wrap.map_or_else(
+                                || diff::RowSlice::whole(line),
+                                |w| w.slice(line, sub),
+                            );
                             let (job, row_bg) = diff_row_job(
-                                &lines[i],
+                                line,
                                 RowStyle {
                                     spans: spans.slice(i),
                                     emphasis: emphasis.slice(i),
+                                    slice: &slice,
                                 },
                                 render_palette,
                                 &font_id,
@@ -8725,11 +9140,13 @@ mod tests {
         let palette = hl.palette().clone();
         let fid = egui::FontId::monospace(13.0);
         let bg = |text: &str, kind| {
+            let line = DiffLine::new(text, kind);
             diff_row_job(
-                &DiffLine::new(text, kind),
+                &line,
                 RowStyle {
                     spans: &[],
                     emphasis: &[],
+                    slice: &diff::RowSlice::whole(&line),
                 },
                 &palette,
                 &fid,
@@ -8774,11 +9191,13 @@ mod tests {
                 LineKind::Del => format!("-{huge}"),
                 _ => huge.clone(),
             };
+            let line = DiffLine::new(text.as_str(), kind);
             let (job, _) = diff_row_job(
-                &DiffLine::new(text.as_str(), kind),
+                &line,
                 RowStyle {
                     spans: &[],
                     emphasis: &[],
+                    slice: &diff::RowSlice::whole(&line),
                 },
                 &palette,
                 &fid,
@@ -8805,11 +9224,13 @@ mod tests {
         let hl = highlight::test_highlighter();
         let palette = hl.palette().clone();
         let fid = egui::FontId::monospace(13.0);
+        let line = DiffLine::new("+let x = 1;", LineKind::Add);
         let (job, _) = diff_row_job(
-            &DiffLine::new("+let x = 1;", LineKind::Add),
+            &line,
             RowStyle {
                 spans: &[(palette.foreground, 0..3)],
                 emphasis: &[],
+                slice: &diff::RowSlice::whole(&line),
             },
             &palette,
             &fid,
@@ -8829,11 +9250,13 @@ mod tests {
         let fid = egui::FontId::monospace(13.0);
         // Three bytes a character, so a byte-index cut lands mid-character.
         let text = format!("+{}", "日".repeat(MAX_ROW_RENDER_CHARS * 2));
+        let line = DiffLine::new(text.as_str(), LineKind::Add);
         let (job, _) = diff_row_job(
-            &DiffLine::new(text.as_str(), LineKind::Add),
+            &line,
             RowStyle {
                 spans: &[],
                 emphasis: &[],
+                slice: &diff::RowSlice::whole(&line),
             },
             &palette,
             &fid,
@@ -8861,7 +9284,7 @@ mod tests {
                 MAX_ROW_RENDER_CHARS + 500..MAX_ROW_RENDER_CHARS + 900,
             ),
         ];
-        let got = clip_spans(&spans, MAX_ROW_RENDER_CHARS);
+        let got = window_spans(&spans, &(0..MAX_ROW_RENDER_CHARS));
         assert_eq!(got.len(), 2, "the span wholly past the cut goes");
         assert_eq!(got[0].1, 0..10, "the span wholly before it is untouched");
         assert_eq!(
@@ -8871,8 +9294,214 @@ mod tests {
         );
         // Same rule for the word-diff emphasis, over the same body.
         let emph = vec![0..10, 10..MAX_ROW_RENDER_CHARS + 500];
-        let got = clip_ranges(&emph, MAX_ROW_RENDER_CHARS);
+        let got = window_ranges(&emph, &(0..MAX_ROW_RENDER_CHARS));
         assert_eq!(got, vec![0..10, 10..MAX_ROW_RENDER_CHARS]);
+    }
+
+    /// A window that does not start at 0 — which is every row of a soft-wrapped line
+    /// past the first — cuts the spans to it AND rebases them, since they index the
+    /// slice the row draws rather than the line it came from. An un-rebased span
+    /// would colour the wrong characters, or fall outside the slice entirely and
+    /// take its text with it (see `append_body`).
+    #[test]
+    fn a_windowed_rows_spans_are_cut_and_rebased_to_it() {
+        let c = egui::Color32::RED;
+        let spans = vec![(c, 0..5), (c, 5..12), (c, 12..20)];
+        assert_eq!(
+            window_spans(&spans, &(5..12)),
+            vec![(c, 0..7)],
+            "a window matching one span keeps it alone, at 0"
+        );
+        assert_eq!(
+            window_spans(&spans, &(3..14))
+                .into_iter()
+                .map(|(_, r)| r)
+                .collect::<Vec<_>>(),
+            vec![0..2, 2..9, 9..11],
+            "both straddlers keep the half that is drawn"
+        );
+        assert!(
+            window_spans(&spans, &(20..24)).is_empty(),
+            "a window past every span draws none of them"
+        );
+        // Same rule for the word-diff emphasis, over the same body.
+        assert_eq!(window_ranges(&[0..5, 12..20], &(3..14)), vec![0..2, 9..11]);
+    }
+
+    /// A soft-wrapped line's visual rows tile it, under one gutter: the first row
+    /// carries the line numbers and the `+`/`-` marker, every continuation blanks
+    /// both columns so the text stays in a single column, and the drawn bodies
+    /// concatenate back to the line.
+    ///
+    /// The two halves have to agree or the wrapping is wrong in a way no unit of
+    /// either half can see: `diff::wrap` subtracts the gutter and marker from the
+    /// columns it wraps at, and `diff_row_job` is what has to actually draw them
+    /// that wide.
+    #[test]
+    fn a_wrapped_lines_rows_tile_it_under_one_gutter() {
+        let hl = highlight::test_highlighter();
+        let palette = hl.palette().clone();
+        let fid = egui::FontId::monospace(13.0);
+        let n = std::num::NonZeroU32::new;
+        let body = "abcdefghij".repeat(10);
+        let body = body.as_str();
+        let lines = vec![DiffLine::with_linenos(
+            format!("+{body}"),
+            LineKind::Add,
+            None,
+            n(7),
+        )];
+        let g = LineNoGutter::measure(&lines);
+        // One digit and a space, on the new side only.
+        assert_eq!(g.chars(), 2);
+        // Comfortably over `diff::wrap`'s minimum body width, so the wrap really
+        // happens at `cols - prefix_len` and not at that floor.
+        let cols = 23;
+        let prefix_len = g.chars() + 1; // + the marker column
+        let idx = diff::WrapIndex::build(&lines, cols, g);
+        let rows = idx.total_rows();
+        assert_eq!(rows, body.len().div_ceil(cols - prefix_len));
+        let mut drawn = String::new();
+        for sub in 0..rows {
+            let slice = idx.slice(&lines[0], sub);
+            let (job, _) = diff_row_job(
+                &lines[0],
+                RowStyle {
+                    spans: &[],
+                    emphasis: &[],
+                    slice: &slice,
+                },
+                &palette,
+                &fid,
+                g,
+                false,
+                true,
+            );
+            let (prefix, text) = job.text.split_at(prefix_len);
+            if sub == 0 {
+                assert_eq!(prefix, "7 +");
+            } else {
+                assert_eq!(prefix, "   ", "row {sub} blanks the gutter and the marker");
+            }
+            assert!(
+                text.len() <= cols - prefix_len,
+                "row {sub} is {} columns wide, over {cols}",
+                text.len() + prefix_len
+            );
+            drawn.push_str(text);
+        }
+        assert_eq!(drawn, body, "every byte of the line is drawn exactly once");
+    }
+
+    /// Every transition of the wrap index, and specifically that **dropping one
+    /// reports a move**.
+    ///
+    /// Only reporting the build looks symmetric and is not. The `ScrollArea`'s offset
+    /// is in visual rows, so the frame after soft wrap is unticked that offset names a
+    /// different line entirely — unticking a few hundred wrapped rows into a diff
+    /// jumped to another file. What the caller does with a `true` is pin the reader's
+    /// line, and the line needs pinning whenever the mapping under it changes, in
+    /// either direction.
+    #[test]
+    fn dropping_the_wrap_index_reports_a_move_exactly_as_building_one_does() {
+        let g = LineNoGutter::default();
+        let lines = vec![
+            DiffLine::new("x".repeat(400), LineKind::Context),
+            DiffLine::new("short", LineKind::Context),
+        ];
+        let mut index = None;
+
+        // Off, and nothing to drop: no move, on this frame or any after it.
+        assert!(!resync_wrap_index(&mut index, false, &lines, 40, g));
+        assert!(!resync_wrap_index(&mut index, false, &lines, 40, g));
+        assert!(index.is_none());
+
+        // Ticked on: built, and a move.
+        assert!(resync_wrap_index(&mut index, true, &lines, 40, g));
+        assert!(index.as_ref().is_some_and(|w| w.total_rows() > lines.len()));
+        // Settled: same inputs, no move — or the pane would be pinned every frame
+        // and could not be scrolled at all.
+        assert!(!resync_wrap_index(&mut index, true, &lines, 40, g));
+        // A narrower pane re-wraps: a move.
+        assert!(resync_wrap_index(&mut index, true, &lines, 30, g));
+
+        // Unticked: the index goes, and that IS a move — this is the assertion the
+        // bug failed.
+        assert!(resync_wrap_index(&mut index, false, &lines, 30, g));
+        assert!(index.is_none());
+        // And exactly once: every frame after the untick is quiet again.
+        assert!(!resync_wrap_index(&mut index, false, &lines, 30, g));
+    }
+
+    /// The pane's virtualization under soft wrapping, end to end: `show_rows`
+    /// scrolls over VISUAL rows, and every callback above the renderer is handed the
+    /// LINE that row belongs to.
+    ///
+    /// The unit tests either side of this one pin the index and the row builder
+    /// separately; this is the seam between them, and it is where an off-by-one
+    /// would show as a row of the wrong file rather than as a failing assertion.
+    #[test]
+    fn a_wrapped_pane_lays_out_visual_rows_and_reports_lines() {
+        let lines = vec![
+            DiffLine::new("commit abc", LineKind::Meta),
+            DiffLine::new("x".repeat(400), LineKind::Context),
+            DiffLine::new("tail", LineKind::Context),
+        ];
+        let cols = 40;
+        let idx = diff::WrapIndex::build(&lines, cols, LineNoGutter::default());
+        assert!(idx.total_rows() > 3, "the long line has to actually wrap");
+        let lay_out = |wrap: Option<&diff::WrapIndex>| {
+            let mut asked: Vec<(usize, usize)> = Vec::new();
+            let mut seen: Option<(usize, usize, std::ops::Range<usize>)> = None;
+            run_headless_input(headless_screen(600.0, 400.0), |ui| {
+                let fid = egui::FontId::monospace(13.0);
+                show_virtualized_diff(
+                    ui,
+                    &fid,
+                    DiffView {
+                        n_lines: lines.len(),
+                        wrap,
+                        content_chars: 0,
+                        scroll_target: None,
+                        last_top_anchor: None,
+                        menu_salt: 0,
+                    },
+                    |v| seen = Some((v.top_line, v.top_row, v.lines)),
+                    |line, sub| {
+                        asked.push((line, sub));
+                        (egui::text::LayoutJob::default(), None, egui::Color32::WHITE)
+                    },
+                    |_| None,
+                    |_, _, _| {},
+                );
+            });
+            (asked, seen.expect("the render reports its viewport"))
+        };
+
+        let (asked, (top_line, top_row, visible)) = lay_out(Some(&idx));
+        // Row 0 is the commit-message line, and rows 1.. are the long line's own,
+        // in order — exactly what the index says.
+        let want: Vec<(usize, usize)> = (0..asked.len()).map(|r| idx.line_of_row(r)).collect();
+        assert_eq!(asked, want);
+        assert!(
+            asked.len() > 3,
+            "the viewport should hold several of the wrapped rows, got {}",
+            asked.len()
+        );
+        assert_eq!((top_line, top_row), (0, 0));
+        assert_eq!(
+            visible,
+            0..lines.len(),
+            "the reported window is in LINES, and here the whole diff is on screen"
+        );
+
+        // The control, and the claim the default rests on: with no index the pane
+        // lays out one row per line and reports the identity — literally the `None`
+        // arm of every conversion above.
+        let (asked, (top_line, top_row, visible)) = lay_out(None);
+        assert_eq!(asked, vec![(0, 0), (1, 0), (2, 0)]);
+        assert_eq!((top_line, top_row), (0, 0));
+        assert_eq!(visible, 0..lines.len());
     }
 
     /// The gutter is prepended by the ROW builder, ahead of the structural early
@@ -8882,6 +9511,13 @@ mod tests {
     /// none — turning line numbers on must not indent the message.
     #[test]
     fn diff_row_job_puts_every_patch_row_in_one_line_number_column() {
+        fn plain(slice: &diff::RowSlice) -> RowStyle<'_> {
+            RowStyle {
+                spans: &[],
+                emphasis: &[],
+                slice,
+            }
+        }
         let hl = highlight::test_highlighter();
         let palette = hl.palette().clone();
         let fid = egui::FontId::monospace(13.0);
@@ -8894,12 +9530,9 @@ mod tests {
             DiffLine::with_linenos("+new", LineKind::Add, None, n(100)),
         ];
         let g = LineNoGutter::measure(&lines);
-        let plain = RowStyle {
-            spans: &[],
-            emphasis: &[],
-        };
         let row = |i: usize, g| {
-            diff_row_job(&lines[i], plain, &palette, &fid, g, false, true)
+            let slice = diff::RowSlice::whole(&lines[i]);
+            diff_row_job(&lines[i], plain(&slice), &palette, &fid, g, false, true)
                 .0
                 .text
         };
@@ -8925,7 +9558,8 @@ mod tests {
         // sit one column left of the changed ones, beside a column of numbers
         // that lines up perfectly.
         let flat = |i: usize| {
-            diff_row_job(&lines[i], plain, &palette, &fid, g, false, false)
+            let slice = diff::RowSlice::whole(&lines[i]);
+            diff_row_job(&lines[i], plain(&slice), &palette, &fid, g, false, false)
                 .0
                 .text
         };
@@ -10174,9 +10808,26 @@ mod tests {
     /// `textures_delta` here, so a future `FullOutput` field with the same drop rule
     /// is covered without this function knowing about it.
     fn run_headless(f: impl FnMut(&mut egui::Ui)) {
+        run_headless_input(egui::RawInput::default(), f);
+    }
+
+    /// `run_headless` for a test that needs a viewport of a stated size — one
+    /// rendering a virtualized list, where the number of rows laid out is the thing
+    /// under test and the default rect is not something to depend on.
+    fn run_headless_input(input: egui::RawInput, f: impl FnMut(&mut egui::Ui)) {
         let ctx = egui::Context::default();
-        ctx.run_ui(egui::RawInput::default(), f)
-            .drop_without_applying_deltas();
+        ctx.run_ui(input, f).drop_without_applying_deltas();
+    }
+
+    /// A `RawInput` whose viewport is `w` × `h` points.
+    fn headless_screen(w: f32, h: f32) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(w, h),
+            )),
+            ..Default::default()
+        }
     }
 
     #[test]
