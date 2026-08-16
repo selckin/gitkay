@@ -383,6 +383,12 @@ any extension that syntax already handles. Matching is case-insensitive, and
 this map is consulted *before* the built-in lookup, so it can also override a
 grammar you dislike.
 
+A few mappings are built in, for suffixes syntect has the grammar for but does
+not claim: `.mjs` and `.cjs` are JavaScript. Anything you write here wins over
+them. Extensions where plain text is genuinely the right rendering — `.pem`, for
+instance, being a base64 block — are deliberately left unmapped: no grammar
+improves them, and claiming one would only colour them wrongly.
+
 ### `[diff.bands]` — the add/remove row tints
 
 The green/red backgrounds behind added and deleted lines, when `syntax = true`.

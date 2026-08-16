@@ -482,6 +482,7 @@ fn default_template() -> String {
          # Key = file extension (no dot); value = a syntax by name (\"XML\") or by one\n\
          # of its own extensions (\"xml\"). Without a mapping such a file falls back to\n\
          # plain text — which still renders, just in one flat colour.\n\
+         # .mjs and .cjs are mapped to JavaScript for you; anything here overrides that.\n\
          # oml = \"xml\"\n\
          # tfvars = \"hcl\"\n\
          \n\
