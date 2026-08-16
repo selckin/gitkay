@@ -51,8 +51,8 @@ use diff_store::DiffStore;
 use graph::{GraphLayoutState, GraphRow, layout_graph_rows};
 use highlight::{DiffBg, Highlighter};
 use history::{
-    CommitInfo, HistoryWalk, PROVISIONAL_HISTORY_DELAY, RefKind, ScopeNotice, diff_paths_for,
-    load_history, provisional_commits, provisional_scope, scope_notice,
+    CommitInfo, HistoryWalk, PROVISIONAL_HISTORY_DELAY, RefKind, ScopeNotice, TipPaths,
+    diff_paths_for, load_history, provisional_commits, provisional_scope, scope_notice,
 };
 use prefetch::{
     InflightClaim, InflightKeys, PoolHandle, PrefetchBudget, PrefetchTarget, WarmDisposition,
@@ -4871,6 +4871,7 @@ impl GitkApp {
                     count,
                     derived,
                     oids,
+                    tip,
                 }) => {
                     // A rebuild is a newer view of the repo than the startup walk,
                     // which was begun in `main()` before the window existed — so it
@@ -4894,7 +4895,7 @@ impl GitkApp {
                     // a history nobody is looking at.
                     self.history_oids = oids;
                     self.install_derived(*derived);
-                    self.refresh_scope_notice();
+                    self.refresh_scope_notice(&tip);
                     self.finish_resync(count, None, previous_oid, previous_index);
                 }
             }
@@ -4914,8 +4915,8 @@ impl GitkApp {
     /// of a walk still running, so its emptiness means "not yet", not "nothing
     /// matched". An append cannot reach a notice either — every case here is about
     /// rows being absent, and an append only adds.
-    fn refresh_scope_notice(&mut self) {
-        let notice = scope_notice(&self.scope, &self.commits);
+    fn refresh_scope_notice(&mut self, tip: &TipPaths) {
+        let notice = scope_notice(&self.scope, &self.commits, tip);
         if notice != self.scope_notice {
             if let Some(n) = &notice {
                 log::warn!("{}", n.text);
@@ -6452,6 +6453,9 @@ impl GitkApp {
                 HistoryWalk {
                     commits,
                     oids: None,
+                    // Provisional: no notice is computed for it at all, so there is
+                    // nothing for a tip answer to phrase.
+                    tip: TipPaths::Unknown,
                 },
                 true,
                 ctx,
@@ -6490,7 +6494,7 @@ impl GitkApp {
         provisional: bool,
         ctx: &egui::Context,
     ) {
-        let HistoryWalk { commits, oids } = walk;
+        let HistoryWalk { commits, oids, tip } = walk;
         let t = std::time::Instant::now();
         let chosen_by_reader = self
             .history_is_provisional
@@ -6501,7 +6505,7 @@ impl GitkApp {
         self.commits = commits;
         self.install_derived(derived);
         if !provisional {
-            self.refresh_scope_notice();
+            self.refresh_scope_notice(&tip);
         }
         // A provisional list is never "all there is", however short: the real walk
         // decides that. Leaving it true would also let the scroll extension run
