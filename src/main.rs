@@ -4638,6 +4638,11 @@ impl GitkApp {
         });
         priority.store(VisibleRange::window(&self.file_line_starts, rows));
         self.highlight_priority = Some(Arc::clone(&priority));
+        // The hand-off, timed: the worker reads the diff but must not race the UI
+        // writing spans into it, so it gets a copy — and a copy is O(lines) of struct
+        // moves and `Arc` bumps on the FRAME LOOP. Cheap for an ordinary diff (the
+        // text itself is shared), and the one thing here that grows without bound.
+        let t_clone = std::time::Instant::now();
         let job = HighlightJob {
             hl: Arc::clone(hl),
             lines: self.diff_lines.clone(),
@@ -4648,6 +4653,11 @@ impl GitkApp {
             tx: self.highlight_tx.clone(),
             ctx: ctx.clone(),
         };
+        log::debug!(
+            "perf: highlight hand-off: copied {} lines in {:?}",
+            job.lines.len(),
+            t_clone.elapsed()
+        );
         // `Builder::spawn` returns Err on thread exhaustion (vs `spawn`, which
         // panics). On failure, highlight synchronously so the diff still gets
         // coloured rather than staying plain forever.
@@ -7444,7 +7454,13 @@ impl eframe::App for GitkApp {
         self.handle_deferred_diff_load(&ctx);
         self.handle_config_reload(&ctx);
         self.drain_history_results();
+        // Timed apart from its neighbours because it is the one that can be slow for a
+        // reason the reader feels: it installs a finished diff and hands it to the
+        // highlighter, both O(lines). The others are bounded by how many results
+        // arrived.
+        let t_worker = std::time::Instant::now();
         self.drain_worker_results(&ctx);
+        let worker_drain = t_worker.elapsed();
         self.drain_apply_results();
         self.drain_commit_stats();
         let t_drains = std::time::Instant::now();
@@ -7740,7 +7756,8 @@ impl eframe::App for GitkApp {
         let total = frame_t0.elapsed();
         if total > std::time::Duration::from_millis(20) {
             log::debug!(
-                "perf: slow frame {total:?} (drains {:?}, keys {:?}, commits {:?}, diff+files {:?})",
+                "perf: slow frame {total:?} (drains {:?} of which worker {worker_drain:?}, \
+                 keys {:?}, commits {:?}, diff+files {:?})",
                 t_drains - frame_t0,
                 t_keys - t_drains,
                 t_commits - t_keys,
