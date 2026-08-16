@@ -50,6 +50,12 @@ impl<K: Clone + Eq + Hash, V> DiffCache<K, V> {
         }
     }
 
+    /// The summed weight — lines — of everything held. For the shutdown timing log,
+    /// where the count is what makes the duration mean something.
+    pub const fn weight(&self) -> usize {
+        self.total
+    }
+
     /// Whether `key` is cached, without touching LRU recency — a peek, unlike the
     /// move-out `remove`. Used by the prefetch dispatch to skip already-cached
     /// neighbours.
