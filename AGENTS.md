@@ -516,7 +516,11 @@ The invariants:
   scroll. Stats **are** derived from a built `DiffData` — `diff::stats_from_data`, called by
   `cache_diff` on every real commit it caches, which is what stops the same blobs being
   read twice (once for the column, once for the pane), and by `run_stats_job` off a
-  persistent-store hit. A warm sends them ITSELF, as soon as its diff exists and
+  persistent-store hit — consulted BEFORE the cost probe, because that probe runs a whole
+  `scoped_diff` and with rename detection on a 1317-delta commit that measured **10.2s**,
+  paid to answer a question already answered on disk (a miss is ~6-8µs). Losing the cost
+  measurement is safe: a stored row is loaded rather than built, and a pruned entry is
+  re-probed by `warm_row` and deferred there. A warm sends them ITSELF, as soon as its diff exists and
   **before it colours**: `cache_diff` only runs when the `WarmResult` lands, on the far
   side of a speculative pass that measured 29.6s once, so a row whose counts were known
   at 418ms shipped them half a minute later — and a blob-heavy row, whose stats job
