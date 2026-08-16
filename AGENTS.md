@@ -216,6 +216,19 @@ inside the allocation, so a row costs ONE allocation on the build's hottest path
 instead of two, and `push_patch_line` assembles each row in a reused buffer rather
 than a `format!` (measured 36% off the per-line construction; the row itself grows
 8 B and the heap per row shrinks ~16 B),
+`DiffRows` (the rows a build is accumulating, plus the widest one measured AS THEY ARE
+PUSHED — `DiffData::max_chars` sizes the pane's horizontal scroll range and used to be
+rescanned off the finished diff, a second traversal of rows that are cache-cold by
+then, at 16ms per 900k lines. A type rather than a counter carried beside the `Vec` for
+two reasons: every writer goes through `push`/`extend`/`set`, so no row can be added
+without being measured — the commit-message header and the diffstat block are as able
+to hold the widest row as a patch line is, and a missed one UNDER-reports, which is the
+direction that truncates the scroll range — and the three signatures carrying the rows
+keep their argument counts, two of them being at clippy's limit already. `mark`/`rewind`
+rather than `truncate`, because a running maximum cannot be un-maxed by dropping rows:
+`emit_converted` abandons a half-written converted patch, and its width would otherwise
+outlive the text. `DiffData::new`, which rescans, is now `#[cfg(test)]` — nothing in the
+app traverses a finished diff for this),
 `LineNoGutter` (the line-number column's widths and per-row text — pure, and here
 rather than in `main.rs` because it is a question about `DiffLine` data),
 the scroll anchor (its own child module,
