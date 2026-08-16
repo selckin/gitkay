@@ -379,15 +379,27 @@ pub fn rewrite_parents(
     out
 }
 
-/// The revwalk `load_commits` and `load_commits_tail` share: TIME|TOPOLOGICAL
-/// sorting plus the scope's pushes. One constructor so the two walks can't diverge
-/// in ordering config — the tail resume is only sound if both produce the same
+/// The revwalk `load_commits` and `load_commits_tail` share: topological sorting
+/// plus the scope's pushes. One constructor so the two walks can't diverge in
+/// ordering config — the tail resume is only sound if both produce the same
 /// deterministic order over the same repo state.
 pub fn history_revwalk<'r>(repo: &'r Repository, scope: &cli::Scope) -> Option<git2::Revwalk<'r>> {
     let Ok(mut revwalk) = repo.revwalk() else {
         return None;
     };
-    if let Err(e) = revwalk.set_sorting(Sort::TIME | Sort::TOPOLOGICAL) {
+    // `TOPOLOGICAL` ALONE, not `TIME | TOPOLOGICAL`. Adding `TIME` orders the
+    // topological result by date, which is `git rev-list --date-order` — measurably
+    // so: it matched that exactly on a kernel clone while sharing only 82 of its
+    // first 120 commits with `--topo-order`. What a reader sees is a maintainer's
+    // merges stacked together with their contents hundreds of rows below.
+    //
+    // Without it libgit2 reproduces `git rev-list --topo-order` — verified against
+    // git itself on five repositories including the kernel, where the two sortings
+    // differ. That is the order `git log --graph` shows, and it is the order the
+    // lazy walk produces, so which of the two answers a scope no longer decides
+    // what order it is drawn in. A commit-graph appearing (a `git gc` runs) must
+    // change the SPEED and nothing else.
+    if let Err(e) = revwalk.set_sorting(Sort::TOPOLOGICAL) {
         log::warn!("gitkay: cannot set commit sort order: {e}");
     }
     if scope.all {
@@ -2343,7 +2355,7 @@ mod tests {
         ];
         let oids: Vec<git2::Oid> = {
             let mut rw = repo.revwalk().unwrap();
-            rw.set_sorting(Sort::TIME | Sort::TOPOLOGICAL).unwrap();
+            rw.set_sorting(Sort::TOPOLOGICAL).unwrap();
             rw.push_head().unwrap();
             rw.flatten().collect()
         };
