@@ -573,6 +573,45 @@ fn timed<T>(acc: &mut std::time::Duration, f: impl FnOnce() -> T) -> T {
 /// page, because `history_worker` opens a fresh `Repository` each time). `None` for
 /// scopes whose walk output is not a plain prefix — a path filter drops and rewrites
 /// as it goes, so draining it is neither free nor a list of what the next page holds.
+/// Can this scope be walked with generation numbers, in `git log --graph`'s order?
+///
+/// Deliberately narrow: the plain current-branch scope and nothing else. What rules
+/// the others out is not the walk but the VERIFICATION — this order was checked
+/// against `git rev-list --topo-order` itself, and only for a single tip. `--all`
+/// needs a tip ordering matched against `git rev-list --all`, a range needs
+/// exclusions the walk has no notion of, and a path filter needs git's history
+/// simplification; each is its own change with its own oracle run. Everything not
+/// listed here falls back to the sorted revwalk, which is slow but correct.
+pub const fn topo_scope(scope: &cli::Scope) -> bool {
+    !scope.all && !scope.reflog && !scope.follow && scope.revs.is_empty() && scope.paths.is_empty()
+}
+
+/// Whether this repository can be walked lazily right now — the scope allows it AND
+/// a readable commit-graph exists. Cheap enough to ask before deciding anything:
+/// opening the kernel's 88MB graph is ~100µs, since nothing is parsed but the header.
+pub fn topo_available(repo: &Repository, scope: &cli::Scope) -> bool {
+    topo_scope(scope) && crate::commitgraph::CommitGraph::for_repo(repo).is_some()
+}
+
+/// `want` oids in `git log --graph` order, or `None` when this repository or scope
+/// cannot be walked that way and the sorted revwalk has to do it.
+fn topo_oids(repo: &Repository, scope: &cli::Scope, want: usize) -> Option<Vec<git2::Oid>> {
+    if !topo_scope(scope) {
+        return None;
+    }
+    let graph = crate::commitgraph::CommitGraph::for_repo(repo)?;
+    let head = repo.head().ok()?.peel_to_commit().ok()?.id();
+    let t = std::time::Instant::now();
+    let oids = crate::topo::TopoWalk::new(repo, &graph, &[head], scope.first_parent).take(want)?;
+    log::debug!(
+        "perf: load_commits: topo walk ({} of {want} rows, graph has {}) {:?}",
+        oids.len(),
+        graph.len(),
+        t.elapsed()
+    );
+    Some(oids)
+}
+
 pub fn load_commits_inner(repo: &Repository, max: usize, scope: &cli::Scope) -> HistoryWalk {
     let t = std::time::Instant::now();
     let ref_map = build_ref_map(repo);
@@ -656,178 +695,195 @@ pub fn load_commits_inner(repo: &Repository, max: usize, scope: &cli::Scope) -> 
     let mut walked_commits: Option<usize> = None;
     // The pushes, separately from the walking they set up: `push_glob` resolves every
     // ref it matches, so `--all` on a tag-heavy repo pays here and nowhere else.
-    let t_setup = std::time::Instant::now();
-    let walk = history_revwalk(repo, scope);
-    let setup = t_setup.elapsed();
-    if let Some(revwalk) = walk {
-        let mut seen = HashSet::new();
-        // Time to the FIRST oid, which is not iteration: libgit2 orders the whole
-        // history inside that first `next()`, so this is the sort. The two are worth
-        // separating because they say different things — a slow sort is the size of the
-        // DAG, a slow iteration after it is the odb underneath.
-        let mut prepared: Option<std::time::Duration> = None;
-        let t_walk = std::time::Instant::now();
-        if scope.paths.is_empty() {
-            // Drain the walk, not just the first `max`: the ordering pass has already
-            // built this list internally, so the remaining oids cost nothing and are
-            // exactly what the next page needs.
-            let mut all: Vec<git2::Oid> = Vec::new();
-            for oid in revwalk.flatten() {
-                if prepared.is_none() {
-                    prepared = Some(t_walk.elapsed());
-                }
-                if !seen.insert(oid) {
-                    continue;
-                }
-                all.push(oid);
-                if all.len() >= HISTORY_OID_CAP {
-                    break;
-                }
-            }
-            let sort = prepared.unwrap_or_default();
-            let iterate = t_walk.elapsed().saturating_sub(sort);
-            let oids = all.len();
-            // `all` is already deduped, so this pass needs its own (empty) seen set.
-            let t_build = std::time::Instant::now();
-            let mut built = HashSet::new();
-            real = build_commits_from_walk(
-                repo,
-                all.iter().copied(),
-                &mut built,
-                &ref_map,
-                max,
-                scope.first_parent,
-            );
-            log::debug!(
-                "perf: load_commits: plain walk — setup {setup:?}, sort {sort:?}, \
-                 iterate ({oids} oids) {iterate:?}, build ({} rows) {:?}",
-                real.len(),
-                t_build.elapsed()
-            );
-            walk_oids = Some(all);
-        } else {
-            // Path filter: drop commits that don't touch the pathspec, then rewrite each
-            // surviving commit's parents to its nearest surviving ancestor — git's history
-            // simplification. Without the rewrite the graph can't connect kept commits
-            // across the dropped ones, so every commit lands on its own lane.
-            // 1. Walk newest→oldest, recording every commit's parents; keep the ones that
-            //    touch the path until we have `max` of them.
-            let mut walked: Vec<(git2::Oid, Vec<git2::Oid>)> = Vec::new();
-            let mut kept: Vec<CommitInfo> = Vec::new();
-            let mut kept_set: HashSet<git2::Oid> = HashSet::new();
-            // In --follow mode we track the single path's name as it changes across
-            // renames, recording each kept commit's name so its diff can follow too.
-            let mut follow_path: Option<String> =
-                scope.follow.then(|| scope.paths.first().cloned()).flatten();
-            // This loop is where a path-filtered walk spends its time, and the four
-            // things it does per commit fail for four different reasons — so each is
-            // summed on its own rather than reported as one number nothing can act on.
-            let (mut find, mut touch, mut build, mut trace) = (
-                std::time::Duration::ZERO,
-                std::time::Duration::ZERO,
-                std::time::Duration::ZERO,
-                std::time::Duration::ZERO,
-            );
-            // How many touch tests ran, and how many of those had to be a whole diff
-            // because a lookup could not stand in (see `commit_touches_paths`). A glob
-            // is 60× the cost of a literal path, and that is worth saying rather than
-            // leaving inside one large `path test` number.
-            let (mut tested, mut diffed) = (0usize, 0usize);
-            for oid in revwalk.flatten() {
-                if prepared.is_none() {
-                    prepared = Some(t_walk.elapsed());
-                }
-                if !seen.insert(oid) {
-                    continue;
-                }
-                let Ok(commit) = timed(&mut find, || repo.find_commit(oid)) else {
-                    continue;
-                };
-                let parents: Vec<git2::Oid> = commit_parents(&commit, scope.first_parent);
-                walked.push((oid, parents.clone()));
-                let test = timed(&mut touch, || {
-                    follow_path.as_ref().map_or_else(
-                        || commit_touches_paths(repo, &commit, &scope.paths),
-                        |p| commit_touches_paths(repo, &commit, std::slice::from_ref(p)),
-                    )
-                });
-                tested += 1;
-                diffed += usize::from(test.by_diff);
-                if test.touched {
-                    kept_set.insert(oid);
-                    let mut info = timed(&mut build, || {
-                        build_commit_info(oid, &commit, parents, &ref_map)
-                    });
-                    if let Some(p) = follow_path.clone() {
-                        info.follow_path = Some(p.clone());
-                        // If the file was renamed into `p` at this commit, follow the
-                        // old name back through the rest of history.
-                        let renamed = timed(&mut trace, || {
-                            file_added(&commit, &p)
-                                .then(|| rename_source(repo, &commit, &p))
-                                .flatten()
-                        });
-                        if let Some(old) = renamed {
-                            follow_path = Some(old);
-                        }
+    // The lazy path first: when generation numbers are available this answers in
+    // milliseconds what the sorted revwalk below takes 45s to answer on a large
+    // repository, and in `git log --graph`'s order rather than date order. It walks
+    // only what was asked for — unlike the sorted walk, whose extra oids are free
+    // because the ordering pass has already produced them — so it caches none.
+    if let Some(oids) = topo_oids(repo, scope, max) {
+        let mut built = HashSet::new();
+        real = build_commits_from_walk(
+            repo,
+            oids.into_iter(),
+            &mut built,
+            &ref_map,
+            max,
+            scope.first_parent,
+        );
+    } else {
+        let t_setup = std::time::Instant::now();
+        let walk = history_revwalk(repo, scope);
+        let setup = t_setup.elapsed();
+        if let Some(revwalk) = walk {
+            let mut seen = HashSet::new();
+            // Time to the FIRST oid, which is not iteration: libgit2 orders the whole
+            // history inside that first `next()`, so this is the sort. The two are worth
+            // separating because they say different things — a slow sort is the size of the
+            // DAG, a slow iteration after it is the odb underneath.
+            let mut prepared: Option<std::time::Duration> = None;
+            let t_walk = std::time::Instant::now();
+            if scope.paths.is_empty() {
+                // Drain the walk, not just the first `max`: the ordering pass has already
+                // built this list internally, so the remaining oids cost nothing and are
+                // exactly what the next page needs.
+                let mut all: Vec<git2::Oid> = Vec::new();
+                for oid in revwalk.flatten() {
+                    if prepared.is_none() {
+                        prepared = Some(t_walk.elapsed());
                     }
-                    kept.push(info);
-                    if kept.len() >= max {
+                    if !seen.insert(oid) {
+                        continue;
+                    }
+                    all.push(oid);
+                    if all.len() >= HISTORY_OID_CAP {
                         break;
                     }
                 }
-            }
-            let sort = prepared.unwrap_or_default();
-            // What the loop cost that none of the four accounted for: the revwalk's own
-            // per-oid work, and the bookkeeping around it.
-            let iterate = t_walk
-                .elapsed()
-                .saturating_sub(sort + find + touch + build + trace);
-            let walked_len = walked.len();
-            walked_commits = Some(walked_len);
-            let t_rewrite = std::time::Instant::now();
-            // 2. nearest[oid] = its nearest kept ancestors. `walked` is topological (each
-            //    child precedes its parents), so a single oldest→newest pass resolves every
-            //    parent before its child — no recursion, safe on deep histories.
-            let mut nearest: std::collections::HashMap<git2::Oid, Vec<git2::Oid>> =
-                std::collections::HashMap::new();
-            for (oid, parents) in walked.iter().rev() {
-                let resolved = if kept_set.contains(oid) {
-                    vec![*oid]
-                } else {
-                    rewrite_parents(parents, &nearest)
-                };
-                nearest.insert(*oid, resolved);
-            }
-            // 3. Rewrite the kept commits' parents to the nearest kept ancestors. The
-            //    virtual entries get the same treatment below, once the probes have
-            //    said whether they exist — a dropped HEAD must not orphan them.
-            for info in &mut kept {
-                info.parents = rewrite_parents(&info.parents, &nearest);
-            }
-            real = kept;
-            log::debug!(
-                "perf: load_commits: path filter over {walked_len} commits — setup {setup:?}, \
+                let sort = prepared.unwrap_or_default();
+                let iterate = t_walk.elapsed().saturating_sub(sort);
+                let oids = all.len();
+                // `all` is already deduped, so this pass needs its own (empty) seen set.
+                let t_build = std::time::Instant::now();
+                let mut built = HashSet::new();
+                real = build_commits_from_walk(
+                    repo,
+                    all.iter().copied(),
+                    &mut built,
+                    &ref_map,
+                    max,
+                    scope.first_parent,
+                );
+                log::debug!(
+                    "perf: load_commits: plain walk — setup {setup:?}, sort {sort:?}, \
+                 iterate ({oids} oids) {iterate:?}, build ({} rows) {:?}",
+                    real.len(),
+                    t_build.elapsed()
+                );
+                walk_oids = Some(all);
+            } else {
+                // Path filter: drop commits that don't touch the pathspec, then rewrite each
+                // surviving commit's parents to its nearest surviving ancestor — git's history
+                // simplification. Without the rewrite the graph can't connect kept commits
+                // across the dropped ones, so every commit lands on its own lane.
+                // 1. Walk newest→oldest, recording every commit's parents; keep the ones that
+                //    touch the path until we have `max` of them.
+                let mut walked: Vec<(git2::Oid, Vec<git2::Oid>)> = Vec::new();
+                let mut kept: Vec<CommitInfo> = Vec::new();
+                let mut kept_set: HashSet<git2::Oid> = HashSet::new();
+                // In --follow mode we track the single path's name as it changes across
+                // renames, recording each kept commit's name so its diff can follow too.
+                let mut follow_path: Option<String> =
+                    scope.follow.then(|| scope.paths.first().cloned()).flatten();
+                // This loop is where a path-filtered walk spends its time, and the four
+                // things it does per commit fail for four different reasons — so each is
+                // summed on its own rather than reported as one number nothing can act on.
+                let (mut find, mut touch, mut build, mut trace) = (
+                    std::time::Duration::ZERO,
+                    std::time::Duration::ZERO,
+                    std::time::Duration::ZERO,
+                    std::time::Duration::ZERO,
+                );
+                // How many touch tests ran, and how many of those had to be a whole diff
+                // because a lookup could not stand in (see `commit_touches_paths`). A glob
+                // is 60× the cost of a literal path, and that is worth saying rather than
+                // leaving inside one large `path test` number.
+                let (mut tested, mut diffed) = (0usize, 0usize);
+                for oid in revwalk.flatten() {
+                    if prepared.is_none() {
+                        prepared = Some(t_walk.elapsed());
+                    }
+                    if !seen.insert(oid) {
+                        continue;
+                    }
+                    let Ok(commit) = timed(&mut find, || repo.find_commit(oid)) else {
+                        continue;
+                    };
+                    let parents: Vec<git2::Oid> = commit_parents(&commit, scope.first_parent);
+                    walked.push((oid, parents.clone()));
+                    let test = timed(&mut touch, || {
+                        follow_path.as_ref().map_or_else(
+                            || commit_touches_paths(repo, &commit, &scope.paths),
+                            |p| commit_touches_paths(repo, &commit, std::slice::from_ref(p)),
+                        )
+                    });
+                    tested += 1;
+                    diffed += usize::from(test.by_diff);
+                    if test.touched {
+                        kept_set.insert(oid);
+                        let mut info = timed(&mut build, || {
+                            build_commit_info(oid, &commit, parents, &ref_map)
+                        });
+                        if let Some(p) = follow_path.clone() {
+                            info.follow_path = Some(p.clone());
+                            // If the file was renamed into `p` at this commit, follow the
+                            // old name back through the rest of history.
+                            let renamed = timed(&mut trace, || {
+                                file_added(&commit, &p)
+                                    .then(|| rename_source(repo, &commit, &p))
+                                    .flatten()
+                            });
+                            if let Some(old) = renamed {
+                                follow_path = Some(old);
+                            }
+                        }
+                        kept.push(info);
+                        if kept.len() >= max {
+                            break;
+                        }
+                    }
+                }
+                let sort = prepared.unwrap_or_default();
+                // What the loop cost that none of the four accounted for: the revwalk's own
+                // per-oid work, and the bookkeeping around it.
+                let iterate = t_walk
+                    .elapsed()
+                    .saturating_sub(sort + find + touch + build + trace);
+                let walked_len = walked.len();
+                walked_commits = Some(walked_len);
+                let t_rewrite = std::time::Instant::now();
+                // 2. nearest[oid] = its nearest kept ancestors. `walked` is topological (each
+                //    child precedes its parents), so a single oldest→newest pass resolves every
+                //    parent before its child — no recursion, safe on deep histories.
+                let mut nearest: std::collections::HashMap<git2::Oid, Vec<git2::Oid>> =
+                    std::collections::HashMap::new();
+                for (oid, parents) in walked.iter().rev() {
+                    let resolved = if kept_set.contains(oid) {
+                        vec![*oid]
+                    } else {
+                        rewrite_parents(parents, &nearest)
+                    };
+                    nearest.insert(*oid, resolved);
+                }
+                // 3. Rewrite the kept commits' parents to the nearest kept ancestors. The
+                //    virtual entries get the same treatment below, once the probes have
+                //    said whether they exist — a dropped HEAD must not orphan them.
+                for info in &mut kept {
+                    info.parents = rewrite_parents(&info.parents, &nearest);
+                }
+                real = kept;
+                log::debug!(
+                    "perf: load_commits: path filter over {walked_len} commits — setup {setup:?}, \
                  sort {sort:?}, iterate {iterate:?}, find_commit {find:?}, \
                  path test ({diffed}/{tested} by diff) {touch:?}, build ({} rows) {build:?}, \
                  rename trace {trace:?}, parent rewrite {:?}",
-                real.len(),
-                t_rewrite.elapsed()
-            );
-            // A filter that kept nothing is about to produce a notice, and the tip is
-            // the only place that can say whether the paths are wrong or the scope is
-            // (see `TipPaths`). One tree match, on the walk's thread, and only here —
-            // a filter that kept something has nothing to explain.
-            if real.is_empty()
-                && let Some((tip, _)) = walked.first()
-            {
-                tip_answer = tip_paths(repo, *tip, &scope.paths);
+                    real.len(),
+                    t_rewrite.elapsed()
+                );
+                // A filter that kept nothing is about to produce a notice, and the tip is
+                // the only place that can say whether the paths are wrong or the scope is
+                // (see `TipPaths`). One tree match, on the walk's thread, and only here —
+                // a filter that kept something has nothing to explain.
+                if real.is_empty()
+                    && let Some((tip, _)) = walked.first()
+                {
+                    tip_answer = tip_paths(repo, *tip, &scope.paths);
+                }
+                nearest_map = Some(nearest);
             }
-            nearest_map = Some(nearest);
         }
     }
     log::debug!(
-        "perf: load_commits: revwalk + build ({} real commits, sort=TIME|TOPOLOGICAL) {:?}",
+        "perf: load_commits: walk + build ({} real commits) {:?}",
         real.len(),
         t.elapsed()
     );
@@ -984,6 +1040,38 @@ pub fn load_commits_tail(
         return None;
     }
     let t = std::time::Instant::now();
+    // The lazy walk extends exactly as the sorted one does — skip the loaded prefix,
+    // check the anchor, build the rest — and it MUST be the one used whenever the
+    // prefix came from it. The two produce different orders (topological against
+    // date), so resuming one from the other's prefix would not merely be slow: it
+    // would splice two orderings together and draw a parent above its own child.
+    // The anchor check would usually catch that, but "usually" is not what the graph
+    // layout rests on.
+    if let Some(oids) = topo_oids(repo, scope, skip + max_new) {
+        let mut iter = oids.into_iter();
+        let mut seen = HashSet::new();
+        let mut last = None;
+        let mut skipped = 0;
+        while skipped < skip {
+            let oid = iter.next()?;
+            if seen.insert(oid) {
+                last = Some(oid);
+                skipped += 1;
+            }
+        }
+        if last != Some(expect_last) {
+            return None;
+        }
+        let ref_map = build_ref_map(repo);
+        let commits =
+            build_commits_from_walk(repo, iter, &mut seen, &ref_map, max_new, scope.first_parent);
+        log::debug!(
+            "perf: load_commits_tail: +{} commits (skipped {skip}, topo) {:?}",
+            commits.len(),
+            t.elapsed()
+        );
+        return Some(commits);
+    }
     let mut iter = history_revwalk(repo, scope)?.flatten();
     // Skip the already-loaded prefix — oid iteration only, none of the
     // find_commit/CommitInfo work — counting like load_commits counts (`seen`
@@ -1641,6 +1729,91 @@ pub fn build_ref_map(
 
 #[cfg(test)]
 mod tests {
+
+    /// With a commit-graph the loader takes the lazy path, and without one it takes
+    /// the sorted revwalk — and both must select the SAME COMMITS. The orders differ
+    /// deliberately (topological against date), so the set is what can be compared,
+    /// and it is the property that matters: a scope shows the same history either
+    /// way, drawn in a different sequence.
+    #[test]
+    fn the_lazy_and_sorted_walks_select_the_same_commits() {
+        let (dir, repo) = crate::test_repo::temp_repo();
+        let tip = crate::tests::merged_history(&repo).3;
+        let scope = cli::Scope::default();
+
+        // No graph yet: the sorted walk answers.
+        assert!(!topo_available(&repo, &scope));
+        let sorted = crate::tests::summaries(&load_commits(&repo, 100, &scope));
+
+        crate::test_repo::write_commit_graph(&repo, &[tip]);
+        let repo = crate::test_repo::open_repo(dir.path());
+        assert!(
+            topo_available(&repo, &scope),
+            "the graph should now be found"
+        );
+        let lazy = crate::tests::summaries(&load_commits(&repo, 100, &scope));
+
+        assert_eq!(
+            lazy.iter().collect::<std::collections::BTreeSet<_>>(),
+            sorted.iter().collect::<std::collections::BTreeSet<_>>(),
+            "same commits either way: lazy {lazy:?} vs sorted {sorted:?}"
+        );
+        assert!(lazy.len() >= 4, "the fixture should have real depth");
+    }
+
+    /// A scope the lazy walk has not been verified against git for must keep using
+    /// the sorted one, whatever the repository holds. The list is deliberately
+    /// narrow, and widening it is a change that owes its own oracle run.
+    #[test]
+    fn only_the_plain_scope_takes_the_lazy_path() {
+        let (dir, repo) = crate::test_repo::temp_repo();
+        let tip = crate::tests::merged_history(&repo).3;
+        crate::test_repo::write_commit_graph(&repo, &[tip]);
+        let repo = crate::test_repo::open_repo(dir.path());
+        assert!(topo_available(&repo, &cli::Scope::default()));
+        for scope in [
+            crate::tests::scope(true, &[]),
+            crate::tests::scope(false, &["HEAD"]),
+            cli::Scope {
+                paths: vec!["f.txt".into()],
+                ..Default::default()
+            },
+            cli::Scope {
+                reflog: true,
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                !topo_available(&repo, &scope),
+                "unverified scope must fall back to the sorted walk"
+            );
+        }
+    }
+
+    /// The scroll extension has to come from the SAME walk the prefix did, or it
+    /// splices a topological order onto a date-ordered one.
+    #[test]
+    fn the_tail_extends_the_lazy_walk_without_a_seam() {
+        let (dir, repo) = crate::test_repo::temp_repo();
+        let mut tip = crate::tests::merged_history(&repo).3;
+        for i in 0..12 {
+            tip = crate::test_repo::commit_file(&repo, "f.txt", &format!("{i}"), &format!("c{i}"));
+        }
+        crate::test_repo::write_commit_graph(&repo, &[tip]);
+        let repo = crate::test_repo::open_repo(dir.path());
+        let scope = cli::Scope::default();
+        assert!(topo_available(&repo, &scope));
+
+        let whole = crate::tests::real_commits(&repo, 100, &scope);
+        let head = crate::tests::real_commits(&repo, 5, &scope);
+        assert_eq!(head.len(), 5);
+        let anchor = head.last().unwrap().oid;
+        let tail = load_commits_tail(&repo, &scope, 5, anchor, 100).expect("a lazy tail");
+
+        let joined: Vec<git2::Oid> = head.iter().chain(tail.iter()).map(|c| c.oid).collect();
+        let want: Vec<git2::Oid> = whole.iter().map(|c| c.oid).collect();
+        assert_eq!(joined, want, "prefix + tail must equal one whole walk");
+    }
     use super::*;
     use crate::DateCol;
     use crate::diff::{

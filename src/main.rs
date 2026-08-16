@@ -18,12 +18,6 @@ use std::sync::mpsc;
 
 mod apply;
 mod cli;
-// Nothing in the binary reads this yet: its consumer is the generation-keyed history
-// walk, which is a separate change. `allow`, not `expect` — an `expect` here is
-// UNFULFILLED under `./build.sh`'s `--all-targets` (the module's own tests use every
-// item) and would fail the stricter of the two clippy gates while satisfying CI's.
-// Delete this line when the walk lands.
-#[allow(dead_code)]
 mod commitgraph;
 mod config;
 mod datefmt;
@@ -40,7 +34,6 @@ mod prefetch;
 #[cfg(test)]
 mod test_repo;
 mod textconv;
-#[allow(dead_code)]
 mod topo;
 mod word_diff;
 mod workers;
@@ -8742,11 +8735,25 @@ fn main() -> eframe::Result {
     let provisional_rx = if provisional_scope(&scope) {
         let repo_path = repo_path.clone();
         let first_parent = scope.first_parent;
+        let scope = scope.clone();
         if spawn_guarded(
             "gitkay-history-quick",
             "provisional history thread panicked",
             move || {
                 if let Ok(repo) = Repository::discover(&repo_path) {
+                    // Nothing to race when the real walk is the lazy one: it answers
+                    // in milliseconds and its answer is EXACT, so showing approximate
+                    // rows first could only introduce the reshuffle this whole
+                    // arrangement exists to avoid. Dropping the sender leaves the
+                    // deadline below with nothing to install, which is already how a
+                    // scope with no provisional walk behaves.
+                    if history::topo_available(&repo, &scope) {
+                        log::debug!(
+                            "perf: startup: skipping the provisional walk — generation \
+                             numbers make the real one exact and fast"
+                        );
+                        return;
+                    }
                     let t = std::time::Instant::now();
                     let commits = provisional_commits(&repo, INITIAL_COMMITS, first_parent);
                     log::debug!(
