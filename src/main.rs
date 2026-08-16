@@ -52,7 +52,7 @@ use graph::{GraphLayoutState, GraphRow, layout_graph_rows};
 use highlight::{DiffBg, Highlighter};
 use history::{
     CommitInfo, HistoryWalk, PROVISIONAL_HISTORY_DELAY, RefKind, diff_paths_for, load_history,
-    provisional_commits, provisional_scope, warn_if_empty_view,
+    provisional_commits, provisional_scope, scope_notice,
 };
 use prefetch::{
     InflightClaim, InflightKeys, PoolHandle, PrefetchBudget, PrefetchTarget, WarmDisposition,
@@ -2608,6 +2608,15 @@ struct GitkApp {
     graph_scroll_to: Option<(usize, Option<egui::Align>)>, // (commit index, alignment) to scroll to in graph view
     repo_path: String,
     scope: cli::Scope, // CLI ref/path scope, set once at startup
+    /// Why the view shows less than `scope` asked for (`history::scope_notice`), drawn
+    /// as a bar above the commit list. `None` while the first real walk is still
+    /// running, so a slow startup is never captioned "no commits match".
+    ///
+    /// Recomputed from each installed list rather than posted by whatever noticed, and
+    /// deliberately not dismissible: it states what is on screen right now, so the
+    /// reload that finds commits clears it and nothing can silence a claim that is
+    /// still true.
+    scope_notice: Option<String>,
     search_text: String,
     search_matches: Vec<usize>,
     search_cursor: usize,
@@ -3355,6 +3364,7 @@ impl GitkApp {
             graph_scroll_to: None,
             repo_path,
             scope,
+            scope_notice: None,
             search_text: String::new(),
             search_matches: Vec::new(),
             search_cursor: 0,
@@ -4866,6 +4876,7 @@ impl GitkApp {
                     // a history nobody is looking at.
                     self.history_oids = oids;
                     self.install_derived(*derived);
+                    self.refresh_scope_notice();
                     self.finish_resync(count, None, previous_oid, previous_index);
                 }
             }
@@ -4873,6 +4884,25 @@ impl GitkApp {
             // mean something else (rewritten history, changed virtual rows); after
             // a pure append the current-key check makes this a no-op.
             self.load_selected_diff();
+        }
+    }
+
+    /// Recompute the scope notice for the commit list just installed, and log it when
+    /// it changes — so the terminal says it once per situation rather than once per
+    /// watcher reload, and says exactly what the window says.
+    ///
+    /// Called from the two places a whole REAL list is installed (the startup install
+    /// and the rebuild), never for the provisional one: that list is an approximation
+    /// of a walk still running, so its emptiness means "not yet", not "nothing
+    /// matched". An append cannot reach a notice either — every case here is about
+    /// rows being absent, and an append only adds.
+    fn refresh_scope_notice(&mut self) {
+        let notice = scope_notice(&self.scope, &self.commits);
+        if notice != self.scope_notice {
+            if let Some(text) = &notice {
+                log::warn!("{text}");
+            }
+            self.scope_notice = notice;
         }
     }
 
@@ -5745,6 +5775,40 @@ impl GitkApp {
         self.select_loaded(clicked_idx);
     }
 
+    /// The scope notice: a tinted bar at the top of the commit list saying why it
+    /// shows less than the command line asked for (`history::scope_notice`), or
+    /// nothing at all when it shows what was asked.
+    ///
+    /// In the list panel and IN THE FLOW, not an overlay like `show_apply_status`:
+    /// this is a statement about the rows, so it belongs above them, and it must
+    /// never cover a row whose absence it is explaining. Nor a toast — the situation
+    /// it reports lasts as long as the view does, and a message that fades leaves a
+    /// blank window with no explanation for whoever looks a minute later.
+    ///
+    /// Wraps rather than eliding: a narrow window would otherwise cut the message
+    /// off mid-sentence, and the reader can't scroll a bar to see the rest.
+    fn show_scope_notice(&self, ui: &mut egui::Ui) {
+        let Some(text) = &self.scope_notice else {
+            return;
+        };
+        egui::Frame::NONE
+            .fill(tinted(YELLOW, 24))
+            .inner_margin(egui::Margin::symmetric(6, 3))
+            .show(ui, |ui| {
+                // A Frame sizes to its content, so without this the tint stops at the
+                // end of the text and reads as a stray highlight rather than a bar.
+                ui.set_min_width(ui.available_width());
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(text)
+                            .font(self.fonts.font_id(Role::Ui))
+                            .color(YELLOW),
+                    )
+                    .wrap(),
+                );
+            });
+    }
+
     fn show_commit_list(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         // Row height follows the largest configured row font (summary/meta) so
         // `[text]` sizes beyond the default don't overlap or clip; today's 20px
@@ -5776,6 +5840,7 @@ impl GitkApp {
             .min_size(120.0)
             .default_size(saved_commit_h)
             .show(ui, |ui| {
+                self.show_scope_notice(ui);
                 let num_commits = self.commits.len();
                 // Reflog rows are parentless, so the graph is just a column of
                 // disconnected dots — drop it and reclaim the width for the text.
@@ -6341,12 +6406,12 @@ impl GitkApp {
             .then(|| self.selected_oid())
             .flatten()
             .filter(|oid| Some(*oid) != self.startup_auto_selected);
-        if !provisional {
-            warn_if_empty_view(&self.scope, &commits);
-        }
         let derived = derive_from_commits(&commits);
         self.commits = commits;
         self.install_derived(derived);
+        if !provisional {
+            self.refresh_scope_notice();
+        }
         // A provisional list is never "all there is", however short: the real walk
         // decides that. Leaving it true would also let the scroll extension run
         // against a prefix load_commits_tail cannot resume from.

@@ -139,6 +139,13 @@ The **uncommitted** and **staged** rows appear when you pass no revision at all
 you have checked out. They honour an active path filter, so an edit outside
 `-- src/` does not put a row on the list.
 
+Arguments that don't make sense are reported in the terminal, and gitkay exits
+without opening a window. Arguments that make sense but select **nothing** — a
+path no commit touches, a range that is empty, a reflog ref that does not exist
+— open the window and say so in a bar above the (empty) commit list, naming the
+pathspec or range as gitkay resolved it. So an empty window is never left
+unexplained.
+
 ### Controls
 
 | Action | Effect |
