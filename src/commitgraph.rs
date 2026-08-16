@@ -540,6 +540,13 @@ impl CommitGraph {
         self.layers.iter().map(|l| l.commits as usize).sum()
     }
 
+    /// Whether every layer carries changed-path filters — `ChangedPaths::open`'s
+    /// question, asked without loading anything, which is what a "would this help?"
+    /// check needs.
+    pub fn has_changed_paths(&self) -> bool {
+        self.layers.iter().all(|l| l.bloom.is_some())
+    }
+
     /// `oid`'s generation number — its topological level, so strictly greater than
     /// every parent's.
     ///
