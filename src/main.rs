@@ -45,8 +45,8 @@ use diff::{
 };
 use diff_cache::DiffCache;
 use diff_highlight::{
-    HighlightBatch, HighlightJob, band_warmable, diff_fully_highlighted, highlight_diff,
-    highlight_diff_until, highlight_scan_stale, highlight_worker, pending_files, spawn_prewarm,
+    HighlightJob, HighlightMsg, band_warmable, highlight_diff, highlight_diff_until,
+    highlight_worker, pending_files, spawn_prewarm,
 };
 use diff_store::DiffStore;
 use graph::{GraphLayoutState, GraphRow, layout_graph_rows};
@@ -347,30 +347,37 @@ const DIFF_LOAD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis
 /// copy detection) crosses the threshold and shows the placeholder.
 const DIFF_PLACEHOLDER_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// The most rows one highlight pass will colour.
+///
+/// A bound on the WORK, not on the diff — which is the whole of the difference. This
+/// was `MAX_HIGHLIGHT_LINES`, a cap on the diff's *size* past which the pane simply
+/// stayed plain, and it stood on two costs. The hand-off's copy of the whole diff was
+/// the one that fixed the number here rather than anywhere else (12.0s on the frame
+/// loop at 76.5M lines, ~0.3s at this bound), and it is gone: the worker shares the
+/// rows now. What remains is the tokenizing itself, at ~3µs/line for plain text and
+/// ~60µs for a real grammar — so an unbounded pass over that same diff is four minutes
+/// of CPU at best and over an hour at worst, and it accumulates a `Vec` of spans per
+/// code line the whole way, for rows nobody will ever scroll to.
+///
+/// That is a bound on appetite, and it belongs on the pass. The worker colours in
+/// `pick_file` order — the visible file first, then a page each way — so every diff,
+/// at any size, is coloured where the reader is looking; only the rows past the budget
+/// go without, and a diff that large is past reading rather than past colouring.
+/// Nothing else changes for it: the pane, the sidebar, word diff, search and the write
+/// actions all work exactly as they do on a coloured diff.
+///
+/// The number is deliberately the old cap's. At ~3-60µs a row it is 6s-120s of
+/// background CPU and a few hundred MB of spans — the ceiling a 2M-line diff was
+/// already allowed to reach, now applied to work instead of to size.
+///
+/// The speculative path has its own, far smaller bound for the same reason
+/// (`PREFETCH_MAX_HIGHLIGHT_LINES`); this is the displayed diff's.
+const HIGHLIGHT_LINE_BUDGET: usize = 2_000_000;
+
 /// Lines per chunk between priority / cancellation re-checks in the streaming
 /// `highlight_worker`. Small enough to switch quickly, large enough that the
 /// per-chunk overhead is negligible. Those re-checks are hints — being a chunk
 /// late costs a slightly worse ordering — so this can afford to be coarse.
-/// The largest diff worth colouring in the background at all.
-///
-/// Two costs grow with the line count and neither is bounded by what the reader can
-/// see. The hand-off copies the whole diff for the worker — measured at **12.0s on the
-/// frame loop** for a 76.5M-line diff, a freeze with the window already painted — and
-/// the tokenizing itself runs at ~3µs/line for plain text and ~60µs for a real grammar,
-/// so that same diff is four minutes of CPU at best and over an hour at worst. It
-/// never finishes; the thread simply runs until the window closes.
-///
-/// So: past this, the pane stays plain. At the cap the copy is ~0.3s (~157ns/line,
-/// dominated by first-touch page faults on the fresh allocation) and the whole-diff
-/// tokenize is minutes — already the wrong side of every trade, and a diff this large
-/// is past reading rather than past colouring. Nothing else changes: the pane, the
-/// sidebar, word diff, search and the write actions all work exactly as they do on a
-/// coloured diff.
-///
-/// The speculative path has had its own, far smaller bound for the same reason
-/// (`PREFETCH_MAX_HIGHLIGHT_LINES`); this is the displayed diff's.
-const MAX_HIGHLIGHT_LINES: usize = 2_000_000;
-
 const HIGHLIGHT_CHUNK: usize = 256;
 
 /// Lines per chunk for the deadline-bounded pre-highlight pass, which is much
@@ -2759,8 +2766,8 @@ struct GitkApp {
     diff_palette: highlight::DiffPalette, // theme-derived diff colours (both modes)
     diff_needs_highlight: bool,           // diff_lines changed; re-run highlight_diff
     diff_generation: Epoch, // bumped each highlight pass; lets stale workers bail + results drop
-    highlight_tx: mpsc::Sender<HighlightBatch>, // worker → UI: per-file span updates
-    highlight_rx: mpsc::Receiver<HighlightBatch>,
+    highlight_tx: mpsc::Sender<HighlightMsg>, // worker → UI: span batches, then the pass's end
+    highlight_rx: mpsc::Receiver<HighlightMsg>,
     highlight_priority: Option<Arc<VisibleRange>>, // visible file range (lo, hi) the worker prioritises
     diff_max_chars: usize, // widest diff line (chars); sizes the virtualized h-scroll for off-screen lines
     /// The displayed diff's line-number column widths — measured once for the whole
@@ -2862,13 +2869,20 @@ struct GitkApp {
     /// generation. So the answer is recomputed only when the generation moved, or when a
     /// highlight batch has landed since a `false`.
     ///
-    /// Memoizing the ANSWER rather than the fact of having scanned is what the scroll
-    /// trigger needs. Recording only "we checked this generation" is enough while the
-    /// trigger is a settled diff (it fires once), but a scroll asks the same question
-    /// again for a generation already answered — so on a diff that is still colouring,
-    /// the scan ran every frame the view sat off the prefetched band: ~8M line checks a
-    /// second on a 133k-line diff.
-    highlight_scan: Option<(u64, bool)>,
+    /// Has colouring settled — i.e. is no highlight pass running for the displayed diff?
+    ///
+    /// What `band_warmable` waits on, and REPORTED by the worker
+    /// (`HighlightMsg::Settled`) rather than derived. It used to be
+    /// `diff_fully_highlighted`, an O(lines) scan for an uncoloured row, memoized per
+    /// generation because both prefetch triggers ask every frame — ~8M line checks a
+    /// second on a 133k-line diff without the memo. Two things retired all of that: a
+    /// pass now stops at `HIGHLIGHT_LINE_BUDGET` and leaves rows uncoloured ON PURPOSE,
+    /// which the scan would read as "still colouring" forever; and the worker knows the
+    /// answer for nothing, where the UI has to look for it.
+    ///
+    /// True with no diff and no pass, which is the state `band_warmable`'s
+    /// `have_highlighter` gate covers at startup.
+    highlight_settled: bool,
     commit_view_range: std::ops::Range<usize>, // visible commit-list rows (set each frame)
     /// Per-commit change counts for the commit-list column. `Some(None)` means
     /// "computed and failed" — distinct from a missing key ("not asked yet"),
@@ -3590,7 +3604,7 @@ impl GitkApp {
             prefetched_view: 0..0,
             inflight_diffs: Arc::default(),
             inflight_loads: HashMap::new(),
-            highlight_scan: None,
+            highlight_settled: true,
             // Empty until the panel has rendered once, NOT a generous estimate: the
             // band is derived from this length, so an over-guess is tripled. The old
             // 0..64 placeholder made the first dispatch warm 127 rows before the
@@ -4603,6 +4617,11 @@ impl GitkApp {
         if !self.diff_needs_highlight {
             return;
         }
+        // Colouring has settled unless this call starts a pass — asserted HERE, ahead of
+        // every branch below, because each of them is a way of not starting one (syntax
+        // off, no diff, no highlighter yet, nothing left to colour) and the previous
+        // diff's answer is not one of them. The spawn writes `false` back.
+        self.highlight_settled = true;
         // Syntax off ⇒ the original flat render path is used; never build the
         // highlighter or tokenize (keeps the disabled mode cost-free).
         if !self.span_settings.enabled {
@@ -4677,29 +4696,12 @@ impl GitkApp {
             self.highlight_priority = None;
             return;
         }
-        // Past a certain size, colouring costs more than it can possibly be worth —
-        // see `MAX_HIGHLIGHT_LINES`. Left plain, deliberately and silently to the
-        // reader: `diff_needs_highlight` is already cleared above, so this is decided
-        // once per diff rather than re-argued every frame.
-        if self.diff_lines.len() > MAX_HIGHLIGHT_LINES {
-            log::debug!(
-                "highlight: {} lines is past the {MAX_HIGHLIGHT_LINES}-line cap — left plain",
-                self.diff_lines.len()
-            );
-            self.highlight_priority = None;
-            // Nothing will colour this diff, so colouring HAS settled — say so, or the
-            // prefetch band (which waits for the foreground diff to finish colouring,
-            // via a `diff_fully_highlighted` that can now never answer true) stays shut
-            // for as long as this diff is displayed. The memo is keyed by the
-            // generation just bumped above, and only a landing batch can invalidate it
-            // — and no batch will land, there being no worker.
-            self.highlight_scan = Some((generation, true));
-            return;
-        }
         log::debug!(
             "perf: async highlight spawned ({} lines)",
             self.diff_lines.len()
         );
+        // A pass is about to run: the band stands aside until it reports back.
+        self.highlight_settled = false;
         // Tokenize off-thread, file-by-file, prioritising the files the render
         // marks visible. The diff is already shown plain.
         // Seed the window with where the view IS (or is about to be), not zeros.
@@ -4752,6 +4754,9 @@ impl GitkApp {
             log::warn!("highlight thread spawn failed; highlighting on the UI thread");
             self.highlight_priority = None;
             highlight_diff(&self.diff_lines, &mut self.diff_spans, &self.diff_files, hl);
+            // Done, synchronously and unbudgeted — nothing will report for this pass, so
+            // say so here or the band waits on a worker that was never created.
+            self.highlight_settled = true;
         }
     }
 
@@ -7226,15 +7231,26 @@ impl GitkApp {
         // Apply finished background-highlight results (one batch per file) for
         // the current diff; drop stale ones (the diff or theme changed since the
         // worker was spawned).
-        let mut applied_highlight = false;
-        while let Ok(batch) = self.highlight_rx.try_recv() {
-            if self.diff_generation.is_current(batch.generation) {
-                for (i, spans) in batch.lines {
-                    // `set` drops a row past the end, which is what `get_mut` did here
-                    // before: a batch is computed against a snapshot and can outlive it.
-                    self.diff_spans.set(i, spans);
+        while let Ok(msg) = self.highlight_rx.try_recv() {
+            match msg {
+                HighlightMsg::Batch(batch) if self.diff_generation.is_current(batch.generation) => {
+                    for (i, spans) in batch.lines {
+                        // `set` drops a row past the end, which is what `get_mut` did
+                        // here before: a batch is computed against a snapshot and can
+                        // outlive it.
+                        self.diff_spans.set(i, spans);
+                    }
                 }
-                applied_highlight = true;
+                // The pass that was colouring the displayed diff has ended, however it
+                // ended: nothing more is competing with the band. A superseded pass's
+                // `Settled` is dropped by the same generation check that drops its
+                // batches — the pass that superseded it is the one still running.
+                HighlightMsg::Settled { generation }
+                    if self.diff_generation.is_current(generation) =>
+                {
+                    self.highlight_settled = true;
+                }
+                _ => {}
             }
         }
         self.ensure_diff_highlighted(ctx);
@@ -7288,42 +7304,22 @@ impl GitkApp {
         if settled_diff_unwarmed || scrolled_off_band {
             // Still never compete with the foreground diff's own colouring: the reader
             // is looking at that, not at a row they might scroll to. With syntax OFF
-            // there is no colouring to compete with — and no spans are ever set, so
-            // `diff_fully_highlighted` answers false for every non-empty diff forever.
-            // Asking it in that mode is what silently kept the whole band cold, making
-            // the removal of the `syntax_enabled` gate above a no-op.
+            // there is no colouring to compete with — and no pass is ever started, so
+            // the question is not asked in that mode at all.
             //
-            // Both triggers go through the memo (`highlight_scan`), which is what keeps
-            // the O(lines) scan off the frame loop: the scroll trigger stays true for
-            // every frame until a dispatch actually succeeds, so an un-memoized question
-            // would be re-asked on all of them.
+            // `highlight_settled` is reported by the pass rather than derived from the
+            // diff, so both triggers can ask on every frame for nothing. It used to be
+            // an O(lines) scan behind a per-generation memo, because the scroll trigger
+            // stays true for every frame until a dispatch actually succeeds.
             let syntax = self.span_settings.enabled;
             let have_highlighter = self.highlighter.is_some();
             if !self.awaiting_first_diff()
-                && band_warmable(syntax, have_highlighter, || {
-                    self.diff_highlight_settled(applied_highlight)
-                })
+                && band_warmable(syntax, have_highlighter, self.highlight_settled)
             {
                 self.prefetched_gen = current_gen;
                 self.dispatch_prefetch(ctx);
             }
         }
-    }
-
-    /// Is the current diff fully coloured? Memoized per `diff_generation`; see
-    /// `highlight_scan` for why the answer and not merely the check is cached.
-    ///
-    /// `applied_highlight` is the frame's "a batch of spans just landed" flag — the only
-    /// event that can turn a `false` into a `true` without the generation moving.
-    fn diff_highlight_settled(&mut self, applied_highlight: bool) -> bool {
-        let generation = self.diff_generation.current();
-        if highlight_scan_stale(self.highlight_scan, generation, applied_highlight) {
-            self.highlight_scan = Some((
-                generation,
-                diff_fully_highlighted(&self.diff_lines, &self.diff_spans, &self.diff_files),
-            ));
-        }
-        self.highlight_scan.is_some_and(|(_, answer)| answer)
     }
 
     /// Global keyboard handling for the frame: focus-search-on-type, Up/Down
@@ -8236,7 +8232,7 @@ fn main() -> eframe::Result {
 mod tests {
     use super::*;
     use crate::diff::{LineStats, RowSpans, oid_staged, oid_uncommitted};
-    use crate::diff_highlight::{file_fully_highlighted, pick_file};
+    use crate::diff_highlight::{file_fully_highlighted, pending_files, pick_file};
     use crate::history::load_commits;
     use crate::test_repo::{commit_file, commit_index, commit_rename, rename_file, temp_repo};
 
@@ -8697,51 +8693,11 @@ mod tests {
         assert!(!file_fully_highlighted(&partial, &spans, 0, 2));
     }
 
-    /// The memo keeps the O(lines) scan off the frame loop. The case that matters is a
-    /// generation already answered `true`: the scroll trigger re-asks on every frame it
-    /// is off-band, and a rule that recomputed on demand would scan the whole diff each
-    /// time — ~8M line checks a second on a 133k-line diff.
+    /// A code line outside every tokenizable file range is never coloured and must not
+    /// keep the diff listed as pending: that is the bug that made the prefetch trigger
+    /// never fire when the question was asked over `[0, len)`.
     #[test]
-    fn a_settled_highlight_answer_is_not_rescanned() {
-        assert!(
-            highlight_scan_stale(None, 4, false),
-            "nothing memoized yet ⇒ scan"
-        );
-        assert!(
-            !highlight_scan_stale(Some((4, true)), 4, false),
-            "answered true for this generation ⇒ never scan again"
-        );
-        assert!(
-            !highlight_scan_stale(Some((4, true)), 4, true),
-            "not even when a batch lands: true cannot become truer"
-        );
-    }
-
-    /// A `false` is not cached forever — a landed batch of spans is the one event that
-    /// can flip it in place, and the generation moving invalidates it outright. Without
-    /// both, a diff finishing its colouring would never trigger the band warm.
-    #[test]
-    fn an_unfinished_highlight_answer_is_rescanned_when_it_can_have_changed() {
-        assert!(
-            highlight_scan_stale(Some((4, false)), 4, true),
-            "a batch landed ⇒ re-ask"
-        );
-        assert!(
-            !highlight_scan_stale(Some((4, false)), 4, false),
-            "but nothing landed ⇒ the answer cannot have changed"
-        );
-        assert!(
-            highlight_scan_stale(Some((4, false)), 5, false),
-            "a new generation is a different diff"
-        );
-        assert!(
-            highlight_scan_stale(Some((4, true)), 5, false),
-            "including one whose predecessor was finished"
-        );
-    }
-
-    #[test]
-    fn diff_fully_highlighted_ignores_untokenized_header_lines() {
+    fn a_row_outside_every_file_range_is_not_pending() {
         let span = || (egui::Color32::WHITE, 0..1);
         let lines = vec![
             DiffLine::new("commit abc", LineKind::Meta), // 0 header (structural)
@@ -8755,15 +8711,12 @@ mod tests {
         let mut spans = RowSpans::blank(lines.len());
         spans.set(2, vec![span()]);
         spans.set(3, vec![span()]);
-        // The untokenized Context line (index 1) is unset but outside any file
-        // range, so the diff still counts as fully highlighted. This is the bug
-        // that made the prefetch trigger never fire with file_fully_highlighted(0,len).
-        assert!(diff_fully_highlighted(&lines, &spans, &files));
+        assert!(pending_files(&lines, &spans, &files).is_empty());
 
-        // An unset code line *inside* the file range ⇒ not done.
+        // An unset code line *inside* the file range ⇒ still pending.
         let mut partial = RowSpans::blank(lines.len());
         partial.set(2, vec![span()]);
-        assert!(!diff_fully_highlighted(&lines, &partial, &files));
+        assert_eq!(pending_files(&lines, &partial, &files).len(), 1);
     }
 
     #[test]
