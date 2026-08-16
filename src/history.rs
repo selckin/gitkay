@@ -1027,23 +1027,81 @@ pub fn topo_window(rows: Vec<(i64, CommitInfo)>) -> Vec<CommitInfo> {
     out
 }
 
-/// An empty view (bad path filter, or an unknown/empty reflog ref) is otherwise a
-/// silent blank window; say so once, when the rows arrive. Paths are matched
-/// repo-root-relative (a path given from a subdirectory won't match — a known
-/// limitation). Called from whichever side installs the first history: `new()` when
-/// the walk beat window creation, `apply_pending_history` when it did not.
-pub fn warn_if_empty_view(scope: &cli::Scope, commits: &[CommitInfo]) {
-    if scope.reflog && commits.is_empty() {
-        log::warn!(
-            "--reflog: no entries for {} (unknown ref or empty reflog)",
-            scope.revs.first().map_or("HEAD", String::as_str)
-        );
-    } else if !scope.paths.is_empty() && !commits.iter().any(|c| is_real_commit(c.oid)) {
-        log::warn!(
-            "no commits match path filter {:?} (paths are repo-root-relative)",
-            scope.paths
-        );
+/// Why the view shows less than the command line asked for, phrased for the reader —
+/// `None` when it shows exactly what was asked.
+///
+/// A command line that is *invalid* never gets this far: `cli::classify` and
+/// `cli::validate` report to the terminal and exit before a window exists. What
+/// reaches here is a scope that parsed, resolved and then selected nothing — a path
+/// filter no commit touches, a range that is empty, a reflog ref with no entries — and
+/// the result is a blank window indistinguishable from a repo that really looks like
+/// that. So the answer is a message rather than a log line: see
+/// `GitkApp::refresh_scope_notice`, which logs it AND puts it on screen, so the
+/// terminal and the window cannot phrase the same situation two ways.
+///
+/// Pure, and derived from the installed list rather than posted by whatever noticed:
+/// a notice can then never outlive the situation it describes — the next walk that
+/// finds rows simply produces `None`.
+///
+/// Note the paths are named as gitkay resolved them (repo-root-relative, rewritten
+/// from the run directory by `cli::token_to_pathspec`), which is the pathspec that
+/// actually matched nothing and may not be what was typed.
+pub fn scope_notice(scope: &cli::Scope, commits: &[CommitInfo]) -> Option<String> {
+    let quoted = |xs: &[String]| {
+        xs.iter()
+            .map(|x| format!("'{x}'"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    if scope.reflog {
+        // Every reflog failure — unknown ref, unreadable log, a ref that simply has
+        // no entries — ends in an empty list, so one message covers them all. Its
+        // detail is in the log lines `load_reflog` writes on the way.
+        return commits.is_empty().then(|| {
+            format!(
+                "No reflog entries for {} — unknown ref, or its reflog is empty.",
+                scope.revs.first().map_or("HEAD", String::as_str)
+            )
+        });
     }
+    // REAL commits, not rows: a path filter still shows the working-tree rows when the
+    // edits touch it, and a range scope shows its own row — neither means the walk
+    // selected anything.
+    if !commits.iter().any(|c| is_real_commit(c.oid)) {
+        return Some(if !scope.paths.is_empty() {
+            let within = if scope.revs.is_empty() {
+                String::new()
+            } else {
+                format!(" in {}", quoted(&scope.revs))
+            };
+            format!("No commits{within} touch {}.", quoted(&scope.paths))
+        } else if !scope.revs.is_empty() {
+            format!("No commits in {}.", quoted(&scope.revs))
+        } else if scope.all {
+            "No commits to show — this repository has none yet.".to_string()
+        } else {
+            // Not necessarily an empty repo: an unborn HEAD (`git checkout --orphan`)
+            // walks to nothing while other branches are full, so this names the branch
+            // rather than the repository.
+            "No commits to show — the current branch has none yet.".to_string()
+        });
+    }
+    // Every lone-range scope gets a combined row, `--combined` or not (the flag only
+    // decides whether the window OPENS on it), so this asks `combined_range` rather
+    // than the flag. A scope entitled to the row and not showing it means `range_ends`
+    // could not resolve an endpoint or their merge base — both logged there, neither
+    // visible in a commit list that is otherwise exactly as expected.
+    if let Some(range) = cli::combined_range(scope)
+        && !commits
+            .iter()
+            .any(|c| diff::CommitKind::of(c.oid) == diff::CommitKind::Range)
+    {
+        return Some(format!(
+            "The combined row for '{}' is missing — its endpoints could not be resolved (see the terminal).",
+            range.token
+        ));
+    }
+    None
 }
 
 /// One history walk's output: the rows to show, and the ordered oids behind them
@@ -2008,6 +2066,124 @@ mod tests {
         let real: Vec<&CommitInfo> = got.iter().filter(|c| is_real_commit(c.oid)).collect();
         assert_eq!(real.len(), 2, "A..B excludes A");
         assert!(real.iter().all(|c| c.source.range().is_none()));
+    }
+
+    /// The notice exists for the window that looks like a working view of a repo with
+    /// nothing in it, so silence on a view that IS what was asked for is half of it.
+    #[test]
+    fn scope_notice_is_silent_when_the_view_holds_what_was_asked_for() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", "a\n", "one");
+
+        let sc = cli::Scope::default();
+        assert_eq!(scope_notice(&sc, &load_commits(&repo, 100, &sc)), None);
+
+        // A path filter that matches is equally quiet.
+        let sc = cli::Scope {
+            paths: vec!["f.txt".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(scope_notice(&sc, &load_commits(&repo, 100, &sc)), None);
+    }
+
+    /// A path filter matching nothing is the case that prompted this: the pathspec is
+    /// named because it is the actionable part, and it is named as GITKAY resolved it
+    /// (repo-root-relative), which is what actually matched nothing.
+    #[test]
+    fn scope_notice_names_a_path_filter_that_matches_nothing() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", "a\n", "one");
+
+        let sc = cli::Scope {
+            paths: vec!["sub/nope.txt".to_string()],
+            ..Default::default()
+        };
+        let notice = scope_notice(&sc, &load_commits(&repo, 100, &sc)).expect("reported");
+        assert!(notice.contains("'sub/nope.txt'"), "{notice}");
+    }
+
+    /// A range whose walk is empty leaves the range row and nothing else, so the row
+    /// count alone cannot tell it from a working view — the notice asks about REAL
+    /// commits for exactly this reason.
+    #[test]
+    fn scope_notice_reports_a_rev_range_that_selects_nothing() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        let base = commit_file(&repo, "f.txt", "a\n", "base");
+        let head = commit_file(&repo, "f.txt", "a\nb\n", "head");
+
+        // Backwards: `head..base` hides everything it pushes.
+        let token = format!("{head}..{base}");
+        let sc = cli::Scope {
+            revs: vec![token.clone()],
+            ..Default::default()
+        };
+        let got = load_commits(&repo, 100, &sc);
+        assert!(
+            got.iter().any(|c| c.oid == diff::oid_range()),
+            "control: the range row itself is still there"
+        );
+        let notice = scope_notice(&sc, &got).expect("reported");
+        assert!(notice.contains(&token), "{notice}");
+    }
+
+    /// `range_ends` refusing an endpoint yields a list that looks entirely normal —
+    /// the walk is unaffected — minus the row the scope was entitled to. Nothing else
+    /// on screen says so.
+    #[test]
+    fn scope_notice_reports_a_lone_range_whose_combined_row_is_missing() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", "a\n", "base");
+        commit_file(&repo, "f.txt", "a\nb\n", "head");
+
+        // A tree-ish endpoint: `revparse_single` resolves it (so `cli::classify` calls
+        // the token a rev), `peel_to_commit` cannot.
+        let token = "HEAD^{tree}..HEAD".to_string();
+        let sc = cli::Scope {
+            combined: true,
+            revs: vec![token.clone()],
+            ..Default::default()
+        };
+        let got = load_commits(&repo, 100, &sc);
+        assert!(
+            got.iter().any(|c| is_real_commit(c.oid)),
+            "control: the commit list itself is unaffected"
+        );
+        let notice = scope_notice(&sc, &got).expect("reported");
+        assert!(notice.contains(&token), "{notice}");
+    }
+
+    /// Every reflog failure — a typo'd ref, an unreadable log, a ref with no entries —
+    /// arrives as an empty list, and `--reflog` is the one mode whose scope names a ref
+    /// that may not exist at all.
+    #[test]
+    fn scope_notice_reports_a_reflog_ref_with_no_entries() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", "a\n", "one");
+
+        let sc = cli::Scope {
+            reflog: true,
+            revs: vec!["no-such-ref".to_string()],
+            ..Default::default()
+        };
+        let notice = scope_notice(&sc, &load_reflog(&repo, 100, &sc)).expect("reported");
+        assert!(notice.contains("no-such-ref"), "{notice}");
+    }
+
+    /// A repo with no commits at all reaches the same blank window by a route the
+    /// command line had no part in, and must not be described as a scope that matched
+    /// nothing — nor as an empty repository, which an unborn HEAD is not.
+    #[test]
+    fn scope_notice_explains_an_empty_default_view() {
+        use crate::test_repo::temp_repo;
+        let (_d, repo) = temp_repo();
+        let sc = cli::Scope::default();
+        let notice = scope_notice(&sc, &load_commits(&repo, 100, &sc)).expect("reported");
+        assert!(notice.contains("current branch"), "{notice}");
     }
 
     #[test]

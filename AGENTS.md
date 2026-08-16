@@ -242,7 +242,8 @@ boundary now enforces rather than merely asserting; see **Startup & timing**),
 `src/history.rs` (the commit list: walking a repo's history into the `CommitInfo`
 rows the app draws, plus the ref map that labels them — `history_revwalk` and the
 loaders, the provisional walk and its `topo_window`, the resumable tail extension,
-the local probes, and `build_ref_map`. git2-facing and egui-free, the same shape
+the local probes, `build_ref_map`, and `scope_notice` — why the list holds less
+than the scope asked for. git2-facing and egui-free, the same shape
 `diff.rs` has: everything here answers "which rows are there", never "how are they
 drawn". See **Startup & timing** for why the walk needs three strategies rather
 than one),
@@ -357,6 +358,28 @@ The invariants:
 ### UI (egui immediate mode)
 - **Top panel**: search bar (SHA/author/message/ref), Enter cycles matches, any keypress focuses search, graph auto-scrolls to match. A changed keystroke selects and centers its match instantly but defers the diff load behind `DIFF_LOAD_DEBOUNCE` (120ms of input pause), so typing a word doesn't spawn a diff worker per keystroke; Enter/arrow match-cycling and clicks load immediately, and any direct `load_selected_diff` cancels the pending debounced load. That timer is **one mechanism, not the search bar's own** — the toolbar's context wheel arms it too (`defer_diff_load`), because supersession drops a stale result but never cancels a running build: with the foreground workers free, a burst starts several complete `get_diff_data` runs on the one path deliberately unguarded by `probe_row_cost`, then refuses to cache any of them
 - **Central panel**: commit graph + list (`show_commit_list`), virtualized with egui `show_rows` (same mechanism as the diff pane). Lazy loading: 200 initial, +500 on scroll-near-bottom — computed on a `gitkay-history-load` worker (never the frame loop), appended incrementally via `load_commits_tail` in the common plain scope, full background rebuild otherwise. The debounced git-watcher reload takes the same worker path. `history_epoch` supersedes stale results; both land in `drain_history_results`. An append installs through `append_commits` — O(tail), not O(history): the graph layout **resumes** from the stored `GraphLayoutState` (pipes + colour counter) and the lookup maps / search matches extend in place, leaving selection and scroll untouched. The resume is unsound when a previously out-of-scope merge parent lands in the tail (its already-laid-out merge row would gain a diagonal only a relayout can add) — `deferred_parents` tracks those and forces a full `resync_commits` then; `layout_resume_matches_full_layout` pins the parity. A rebuild arrives with its `DerivedHistory` already computed on the worker (`rebuild_load`), so the frame loop only installs it and restores the selection (`install_derived` + `finish_resync`)
+- **Scope notice**: a tinted bar at the top of the commit list saying why the view
+  holds less than the command line asked for — `history::scope_notice`, pure, one
+  phrasing for both the log line and the bar (`refresh_scope_notice` writes both, and
+  logs only on a CHANGE so a watcher reload doesn't repeat it). An *invalid* command
+  line never gets here: `cli::classify`/`cli::validate` report to the terminal and
+  exit before a window exists. What does is a scope that parsed, resolved and then
+  selected nothing — a path filter no commit touches, an empty range, a reflog ref
+  with no entries, an unborn HEAD — which otherwise paints a blank window
+  indistinguishable from a repo that really looks like that. It also covers the one
+  shortfall that is NOT an empty window: a lone-range scope whose combined row
+  `range_ends` refused, where the commit list beside it looks entirely normal.
+  Three properties are load-bearing. It is **derived from the installed list**, not
+  posted by whatever noticed, so it cannot outlive the situation — the next walk that
+  finds rows produces `None`. It is **not computed for the provisional list**, whose
+  emptiness means "still walking", not "nothing matched". And it is **not
+  dismissible**: it states what is on screen right now, so nothing can silence a claim
+  that is still true. Recomputed at the two places a whole real list is installed
+  (`install_startup_history`, the `Rebuild` arm of `drain_history_results`); an append
+  can't reach one, since every case is about rows being ABSENT. Drawn in the flow at
+  the top of the list panel rather than as an overlay like `show_apply_status` — it
+  must never cover a row whose absence it is explaining — and it wraps rather than
+  eliding, a bar being unscrollable.
 - **Commit-list stats column**: each row's files-changed / `+`/`-` counts, from
   `diff::commit_stats` — the same `scoped_diff` prologue the pane's own
   `build_diff_data` runs (options, builder, rename post-pass), so the column can
@@ -871,8 +894,10 @@ claiming, and `warm_disposition`'s precedence),
 `history` (the walk over real temp repos: the tail extension against a full walk,
 the provisional walk's agreement with the real one and the two orderings that break
 it, the path filter's parent rewriting, `--first-parent`, `--follow`, the reflog and
-the range endpoints — sharing `main`'s `scope`/`summaries`/`real_commits` fixtures
-rather than keeping copies that drift), `textconv` (driver resolution and its re-resolution after `invalidate`, the
+the range endpoints, and `scope_notice` over every shortfall it names — each with a
+control asserting what the list still holds, since a notice that fires on a healthy
+view is the failure worth catching — sharing `main`'s
+`scope`/`summaries`/`real_commits` fixtures rather than keeping copies that drift), `textconv` (driver resolution and its re-resolution after `invalidate`, the
 runner's argument shape, its two bounds and the fork that used to defeat them, the
 hung-driver latch and the reload that re-arms it, the reported driver CHANGE that lets
 the two caches be dropped — including one carried by a key only libgit2 reads, which
