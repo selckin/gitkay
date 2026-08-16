@@ -766,8 +766,11 @@ pub struct DiffData {
     /// Widest line in characters — sizes the virtualized diff's horizontal
     /// scroll content (only visible rows are laid out, so egui can't otherwise
     /// know an off-screen line is wide; assumes a monospace diff font). Computed
-    /// here at build time — on whatever worker built the diff — so installing a
-    /// diff never rescans every line on the UI thread.
+    /// at build time — on whatever worker built the diff — so installing a diff
+    /// never rescans every line on the UI thread, and on the build path
+    /// accumulated row by row as they are pushed (`DiffRows`) rather than by a
+    /// second traversal once the build is over, which walks rows that are
+    /// cache-cold by then.
     pub max_chars: usize,
     /// A `diff.<driver>.textconv` was configured for one of these files and could
     /// not be run, so that file fell back to its raw body.
@@ -782,28 +785,35 @@ pub struct DiffData {
 }
 
 impl DiffData {
-    /// Finalize a diff builder's output. Neither derived per-row value is computed
-    /// here: spans start blank (the highlighter fills them, in viewport order) and
-    /// emphasis is not even part of a diff — the UI fills one window at a time
-    /// (`emphasize_rows`), so no builder or worker ever pays the LCS for lines nobody
-    /// looks at.
+    /// `with_max_chars` with the widest line rescanned off the finished rows.
+    ///
+    /// Test-only, and that is the point of `DiffRows`: the build path accumulates the
+    /// same value as it pushes, so nothing in the app traverses a finished diff to get
+    /// it. What is left is a suite assembling rows by hand, which has nothing to hand
+    /// over.
+    #[cfg(test)]
     pub fn new(lines: Vec<DiffLine>, files: Vec<FileEntry>) -> Self {
-        let max_chars = lines
-            .iter()
-            .map(|l| l.text.chars().count())
-            .max()
-            .unwrap_or(0);
+        let max_chars = lines.iter().map(row_chars).max().unwrap_or(0);
         Self::with_max_chars(lines, files, max_chars)
     }
 
-    /// A diff whose widest line is already known, and which cannot have failed a
-    /// conversion — the persistent store's decoder, where `textconv_failed` is `false`
-    /// by construction because a failed diff is never written.
+    /// Finalize a diff whose widest line is already known: the build path, where
+    /// `DiffRows` measured every row as it was pushed, and the persistent store's
+    /// decoder, which encodes the value.
     ///
-    /// NOT for the display round-trip, which has a flag to carry: see `into_parts`.
-    /// This constructor used to serve both, and stating `false` here laundered a
-    /// transient textconv failure straight past `cache_diff`'s guard and back into the
-    /// LRU, for the one diff most likely to be revisited.
+    /// Neither derived per-row value is computed here: spans start blank (the
+    /// highlighter fills them, in viewport order) and emphasis is not even part of a
+    /// diff — the UI fills one window at a time (`emphasize_rows`), so no builder or
+    /// worker ever pays the LCS for lines nobody looks at.
+    ///
+    /// `textconv_failed` is stated `false` — true by construction for the decoder (a
+    /// failed diff is never written), and overwritten straight afterwards by
+    /// `build_diff_data`, which is holding the flag its own pass just returned. NOT for
+    /// the display round-trip, which has a flag to carry and no builder beside it to
+    /// take it from: see `into_parts`. This constructor used to serve that too, and
+    /// stating `false` here laundered a transient textconv failure straight past
+    /// `cache_diff`'s guard and back into the LRU, for the one diff most likely to be
+    /// revisited.
     pub fn with_max_chars(lines: Vec<DiffLine>, files: Vec<FileEntry>, max_chars: usize) -> Self {
         Self {
             // The one place a diff's span slots are allocated against its rows, which
@@ -869,6 +879,105 @@ impl DiffData {
     /// at the call site before returning this).
     pub fn empty() -> Self {
         Self::with_max_chars(Vec::new(), Vec::new(), 0)
+    }
+}
+
+/// One row's width in characters. NOT `text.len()`: that is exact for ASCII and three
+/// times too wide for CJK, and this value sizes the horizontal scroll range.
+fn row_chars(line: &DiffLine) -> usize {
+    line.text.chars().count()
+}
+
+/// The rows a diff build is accumulating, with the widest one measured as they go.
+///
+/// `DiffData::max_chars` sizes the pane's horizontal scroll range, and `DiffData::new`
+/// derives it by rescanning every row once the build has finished — a second traversal
+/// of rows that are cache-cold by then, measured at 16ms per 900k lines and so ~1.4s on
+/// a 76.5M-line diff. Measured at the push instead, the text is the one the builder
+/// just wrote.
+///
+/// A type rather than a running counter carried beside the `Vec`, for two reasons.
+/// Every row a build emits goes through `push`/`extend`/`set`, so none can be added
+/// without being measured — the commit-message header and the diffstat block are as
+/// able to hold the widest row as a patch line is, and a missed one under-reports,
+/// which is the direction that truncates the scroll range. And the three signatures
+/// that carry the rows (`append_diff_body`, `push_patch_line`, `emit_converted`) keep
+/// their argument counts, two of them sitting at clippy's limit already.
+#[derive(Default)]
+struct DiffRows {
+    lines: Vec<DiffLine>,
+    max_chars: usize,
+}
+
+/// A point in a `DiffRows` a build can rewind to. Carries the widest row seen at that
+/// point as well as the row count — see `DiffRows::rewind`.
+#[derive(Clone, Copy)]
+struct RowMark {
+    len: usize,
+    max_chars: usize,
+}
+
+impl DiffRows {
+    /// Start from rows the caller assembled itself — a diff's header block — measuring
+    /// them: a commit message line is routinely the widest row in a small diff.
+    fn new(lines: Vec<DiffLine>) -> Self {
+        let max_chars = lines.iter().map(row_chars).max().unwrap_or(0);
+        Self { lines, max_chars }
+    }
+
+    const fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    fn push(&mut self, line: DiffLine) {
+        self.max_chars = self.max_chars.max(row_chars(&line));
+        self.lines.push(line);
+    }
+
+    fn extend(&mut self, lines: impl IntoIterator<Item = DiffLine>) {
+        for line in lines {
+            self.push(line);
+        }
+    }
+
+    /// `n` empty placeholder rows for `set` to fill once the counts they state are
+    /// final — the diffstat block, which is drawn above the patch but counts what the
+    /// patch pass finds. Empty, so they widen nothing until they are written.
+    fn reserve_blank(&mut self, n: usize, kind: LineKind) {
+        self.lines
+            .resize_with(self.lines.len() + n, || DiffLine::new("", kind));
+    }
+
+    /// Overwrite a row `reserve_blank` put there. Out of range is a no-op, as the
+    /// `get_mut` this replaced was: the reservation is exact by construction, and a
+    /// mismatch must not panic in the middle of a build.
+    fn set(&mut self, i: usize, line: DiffLine) {
+        if let Some(slot) = self.lines.get_mut(i) {
+            self.max_chars = self.max_chars.max(row_chars(&line));
+            *slot = line;
+        }
+    }
+
+    const fn mark(&self) -> RowMark {
+        RowMark {
+            len: self.lines.len(),
+            max_chars: self.max_chars,
+        }
+    }
+
+    /// Drop everything pushed since `mark`, INCLUDING its contribution to the widest
+    /// row. A running maximum cannot be un-maxed by truncating alone, and what a rewind
+    /// drops is a half-written converted patch about to be replaced by the raw body —
+    /// leaving its width behind would size the scroll range for text no longer on
+    /// screen.
+    fn rewind(&mut self, mark: RowMark) {
+        self.lines.truncate(mark.len);
+        self.max_chars = mark.max_chars;
+    }
+
+    /// The rows and the width measured over them, for `DiffData::with_max_chars`.
+    fn finish(self) -> (Vec<DiffLine>, usize) {
+        (self.lines, self.max_chars)
     }
 }
 
@@ -1196,7 +1305,7 @@ pub fn delta_path_bytes<'a>(delta: &git2::DiffDelta<'a>) -> &'a [u8] {
 /// the scroll anchor, the hunk headers and the sidebar all work with no knowledge of
 /// any of it.
 fn push_patch_line(
-    lines: &mut Vec<DiffLine>,
+    lines: &mut DiffRows,
     files: &mut [FileEntry],
     file_idx: Option<usize>,
     line: &git2::DiffLine<'_>,
@@ -1295,7 +1404,7 @@ fn push_patch_line(
 ///
 /// Returns whether any `diff.<driver>.textconv` FAILED — see `DiffData::textconv_failed`.
 fn append_diff_body(
-    lines: &mut Vec<DiffLine>,
+    lines: &mut DiffRows,
     files: &mut Vec<FileEntry>,
     repo: &Repository,
     source: DiffSource,
@@ -1405,7 +1514,7 @@ fn append_diff_body(
     // `diff_line_idx` the print records below is already correct.
     let stats_at = settings.show_stats.then(|| {
         let at = lines.len();
-        lines.resize_with(at + files.len() + 1, || DiffLine::new("", LineKind::Stat));
+        lines.reserve_blank(files.len() + 1, LineKind::Stat);
         lines.push(DiffLine::new("", LineKind::Blank));
         at
     });
@@ -1575,9 +1684,7 @@ fn append_diff_body(
             .into_iter()
             .enumerate()
         {
-            if let Some(slot) = lines.get_mut(at + row) {
-                *slot = DiffLine::new(text, LineKind::Stat);
-            }
+            lines.set(at + row, DiffLine::new(text, LineKind::Stat));
         }
     }
 
@@ -1718,10 +1825,10 @@ pub fn build_diff_data<'r>(
             return DiffData::empty();
         }
     };
-    let mut lines = header;
+    let mut rows = DiffRows::new(header);
     let mut files = Vec::new();
     let failed = append_diff_body(
-        &mut lines,
+        &mut rows,
         &mut files,
         repo,
         scope.source,
@@ -1729,9 +1836,10 @@ pub fn build_diff_data<'r>(
         settings,
         env,
     );
+    let (lines, max_chars) = rows.finish();
     DiffData {
         textconv_failed: failed,
-        ..DiffData::new(lines, files)
+        ..DiffData::with_max_chars(lines, files, max_chars)
     }
 }
 
@@ -2826,6 +2934,109 @@ pub mod tests {
             detect_renames,
             ..base_settings()
         }
+    }
+
+    /// `max_chars` sizes the pane's horizontal scroll range, and the build accumulates
+    /// it as it pushes rows (`DiffRows`) instead of rescanning the finished diff. So it
+    /// has to say what a rescan would, whichever part of the build produced the widest
+    /// row — a push that skipped its measurement under-reports, and the direction
+    /// matters: too small truncates the scroll range for the one line that needed it.
+    #[test]
+    fn max_chars_matches_a_rescan_of_the_finished_rows() {
+        let (_d, repo, oid) = everything_repo();
+        for show_stats in [false, true] {
+            let s = DiffSettings {
+                show_stats,
+                ..base_settings()
+            };
+            let data = diff_of(&repo, oid, s, None);
+            assert_eq!(
+                data.max_chars,
+                data.lines.iter().map(row_chars).max().unwrap_or(0),
+                "show_stats={show_stats}"
+            );
+            assert!(data.max_chars > 0, "control: the fixture has rows");
+        }
+    }
+
+    /// The header block is the caller's, assembled before `append_diff_body` runs, and
+    /// a commit message line is routinely the widest row in a small diff — so
+    /// `DiffRows::new` measures what it is handed rather than starting at zero.
+    #[test]
+    fn max_chars_counts_the_commit_message_header() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", "a\n", "base");
+        let wide = "x".repeat(300);
+        let oid = commit_file(&repo, "f.txt", "b\n", &wide);
+        let data = diff_of(&repo, oid, base_settings(), None);
+        // The message is indented by four, and nothing in this patch comes close.
+        assert_eq!(data.max_chars, wide.chars().count() + 4);
+    }
+
+    /// Counted in CHARS, not bytes: `text.len()` is exact for ASCII and three times too
+    /// wide for CJK, which would size the scroll range for a line that isn't there.
+    #[test]
+    fn max_chars_counts_characters_not_bytes() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        let wide = "日".repeat(100);
+        let oid = commit_file(&repo, "f.txt", &format!("{wide}\n"), "cjk");
+        let data = diff_of(&repo, oid, base_settings(), None);
+        // The added row, plus its `+` marker — not the 300 bytes it occupies.
+        assert_eq!(data.max_chars, 101);
+    }
+
+    /// `extend` measures every row it takes, not the first or the last. The sweep's
+    /// synthesized header goes in this way, and its `diff --git` line is as wide as the
+    /// path is long.
+    #[test]
+    fn extending_rows_measures_each_one() {
+        for widest in 0..3 {
+            let mut rows = DiffRows::new(Vec::new());
+            // The same three rows in each rotation, so no position is privileged.
+            let mut lines: Vec<DiffLine> = (0..3)
+                .map(|i| DiffLine::new("-".repeat(i * 10 + 1), LineKind::FileMeta))
+                .collect();
+            lines.rotate_left(widest);
+            rows.extend(lines);
+            let (lines, max_chars) = rows.finish();
+            assert_eq!(max_chars, lines.iter().map(row_chars).max().unwrap());
+            assert_eq!(max_chars, 21);
+        }
+    }
+
+    /// A rewind takes the widest row back with the rows it drops. `emit_converted`
+    /// abandons a half-written converted patch and falls back to the raw body; a
+    /// running maximum cannot be un-maxed by truncating alone, so the mark carries it.
+    #[test]
+    fn rewinding_rows_restores_the_widest_one() {
+        let mut rows = DiffRows::new(vec![DiffLine::new("short", LineKind::Meta)]);
+        let mark = rows.mark();
+        rows.push(DiffLine::new(
+            "a much wider row than that one",
+            LineKind::Add,
+        ));
+        assert!(rows.max_chars > mark.max_chars, "control: the row is wider");
+        rows.rewind(mark);
+        assert_eq!(rows.len(), 1);
+        let (lines, max_chars) = rows.finish();
+        assert_eq!(max_chars, lines.iter().map(row_chars).max().unwrap());
+    }
+
+    /// A reserved row is measured when it is WRITTEN, not when it is reserved: the
+    /// diffstat block reserves its rows before the patch pass (so every
+    /// `diff_line_idx` that pass records is right) and fills them once the counts are
+    /// final.
+    #[test]
+    fn a_filled_placeholder_row_is_measured() {
+        let mut rows = DiffRows::new(Vec::new());
+        rows.reserve_blank(2, LineKind::Stat);
+        assert_eq!(rows.max_chars, 0, "an empty placeholder widens nothing");
+        rows.set(1, DiffLine::new("a filled stat row", LineKind::Stat));
+        let (lines, max_chars) = rows.finish();
+        assert_eq!(max_chars, lines.iter().map(row_chars).max().unwrap());
+        assert_eq!(max_chars, "a filled stat row".len());
     }
 
     /// git's line numbers ride along on every patch row: a context row carries

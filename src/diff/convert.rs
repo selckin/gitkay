@@ -22,7 +22,9 @@
 
 use git2::Repository;
 
-use super::{DiffLine, DiffSettings, DiffSource, FileEntry, LineKind, diff_opts, push_patch_line};
+use super::{
+    DiffLine, DiffRows, DiffSettings, DiffSource, FileEntry, LineKind, diff_opts, push_patch_line,
+};
 use crate::textconv::{self, Side, Textconv};
 
 /// One SIDE's path as raw bytes, falling back to the other side's when that side has
@@ -465,7 +467,7 @@ pub(super) fn header_prefixes<'a>(
 /// difference between the two callers — see `HeaderOf`. It says nothing about what
 /// may be converted: that is `ctx.modes`, which both callers have.
 pub(super) fn emit_converted(
-    lines: &mut Vec<DiffLine>,
+    lines: &mut DiffRows,
     files: &mut [FileEntry],
     ctx: ConvertCtx<'_>,
     fi: usize,
@@ -556,7 +558,7 @@ pub(super) fn emit_converted(
     // Past this point rows are being written, so every exit either finishes the
     // conversion or REWINDS to here: falling back to the raw body without rewinding
     // would print it under a half-written converted patch. See the `printed` error arm.
-    let rewind = (lines.len(), files[fi].additions, files[fi].deletions);
+    let rewind = (lines.mark(), files[fi].additions, files[fi].deletions);
     files[fi].is_converted = true;
     match header {
         HeaderOf::OnScreen { prefixes } if delta.flags().contains(git2::DiffFlags::BINARY) => {
@@ -592,7 +594,7 @@ pub(super) fn emit_converted(
         // body, exactly as a driver that could not be run does. Nothing else has been
         // touched: `push_patch_line` only appends and adjusts this file's own counts.
         log::warn!("gitkay: error rendering a converted patch: {e}");
-        lines.truncate(rewind.0);
+        lines.rewind(rewind.0);
         files[fi].is_converted = false;
         (files[fi].additions, files[fi].deletions) = (rewind.1, rewind.2);
         return Substitution::Failed;
@@ -1282,6 +1284,49 @@ pub(super) mod tests {
             at(0) < at(1),
             "the list order must be the order the patches are drawn"
         );
+    }
+
+    /// `max_chars` sizes the pane's horizontal scroll range and is accumulated as the
+    /// build pushes rows, so it has to agree with a rescan of what came out — here over
+    /// the rows a CONVERSION produces, which reach `DiffRows` by both of the routes the
+    /// substitution has (in place under libgit2's header, and swept). A converted
+    /// archive is as long as any other file, so this is a real source of the widest
+    /// row, not a corner.
+    #[test]
+    fn a_converted_patchs_widest_row_is_measured_as_it_is_pushed() {
+        use crate::diff::row_chars;
+        use crate::test_repo::{commit_file, write_attributes};
+        // Wide enough that a converted row, and nothing else, is the widest one. The
+        // size keeps the two sides apart under `ignore_ws`, which the converted patch
+        // is generated with too — see the sweep's own fixtures.
+        let pad = "x".repeat(400);
+        let (t, repo, _cmd) = driven_repo(&format!(
+            "printf 'CONVERTED %s %s {pad}\\n' \"$(wc -c < \"$1\" | tr -d ' ')\" \"$(cat \"$1\")\"\n"
+        ));
+        // Both driven, so both conversion routes run in one diff: `a.dat` changes by
+        // whitespace alone and is swept, `b.txt` changes for real and is substituted
+        // under the header libgit2 printed.
+        write_attributes(&repo, "*.dat diff=gktest\n*.txt diff=gktest\n");
+        let _ = t;
+        commit_file(&repo, "a.dat", "a\n", "one");
+        commit_file(&repo, "b.txt", "x\n", "one b");
+        let head = commit_both(&repo, "a \n", "y\n");
+
+        let settings = DiffSettings {
+            ignore_ws: true,
+            ..conv_settings()
+        };
+        let data = diff_of(&repo, head, settings, Some(&Textconv::new()));
+        assert!(
+            data.files.iter().all(|f| f.is_converted),
+            "control: both routes must have converted: {:?}",
+            texts(&data)
+        );
+        assert_eq!(
+            data.max_chars,
+            data.lines.iter().map(row_chars).max().unwrap_or(0)
+        );
+        assert!(data.max_chars > 400, "the converted body is the widest row");
     }
 
     /// git resolves a driver per FILESPEC, so a rename across a driver boundary
