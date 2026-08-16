@@ -1035,6 +1035,20 @@ pub fn scoped_diff_opts(settings: DiffSettings, paths: &[String]) -> DiffOptions
 /// has no entry of its own left in the diff — the case `resolve_anchor`'s
 /// `Renamed` gate exists for. A detection error is logged and left non-fatal —
 /// the diff simply stays in its raw add/delete form (mirrors `rename_source`).
+/// A `find_similar` slower than this gets a line in the log.
+///
+/// Rename/copy detection scores add/delete pairs by hashing blob CONTENT, so its cost
+/// tracks BYTES rather than the number of files — which makes it a candidate for a
+/// large share of a build on a repo of gigabyte-scale blobs, and nothing currently
+/// attributes any of a build's time to it. Thresholded rather than always-on because
+/// `scoped_diff` is also what the commit-list stats column runs, eight workers wide, on
+/// every visible row: an unconditional line per call would bury every other log to
+/// report 61µs.
+///
+/// Well clear of anything ordinary — the whole of `scoped_diff` measured 61µs on a
+/// 900k-line single-file diff — so a quiet log means detection is not the problem.
+const SLOW_DETECT_SIMILAR: std::time::Duration = std::time::Duration::from_millis(250);
+
 pub fn detect_similar(diff: &mut git2::Diff, settings: DiffSettings) {
     if !settings.detect_renames && !settings.detect_copies {
         return;
@@ -1780,11 +1794,24 @@ fn scoped_diff_with<'r, T>(
     measure: impl FnOnce(&'r Repository, &git2::Diff<'r>) -> T,
 ) -> Result<(git2::Diff<'r>, T), git2::Error> {
     let mut opts = scoped_diff_opts(settings, paths);
+    let t = std::time::Instant::now();
     let mut diff = build(repo, &mut opts)?;
+    let built = t.elapsed();
     let measured = measure(repo, &diff);
     // Rename/copy coalescing is a post-pass, not a DiffOptions flag: without it a
     // rename counts as two changed files in the column and one in the pane.
+    let t = std::time::Instant::now();
     detect_similar(&mut diff, settings);
+    let detected = t.elapsed();
+    if detected >= SLOW_DETECT_SIMILAR {
+        log::debug!(
+            "perf: scoped_diff: {} deltas — tree walk {built:?}, rename/copy detection \
+             {detected:?} (renames={}, copies={})",
+            diff.deltas().len(),
+            settings.detect_renames,
+            settings.detect_copies
+        );
+    }
     Ok((diff, measured))
 }
 
