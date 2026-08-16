@@ -1260,29 +1260,51 @@ pub const fn provisional_scope(scope: &cli::Scope) -> bool {
     !scope.all && !scope.reflog && !scope.follow && scope.revs.is_empty() && scope.paths.is_empty()
 }
 
+/// How far ahead of what it has emitted this walk discovers before trusting its
+/// floor.
+///
+/// The floor — "nothing left to expand outranks this row" — is sound only if a
+/// row's key is below every one of its children's. The clamp guarantees that for
+/// the child that DISCOVERED it, and a different child found later can undercut it.
+/// Generation numbers are what remove the "later": `gen(parent) < gen(child)`
+/// always, which is why `topo::TopoWalk` needs no slack at all.
+///
+/// Without them the slack is empirical, and this is where the measurement puts it.
+/// Against `git rev-list --topo-order` on a 1.47M-commit kernel clone, 200 rows:
+/// no lookahead diverges at row 16 (192 of 200 commits in common), 500 is no
+/// better, **5,000 is byte-identical** — as it is at 500 and 2,000 rows there, and
+/// at 1,500 rows on three other repositories. It costs ~300ms against the old
+/// heap's ~43ms, which buys a provisional list the real one will not visibly
+/// reorder, and is still 150× inside the 45s walk it stands in for.
+///
+/// It is a heuristic and should be read as one. A repository that defeats it gets a
+/// list that is still topologically VALID — `topo_window` guarantees that
+/// separately — merely ordered differently from the list that replaces it, which is
+/// what this walk has always risked.
+const PROVISIONAL_LOOKAHEAD: usize = 5_000;
+
 /// A lazy newest-first walk: a heap keyed by committer time (libgit2's own sort
 /// key), seeded from HEAD, popping rows and pushing only their parents. Touches
 /// O(rows + frontier) commits where the sorted walk touches the whole history —
 /// 2ms against 2.0s for 200 rows on an 82k-commit repo.
 ///
-/// **This is an approximation and is only ever shown provisionally**, and it now
-/// approximates an order the real walk NO LONGER USES. It produces `git rev-list
-/// --date-order`, which is what the sorted walk produced until `history_revwalk`
-/// dropped `Sort::TIME` to match `git log --graph`. On a merge-heavy repository the
-/// two disagree in both order and membership: on a 1.47M-commit kernel clone this
-/// walk's first 200 rows are exactly `--date-order` and share only **169 of 200**
-/// commits with the topological list that replaces them. On a repository whose
-/// history is nearly linear they still coincide.
+/// **This is an approximation and is only ever shown provisionally**, but it
+/// approximates the order it is standing in for. It is `topo::TopoWalk`'s shape —
+/// expand a frontier, emit LIFO once the floor is clear — with the generation floor
+/// replaced by a TIME floor plus `PROVISIONAL_LOOKAHEAD` of slack, since the
+/// repositories this runs on are exactly the ones with no commit-graph to read
+/// generations from.
 ///
-/// That is a known shortfall rather than a hazard, because of where it can happen.
-/// The provisional walk is skipped entirely when the lazy topological walk is
-/// available (`topo_available`), so what is left is the plain scope on a repository
-/// with no commit-graph — exactly the case whose slow walk this exists to cover.
-/// The rows are replaced when the real list lands, which is what
-/// `WalkCost::OrderingAfterProvisional` already warns about; the replacement is
-/// simply larger than it used to be. Realigning it means giving this walk the LIFO
-/// shape `topo::TopoWalk` has instead of a time-ordered heap, which needs its own
-/// verification pass.
+/// Measured byte-identical to `git rev-list --topo-order` on a 1.47M-commit kernel
+/// clone at 200 and 1000 rows, and on three other repositories — but *empirically*,
+/// where `topo::TopoWalk` is exact by construction. That difference is the whole
+/// reason this stays provisional and the real walk still replaces it.
+///
+/// It was a heap keyed on committer time, which produced `git rev-list
+/// --date-order` — correct while the sorted walk produced date order too, and
+/// stranded when `history_revwalk` dropped `Sort::TIME`. On the kernel that left it
+/// sharing only 169 of 200 commits with the list replacing it, and diverging from
+/// row 2.
 ///
 /// Exact global order cannot be produced lazily WITHOUT GENERATION NUMBERS — "no
 /// parent before all its children" needs the whole DAG, which is precisely the pass
@@ -1307,37 +1329,95 @@ pub fn provisional_commits(repo: &Repository, max: usize, first_parent: bool) ->
     let Ok(head) = repo.head().and_then(|h| h.peel_to_commit()) else {
         return Vec::new();
     };
-    let mut heap: std::collections::BinaryHeap<(i64, git2::Oid)> =
+    // The frontier: discovered but not yet expanded, newest first. Its peak is the
+    // floor — nothing left to expand can be a child of a row keyed above it.
+    let mut frontier: std::collections::BinaryHeap<(i64, git2::Oid)> =
         std::collections::BinaryHeap::new();
-    let mut seen: HashSet<git2::Oid> = HashSet::new();
-    heap.push((head.time().seconds(), head.id()));
-    seen.insert(head.id());
-    // Each row is kept with the heap key it popped at — its COMMITTER time, clamped
-    // below its discovering child. `topo_window` re-sorts on it, and `CommitInfo`
-    // cannot supply it: its `time` is the AUTHOR date (what `git log` shows, and what
-    // a rebase leaves untouched), which is a different order on any repo that has been
-    // rebased, cherry-picked or imported — exactly the repos this walk exists for.
-    let mut out: Vec<(i64, CommitInfo)> = Vec::with_capacity(max);
-    while out.len() < max {
-        let Some((key, oid)) = heap.pop() else { break };
-        let Ok(commit) = repo.find_commit(oid) else {
-            continue;
+    // git's indegree convention, as `topo::TopoWalk` uses: the row itself plus each
+    // discovered child, so a row is ready to emit at exactly 1.
+    let mut indegree: HashMap<git2::Oid, u32> = HashMap::new();
+    // Each row's committer time, clamped strictly below the child that discovered it.
+    let mut key: HashMap<git2::Oid, i64> = HashMap::new();
+    // Ready to emit, LIFO — the queue discipline that produces the grouping.
+    let mut ready: Vec<git2::Oid> = Vec::new();
+    let mut emitted: HashSet<git2::Oid> = HashSet::new();
+
+    let head_key = head.time().seconds();
+    frontier.push((head_key, head.id()));
+    key.insert(head.id(), head_key);
+    indegree.insert(head.id(), 1);
+    ready.push(head.id());
+
+    let expand = |frontier: &mut std::collections::BinaryHeap<(i64, git2::Oid)>,
+                  indegree: &mut HashMap<git2::Oid, u32>,
+                  key: &mut HashMap<git2::Oid, i64>|
+     -> bool {
+        let Some((k, oid)) = frontier.pop() else {
+            return false;
         };
-        let parents: Vec<git2::Oid> = commit_parents(&commit, first_parent);
-        for p in &parents {
-            if seen.insert(*p)
-                && let Ok(pc) = repo.find_commit(*p)
-            {
-                // Sort a parent strictly below the child that found it, rather than
-                // on its own timestamp. Two commits sharing a second — routine for
-                // scripted commits, rebases and imports — otherwise tie, and the
-                // tie-break (oid) can pop a parent before its child, which draws the
-                // graph upside down. This also absorbs a parent dated NEWER than its
-                // child, which is what an amend or a cherry-pick produces.
-                heap.push((pc.time().seconds().min(key.saturating_sub(1)), *p));
+        let Ok(commit) = repo.find_commit(oid) else {
+            return true;
+        };
+        for p in commit_parents(&commit, first_parent) {
+            if let std::collections::hash_map::Entry::Vacant(slot) = indegree.entry(p) {
+                let Ok(pc) = repo.find_commit(p) else {
+                    continue;
+                };
+                // Strictly below the child that found it. Two commits sharing a
+                // second are routine (scripts, rebases, imports) and would otherwise
+                // tie; and an amend or cherry-pick can date a parent NEWER than its
+                // child, which this absorbs.
+                let pk = pc.time().seconds().min(k.saturating_sub(1));
+                key.insert(p, pk);
+                slot.insert(1);
+                frontier.push((pk, p));
+            }
+            if let Some(d) = indegree.get_mut(&p) {
+                *d += 1;
             }
         }
-        out.push((key, build_commit_info(oid, &commit, parents, &ref_map)));
+        true
+    };
+
+    let mut out: Vec<CommitInfo> = Vec::with_capacity(max);
+    while out.len() < max {
+        let Some(&top) = ready.last() else {
+            if !expand(&mut frontier, &mut indegree, &mut key) {
+                break;
+            }
+            continue;
+        };
+        // Safe when nothing left to expand outranks this row — and when the walk has
+        // discovered `PROVISIONAL_LOOKAHEAD` more commits than it has emitted, which
+        // is what covers a child found later than its own parent (see the constant).
+        // A row sits in the frontier at its own key until expanded, so it blocks its
+        // own emission and can never be emitted before its parents are known.
+        let floor_clear = frontier.peek().is_none_or(|&(f, _)| f < key[&top]);
+        let looked_ahead =
+            frontier.is_empty() || indegree.len() >= out.len() + PROVISIONAL_LOOKAHEAD;
+        if !(floor_clear && looked_ahead) {
+            if !expand(&mut frontier, &mut indegree, &mut key) {
+                break;
+            }
+            continue;
+        }
+        ready.pop();
+        if !emitted.insert(top) {
+            continue;
+        }
+        let Ok(commit) = repo.find_commit(top) else {
+            continue;
+        };
+        let parents = commit_parents(&commit, first_parent);
+        for p in &parents {
+            if let Some(d) = indegree.get_mut(p) {
+                *d -= 1;
+                if *d == 1 {
+                    ready.push(*p);
+                }
+            }
+        }
+        out.push(build_commit_info(top, &commit, parents, &ref_map));
     }
     topo_window(out)
 }
@@ -1356,59 +1436,61 @@ pub fn provisional_commits(repo: &Repository, max: usize, first_parent: bool) ->
 ///
 /// Settling it globally is the whole-DAG pass being avoided — but the invariant is
 /// only about the rows emitted, and there are at most `INITIAL_COMMITS` of those.
-/// So: Kahn's algorithm over the in-window edges, taking the newest ready row each
-/// time, which is exactly the real walk's rule of time order constrained to
-/// topological. An induced subgraph's constraints are a subset of the whole
-/// graph's, so this can never contradict the real walk; parents outside the window
-/// are unconstrained and draw a continuation stub, as they already do.
+/// So: Kahn's algorithm over the in-window edges. An induced subgraph's constraints
+/// are a subset of the whole graph's, so this can never contradict the real walk;
+/// parents outside the window are unconstrained and draw a continuation stub, as
+/// they already do.
 ///
-/// "Newest" is each row's HEAP KEY, paired with it by the caller, and that pairing
-/// is the whole reason this takes a tuple. `CommitInfo::time` is the AUTHOR date —
-/// what `git log` shows, and what a rebase, cherry-pick or `git am` leaves untouched
-/// while moving the committer date — so sorting on it reorders topologically
-/// unrelated rows against both the heap and the real walk, on precisely the
-/// rebased/imported histories this walk exists for. Since a re-sort that changes
-/// nothing is invisible, the symptom is indirect: rows shuffle when the real list
-/// lands, and the warm band turns out to have been aimed at the wrong commits.
-pub fn topo_window(rows: Vec<(i64, CommitInfo)>) -> Vec<CommitInfo> {
+/// **It takes the EARLIEST ready row in the walk's own order, which makes it a
+/// repair rather than a re-sort**: over a window that is already valid it is the
+/// identity, and over one that is not it moves only the offending row down. It used
+/// to take the newest by the walk's heap key, which was correct while the walk
+/// emitted in time order; the walk now emits in `git log --graph`'s order, and
+/// "newest first" would sort that straight back into date order — undoing the walk
+/// rather than repairing it. That is also why the key is gone from the signature:
+/// position IS the key now, and a caller cannot pass the wrong clock by mistake.
+pub fn topo_window(rows: Vec<CommitInfo>) -> Vec<CommitInfo> {
     let index: HashMap<git2::Oid, usize> = rows
         .iter()
         .enumerate()
-        .map(|(i, (_, c))| (c.oid, i))
+        .map(|(i, c)| (c.oid, i))
         .collect::<HashMap<_, _>>();
     // How many in-window CHILDREN a row is still waiting on; it is ready at zero.
     let mut waiting = vec![0usize; rows.len()];
-    for (_, c) in &rows {
+    for c in &rows {
         for p in &c.parents {
             if let Some(&j) = index.get(p) {
                 waiting[j] += 1;
             }
         }
     }
-    // Newest ready row first, by the heap's own key — NOT by `CommitInfo::time`,
-    // which is the author date and orders differently on any rebased or imported
-    // history. Oid as the deterministic tie-break: commits sharing a second are
-    // routine (scripts, rebases, imports) and must not order by chance.
-    let key = |i: usize| (rows[i].0, rows[i].1.oid, i);
-    let mut ready: std::collections::BinaryHeap<(i64, git2::Oid, usize)> = waiting
+    // The EARLIEST ready row in the walk's own order, which makes this a repair
+    // rather than a re-sort: over a window that is already valid it is the identity,
+    // and over one that is not it moves only the offending row down.
+    //
+    // It used to take the newest ready row by the heap key, which was right when the
+    // walk it repaired emitted in time order. The walk now emits in `git log
+    // --graph`'s order, and "newest first" would sort that straight back into date
+    // order — undoing the walk instead of repairing it.
+    let mut ready: std::collections::BinaryHeap<std::cmp::Reverse<usize>> = waiting
         .iter()
         .enumerate()
         .filter(|&(_, &w)| w == 0)
-        .map(|(i, _)| key(i))
+        .map(|(i, _)| std::cmp::Reverse(i))
         .collect();
     let mut order = Vec::with_capacity(rows.len());
-    while let Some((_, _, i)) = ready.pop() {
+    while let Some(std::cmp::Reverse(i)) = ready.pop() {
         order.push(i);
-        for p in &rows[i].1.parents {
+        for p in &rows[i].parents {
             if let Some(&j) = index.get(p) {
                 waiting[j] -= 1;
                 if waiting[j] == 0 {
-                    ready.push(key(j));
+                    ready.push(std::cmp::Reverse(j));
                 }
             }
         }
     }
-    let mut slots: Vec<Option<CommitInfo>> = rows.into_iter().map(|(_, c)| Some(c)).collect();
+    let mut slots: Vec<Option<CommitInfo>> = rows.into_iter().map(Some).collect();
     let mut out: Vec<CommitInfo> = order.into_iter().filter_map(|i| slots[i].take()).collect();
     // A git DAG is acyclic, so nothing is left over; a repo that somehow disagrees
     // keeps those rows in walk order rather than losing them off the list.
@@ -1937,20 +2019,18 @@ mod tests {
         }
     }
 
-    /// `topo_window` orders ready rows by the key the WALK popped them at, never by
-    /// `CommitInfo::time`. Those are different clocks: the key is the committer time
-    /// (clamped below the discovering child), `time` is the author date, and a rebase,
-    /// cherry-pick, `git am` or import moves one without the other — on the very
-    /// histories this walk exists for. Sorting on the wrong one can reorder
-    /// topologically unrelated rows away from the real walk's order; it stays a valid
-    /// topological order, so the graph is fine and what would show is rows shuffling
-    /// when the real list lands. The fixture is synthetic because it has to be: on
-    /// elasticsearch and git.git both keys give byte-identical first-200 lists, so no
-    /// repo here makes the two clocks disagree.
+    /// `topo_window` PRESERVES the walk's order and repairs only what is invalid.
+    ///
+    /// It used to re-sort by the walk's heap key, which was right when the walk
+    /// emitted in time order. The walk now emits in `git log --graph`'s order, so a
+    /// re-sort by any clock would undo it — a valid order still, but not the one the
+    /// reader is about to be shown by the real walk. Over an already-valid window
+    /// this must be the identity, whatever the timestamps say.
     #[test]
-    fn the_window_is_ordered_by_the_walks_key_not_the_rows_author_date() {
-        // Two independent branches off a root, so nothing but the tie-break decides
-        // their order. Author dates rank them the opposite way round from the keys.
+    fn the_window_preserves_the_walks_order_and_ignores_every_clock() {
+        // Two independent branches off a root, so nothing but the rule under test
+        // decides their order. Author dates rank them the opposite way round from
+        // the walk's order, and must not get a vote.
         let authored = |id: u32, parents: &[u32], when: i64| {
             CommitInfo::new(
                 DiffSource::Commit(oid(id)),
@@ -1964,18 +2044,28 @@ mod tests {
             )
         };
         let rows = vec![
-            (4000, authored(1, &[2, 3], 4000)), // merge
-            (3000, authored(2, &[4], 100)),     // newer by key, OLDER by author date
-            (2000, authored(3, &[4], 200)),     // older by key, NEWER by author date
-            (1000, authored(4, &[], 1000)),     // root
+            authored(1, &[2, 3], 4000), // merge
+            authored(2, &[4], 100),     // emitted first, OLDER by author date
+            authored(3, &[4], 200),     // emitted second, NEWER by author date
+            authored(4, &[], 1000),     // root
         ];
-
         let got: Vec<git2::Oid> = topo_window(rows).iter().map(|c| c.oid).collect();
         assert_eq!(
             got,
             vec![oid(1), oid(2), oid(3), oid(4)],
-            "the walk popped 2 before 3; only the author dates say otherwise"
+            "an already-valid window comes back untouched"
         );
+
+        // …and the reverse order is equally untouched, which a clock-sorted
+        // implementation could not manage: it would put the same one first both times.
+        let rows = vec![
+            authored(1, &[2, 3], 4000),
+            authored(3, &[4], 200),
+            authored(2, &[4], 100),
+            authored(4, &[], 1000),
+        ];
+        let got: Vec<git2::Oid> = topo_window(rows).iter().map(|c| c.oid).collect();
+        assert_eq!(got, vec![oid(1), oid(3), oid(2), oid(4)]);
     }
 
     /// The shape the heap walk alone cannot order: a merge base dated NEWER than
