@@ -267,7 +267,15 @@ bound stands in for the other. **EVERY colour pass needs both**, and the specula
 had only the line cap until a 5,310-line row under a 10,000-line cap coloured for
 **29.6 seconds** — 5.6ms a line, 43× the rate that cap's "~1.3s worst case" assumed. The
 rate is a property of the grammar, not of the repo, so no line count can stand in for a
-clock: see `Limits::highlight_budget`). The worker SHARES the rows with the UI — two `Arc` clones
+clock: see `Limits::highlight_budget`. **A budget over LINES cannot bound one line
+either** — every pass checks its deadline between chunks of 16 or 256 lines, never
+inside one — so `highlight::MAX_TOKENIZE_CHARS` (20,000) bounds what syntect sees of a
+single line, which is what makes the clocks above mean anything: a repo of minified
+sources had a 1.5s budget overrun to 13.5s and a 20s one to 25.4s, ~750ms on ONE line.
+The tail past it takes a single flat span rather than none, because `append_body`'s span
+path emits only the spans and a body whose tail no span reaches is not drawn at all. It
+is deliberately NOT `MAX_ROW_RENDER_CHARS`, which bounds an unwrapped row's VERTICES and
+is expected to move when soft wrapping lands). The worker SHARES the rows with the UI — two `Arc` clones
 and the pending-file list — where it used to be handed a copy of the whole diff, which
 measured 12.0s on the frame loop at 76.5M lines; and it REPORTS its own end
 (`HighlightMsg::Settled`, from a drop guard, so a superseded or panicking pass says so
