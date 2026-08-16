@@ -566,6 +566,7 @@ pub fn spawn_prewarm(repo_path: String) -> Option<mpsc::Receiver<Arc<Highlighter
 mod tests {
     use super::*;
     use crate::diff;
+    use crate::diff::BuildEnv;
     use crate::diff::LineKind;
     use crate::test_repo::file_entry as fe;
     use crate::test_repo::temp_repo;
@@ -592,7 +593,7 @@ mod tests {
             &repo,
             &diff::RowScope::new(diff::DiffSource::Commit(oid)),
             probe_settings(),
-            None,
+            BuildEnv::NONE,
         );
         let entry = data
             .files

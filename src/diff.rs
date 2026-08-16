@@ -765,24 +765,197 @@ pub fn detect_similar(diff: &mut git2::Diff, settings: DiffSettings) {
     }
 }
 
-/// Build a row's displayed diff.
+/// Which stage of a diff build is running.
 ///
-/// `tc` is `Some` only when the reader has left `[diff] textconv` on AND this build
-/// is allowed to run external commands; `None` means "build the diff the way we
-/// always did", which is also what a repo with no drivers configured amounts to.
+/// The three are where a slow build actually spends its time, and each is one libgit2
+/// call or loop — so this is as fine as an honest report gets, and only the last of
+/// them has anything to count.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DiffPhase {
+    /// Building the git2 diff: the tree walk, then rename/copy detection.
+    #[default]
+    Preparing,
+    /// `Diff::stats` — which reads every blob to count its lines. Named rather than
+    /// folded into a neighbour because it is silent and, on a large commit, a real
+    /// share of the wait.
+    Summarising,
+    /// Generating the patch, delta by delta. The one phase with a denominator.
+    Patching,
+}
+
+impl DiffPhase {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Preparing => 0,
+            Self::Summarising => 1,
+            Self::Patching => 2,
+        }
+    }
+
+    /// Anything but the three codes above is unreachable — `code` is the only writer —
+    /// and resolves to the phase that claims the least.
+    const fn of_code(code: u8) -> Self {
+        match code {
+            1 => Self::Summarising,
+            2 => Self::Patching,
+            _ => Self::Preparing,
+        }
+    }
+}
+
+/// A live report from the diff build the reader is waiting on — what the
+/// "Loading diff…" placeholder shows instead of nothing.
+///
+/// Atomics rather than a channel because the reader wants the CURRENT state, not
+/// every state: the frame loop samples this when it paints, and a build that emits
+/// thousands of file boundaries must not queue up messages nobody will read. Nothing
+/// here is an input to the diff, so a lost update costs a frame of staleness and
+/// nothing else — hence `Relaxed` throughout, and a poisoned path lock that drops the
+/// name rather than panicking mid-build.
+///
+/// Only the FOREGROUND load carries one. The prefetch pool builds diffs nobody is
+/// waiting on and the stats column builds dozens at once; neither has a placeholder
+/// to fill in, so both leave it `None` and pay nothing at all.
+#[derive(Default)]
+pub struct DiffProgress {
+    phase: std::sync::atomic::AtomicU8,
+    files_done: std::sync::atomic::AtomicUsize,
+    files_total: std::sync::atomic::AtomicUsize,
+    /// The delta whose patch is being generated. A lock rather than an atomic because
+    /// it is a path: written once per file, read once per frame.
+    file: std::sync::Mutex<String>,
+}
+
+/// One sample of a `DiffProgress`, taken whole so the phase and the counts a frame
+/// draws cannot come from two different moments.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct DiffProgressReport {
+    pub phase: DiffPhase,
+    /// Deltas whose patch generation has STARTED. A delta that prints no body prints
+    /// no header either (libgit2 emits neither for an unchanged or empty one), so a
+    /// finished build can leave this below `files_total` — the count is a position,
+    /// not a percentage to be trusted to reach 100.
+    pub files_done: usize,
+    pub files_total: usize,
+    pub file: String,
+}
+
+impl DiffProgress {
+    fn set_phase(&self, phase: DiffPhase) {
+        self.phase
+            .store(phase.code(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Take a sample: phase, counts and the current path.
+    pub fn report(&self) -> DiffProgressReport {
+        use std::sync::atomic::Ordering::Relaxed;
+        DiffProgressReport {
+            phase: DiffPhase::of_code(self.phase.load(Relaxed)),
+            files_done: self.files_done.load(Relaxed),
+            files_total: self.files_total.load(Relaxed),
+            file: self
+                .file
+                .lock()
+                .map_or_else(|_| String::new(), |f| f.clone()),
+        }
+    }
+}
+
+/// The optional capabilities a build may use, besides the repo and the settings: the
+/// textconv drivers, and the progress sink the foreground load reports into.
+///
+/// One value rather than two parameters because the pipeline it travels —
+/// `get_diff_data` → `build_diff_data` → `append_diff_body` — already sat at clippy's
+/// argument limit carrying the drivers alone, and because both answer the same
+/// question: what else may this build reach for? A third capability now costs no
+/// signature change anywhere.
+///
+/// Threaded as a parameter and never a global, for the reason the drivers always
+/// were: a global would make `get_diff_data` depend on invisible process state, and
+/// the suite needs per-repo drivers.
+#[derive(Clone, Copy, Default)]
+pub struct BuildEnv<'a> {
+    /// `Some` only when the reader has left `[diff] textconv` on AND this build is
+    /// allowed to run external commands; `None` means "build the diff the way we
+    /// always did", which is also what a repo with no drivers configured amounts to.
+    pub tc: Option<&'a Textconv>,
+    /// `Some` only for the one build a reader is sitting in front of.
+    pub progress: Option<&'a DiffProgress>,
+}
+
+impl<'a> BuildEnv<'a> {
+    /// Neither — every build nobody is watching, in a repo that drives nothing.
+    ///
+    /// `allow`, not `expect`: every caller is a test, and the two clippy gates
+    /// disagree about that (see the note in AGENTS.md).
+    #[allow(dead_code)]
+    pub const NONE: Self = Self {
+        tc: None,
+        progress: None,
+    };
+
+    /// Drivers, no progress: the prefetch pool and the stats column.
+    pub const fn of(tc: Option<&'a Textconv>) -> Self {
+        Self { tc, progress: None }
+    }
+
+    /// `of`, for a caller holding the drivers themselves rather than an `Option`.
+    #[allow(dead_code)]
+    pub const fn textconv(tc: &'a Textconv) -> Self {
+        Self::of(Some(tc))
+    }
+
+    /// Drivers (when configured) and a progress sink: the foreground diff load.
+    pub const fn tracked(tc: Option<&'a Textconv>, progress: &'a DiffProgress) -> Self {
+        Self {
+            tc,
+            progress: Some(progress),
+        }
+    }
+
+    /// The `Option` juggling lives here, once, so the build sites read as plain
+    /// statements of what stage they are at.
+    fn phase(self, phase: DiffPhase) {
+        if let Some(p) = self.progress {
+            p.set_phase(phase);
+        }
+    }
+
+    /// The patch pass is starting, over `total` deltas.
+    fn start_patch(self, total: usize) {
+        if let Some(p) = self.progress {
+            p.files_total
+                .store(total, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.phase(DiffPhase::Patching);
+    }
+
+    /// A delta's patch is being generated.
+    fn enter_file(self, path: &[u8]) {
+        let Some(p) = self.progress else { return };
+        p.files_done
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut f) = p.file.lock() {
+            f.clear();
+            f.push_str(&String::from_utf8_lossy(path));
+        }
+    }
+}
+
+/// Build a row's displayed diff.
 pub fn get_diff_data(
     repo: &Repository,
     scope: &RowScope,
     settings: DiffSettings,
-    tc: Option<&Textconv>,
+    env: BuildEnv<'_>,
 ) -> DiffData {
     // Working-tree rows diff the index / worktree; the range row diffs the two trees its
     // variant carries; a real commit diffs against its parent. Exhaustive over the enum,
     // so a new source can't silently fall through to the commit path.
     let oid = match scope.source {
-        DiffSource::Uncommitted => return get_working_tree_diff(repo, settings, scope, tc),
-        DiffSource::Staged => return get_staged_diff(repo, settings, scope, tc),
-        DiffSource::Range(ends) => return get_range_diff(repo, ends, settings, scope, tc),
+        DiffSource::Uncommitted => return get_working_tree_diff(repo, settings, scope, env),
+        DiffSource::Staged => return get_staged_diff(repo, settings, scope, env),
+        DiffSource::Range(ends) => return get_range_diff(repo, ends, settings, scope, env),
         DiffSource::Commit(oid) => oid,
     };
 
@@ -823,7 +996,7 @@ pub fn get_diff_data(
         repo,
         settings,
         scope,
-        tc,
+        env,
         header,
         &format!("commit {oid}"),
         |repo, opts| commit_parent_diff(repo, &commit, Some(opts)),
@@ -948,8 +1121,9 @@ fn append_diff_body(
     source: DiffSource,
     diff: &git2::Diff,
     settings: DiffSettings,
-    tc: Option<&Textconv>,
+    env: BuildEnv<'_>,
 ) -> bool {
+    let tc = env.tc;
     // Collect file stats. `FileEntry::path_bytes` is the identity key for matching
     // patch lines back to their file below — `files[i].path` is a lossy display
     // string, so two non-UTF-8 names could share one and collide.
@@ -1047,6 +1221,8 @@ fn append_diff_body(
     // it, which is accepted: it matches the tool it imitates, against a column whose
     // contract is internal consistency.
     if settings.show_stats {
+        // Reads every blob to count its lines, and says nothing while it does.
+        env.phase(DiffPhase::Summarising);
         if let Ok(stats) = diff.stats()
             && let Ok(s) = stats.to_buf(git2::DiffStatsFormat::FULL, 80)
         {
@@ -1072,6 +1248,9 @@ fn append_diff_body(
     // libgit2 had to C-quote — falls back to `DEFAULT_PREFIXES`.
     let mut prefixes: Option<(String, String)> = None;
     let mut failed = false;
+    // The delta count is the denominator the placeholder shows. `files` is one entry
+    // per delta (built above), so this is the count libgit2 is about to walk.
+    env.start_patch(files.len());
     let printed = diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
         // The file header is BOTH the delta boundary and where a driven delta is
         // substituted, and the ordering is exact rather than lucky: `diff_print.c:604`
@@ -1092,6 +1271,12 @@ fn append_diff_body(
         // than a mis-attributed file.
         if line.origin() == 'F' {
             let path = delta_path_bytes(&delta);
+            // The delta boundary is also the only progress this pass can report: a
+            // single file's patch generation is one libgit2 call with nothing inside
+            // it to count, which is exactly the case (one huge blob) where the wait is
+            // longest — so the NAME is reported alongside the count, and a build stuck
+            // on one file at least says which.
+            env.enter_file(path);
             let from = current_file_idx.map_or(0, |i| i + 1);
             current_file_idx = files
                 .iter()
@@ -1308,11 +1493,12 @@ pub fn build_diff_data<'r>(
     repo: &'r Repository,
     settings: DiffSettings,
     scope: &RowScope,
-    tc: Option<&Textconv>,
+    env: BuildEnv<'_>,
     header: Vec<DiffLine>,
     what: &str,
     build: impl FnOnce(&'r Repository, &mut DiffOptions) -> Result<git2::Diff<'r>, git2::Error>,
 ) -> DiffData {
+    env.phase(DiffPhase::Preparing);
     let diff = match scoped_diff(repo, settings, &scope.paths, build) {
         Ok(d) => d,
         Err(e) => {
@@ -1329,7 +1515,7 @@ pub fn build_diff_data<'r>(
         scope.source,
         &diff,
         settings,
-        tc,
+        env,
     );
     DiffData {
         textconv_failed: failed,
@@ -1343,7 +1529,7 @@ pub fn virtual_diff<'r>(
     repo: &'r Repository,
     settings: DiffSettings,
     scope: &RowScope,
-    tc: Option<&Textconv>,
+    env: BuildEnv<'_>,
     title: &str,
     what: &str,
     build: impl FnOnce(&'r Repository, &mut DiffOptions) -> Result<git2::Diff<'r>, git2::Error>,
@@ -1352,7 +1538,7 @@ pub fn virtual_diff<'r>(
         DiffLine::new(title, LineKind::Meta),
         DiffLine::new("", LineKind::Blank),
     ];
-    build_diff_data(repo, settings, scope, tc, header, what, build)
+    build_diff_data(repo, settings, scope, env, header, what, build)
 }
 
 /// The HEAD commit's tree, or `None` on an unborn HEAD (fresh `git init`) — a staged
@@ -1407,13 +1593,13 @@ pub fn get_working_tree_diff(
     repo: &Repository,
     settings: DiffSettings,
     scope: &RowScope,
-    tc: Option<&Textconv>,
+    env: BuildEnv<'_>,
 ) -> DiffData {
     virtual_diff(
         repo,
         settings,
         scope,
-        tc,
+        env,
         "Uncommitted changes (working tree)",
         "working tree",
         worktree_git_diff,
@@ -1425,13 +1611,13 @@ pub fn get_staged_diff(
     repo: &Repository,
     settings: DiffSettings,
     scope: &RowScope,
-    tc: Option<&Textconv>,
+    env: BuildEnv<'_>,
 ) -> DiffData {
     virtual_diff(
         repo,
         settings,
         scope,
-        tc,
+        env,
         "Staged changes (index)",
         "staged changes",
         staged_git_diff,
@@ -1493,7 +1679,7 @@ pub fn get_range_diff(
     ends: RangeEnds,
     settings: DiffSettings,
     scope: &RowScope,
-    tc: Option<&Textconv>,
+    env: BuildEnv<'_>,
 ) -> DiffData {
     // Lossy, like every other summary here: a legacy-encoded subject should render
     // with replacement chars rather than vanish.
@@ -1523,7 +1709,7 @@ pub fn get_range_diff(
         repo,
         settings,
         scope,
-        tc,
+        env,
         header,
         &format!("range {}..{}", ends.base, ends.head),
         |repo, opts| range_git_diff(repo, ends, opts),
@@ -2223,7 +2409,7 @@ pub mod tests {
             RangeEnds { base, head },
             base_settings(),
             &RowScope::new(DiffSource::Range(RangeEnds { base, head })),
-            None,
+            BuildEnv::NONE,
         );
 
         assert_eq!(
@@ -2255,7 +2441,7 @@ pub mod tests {
             RangeEnds { base, head },
             base_settings(),
             &RowScope::new(DiffSource::Range(RangeEnds { base, head })),
-            None,
+            BuildEnv::NONE,
         );
 
         assert!(
@@ -2278,7 +2464,7 @@ pub mod tests {
             RangeEnds { base, head },
             base_settings(),
             &RowScope::new(DiffSource::Range(RangeEnds { base, head })),
-            None,
+            BuildEnv::NONE,
         );
 
         assert_eq!(data.files.len(), 1);
@@ -2298,7 +2484,7 @@ pub mod tests {
             &repo,
             &RowScope::new(DiffSource::Range(RangeEnds { base, head })),
             base_settings(),
-            None,
+            BuildEnv::NONE,
         );
         assert_eq!(data.files.len(), 1);
         assert_eq!(data.files[0].path, "f.txt");
@@ -2442,7 +2628,7 @@ pub mod tests {
             &repo,
             &RowScope::new(DiffSource::Commit(oid)),
             base_settings(),
-            None,
+            BuildEnv::NONE,
         );
 
         // Context rows carry no marker prefix in gitkay (the origin char is
@@ -2495,7 +2681,7 @@ pub mod tests {
             &repo,
             &RowScope::new(DiffSource::Commit(oid)),
             base_settings(),
-            None,
+            BuildEnv::NONE,
         );
         let marker = data
             .lines
@@ -2511,7 +2697,7 @@ pub mod tests {
             &repo2,
             &RowScope::new(DiffSource::Commit(oid2)),
             base_settings(),
-            None,
+            BuildEnv::NONE,
         );
         let bin = data2
             .lines
@@ -2600,6 +2786,58 @@ pub mod tests {
         }
     }
 
+    /// The progress sink is only useful if the build actually writes to it, and a
+    /// dropped `BuildEnv` somewhere in the pipeline would leave it silently at its
+    /// defaults — a placeholder frozen on "comparing trees" for the whole wait, which
+    /// is exactly the impression it exists to remove.
+    ///
+    /// Asserts what a finished build must have reported: the last phase, a total that
+    /// is the diff's own file count, and a `files_done` that reached it here (every
+    /// fixture file has a patch body — a delta that prints none reports none, which is
+    /// why the general contract is `<=`).
+    #[test]
+    fn a_build_reports_its_progress_as_it_goes() {
+        use crate::test_repo::{commit_file, commit_index, stage, temp_repo, write_file};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.rs", "one\n", "add a");
+        commit_file(&repo, "b.rs", "one\n", "add b");
+        write_file(&repo, "a.rs", "two\n");
+        write_file(&repo, "b.rs", "two\n");
+        stage(&repo, "a.rs");
+        stage(&repo, "b.rs");
+        let oid = {
+            let mut index = repo.index().unwrap();
+            commit_index(&repo, &mut index, "touch both")
+        };
+        let scope = RowScope::new(DiffSource::Commit(oid));
+
+        let progress = DiffProgress::default();
+        assert_eq!(
+            progress.report(),
+            DiffProgressReport::default(),
+            "control: nothing is claimed before a build runs"
+        );
+
+        let data = get_diff_data(
+            &repo,
+            &scope,
+            DiffSettings {
+                show_stats: true,
+                ..base_settings()
+            },
+            BuildEnv::tracked(None, &progress),
+        );
+
+        let report = progress.report();
+        assert_eq!(report.phase, DiffPhase::Patching, "{report:?}");
+        assert_eq!(report.files_total, data.files.len(), "{report:?}");
+        assert_eq!(report.files_done, data.files.len(), "{report:?}");
+        assert!(
+            data.files.iter().any(|f| f.path == report.file),
+            "the reported file is one of the diff's own: {report:?}"
+        );
+    }
+
     /// The column and the file-list sidebar must never show different numbers for the
     /// same commit. They can't, by construction — `commit_stats` runs the same builders,
     /// options and rename post-pass `get_diff_data` does — and this is what pins that.
@@ -2622,7 +2860,12 @@ pub mod tests {
             )
             .unwrap();
 
-            let data = get_diff_data(&repo, &RowScope::new(DiffSource::Commit(oid)), s, None);
+            let data = get_diff_data(
+                &repo,
+                &RowScope::new(DiffSource::Commit(oid)),
+                s,
+                BuildEnv::NONE,
+            );
             // Through the production function, not a copy of it: `cache_diff` derives
             // the column from a built diff by calling exactly this, so a divergence
             // here is a divergence the user would see.
@@ -3227,7 +3470,12 @@ pub mod tests {
         s: DiffSettings,
         tc: Option<&Textconv>,
     ) -> DiffData {
-        get_diff_data(repo, &RowScope::new(DiffSource::Commit(oid)), s, tc)
+        get_diff_data(
+            repo,
+            &RowScope::new(DiffSource::Commit(oid)),
+            s,
+            BuildEnv::of(tc),
+        )
     }
 
     pub fn texts(data: &DiffData) -> Vec<String> {
@@ -3274,7 +3522,7 @@ pub mod tests {
         let head = commit_two_zips(&repo);
         let scope = RowScope::new(DiffSource::Commit(head));
         let tc = Textconv::new();
-        let data = get_diff_data(&repo, &scope, conv_settings(), Some(&tc));
+        let data = get_diff_data(&repo, &scope, conv_settings(), BuildEnv::textconv(&tc));
         assert_eq!(
             stats_from_data(&data),
             CommitStats {

@@ -37,10 +37,11 @@ mod workers;
 use config::{FileListLayout, Fonts, Role};
 use datefmt::{RELATIVE_DATE_SAMPLE, format_commit_time, format_relative_time};
 use diff::{
-    CommitKind, CommitStats, DiffAnchor, DiffData, DiffLine, DiffSettings, DiffSource, FileEntry,
-    LineKind, LineNoGutter, RowScope, StatsWant, capture_anchor, emphasize_rows,
-    file_index_at_line, file_index_at_line_opt, file_line_starts, get_diff_data, hash_diff_content,
-    is_real_commit, next_file_line, resolve_anchor,
+    BuildEnv, CommitKind, CommitStats, DiffAnchor, DiffData, DiffLine, DiffPhase, DiffProgress,
+    DiffProgressReport, DiffSettings, DiffSource, FileEntry, LineKind, LineNoGutter, RowScope,
+    StatsWant, capture_anchor, emphasize_rows, file_index_at_line, file_index_at_line_opt,
+    file_line_starts, get_diff_data, hash_diff_content, is_real_commit, next_file_line,
+    resolve_anchor,
 };
 use diff_cache::DiffCache;
 use diff_highlight::{
@@ -1871,7 +1872,7 @@ fn build_or_load(
     repo: &Repository,
     scope: &RowScope,
     settings: DiffSettings,
-    tc: Option<&Textconv>,
+    env: BuildEnv<'_>,
     store_cap: Option<usize>,
 ) -> DiffData {
     if let Some(store) = store
@@ -1892,7 +1893,7 @@ fn build_or_load(
     // joined the key to prevent, arriving by the one route the key cannot see.
     let drivers_before = store.map(DiffStore::drivers);
     let t = std::time::Instant::now();
-    let data = get_diff_data(repo, scope, settings, tc);
+    let data = get_diff_data(repo, scope, settings, env);
     let built = t.elapsed();
     if let Some(store) = store
         && built >= store.min_build()
@@ -2499,6 +2500,23 @@ fn select_accent() -> egui::Color32 {
 
 // ── App state ────────────────────────────────────────────────────────────
 
+/// The one in-flight foreground diff load: when the reader started waiting, and what
+/// the build is reporting back.
+///
+/// Both, together, because both are only meaningful while a load is running and both
+/// must stop being read the moment one is not: `Option<DiffLoadState>` is the whole
+/// "is a diff loading?" answer, where two parallel fields could disagree.
+struct DiffLoadState {
+    /// When the current RUN of loading began — preserved across re-dispatch, so a
+    /// burst of navigation is one wait rather than a series of fresh ones. What
+    /// `DIFF_PLACEHOLDER_DELAY` is measured against.
+    started: std::time::Instant,
+    /// What the running build writes into (`diff::DiffProgress`), read once a frame
+    /// by the placeholder. Shared with the worker, and with `inflight_loads` so a
+    /// bounce-back can adopt it.
+    progress: Arc<DiffProgress>,
+}
+
 /// Drives the one-time deferral of the startup diff. `GitkApp::new` runs during
 /// window creation (eframe doesn't paint until the creator returns), so computing
 /// the first diff there blocks the window from appearing on a potentially slow,
@@ -2851,7 +2869,10 @@ struct GitkApp {
     /// `dispatch_diff_load` / the drain's `awaiting` rule). Sound because every
     /// diff-load worker exit path reports a `DiffLoadResult` (normal, failed,
     /// superseded bail, panic), so the drain always clears the entry.
-    inflight_loads: HashSet<DiffCacheKey>,
+    /// The foreground diff loads running right now, each with the progress handle
+    /// its worker reports into — so a bounce-back adopts both the worker and what it
+    /// has to say. Real commits only; a virtual row's key moves under it.
+    inflight_loads: HashMap<DiffCacheKey, Arc<DiffProgress>>,
     /// Background history loads (lazy-load extension + watcher rebuild). Results
     /// return over this channel; `history_epoch` supersedes stale ones; the
     /// in-flight flag stops the scroll trigger from re-dispatching every frame.
@@ -2860,13 +2881,14 @@ struct GitkApp {
     history_epoch: Epoch,
     history_inflight: bool,
     // A diff-load worker is in flight iff this is `Some` — the single source of truth
-    // (no separate bool to keep in sync). Holds when the current load began, so the
-    // "Loading diff…" placeholder can be delayed past DIFF_PLACEHOLDER_DELAY. Preserved
-    // across rapid re-dispatch (get_or_insert) so continuous loading still crosses the
-    // threshold; cleared to None when a load applies, fails, or is cancelled.
-    diff_load_started_at: Option<std::time::Instant>,
+    // (no separate bool to keep in sync). Carries when the current load began, so the
+    // "Loading diff…" placeholder can be delayed past DIFF_PLACEHOLDER_DELAY, and what
+    // that build is reporting, so the placeholder can say more than "…". Cleared to
+    // None when a load applies, fails, or is cancelled — one field, so the clock and
+    // the report cannot outlive each other.
+    diff_load: Option<DiffLoadState>,
     /// Whether the in-flight load is a same-oid rebuild (`ScrollPlan::Anchor`) —
-    /// only meaningful while `diff_load_started_at` is `Some`, and rewritten by
+    /// only meaningful while `diff_load` is `Some`, and rewritten by
     /// every dispatch so a burst that changes character mid-flight (toggle the
     /// toolbar, then arrow away before it lands) is classified by its latest
     /// dispatch rather than its first.
@@ -3088,6 +3110,77 @@ fn notice_tint(notice: &ScopeNotice) -> egui::Color32 {
     } else {
         SURFACE0
     }
+}
+
+/// How often the "Loading diff…" placeholder re-paints while a build runs. Nothing
+/// else asks for a frame during one, so this is the counter's entire clock — slow
+/// enough to cost nothing on an idle window, fast enough that a tenth-of-a-second
+/// figure does not visibly stutter.
+const LOADING_TICK: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// How long a load must run before the placeholder starts naming seconds. Below this
+/// the number would appear and vanish inside one glance, and "0.1s" answers a
+/// question nobody was asking yet.
+const LOADING_ELAPSED_FLOOR: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How much of the file being generated the placeholder shows. Tail, not head: the
+/// distinguishing part of a path is its end.
+const LOADING_PATH_CHARS: usize = 44;
+
+/// `s`, or its last `max` characters behind an ellipsis.
+///
+/// Chars, not bytes — a path is arbitrary bytes rendered lossily, and slicing one
+/// mid-codepoint panics. Pure, and not `left_elide`: that one measures against a font
+/// to fill a pixel width, where this is a budget inside a line of prose.
+fn tail_elide(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    let skip = count - max.saturating_sub(1);
+    std::iter::once('…').chain(s.chars().skip(skip)).collect()
+}
+
+/// The "Loading diff…" line: what the build is doing, and how long it has been at it.
+///
+/// The elapsed time alone would say only "still working"; the phase and the file
+/// counter say WHERE the time is going, which is the difference between a wait and a
+/// hang. Both halves are needed because they cover opposite shapes: a commit touching
+/// thousands of files advances the counter and never dwells, while a three-line patch
+/// inside a 265MB blob sits on `1/1` for eleven seconds — there the file NAME is the
+/// answer, and the clock is what says it is still moving.
+///
+/// Pure, so the phrasing is testable without a build, a worker or a frame.
+fn loading_diff_text(elapsed: std::time::Duration, report: Option<&DiffProgressReport>) -> String {
+    // Infallible into a String; the results are discarded for that reason.
+    use std::fmt::Write as _;
+    let mut s = String::from("Loading diff…");
+    match report {
+        // Only before the first report — the handle is created with the dispatch, so
+        // in practice this is the frame before the worker starts.
+        None => {}
+        Some(r) => {
+            s.push(' ');
+            match r.phase {
+                DiffPhase::Preparing => s.push_str("comparing trees"),
+                DiffPhase::Summarising => s.push_str("counting lines"),
+                // A zero total is a diff with no deltas, which cannot be slow — but it
+                // would read as "0/0 files", so say what is happening instead.
+                DiffPhase::Patching if r.files_total == 0 => s.push_str("generating the patch"),
+                DiffPhase::Patching => {
+                    let _ = write!(s, "{}/{} files", r.files_done, r.files_total);
+                    if !r.file.is_empty() {
+                        s.push_str(" · ");
+                        s.push_str(&tail_elide(&r.file, LOADING_PATH_CHARS));
+                    }
+                }
+            }
+        }
+    }
+    if elapsed >= LOADING_ELAPSED_FLOOR {
+        let _ = write!(s, " ({:.1}s)", elapsed.as_secs_f32());
+    }
+    s
 }
 
 fn show_toast(
@@ -3449,7 +3542,7 @@ impl GitkApp {
             // Empty, so the first frame always dispatches.
             prefetched_view: 0..0,
             inflight_diffs: Arc::default(),
-            inflight_loads: HashSet::new(),
+            inflight_loads: HashMap::new(),
             highlight_scan: None,
             // Empty until the panel has rendered once, NOT a generous estimate: the
             // band is derived from this length, so an over-guess is tripled. The old
@@ -3468,7 +3561,7 @@ impl GitkApp {
             diff_load_tx,
             diff_load_rx,
             diff_load_epoch: Epoch::default(),
-            diff_load_started_at: None,
+            diff_load: None,
             diff_load_is_rebuild: false,
             history_load_tx,
             history_load_rx,
@@ -3665,7 +3758,7 @@ impl GitkApp {
         if let Some(oid) = self.selected_oid()
             && self.shows_current(&self.diff_cache_key(oid))
         {
-            if self.diff_load_started_at.take().is_some() {
+            if self.diff_load.take().is_some() {
                 self.diff_load_epoch.bump();
             }
             // Drop any restore target queued for the abandoned navigation — left
@@ -3692,7 +3785,7 @@ impl GitkApp {
             // No selection: supersede any in-flight load, stash the outgoing diff for a
             // later revisit, and clear the pane.
             self.diff_load_epoch.bump();
-            self.diff_load_started_at = None;
+            self.diff_load = None;
             self.stash_current_diff();
             self.clear_diff_pane();
             return;
@@ -3974,7 +4067,7 @@ impl GitkApp {
     /// only: a virtual key is content-keyed, so two computes of it aren't "the
     /// same diff" and those always take a fresh worker.
     fn awaiting(&self, key: &DiffCacheKey) -> bool {
-        self.diff_load_started_at.is_some()
+        self.diff_load.is_some()
             && is_real_commit(key.oid)
             && self.selected_oid() == Some(key.oid)
             && self.key_is_current(key)
@@ -4032,7 +4125,7 @@ impl GitkApp {
         // load, or nothing if the pane already blanked to a placeholder) before it's
         // replaced, so a later revisit restores it instantly.
         self.stash_current_diff();
-        self.diff_load_started_at = None;
+        self.diff_load = None;
         // Harvest the INCOMING diff's numbers, not only the outgoing one's.
         // `stash_current_diff` → `cache_diff` covers the diff being replaced, which
         // left the SELECTED row — the one commit whose diff is guaranteed to exist —
@@ -4101,12 +4194,31 @@ impl GitkApp {
         // sit dangling until some LATER same-oid install consumed it — the oid
         // tag alone can't catch that, since the oid would still match.
         if self.shows_current(&key) {
-            self.diff_load_started_at = None;
+            self.diff_load = None;
             self.pending_anchor = None;
             return;
         }
         let data = self.diff_cache.remove(&key).unwrap_or(data);
         self.apply_loaded_diff(key, data);
+    }
+
+    /// Enter — or stay in — the loading state, reporting into `progress`.
+    ///
+    /// The start instant is PRESERVED across a re-dispatch, because a burst of
+    /// navigation is one wait to the reader: resetting it per dispatch would keep the
+    /// placeholder from ever appearing while they arrow through cold history. The
+    /// progress handle is replaced, the newest job being the one they are now waiting
+    /// on. One field, so neither half can be armed without the other.
+    fn arm_diff_load(&mut self, progress: Arc<DiffProgress>) {
+        match &mut self.diff_load {
+            Some(state) => state.progress = progress,
+            None => {
+                self.diff_load = Some(DiffLoadState {
+                    started: std::time::Instant::now(),
+                    progress,
+                });
+            }
+        }
     }
 
     /// Spawn a diff-load worker for `oid`, arm the loading state, and bump the epoch so
@@ -4122,14 +4234,6 @@ impl GitkApp {
         // so a load that changes character mid-flight is classified by its latest
         // dispatch.
         self.diff_load_is_rebuild = same_oid_rebuild;
-        // Keep the previous diff on screen while the worker runs — don't clear the pane.
-        // The render path only blanks to the "Loading diff…" placeholder once the load
-        // outlives DIFF_PLACEHOLDER_DELAY, so a fast uncached load swaps straight to the
-        // new diff without a blank / sidebar-collapse strobe. Preserve the start time
-        // across rapid re-dispatch (get_or_insert, not a per-selection reset) so
-        // continuous loading still crosses the threshold and shows the placeholder.
-        self.diff_load_started_at
-            .get_or_insert_with(std::time::Instant::now);
 
         // A worker for this exact key is already in flight — the user bounced back
         // to a commit whose load never finished. Don't stack an identical worker:
@@ -4138,10 +4242,24 @@ impl GitkApp {
         // epoch or not; a worker that bailed pre-compute reports `data: None` and
         // the drain re-dispatches). The epoch bump above still supersedes workers
         // for OTHER keys.
-        if is_real_commit(key.oid) && self.inflight_loads.contains(&key) {
+        //
+        // The running worker's own progress handle is adopted with it — which is why
+        // `inflight_loads` holds one per key rather than being a bare set: a fresh
+        // handle here would park the placeholder on "comparing trees" for a build
+        // already most of the way through its files.
+        if is_real_commit(key.oid)
+            && let Some(running) = self.inflight_loads.get(&key).map(Arc::clone)
+        {
             log::debug!("diff-load: adopt in-flight worker for {}", key.oid);
+            self.arm_diff_load(running);
             return;
         }
+        let progress = Arc::new(DiffProgress::default());
+        // Keep the previous diff on screen while the worker runs — don't clear the pane.
+        // The render path only blanks to the "Loading diff…" placeholder once the load
+        // outlives DIFF_PLACEHOLDER_DELAY, so a fast uncached load swaps straight to the
+        // new diff without a blank / sidebar-collapse strobe.
+        self.arm_diff_load(Arc::clone(&progress));
 
         let oid = key.oid;
         // The job owns its inputs: paths and key are moved in (not cloned) — on the
@@ -4198,6 +4316,7 @@ impl GitkApp {
             ctx: self.egui_ctx.clone(),
             prehighlight,
             deps: self.diff_deps.clone(),
+            progress: Arc::clone(&progress),
         };
         // Hand it to a worker that already owns a repo handle. The claim rides
         // along and is released when the job ends, panic included.
@@ -4214,7 +4333,7 @@ impl GitkApp {
             // stacking a duplicate; the drain removes the entry when its (always
             // delivered) result arrives.
             if let Some(k) = tracked_key {
-                self.inflight_loads.insert(k);
+                self.inflight_loads.insert(k, progress);
             }
         } else {
             log::warn!("no foreground worker took the diff load; loading synchronously");
@@ -4229,7 +4348,9 @@ impl GitkApp {
                         &repo,
                         &scope,
                         self.diff_settings,
-                        textconv_for(&self.diff_deps.textconv, self.diff_settings),
+                        // No progress sink: this path runs ON the frame loop, so
+                        // nothing could paint a placeholder while it does.
+                        BuildEnv::of(textconv_for(&self.diff_deps.textconv, self.diff_settings)),
                         None,
                     );
                     let key =
@@ -4240,7 +4361,7 @@ impl GitkApp {
                 // doesn't stick on the placeholder; the previous diff stays on screen.
                 Err(e) => {
                     log::warn!("diff-load fallback: repo discover failed: {e}");
-                    self.diff_load_started_at = None;
+                    self.diff_load = None;
                 }
             }
         }
@@ -4559,18 +4680,17 @@ impl GitkApp {
     /// `startup_diff` is half the answer and is easy to leave out — the first frame
     /// deliberately paints the commit list BEFORE dispatching any diff
     /// (`StartupDiff::NeedsPaint`), so on that frame no load has started and a check
-    /// on `diff_load_started_at` alone reads as "nothing is loading". Measured with
+    /// on `diff_load` alone reads as "nothing is loading". Measured with
     /// only that half: the prefetch band waited correctly while eight stats jobs went
     /// out on the first frame and finished at 631–700ms, straddling the 692ms diff
     /// they were supposed to yield to.
     ///
     /// Both halves release on failure rather than sticking: a failed load clears
-    /// `diff_load_started_at`, and `StartupDiff` reaches `Done` whether or not a diff
+    /// `diff_load`, and `StartupDiff` reaches `Done` whether or not a diff
     /// arrived — including when there are no commits to load one for.
     const fn awaiting_first_diff(&self) -> bool {
         self.current_diff_key.is_none()
-            && (self.diff_load_started_at.is_some()
-                || !matches!(self.startup_diff, StartupDiff::Done))
+            && (self.diff_load.is_some() || !matches!(self.startup_diff, StartupDiff::Done))
     }
 
     /// Queue the commit-list rows still needing numbers onto the shared pool.
@@ -6310,7 +6430,7 @@ impl GitkApp {
                 // load_selected_diff) only once the sidebar shows the
                 // diff it was queued for — never mid-load, when the
                 // rows on screen still belong to the outgoing diff.
-                if self.diff_load_started_at.is_none()
+                if self.diff_load.is_none()
                     && let Some(y) = self.file_list_scroll_to.take()
                 {
                     file_scroll = file_scroll.vertical_scroll_offset(y);
@@ -6372,7 +6492,7 @@ impl GitkApp {
                     // across the load, so the stale target would jump
                     // the INCOMING diff to an arbitrary line.
                     if let Some(li) = scroll_to
-                        && self.diff_load_started_at.is_none()
+                        && self.diff_load.is_none()
                     {
                         self.diff_scroll_to = Some(li);
                     }
@@ -6972,7 +7092,7 @@ impl GitkApp {
                     // Stop the spinner and clear the pane — keeping the previous commit's
                     // diff would misattribute it to the now-selected commit. Stash it
                     // first so a revisit is instant; re-selecting this commit retries.
-                    self.diff_load_started_at = None;
+                    self.diff_load = None;
                     self.stash_current_diff();
                     self.clear_diff_pane();
                 }
@@ -7386,7 +7506,7 @@ impl eframe::App for GitkApp {
                 // DIFF_PLACEHOLDER_DELAY do we blank to the "Loading diff…" placeholder.
                 // Snapshot the decision once so the sidebar and the diff pane agree even
                 // if the threshold is crossed mid-frame.
-                let diff_load_elapsed = self.diff_load_started_at.map(|t| t.elapsed());
+                let diff_load_elapsed = self.diff_load.as_ref().map(|l| l.started.elapsed());
                 // A same-oid rebuild NEVER blanks. The outgoing diff is the same
                 // commit in a different shape, so holding it says strictly more than
                 // "Loading diff…" does — and pre-highlighting deliberately pushes
@@ -7435,9 +7555,18 @@ impl eframe::App for GitkApp {
                     // threshold to wake for.
                     if let Some(elapsed) = diff_load_elapsed {
                         if showing_placeholder {
+                            let report = self.diff_load.as_ref().map(|l| l.progress.report());
+                            let text = loading_diff_text(elapsed, report.as_ref());
                             ui.centered_and_justified(|ui| {
-                                ui.label(egui::RichText::new("Loading diff…").color(SUBTEXT));
+                                ui.label(egui::RichText::new(text).color(SUBTEXT));
                             });
+                            // Nothing else will ask for a frame: the worker only
+                            // repaints when it FINISHES, and a long build produces no
+                            // input of its own. Without this the counter would freeze
+                            // at whatever it read on the frame that blanked the pane —
+                            // which is exactly the "is it stuck?" question it exists
+                            // to answer.
+                            ui.ctx().request_repaint_after(LOADING_TICK);
                             return;
                         }
                         if can_blank {
@@ -9631,14 +9760,19 @@ mod tests {
                 show_stats: true,
                 ..ds()
             },
-            None,
+            BuildEnv::NONE,
         );
         assert!(
             on.lines.iter().any(|l| l.kind == LineKind::Stat),
             "show_stats=true must include the diffstat block"
         );
 
-        let off = get_diff_data(&repo, &RowScope::new(DiffSource::Commit(c2)), ds(), None);
+        let off = get_diff_data(
+            &repo,
+            &RowScope::new(DiffSource::Commit(c2)),
+            ds(),
+            BuildEnv::NONE,
+        );
         assert!(
             !off.lines.iter().any(|l| l.kind == LineKind::Stat),
             "show_stats=false must omit the diffstat block"
@@ -9662,24 +9796,32 @@ mod tests {
             detect_renames: true,
             ..ds()
         };
-        let files: Vec<String> =
-            get_diff_data(&repo, &RowScope::new(DiffSource::Commit(oid)), on, None)
-                .files
-                .iter()
-                .map(|f| f.path.clone())
-                .collect();
+        let files: Vec<String> = get_diff_data(
+            &repo,
+            &RowScope::new(DiffSource::Commit(oid)),
+            on,
+            BuildEnv::NONE,
+        )
+        .files
+        .iter()
+        .map(|f| f.path.clone())
+        .collect();
         assert_eq!(
             files,
             vec!["new.txt".to_string()],
             "rename detected ⇒ one entry"
         );
 
-        let mut files: Vec<String> =
-            get_diff_data(&repo, &RowScope::new(DiffSource::Commit(oid)), ds(), None)
-                .files
-                .iter()
-                .map(|f| f.path.clone())
-                .collect();
+        let mut files: Vec<String> = get_diff_data(
+            &repo,
+            &RowScope::new(DiffSource::Commit(oid)),
+            ds(),
+            BuildEnv::NONE,
+        )
+        .files
+        .iter()
+        .map(|f| f.path.clone())
+        .collect();
         files.sort();
         assert_eq!(
             files,
@@ -9699,7 +9841,12 @@ mod tests {
             detect_renames: true,
             ..ds()
         };
-        let data = get_diff_data(&repo, &RowScope::new(DiffSource::Commit(oid)), s, None);
+        let data = get_diff_data(
+            &repo,
+            &RowScope::new(DiffSource::Commit(oid)),
+            s,
+            BuildEnv::NONE,
+        );
         assert_eq!(data.files.len(), 1);
         assert_eq!(data.files[0].path, "new.txt");
         assert_eq!(data.files[0].old_path.as_deref(), Some("old.txt"));
@@ -9739,7 +9886,12 @@ mod tests {
             detect_copies: true,
             ..ds()
         };
-        let data = get_diff_data(&repo, &RowScope::new(DiffSource::Commit(oid)), s, None);
+        let data = get_diff_data(
+            &repo,
+            &RowScope::new(DiffSource::Commit(oid)),
+            s,
+            BuildEnv::NONE,
+        );
         let b = data
             .files
             .iter()
@@ -10238,6 +10390,76 @@ mod tests {
         assert!(char_count(&out) <= 4.0);
     }
 
+    fn progress_at(phase: DiffPhase, done: usize, total: usize, file: &str) -> DiffProgressReport {
+        DiffProgressReport {
+            phase,
+            files_done: done,
+            files_total: total,
+            file: file.to_string(),
+        }
+    }
+
+    /// Each phase says what it is doing in its own words, and the counter appears only
+    /// where there is something to count — "0/0 files" would be the placeholder
+    /// claiming a denominator it does not have.
+    #[test]
+    fn the_loading_line_names_the_phase_it_is_in() {
+        let quick = std::time::Duration::from_millis(200);
+        let r = progress_at(DiffPhase::Preparing, 0, 0, "");
+        assert_eq!(
+            loading_diff_text(quick, Some(&r)),
+            "Loading diff… comparing trees"
+        );
+        let r = progress_at(DiffPhase::Summarising, 0, 0, "");
+        assert_eq!(
+            loading_diff_text(quick, Some(&r)),
+            "Loading diff… counting lines"
+        );
+        let r = progress_at(DiffPhase::Patching, 0, 0, "");
+        assert_eq!(
+            loading_diff_text(quick, Some(&r)),
+            "Loading diff… generating the patch"
+        );
+        let r = progress_at(DiffPhase::Patching, 7, 20, "src/a.rs");
+        assert_eq!(
+            loading_diff_text(quick, Some(&r)),
+            "Loading diff… 7/20 files · src/a.rs"
+        );
+        // Before the worker has reported anything, and for a load with no handle at
+        // all, the line is exactly what it always was.
+        assert_eq!(loading_diff_text(quick, None), "Loading diff…");
+    }
+
+    /// The clock is the half that keeps moving when the counter cannot — a huge blob
+    /// sits on one file for seconds — but it only starts once the wait is real, so a
+    /// glancing placeholder doesn't flash a number.
+    #[test]
+    fn the_loading_line_starts_counting_seconds_once_the_wait_is_real() {
+        let r = progress_at(DiffPhase::Patching, 1, 1, "big.bin");
+        let just_under = LOADING_ELAPSED_FLOOR.saturating_sub(std::time::Duration::from_millis(1));
+        assert!(!loading_diff_text(just_under, Some(&r)).contains('('));
+        assert_eq!(
+            loading_diff_text(std::time::Duration::from_millis(11_500), Some(&r)),
+            "Loading diff… 1/1 files · big.bin (11.5s)"
+        );
+    }
+
+    /// A path longer than the budget keeps its END — which is the part that identifies
+    /// it — and is cut on char boundaries, a path being arbitrary bytes rendered
+    /// lossily.
+    #[test]
+    fn the_loading_line_elides_a_long_path_from_the_left() {
+        let long = format!("{}/αβγδε.rs", "deep/".repeat(20));
+        let out = loading_diff_text(
+            std::time::Duration::ZERO,
+            Some(&progress_at(DiffPhase::Patching, 1, 2, &long)),
+        );
+        let shown = out.rsplit(" · ").next().expect("the path is last");
+        assert_eq!(shown.chars().count(), LOADING_PATH_CHARS, "{out}");
+        assert!(shown.starts_with('…'), "{out}");
+        assert!(shown.ends_with("αβγδε.rs"), "{out}");
+    }
+
     /// One `MouseWheel` event, as a backend reports it.
     fn wheel(unit: egui::MouseWheelUnit, dy: f32, modifiers: egui::Modifiers) -> egui::Event {
         egui::Event::MouseWheel {
@@ -10384,7 +10606,7 @@ mod tests {
             StoreContext::of(&repo).expect("hashable"),
             std::time::Duration::from_hours(1),
         );
-        let built = build_or_load(Some(&never), &repo, &scope, s, None, None);
+        let built = build_or_load(Some(&never), &repo, &scope, s, BuildEnv::NONE, None);
         assert!(!built.lines.is_empty(), "control: the diff is real");
         assert_eq!(
             std::fs::read_dir(dir.path()).map_or(0, Iterator::count),
@@ -10398,9 +10620,9 @@ mod tests {
             StoreContext::of(&repo).expect("hashable"),
             std::time::Duration::ZERO,
         );
-        let a = build_or_load(Some(&always), &repo, &scope, s, None, None);
+        let a = build_or_load(Some(&always), &repo, &scope, s, BuildEnv::NONE, None);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "written");
-        let b = build_or_load(Some(&always), &repo, &scope, s, None, None);
+        let b = build_or_load(Some(&always), &repo, &scope, s, BuildEnv::NONE, None);
         assert_eq!(a.lines.len(), b.lines.len());
         assert_eq!(a.max_chars, b.max_chars);
     }
@@ -10426,7 +10648,7 @@ mod tests {
         };
         let tc = Textconv::new();
 
-        let data = get_diff_data(&repo, &scope, s, Some(&tc));
+        let data = get_diff_data(&repo, &scope, s, BuildEnv::textconv(&tc));
         assert!(
             !data.lines.is_empty(),
             "control: the pane still shows the raw diff rather than blanking"
@@ -10442,7 +10664,14 @@ mod tests {
             StoreContext::of(&repo).expect("hashable"),
             std::time::Duration::ZERO,
         );
-        build_or_load(Some(&store), &repo, &scope, s, Some(&tc), None);
+        build_or_load(
+            Some(&store),
+            &repo,
+            &scope,
+            s,
+            BuildEnv::textconv(&tc),
+            None,
+        );
         assert_eq!(
             std::fs::read_dir(store_dir.path()).unwrap().count(),
             0,
@@ -10472,7 +10701,7 @@ mod tests {
         let repo = crate::test_repo::open_repo(dir.path());
         let store = DiffStore::at(root, ctx, std::time::Duration::ZERO);
 
-        let data = build_or_load(Some(&store), &repo, &scope, s, None, None);
+        let data = build_or_load(Some(&store), &repo, &scope, s, BuildEnv::NONE, None);
         assert!(data.lines.is_empty(), "control: the build did fail");
         assert_eq!(
             std::fs::read_dir(store_dir.path()).map_or(0, Iterator::count),
@@ -10501,7 +10730,7 @@ mod tests {
         );
         // And the same commit's real diff IS worth persisting, so the guard is
         // rejecting the failure rather than the commit.
-        let real = get_diff_data(&repo, &scope, probe_settings(), None);
+        let real = get_diff_data(&repo, &scope, probe_settings(), BuildEnv::NONE);
         assert!(worth_persisting(&repo, &scope, &real));
     }
 
@@ -10532,7 +10761,7 @@ mod tests {
             &repo,
             &RowScope::new(DiffSource::Commit(root_oid)),
             s,
-            None,
+            BuildEnv::NONE,
             None,
         );
         assert_eq!(
@@ -10557,7 +10786,7 @@ mod tests {
             &repo,
             &RowScope::new(DiffSource::Commit(child)),
             s,
-            None,
+            BuildEnv::NONE,
             None,
         );
         assert_eq!(
@@ -10591,7 +10820,14 @@ mod tests {
 
         // Speculative, cap of 1: any real diff exceeds it, nothing is written.
         let spec = tempfile::tempdir().unwrap();
-        build_or_load(Some(&mk(spec.path())), &repo, &scope, s, None, Some(1));
+        build_or_load(
+            Some(&mk(spec.path())),
+            &repo,
+            &scope,
+            s,
+            BuildEnv::NONE,
+            Some(1),
+        );
         assert_eq!(
             std::fs::read_dir(spec.path()).map_or(0, Iterator::count),
             0,
@@ -10600,7 +10836,14 @@ mod tests {
 
         // Displayed: no cap, so the same diff IS worth keeping.
         let shown = tempfile::tempdir().unwrap();
-        build_or_load(Some(&mk(shown.path())), &repo, &scope, s, None, None);
+        build_or_load(
+            Some(&mk(shown.path())),
+            &repo,
+            &scope,
+            s,
+            BuildEnv::NONE,
+            None,
+        );
         assert_eq!(
             std::fs::read_dir(shown.path()).unwrap().count(),
             1,
@@ -10627,14 +10870,14 @@ mod tests {
             std::time::Duration::from_hours(1),
         );
 
-        build_or_load(Some(&store), &repo, &scope, s, None, None);
+        build_or_load(Some(&store), &repo, &scope, s, BuildEnv::NONE, None);
         assert_eq!(
             std::fs::read_dir(dir.path()).map_or(0, Iterator::count),
             0,
             "control: nothing is worth an hour"
         );
         store.set_min_build(std::time::Duration::ZERO);
-        build_or_load(Some(&store), &repo, &scope, s, None, None);
+        build_or_load(Some(&store), &repo, &scope, s, BuildEnv::NONE, None);
         assert_eq!(
             std::fs::read_dir(dir.path()).unwrap().count(),
             1,
@@ -10660,7 +10903,7 @@ mod tests {
                 detect_copies: false,
                 textconv: false,
             },
-            None,
+            BuildEnv::NONE,
             None,
         );
         assert!(!data.lines.is_empty());

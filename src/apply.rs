@@ -1409,7 +1409,7 @@ pub fn apply_request(
 mod tests {
     use super::*;
     use crate::diff::{
-        DiffSettings, RangeEnds, RowScope, hunk_at_line, oid_staged, oid_uncommitted,
+        BuildEnv, DiffSettings, RangeEnds, RowScope, hunk_at_line, oid_staged, oid_uncommitted,
     };
     use crate::test_repo::{
         commit_bytes, commit_file, commit_index, commit_rename, corrupt_head, index_blob,
@@ -2182,7 +2182,7 @@ mod tests {
             &repo,
             settings(),
             &RowScope::new(DiffSource::Uncommitted),
-            None,
+            BuildEnv::NONE,
         );
         // Row of the "+EDITED 17" line.
         let row = data
@@ -2324,7 +2324,7 @@ mod tests {
             &repo,
             &RowScope::new(DiffSource::Commit(target)),
             settings(),
-            None,
+            BuildEnv::NONE,
         );
         let row = data
             .lines
@@ -2782,7 +2782,7 @@ mod tests {
             &repo,
             &RowScope::new(DiffSource::Commit(target)),
             settings(),
-            None,
+            BuildEnv::NONE,
         );
         let row = data
             .lines
@@ -2893,7 +2893,7 @@ mod tests {
             &repo,
             settings(),
             &RowScope::new(DiffSource::Uncommitted),
-            None,
+            BuildEnv::NONE,
         );
         let row = data
             .lines
@@ -2949,7 +2949,7 @@ mod tests {
             &repo,
             settings(),
             &RowScope::new(DiffSource::Uncommitted),
-            None,
+            BuildEnv::NONE,
         );
         let f = &data.files[0];
         assert_eq!(f.status, git2::Delta::Modified);
@@ -2990,7 +2990,7 @@ mod tests {
             &repo,
             settings(),
             &RowScope::new(DiffSource::Staged),
-            None,
+            BuildEnv::NONE,
         );
         let row = data
             .lines
@@ -3035,7 +3035,7 @@ mod tests {
             &repo,
             &RowScope::new(DiffSource::Commit(target)),
             settings(),
-            None,
+            BuildEnv::NONE,
         );
         let row = data
             .lines
@@ -3136,7 +3136,7 @@ mod tests {
             &repo,
             settings(),
             &RowScope::new(DiffSource::Uncommitted),
-            None,
+            BuildEnv::NONE,
         );
         let f = data
             .files
@@ -3229,7 +3229,7 @@ mod tests {
             &repo,
             settings(),
             &RowScope::new(DiffSource::Uncommitted),
-            None,
+            BuildEnv::NONE,
         );
         let f = &data.files[0];
         assert_eq!(f.status, git2::Delta::Modified);
@@ -3262,7 +3262,7 @@ mod tests {
             &repo,
             settings(),
             &RowScope::new(DiffSource::Uncommitted),
-            None,
+            BuildEnv::NONE,
         );
         let f = &data.files[0];
         assert_eq!(f.status, git2::Delta::Deleted);
@@ -3345,7 +3345,7 @@ mod tests {
             &repo,
             ws,
             &RowScope::new(DiffSource::Uncommitted),
-            None,
+            BuildEnv::NONE,
         );
         let row = data
             .lines
@@ -3457,7 +3457,7 @@ mod tests {
             &repo,
             settings(),
             &RowScope::new(DiffSource::Uncommitted),
-            None,
+            BuildEnv::NONE,
         );
         let f = &data.files[0];
         assert_eq!(f.status, git2::Delta::Deleted);
@@ -3529,7 +3529,7 @@ mod tests {
             &repo,
             settings(),
             &RowScope::new(DiffSource::Staged),
-            None,
+            BuildEnv::NONE,
         );
         let row = data
             .lines
@@ -3834,7 +3834,7 @@ mod tests {
             &repo,
             ws,
             &RowScope::new(DiffSource::Uncommitted),
-            None,
+            BuildEnv::NONE,
         );
         // The row the user right-clicks: the "+EDITED 10" line itself.
         let row = data
@@ -3898,7 +3898,7 @@ mod tests {
             &repo,
             copy_settings(),
             &RowScope::new(DiffSource::Staged),
-            None,
+            BuildEnv::NONE,
         );
         let b = data
             .files
@@ -3941,7 +3941,7 @@ mod tests {
             &repo,
             copy_settings(),
             &RowScope::new(DiffSource::Staged),
-            None,
+            BuildEnv::NONE,
         );
         let b = data.files.iter().find(|f| f.path == "b.rs").unwrap();
         assert_eq!(b.status, git2::Delta::Copied);
@@ -4008,7 +4008,7 @@ mod tests {
             &repo,
             settings,
             &RowScope::new(DiffSource::Staged),
-            Some(&tc),
+            BuildEnv::textconv(&tc),
         );
         let file = data.files.iter().find(|f| f.path == "a.zip").unwrap();
         assert!(
@@ -4060,7 +4060,7 @@ mod tests {
             &repo,
             copy_settings(),
             &RowScope::new(DiffSource::Staged),
-            None,
+            BuildEnv::NONE,
         );
         let b = data
             .files
@@ -4104,7 +4104,7 @@ mod tests {
             &repo,
             &RowScope::new(DiffSource::Commit(oid)),
             copy_settings(),
-            None,
+            BuildEnv::NONE,
         );
         let b = data
             .files

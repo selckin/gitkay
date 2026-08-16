@@ -234,6 +234,7 @@ pub fn anchor_hint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff::BuildEnv;
     use git2::Repository;
 
     use crate::diff::tests::{base_settings, diff_of};
@@ -256,7 +257,7 @@ mod tests {
                 show_stats: true,
                 ..base_settings()
             },
-            None,
+            BuildEnv::NONE,
         );
 
         // From the very top: past the commit header, the stat block and the file
@@ -296,7 +297,7 @@ mod tests {
             &repo,
             &RowScope::new(DiffSource::Commit(oid)),
             base_settings(),
-            None,
+            BuildEnv::NONE,
         );
 
         let del = data
@@ -335,7 +336,7 @@ mod tests {
             &repo,
             &RowScope::new(DiffSource::Commit(oid)),
             base_settings(),
-            None,
+            BuildEnv::NONE,
         );
 
         let last = data.lines.len() - 1;
@@ -369,7 +370,7 @@ mod tests {
             &repo,
             &RowScope::new(DiffSource::Commit(oid)),
             base_settings(),
-            None,
+            BuildEnv::NONE,
         );
         assert!(
             !data.lines.is_empty(),
