@@ -345,10 +345,11 @@ The big picture, ahead of the detail sections below:
   syntax-highlight asynchronously off the UI thread.
 
 ### Data Layer (`src/history.rs` + `src/diff.rs`)
-- `load_commits()` — **two walks, one order**. The plain scope goes through
+- `load_commits()` — **two walks, one order**. The plain scope and `--all` go through
   `topo::TopoWalk` when the repo has a commit-graph (`history::topo_available`):
   generation numbers make a lazy topological walk exact, so 200 rows off a
-  1.47M-commit kernel clone cost 1.0s instead of 45s. Every other scope, and every
+  1.47M-commit kernel clone cost 1.0s instead of 45s, and 423ms instead of 44.8s
+  under `--all` (which git itself answers in 3.1s). Every other scope, and every
   repo without the file, falls back to the `git2` revwalk. Both produce `git log
   --graph`'s order — see **The commit order** below. Precomputed ref map either way
 - `load_commits_tail()` — incremental extension for the plain (no path filter,
@@ -459,11 +460,32 @@ Two implementations produce it and they must not disagree:
 commit-graph in the background must change how fast the list appears and nothing
 about what it says.
 
-`topo_scope` is deliberately narrow — the plain current-branch scope only. Nothing
-about `--all`, a range or a path filter is beyond the walk; what is missing is the
-VERIFICATION, since the order was checked against git for a single tip. Widening it
-owes an oracle run against `git rev-list --topo-order` for that scope, not an
-argument.
+**Under `--all` the tips are the order** — the walk seeds its stack with them — and
+git's are its starting points sorted by COMMITTER date, newest first
+(`commit_list_insert_by_date` over refs taken in `for_each_ref` order), with the
+refname as the only tiebreak. `history::topo_tips` reproduces that, sorting the
+refnames itself rather than inheriting libgit2's iteration order, and takes the same
+ref set `history_revwalk` pushes: `refs/heads/*`, `refs/remotes/*`, `refs/tags/*`,
+plus HEAD for the detached case. That set is narrower than `git rev-list --all`,
+which walks everything under `refs/` — so an oracle run on a repository holding
+`refs/stash` or `refs/notes/*` must name the tips explicitly (`--stdin`) rather than
+pass `--all`.
+
+**A tip is routinely another tip's ancestor** (every tag on a commit the branch
+descends from) and is then not a starting point at all. git drops those before it
+starts, by computing indegrees down to the lowest tip's generation — a whole-history
+pass on a repository with an old tag, which is the pass this walk exists to avoid.
+`TopoWalk` seeds them anyway and filters at the moment one is POPPED, when the
+generation floor has just made its indegree final; the emitted sequence is
+unchanged, because dropping a stack entry that could not have been emitted there
+disturbs no order. Verified byte-identical to `git rev-list --topo-order` over the
+whole history of four repositories carrying 156–452 tags, and at 200/1,000/10,000
+rows on the kernel.
+
+`topo_scope` is deliberately narrow — the current-branch scope and `--all`. Nothing
+about a range or a path filter is beyond the walk; what is missing is the
+VERIFICATION. Widening it owes an oracle run against `git rev-list --topo-order` for
+that scope, not an argument.
 
 ### Graph Layout (`src/graph.rs`)
 - **Pipes**: `Vec<Option<(Oid, color_index)>>` — fixed column slots, `None` = empty

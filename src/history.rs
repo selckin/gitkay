@@ -587,15 +587,14 @@ fn timed<T>(acc: &mut std::time::Duration, f: impl FnOnce() -> T) -> T {
 /// as it goes, so draining it is neither free nor a list of what the next page holds.
 /// Can this scope be walked with generation numbers, in `git log --graph`'s order?
 ///
-/// Deliberately narrow: the plain current-branch scope and nothing else. What rules
-/// the others out is not the walk but the VERIFICATION — this order was checked
-/// against `git rev-list --topo-order` itself, and only for a single tip. `--all`
-/// needs a tip ordering matched against `git rev-list --all`, a range needs
-/// exclusions the walk has no notion of, and a path filter needs git's history
-/// simplification; each is its own change with its own oracle run. Everything not
-/// listed here falls back to the sorted revwalk, which is slow but correct.
+/// Deliberately narrow: the current-branch scope and `--all`, each verified against
+/// `git rev-list --topo-order` for the tips it seeds. What rules the others out is not
+/// the walk but the VERIFICATION — a range needs exclusions the walk has no notion of,
+/// a path filter needs git's history simplification, and `--follow` needs the rename
+/// trace that rides on it; each is its own change with its own oracle run. Everything
+/// not listed here falls back to the sorted revwalk, which is slow but correct.
 pub const fn topo_scope(scope: &cli::Scope) -> bool {
-    !scope.all && !scope.reflog && !scope.follow && scope.revs.is_empty() && scope.paths.is_empty()
+    !scope.reflog && !scope.follow && scope.revs.is_empty() && scope.paths.is_empty()
 }
 
 /// Whether this repository can be walked lazily right now — the scope allows it AND
@@ -605,6 +604,67 @@ pub fn topo_available(repo: &Repository, scope: &cli::Scope) -> bool {
     topo_scope(scope) && crate::commitgraph::CommitGraph::for_repo(repo).is_some()
 }
 
+/// The commits a lazy walk starts from, in the order git starts from them — which is
+/// the order they are emitted in, since the walk seeds its stack with them.
+///
+/// For the plain scope that is HEAD alone. For `--all` it is the same set
+/// `history_revwalk` pushes (`refs/heads/*`, `refs/remotes/*`, `refs/tags/*`, plus
+/// HEAD, whose commits are not under `refs/` when it is detached), ordered as git
+/// orders its own starting points: **by committer date, newest first**, resolving ties
+/// by the refname the commit was reached through. git builds that list with
+/// `commit_list_insert_by_date` over refs taken in `for_each_ref` order, so the date is
+/// the ordering and the refname is only the tiebreak; sorting the refnames ourselves
+/// makes the tiebreak deterministic rather than a property of libgit2's iteration.
+///
+/// The date is the COMMITTER's, matching git's `commit->date` — not the author date the
+/// rows display.
+///
+/// Peeling is what a tag needs (an annotated tag's oid is the tag object's), and a tag
+/// of a blob or a tree simply has no commit to contribute and is skipped — as it is in
+/// `build_ref_map`, and as `git rev-list --all` skips it.
+fn topo_tips(repo: &Repository, scope: &cli::Scope) -> Option<Vec<git2::Oid>> {
+    /// The three `history_revwalk` pushes for `--all`, as prefixes: libgit2 matches
+    /// `refs/heads/*` with `fnmatch` and no `FNM_PATHNAME`, so its `*` spans `/` and a
+    /// nested branch name is in scope exactly as a prefix test makes it.
+    const PREFIXES: [&str; 3] = ["refs/heads/", "refs/remotes/", "refs/tags/"];
+    if !scope.all {
+        return Some(vec![repo.head().ok()?.peel_to_commit().ok()?.id()]);
+    }
+    let commit_of = |r: &git2::Reference<'_>| -> Option<(git2::Oid, i64)> {
+        let commit = r.peel_to_commit().ok()?;
+        Some((commit.id(), commit.time().seconds()))
+    };
+    let mut named: Vec<(String, git2::Oid, i64)> = repo
+        .references()
+        .ok()?
+        .flatten()
+        .filter_map(|r| {
+            let name = r.name().ok()?.to_string();
+            PREFIXES.iter().any(|p| name.starts_with(p)).then_some(())?;
+            let (oid, when) = commit_of(&r)?;
+            Some((name, oid, when))
+        })
+        .collect();
+    named.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut tips: Vec<(git2::Oid, i64)> = named.into_iter().map(|(_, o, w)| (o, w)).collect();
+    // HEAD last, exactly where `git rev-list --all` adds it: after every ref, so it
+    // only introduces a commit when it is detached, and ties break behind the refs.
+    if let Ok(head) = repo.head()
+        && let Some(tip) = commit_of(&head)
+    {
+        tips.push(tip);
+    }
+    // Stable, so the refname order above survives as the tiebreak.
+    tips.sort_by_key(|(_, when)| std::cmp::Reverse(*when));
+    let mut seen = HashSet::new();
+    Some(
+        tips.into_iter()
+            .map(|(oid, _)| oid)
+            .filter(|oid| seen.insert(*oid))
+            .collect(),
+    )
+}
+
 /// `want` oids in `git log --graph` order, or `None` when this repository or scope
 /// cannot be walked that way and the sorted revwalk has to do it.
 fn topo_oids(repo: &Repository, scope: &cli::Scope, want: usize) -> Option<Vec<git2::Oid>> {
@@ -612,9 +672,9 @@ fn topo_oids(repo: &Repository, scope: &cli::Scope, want: usize) -> Option<Vec<g
         return None;
     }
     let graph = crate::commitgraph::CommitGraph::for_repo(repo)?;
-    let head = repo.head().ok()?.peel_to_commit().ok()?.id();
+    let tips = topo_tips(repo, scope)?;
     let t = std::time::Instant::now();
-    let oids = crate::topo::TopoWalk::new(repo, &graph, &[head], scope.first_parent).take(want)?;
+    let oids = crate::topo::TopoWalk::new(repo, &graph, &tips, scope.first_parent).take(want)?;
     log::debug!(
         "perf: load_commits: topo walk ({} of {want} rows, graph has {}) {:?}",
         oids.len(),
@@ -1872,18 +1932,106 @@ mod tests {
         assert!(lazy.len() >= 4, "the fixture should have real depth");
     }
 
+    /// `--all` seeds every branch, remote and tag, and it is the scope the sorted walk
+    /// hurts most (939 refs and 44.8s on a kernel clone, against 423ms lazily) — so it
+    /// takes the lazy path too, and must select what the sorted walk selects.
+    #[test]
+    fn the_lazy_and_sorted_walks_select_the_same_commits_for_all_refs() {
+        let (dir, repo) = crate::test_repo::temp_repo();
+        let (root, main_c, side_c, tip) = crate::tests::merged_history(&repo);
+        // A tag on a commit the branch descends from: the tip that is another tip's
+        // ancestor, which is what `--all` adds to the walk's problem.
+        repo.tag_lightweight("v1", &repo.find_object(root, None).unwrap(), false)
+            .unwrap();
+        let scope = crate::tests::scope(true, &[]);
+
+        assert!(!topo_available(&repo, &scope));
+        let sorted = crate::tests::summaries(&load_commits(&repo, 100, &scope));
+
+        crate::test_repo::write_commit_graph(&repo, &[tip, side_c]);
+        let repo = crate::test_repo::open_repo(dir.path());
+        assert!(
+            topo_available(&repo, &scope),
+            "the graph should now be found"
+        );
+        let lazy = crate::tests::summaries(&load_commits(&repo, 100, &scope));
+
+        assert_eq!(
+            lazy.iter().collect::<std::collections::BTreeSet<_>>(),
+            sorted.iter().collect::<std::collections::BTreeSet<_>>(),
+            "same commits either way: lazy {lazy:?} vs sorted {sorted:?}"
+        );
+        let _ = main_c;
+        assert!(lazy.len() >= 4, "the fixture should have real depth");
+    }
+
+    /// The tips ARE the emission order — the walk seeds its stack with them — and git
+    /// takes them newest committer date first, whatever order the refs come in. A
+    /// branch committed out of clock order (a rebase, an amend, a skewed clock) is
+    /// what tells the two apart.
+    #[test]
+    fn the_all_scope_seeds_its_tips_newest_first() {
+        let (_d, repo) = crate::test_repo::temp_repo();
+        let root = crate::test_repo::commit_file_at(&repo, "f.txt", "0", "root", 1_000, &[]);
+        // The newer commit sits on the alphabetically EARLIER branch, so a walk that
+        // took the refs in refname order would seed them the other way round.
+        let newer = crate::test_repo::commit_file_at(&repo, "a.txt", "a", "newer", 3_000, &[root]);
+        let older = crate::test_repo::commit_file_at(&repo, "b.txt", "b", "older", 2_000, &[root]);
+        for (name, oid) in [("aaa", newer), ("zzz", older)] {
+            repo.branch(name, &repo.find_commit(oid).unwrap(), false)
+                .unwrap();
+        }
+        repo.tag_lightweight("v1", &repo.find_object(root, None).unwrap(), false)
+            .unwrap();
+
+        let scope = crate::tests::scope(true, &[]);
+        assert_eq!(
+            topo_tips(&repo, &scope).expect("tips for --all"),
+            vec![newer, older, root],
+            "newest committer date first"
+        );
+        // The plain scope has exactly one tip, whatever else the repository holds.
+        repo.set_head("refs/heads/zzz").unwrap();
+        assert_eq!(
+            topo_tips(&repo, &cli::Scope::default()).unwrap(),
+            vec![older]
+        );
+    }
+
+    /// Two tips a repository committed in the same second: the date cannot separate
+    /// them, so the refname does — git's own tiebreak, since it takes its starting
+    /// points in `for_each_ref` order and inserts them by date. Without a tiebreak of
+    /// our own this would follow libgit2's ref iteration and vary.
+    #[test]
+    fn tips_committed_in_the_same_second_fall_back_to_refname_order() {
+        let (_d, repo) = crate::test_repo::temp_repo();
+        let root = crate::test_repo::commit_file_at(&repo, "f.txt", "0", "root", 1_000, &[]);
+        let a = crate::test_repo::commit_file_at(&repo, "a.txt", "a", "a", 2_000, &[root]);
+        let b = crate::test_repo::commit_file_at(&repo, "b.txt", "b", "b", 2_000, &[root]);
+        // Named so the refname order is the reverse of the creation order.
+        repo.branch("zzz", &repo.find_commit(a).unwrap(), false)
+            .unwrap();
+        repo.branch("aaa", &repo.find_commit(b).unwrap(), false)
+            .unwrap();
+        assert_eq!(
+            topo_tips(&repo, &crate::tests::scope(true, &[])).unwrap(),
+            vec![b, a],
+            "refs/heads/aaa before refs/heads/zzz"
+        );
+    }
+
     /// A scope the lazy walk has not been verified against git for must keep using
     /// the sorted one, whatever the repository holds. The list is deliberately
     /// narrow, and widening it is a change that owes its own oracle run.
     #[test]
-    fn only_the_plain_scope_takes_the_lazy_path() {
+    fn only_verified_scopes_take_the_lazy_path() {
         let (dir, repo) = crate::test_repo::temp_repo();
         let tip = crate::tests::merged_history(&repo).3;
         crate::test_repo::write_commit_graph(&repo, &[tip]);
         let repo = crate::test_repo::open_repo(dir.path());
         assert!(topo_available(&repo, &cli::Scope::default()));
+        assert!(topo_available(&repo, &crate::tests::scope(true, &[])));
         for scope in [
-            crate::tests::scope(true, &[]),
             crate::tests::scope(false, &["HEAD"]),
             cli::Scope {
                 paths: vec!["f.txt".into()],
