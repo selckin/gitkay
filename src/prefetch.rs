@@ -1582,6 +1582,18 @@ fn warm_row(
     // At `trace`, not `debug`: several workers logging twice a row is a lot of output,
     // and every field here reappears on the `done` line.
     log::trace!("prefetch: start {} ({:?})", target.key.oid, target.depth);
+    // A HEAVY row is the exception, and it gets a `debug` line of its own — the
+    // coordinator logs the hand-off, so this is what separates "the worker never picked
+    // the job up" from "the worker is inside the build": the two have identical
+    // symptoms (a row dispatched and never reported) and completely different causes.
+    // Rare by construction, so it costs an ordinary repo nothing.
+    if target.probed.is_some() {
+        log::debug!(
+            "prefetch: heavy worker {} starting {}",
+            ctx.id,
+            target.key.oid
+        );
+    }
     // Started AFTER the log call, deliberately. `env_logger` takes the stderr lock, so
     // with a slow sink (a pipe into a pager or grep) that call blocks — and with the
     // timer above it that wait was reported as compute: measured, 33- and 56-line rows
