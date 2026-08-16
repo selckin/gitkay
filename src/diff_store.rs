@@ -789,12 +789,35 @@ impl DiffStore {
         Some(data)
     }
 
-    /// Persist a diff. Silent no-op for a row with no key (the virtual rows).
+    /// Persist a diff. Silent no-op for a row with no key (the virtual rows), and for
+    /// one too large for the store to keep (see `MAX_ENTRY_BYTES`).
+    ///
+    /// The cap is enforced HERE rather than left to the caller, because it is the
+    /// store's own budget that decides it: `build_or_load`'s `store_cap` is a
+    /// different question (whether the CALLER will keep what it built), and the
+    /// foreground load deliberately answers "no cap of my own" to it.
     pub fn save(&self, scope: &RowScope, settings: DiffSettings, data: &DiffData) {
         let Some(key) = self.key(scope, settings) else {
             return;
         };
-        if let Err(e) = self.write_atomic(key, &encode(data)) {
+        // Cheap first, and the order is the whole point: `encode` builds the entry in
+        // memory, so refusing only afterwards would still spend the seconds and the
+        // gigabytes on exactly the diffs worth refusing. `min_encoded_bytes` is a floor
+        // the encoder cannot go under, so a refusal here is never a false one.
+        if over_entry_cap(
+            key,
+            min_encoded_bytes(data.lines.len(), data.files.len()),
+            false,
+        ) {
+            return;
+        }
+        let bytes = encode(data);
+        // Then exactly, for what the floor lets through: a few very long lines encode
+        // to far more than their count suggests.
+        if over_entry_cap(key, bytes.len() as u64, true) {
+            return;
+        }
+        if let Err(e) = self.write_atomic(key, &bytes) {
             // Once per store, not once per row: a whole band failing to write
             // would otherwise print one line per row per dispatch.
             if !self.warned.swap(true, Ordering::Relaxed) {
@@ -864,6 +887,46 @@ fn touch(path: &Path) -> std::io::Result<()> {
 /// entries under 1MB, four orders of magnitude apart, so this holds hundreds of
 /// bands in practice.
 pub const DEFAULT_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The largest entry the store will write: an eighth of the budget.
+///
+/// An entry larger than the budget itself cannot survive the next prune, so writing
+/// one is pure waste — and not small waste. Measured on a repo of large data blobs:
+/// one commit produced a 76.5M-line diff whose build took 89.5s and whose SAVE took a
+/// further 9s, encoding gigabytes into `~/.cache/gitkay/diffs` to produce a file the
+/// next launch deletes unread.
+///
+/// An eighth rather than the whole, so one outsized entry cannot evict the band of
+/// small ones the store exists to hold: a measured band was 21 entries under 1MB, so
+/// 32MB already allows an entry thirty times that whole working set. The same
+/// reasoning, and the same divisor, as the prefetch cache's `max_entry_lines`.
+///
+/// The cost of refusing is that such a diff is rebuilt on every visit. That is the
+/// right trade at this size — a diff this large has no fast path anyway (its INSTALL
+/// alone takes seconds), and the alternative spends the whole store on it.
+pub const MAX_ENTRY_BYTES: u64 = DEFAULT_BUDGET_BYTES / 8;
+
+/// A floor on what `encode` will produce for a diff of this shape: the fixed
+/// per-line and per-file fields, before a byte of text. Pure and count-based so the
+/// decision can be made — and tested — without building the diff it describes.
+const fn min_encoded_bytes(lines: usize, files: usize) -> u64 {
+    lines as u64 * LINE_MIN_BYTES as u64 + files as u64 * FILE_MIN_BYTES as u64
+}
+
+/// Whether an entry of this size is too large for the store to keep, saying so once
+/// when it is. `measured` distinguishes the floor from the real size in the log: a
+/// reader wondering why one commit rebuilds on every visit needs to know which of the
+/// two checks refused it.
+fn over_entry_cap(key: git2::Oid, bytes: u64, measured: bool) -> bool {
+    if bytes <= MAX_ENTRY_BYTES {
+        return false;
+    }
+    log::debug!(
+        "diff store: not saving {key} — {}{bytes} bytes, over the {MAX_ENTRY_BYTES}-byte entry cap",
+        if measured { "" } else { "at least " }
+    );
+    true
+}
 
 /// How long a temp file must sit before it is assumed orphaned. The longest
 /// measured build is ~14s, so an hour is three orders of magnitude of headroom
@@ -1606,6 +1669,51 @@ mod tests {
 
         assert!(store.load(&scope_of(oid), settings()).is_none(), "miss");
         assert!(!entry.exists(), "and the bad file is gone");
+    }
+
+    /// The cheap check, on the shape that motivated the cap: a diff whose LINE COUNT
+    /// alone puts it past the budget must be refused before `encode` is called, since
+    /// encoding it is the multi-second, multi-gigabyte part.
+    ///
+    /// The figures are the measured ones — a 76.5M-line diff over 23 files — against
+    /// a large-but-ordinary diff that must still be stored.
+    #[test]
+    fn a_diff_too_large_to_keep_is_refused_from_its_line_count_alone() {
+        assert!(
+            min_encoded_bytes(76_569_576, 23) > MAX_ENTRY_BYTES,
+            "the measured pathological diff is refused without encoding it"
+        );
+        assert!(
+            min_encoded_bytes(50_000, 300) <= MAX_ENTRY_BYTES,
+            "a large but ordinary diff is still worth keeping"
+        );
+    }
+
+    /// The exact check, on the shape the floor cannot see: few lines, each enormous.
+    /// Without it a minified bundle's diff writes an entry that survives the prune
+    /// only by evicting most of the store.
+    #[test]
+    fn an_entry_over_the_cap_is_not_written_even_when_its_line_count_is_small() {
+        let (_d, repo) = temp_repo();
+        let oid = commit_file(&repo, "a.txt", "one\n", "c");
+        let (_t, store) = temp_store(&repo);
+
+        // 100 lines of 400KB: ~40MB encoded, past the cap, while the line-count floor
+        // sees under 2KB — so this reaches the check after `encode`, not before it.
+        let lines: Vec<DiffLine> = (0..100)
+            .map(|_| line(&"x".repeat(400 * 1024), LineKind::Context, 1, 1))
+            .collect();
+        assert!(
+            min_encoded_bytes(lines.len(), 0) <= MAX_ENTRY_BYTES,
+            "control: the cheap check lets this through"
+        );
+        store.save(&scope_of(oid), settings(), &DiffData::new(lines, vec![]));
+
+        assert_eq!(
+            std::fs::read_dir(store.root()).map_or(0, Iterator::count),
+            0,
+            "nothing written, temp file included"
+        );
     }
 
     /// Never persist a row whose content is not pinned by its key.

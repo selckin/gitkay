@@ -221,8 +221,9 @@ role→FontId map), `src/highlight.rs` (syntect highlighter, theme/palette
 resolution, grammar selection, per-line tokenization — no diff knowledge; the
 diff-side orchestration is `src/diff_highlight.rs`), `src/diff_cache.rs` (line-budget LRU cache),
 `src/diff_store.rs` (the persistent layer below that cache: a hand-rolled binary
-codec for a diff's structure, key derivation, atomic load/save, and the
-budget-and-temp-sweep pruner),
+codec for a diff's structure, key derivation, atomic load/save under its own
+`MAX_ENTRY_BYTES` — an entry the budget could never keep is refused before it is
+even encoded — and the budget-and-temp-sweep pruner),
 `src/diff/convert.rs` (turning a delta a driver applies to into a readable patch
 body: the substitution point, the synthesized header, the `ignore_ws` sweep, and the
 two mode sources — see **Textconv**),
@@ -948,7 +949,9 @@ row carries being dropped whole, and every patch row filling exactly the width
 `chars()` promises — the two halves the pane reserves and draws with, which is
 what stops them drifting), `diff_cache` (LRU eviction), `diff_store`
 (codec round trips including a non-UTF-8 path and every tag, key derivation, load/save
-over real temp repos, and the pruner's eviction + temp sweep), `word_diff` (LCS word
+over real temp repos, the entry cap from both sides — the measured 76.5M-line shape
+refused from its line count alone, and a few enormous lines refused only after
+encoding — and the pruner's eviction + temp sweep), `word_diff` (LCS word
 alignment), `prefetch` (the coordinator's scheduling decisions, driven through its message
 protocol rather than by reaching into its fields: the heavy lane's two admission
 bounds and the stampede a whole dispatch would otherwise commit, the deferral round
