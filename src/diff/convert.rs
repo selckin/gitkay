@@ -616,6 +616,7 @@ pub(super) fn move_to_end(files: &mut Vec<FileEntry>, picked: &[usize]) {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use crate::diff::BuildEnv;
     use crate::diff::tests::{CONV, base_settings, conv_settings, diff_of, texts};
     use crate::diff::{RowScope, delta_path_bytes, get_diff_data, scoped_diff_opts, source_diff};
 
@@ -757,7 +758,7 @@ pub(super) mod tests {
             &repo,
             &RowScope::new(DiffSource::Uncommitted),
             conv_settings(),
-            Some(&tc),
+            BuildEnv::textconv(&tc),
         );
         let named: Vec<&str> = data
             .lines
@@ -1345,7 +1346,12 @@ pub(super) mod tests {
             "the fixture must really produce a conflicted delta"
         );
 
-        let data = get_diff_data(&repo, &scope, conv_settings(), Some(&Textconv::new()));
+        let data = get_diff_data(
+            &repo,
+            &scope,
+            conv_settings(),
+            BuildEnv::textconv(&Textconv::new()),
+        );
         assert!(
             !data.textconv_failed,
             "a side libgit2 named no blob for is not a driver failure: {:?}",
@@ -1375,7 +1381,12 @@ pub(super) mod tests {
         write_conflict_stages(&repo, "c.txt", ["whatever\n"; 3]);
 
         let scope = RowScope::new(DiffSource::Uncommitted);
-        let data = get_diff_data(&repo, &scope, conv_settings(), Some(&Textconv::new()));
+        let data = get_diff_data(
+            &repo,
+            &scope,
+            conv_settings(),
+            BuildEnv::textconv(&Textconv::new()),
+        );
         let rows = texts(&data);
         assert!(
             data.files.iter().any(|f| f.path == "c.txt"),

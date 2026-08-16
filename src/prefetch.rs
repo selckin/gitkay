@@ -25,8 +25,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use git2::Repository;
 
 use crate::diff::{
-    self, CommitStats, DiffData, DiffSettings, FileEntry, RowScope, StatsWant, commit_stats,
-    is_real_commit,
+    self, BuildEnv, CommitStats, DiffData, DiffSettings, FileEntry, RowScope, StatsWant,
+    commit_stats, is_real_commit,
 };
 use crate::highlight::Highlighter;
 use crate::history::CommitInfo;
@@ -1489,7 +1489,9 @@ fn warm_row(
         repo,
         &target.scope,
         target.key.settings,
-        tc,
+        // No progress sink: nobody is waiting on a speculative warm, so there is no
+        // placeholder for it to fill in.
+        BuildEnv::of(tc),
         // Speculative: capped, because the drop below would throw this away.
         Some(ctx.limits.max_entry_lines),
     );
@@ -2452,7 +2454,7 @@ mod tests {
         // And the pane's own numbers for that row really are the converted ones, which
         // is what the column would have contradicted.
         let tc = Textconv::new();
-        let data = diff::get_diff_data(&repo, &scope, job(true).settings, Some(&tc));
+        let data = diff::get_diff_data(&repo, &scope, job(true).settings, BuildEnv::textconv(&tc));
         assert_eq!(
             diff::stats_from_data(&data).lines,
             LineStats::Counted(1, 1),

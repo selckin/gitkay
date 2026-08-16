@@ -1385,7 +1385,9 @@ pub fn build_ref_map(
 mod tests {
     use super::*;
     use crate::DateCol;
-    use crate::diff::{DiffSettings, DiffSource, RowScope, get_diff_data, oid_uncommitted};
+    use crate::diff::{
+        BuildEnv, DiffSettings, DiffSource, RowScope, get_diff_data, oid_uncommitted,
+    };
     use crate::test_repo::*;
     use crate::tests::{
         ci, ds, first_parent_scope, merged_history, oid, real_commits, scope, summaries,
@@ -1850,7 +1852,7 @@ mod tests {
                 show_stats: true,
                 ..ds()
             },
-            None,
+            BuildEnv::NONE,
         );
         let files: Vec<&str> = data.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(files, vec!["a.txt"]);

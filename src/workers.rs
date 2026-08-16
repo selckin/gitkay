@@ -21,7 +21,8 @@ use git2::Repository;
 
 use crate::cli;
 use crate::diff::{
-    CommitStats, DiffAnchor, DiffData, DiffSettings, RowScope, StatsWant, anchor_hint,
+    BuildEnv, CommitStats, DiffAnchor, DiffData, DiffProgress, DiffSettings, RowScope, StatsWant,
+    anchor_hint,
 };
 use crate::highlight::Highlighter;
 use crate::history::{
@@ -78,6 +79,10 @@ pub struct DiffLoadJob {
     pub prehighlight: Option<PreHighlight>,
     /// The persistent store and the textconv drivers; see `DiffDeps`.
     pub deps: DiffDeps,
+    /// Where this build reports what it is doing, for the "Loading diff…"
+    /// placeholder. The foreground load is the only build that carries one — it is
+    /// the only one somebody is sitting in front of.
+    pub progress: Arc<DiffProgress>,
 }
 
 /// Deliver a `data: None` result for a diff-load worker exiting without a diff
@@ -123,6 +128,7 @@ pub fn diff_load_job(repo: &Repository, job: DiffLoadJob) {
         ctx,
         prehighlight,
         deps,
+        progress,
     } = job;
     // Superseded before we even ran.
     if !current_epoch.is_current(epoch) {
@@ -138,7 +144,7 @@ pub fn diff_load_job(repo: &Repository, job: DiffLoadJob) {
         repo,
         &scope,
         key.settings,
-        textconv_for(&deps.textconv, key.settings),
+        BuildEnv::tracked(textconv_for(&deps.textconv, key.settings), &progress),
         None,
     );
     // Content-key a working-tree row off-thread here so an unchanged working tree hits

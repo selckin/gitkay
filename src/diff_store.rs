@@ -936,6 +936,7 @@ pub fn prune(root: &Path, budget: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff::BuildEnv;
     use crate::diff::{DiffData, DiffLine, FileEntry, LineKind};
     use std::num::NonZeroU32;
     use std::sync::Arc;
@@ -1534,7 +1535,7 @@ mod tests {
         let oid = commit_file(&repo, "a.rs", "fn main() {\n    todo!()\n}\n", "two");
         let (_t, store) = temp_store(&repo);
 
-        let built = crate::diff::get_diff_data(&repo, &scope_of(oid), settings(), None);
+        let built = crate::diff::get_diff_data(&repo, &scope_of(oid), settings(), BuildEnv::NONE);
         assert!(!built.lines.is_empty(), "control: the diff is not empty");
 
         store.save(&scope_of(oid), settings(), &built);
@@ -1571,7 +1572,7 @@ mod tests {
         let oid = commit_rename(&repo, "old.txt", "new.txt", "rename");
         let (_t, store) = temp_store(&repo);
 
-        let built = crate::diff::get_diff_data(&repo, &scope_of(oid), settings(), None);
+        let built = crate::diff::get_diff_data(&repo, &scope_of(oid), settings(), BuildEnv::NONE);
         store.save(&scope_of(oid), settings(), &built);
         let back = store.load(&scope_of(oid), settings()).expect("hit");
 
@@ -1597,7 +1598,7 @@ mod tests {
         let (_d, repo) = temp_repo();
         let oid = commit_file(&repo, "a.txt", "one\n", "c");
         let (_t, store) = temp_store(&repo);
-        let built = crate::diff::get_diff_data(&repo, &scope_of(oid), settings(), None);
+        let built = crate::diff::get_diff_data(&repo, &scope_of(oid), settings(), BuildEnv::NONE);
         store.save(&scope_of(oid), settings(), &built);
 
         let entry = only_entry(&store);
@@ -1633,7 +1634,7 @@ mod tests {
         let (_d, repo) = temp_repo();
         let oid = commit_file(&repo, "a.txt", "one\n", "c");
         let (_t, store) = temp_store(&repo);
-        let built = crate::diff::get_diff_data(&repo, &scope_of(oid), settings(), None);
+        let built = crate::diff::get_diff_data(&repo, &scope_of(oid), settings(), BuildEnv::NONE);
         store.save(&scope_of(oid), settings(), &built);
 
         let entry = only_entry(&store);

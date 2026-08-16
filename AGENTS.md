@@ -194,6 +194,9 @@ and the wiring. Those modules: `src/diff.rs` (the diff **data** layer: `DiffLine
 `DiffData` / `FileEntry` / `DiffSettings`, `CommitKind` + the sentinel oids,
 `DiffSource` + `RowScope` (what a row's diff is taken over, and the pathspec —
 the one value every diff entry point receives),
+`BuildEnv` (what a build MAY use, as opposed to what it is over: the textconv
+drivers and the progress sink) and `DiffProgress`/`DiffPhase` (see **Diff-load
+progress**),
 `get_diff_data` and the commit/staged/worktree builders (all three run through
 one `build_diff_data` pipeline, whose diff-building prologue — scoped options,
 build, `detect_similar` — is `scoped_diff`, shared with `commit_stats` so the
@@ -652,6 +655,32 @@ The invariants:
   And a wheel step **defers** its re-diff (`defer_diff_load`) where a click loads at
   once — see the top panel's `DIFF_LOAD_DEBOUNCE` for why supersession does not cover
   a burst.
+- **Diff-load progress**: past `DIFF_PLACEHOLDER_DELAY` a commit switch blanks the
+  pane, and what it blanks to says what the build is doing rather than only that it is
+  doing something — `loading_diff_text` (pure), fed by a `diff::DiffProgress` the
+  running build writes into. Three phases (`DiffPhase`), which is as fine as an honest
+  report gets: each is one libgit2 call or loop, and only the patch pass has a
+  denominator (`Loading diff… 143/2310 files · src/…/Foo.java (11.5s)`).
+  **The counter and the clock cover opposite shapes and both are needed**: a commit
+  touching thousands of files advances the counter, while a three-line patch inside a
+  265MB blob sits on `1/1` for eleven seconds — there the file NAME says where the time
+  is going and the clock says it is still moving. Seconds appear only past
+  `LOADING_ELAPSED_FLOOR`, so a glancing placeholder flashes no number.
+  Atomics rather than a channel: the reader wants the current state, not every state,
+  and a build emitting thousands of file boundaries must not queue messages nobody
+  reads. Nothing in it is an input to the diff, so a lost update costs a frame of
+  staleness — `Relaxed` throughout, and a poisoned path lock drops the name rather than
+  panicking mid-build.
+  **Only the foreground load carries a sink.** The prefetch pool and the stats column
+  build diffs nobody is waiting on, pass `BuildEnv::of(..)`, and pay nothing.
+  Two things are easy to get wrong. The placeholder must **ask for its own repaints**
+  (`LOADING_TICK`): the worker only repaints when it FINISHES, and a long build
+  produces no input, so without it the counter freezes at whatever the blanking frame
+  read — precisely the "is it stuck?" impression it exists to remove. And the handle
+  lives on `GitkApp::diff_load` (`DiffLoadState`) **beside the start instant, in one
+  `Option`**, so "a diff is loading" stays one answer; `inflight_loads` maps each
+  running key to its handle so a bounce-back adopts the worker AND its progress
+  instead of resetting the display to "comparing trees".
 - **Bottom panel**: diff view (left, syntax-highlighted) + file list sidebar
   (right, dynamic width). **Both read in the same order, and it is the sidebar's**
   — one decision made once in `build_file_rows`, whose grouped layout is not the
@@ -812,10 +841,12 @@ The invariants:
   `diff_store::entry_key`'s exhaustive destructure makes omitting it a compile error.
   No toolbar checkbox: whether this machine may run external commands is not a
   read-while-reading decision.
-- **`Textconv` is threaded as a parameter, never a global** — `Option<&Textconv>` down
+- **`Textconv` is threaded as a parameter, never a global** — inside `BuildEnv`, down
   `get_diff_data` → `build_diff_data` → `append_diff_body`. A global would make
   `get_diff_data` depend on invisible process state, and the suite needs per-repo
-  drivers.
+  drivers. It shares that value with the progress sink (see **Diff-load progress**)
+  because the pipeline sat at clippy's argument limit carrying the drivers alone; a
+  third optional capability now costs no signature change.
 - **A driven row is costly whatever its size** — byte-thresholding cannot see a
   subprocess coming. `RowCostProbe::driven` routes it to the heavy lane and makes its
   stats job send a file count and stop, so no driver ever runs on the commit-list
@@ -898,7 +929,10 @@ The invariants:
 Each module carries its own `#[cfg(test)]` suite: `config` (TOML parsing +
 clamping), `highlight` (theme/palette resolution), `cli` (rev-vs-path
 classification + pathspec/title helpers), `diff` (line/file lookups, windowed
-word-diff laziness, content hashing, and the textconv substitution over real temp
+word-diff laziness, content hashing, the progress a build reports as it goes — a
+control asserting the sink is untouched beforehand, since a `BuildEnv` dropped
+anywhere in the pipeline would leave the placeholder frozen at its defaults rather
+than fail — and the textconv substitution over real temp
 repos: the delta boundary a typechange breaks, the sweep — its synthesized header and
 the entry re-ordering that follows it — the two mode sources, the unmerged path
 that used to switch textconv off for the pane, the conflicted path whose null old oid
@@ -944,7 +978,9 @@ read out of fixtures written in git's own layout, flat and fanned out — every 
 fixture a `/bin/sh` script, so the suite depends on nothing else), `apply` (the largest suite — hunk matching and error phrasing
 as pure units, then stage/unstage/revert end-to-end over real temp repos: renames,
 binaries, symlinks, modes, and every refusal the write layer owes the user), and `main` (graph
-layout, diff integration over temp repos, and UI helpers). The graph-layout suite uses fake
+layout, diff integration over temp repos, and UI helpers — including
+`loading_diff_text`, whose three cases are each a sentence the reader will stare at
+while they wait). The graph-layout suite uses fake
 OIDs via `oid(n)` — no real repo needed — and pins the layout invariants (lane
 stability, merge diagonals, convergence, out-of-scope-parent continuation
 lines; `grep 'fn test_' src/graph.rs` for the list), plus
