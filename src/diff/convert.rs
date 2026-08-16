@@ -567,6 +567,9 @@ pub(super) fn emit_converted(
         HeaderOf::OnScreen { .. } => {}
         HeaderOf::Missing { prefixes } => lines.extend(swept_header_lines(delta, prefixes)),
     }
+    // One buffer for this whole converted patch, for the reason `push_patch_line`
+    // states: it runs per row, and a converted archive is as long as any other file.
+    let mut buf = String::new();
     let printed = patch.print(&mut |_, _, line| {
         // The generated patch's own file header is never used: in the substitution
         // case the REAL one — `diff --git`, `index`, mode and rename lines, which is
@@ -574,7 +577,7 @@ pub(super) fn emit_converted(
         // has just been replaced by one that does not claim object ids no odb holds
         // (see `swept_header_lines`).
         if line.origin() != 'F' {
-            push_patch_line(lines, files, Some(fi), &line);
+            push_patch_line(lines, files, Some(fi), &line, &mut buf);
         }
         true
     });
@@ -704,7 +707,7 @@ pub(super) mod tests {
             .lines
             .iter()
             .filter(|l| l.kind == LineKind::FileName)
-            .map(|l| l.text.as_str())
+            .map(|l| &*l.text)
             .collect();
         // Against the prefixes the header above them used, not a hardcoded `a/`:
         // `diff.noprefix` and `diff.mnemonicprefix` move them per repo, and a pair
@@ -728,7 +731,7 @@ pub(super) mod tests {
         let pair = data
             .lines
             .iter()
-            .position(|l| l.text.as_str() == format!("+++ {np}a.zip"))
+            .position(|l| *l.text == *format!("+++ {np}a.zip"))
             .expect("the pair is on screen");
         let hunk = data
             .lines
@@ -764,7 +767,7 @@ pub(super) mod tests {
             .lines
             .iter()
             .filter(|l| l.kind == LineKind::FileName)
-            .map(|l| l.text.as_str())
+            .map(|l| &*l.text)
             .collect();
         assert!(
             !named.iter().any(|l| l.contains("/dev/null")),
