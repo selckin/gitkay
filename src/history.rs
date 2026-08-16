@@ -537,6 +537,11 @@ pub fn load_commits_inner(repo: &Repository, max: usize, scope: &cli::Scope) -> 
     // The path filter's parent rewrite, kept so the virtual rows can be rewritten
     // through the same map once they exist (a dropped HEAD must not orphan them).
     let mut nearest_map: Option<std::collections::HashMap<git2::Oid, Vec<git2::Oid>>> = None;
+    // How many commits the path filter EXAMINED, which is the number the slow-walk
+    // warning has to quote: `real.len()` is what survived it. Only that branch sets it,
+    // which is what makes `WalkCost::PathFilter` unconstructible without its
+    // denominator.
+    let mut walked_commits: Option<usize> = None;
     // The pushes, separately from the walking they set up: `push_glob` resolves every
     // ref it matches, so `--all` on a tag-heavy repo pays here and nowhere else.
     let t_setup = std::time::Instant::now();
@@ -660,6 +665,7 @@ pub fn load_commits_inner(repo: &Repository, max: usize, scope: &cli::Scope) -> 
                 .elapsed()
                 .saturating_sub(sort + find + touch + build + trace);
             let walked_len = walked.len();
+            walked_commits = Some(walked_len);
             let t_rewrite = std::time::Instant::now();
             // 2. nearest[oid] = its nearest kept ancestors. `walked` is topological (each
             //    child precedes its parents), so a single oldest→newest pass resolves every
@@ -705,7 +711,7 @@ pub fn load_commits_inner(repo: &Repository, max: usize, scope: &cli::Scope) -> 
         real.len(),
         t.elapsed()
     );
-    note_slow_history_walk(t.elapsed(), real.len(), provisional_scope(scope));
+    note_slow_history_walk(t.elapsed(), real.len(), WalkCost::of(scope, walked_commits));
 
     // Join the probes now — their half-second ran alongside the walk above — and put
     // the rows they decide at the top, ahead of the real commits.
@@ -921,39 +927,99 @@ pub fn should_note_slow_walk(
     elapsed >= SLOW_HISTORY_WALK && !latch.swap(true, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// What a slow walk actually spent its time on — the warning's why-clause, and the
+/// count it should quote.
+///
+/// It is not the same for every scope, and saying "the whole history walked and sorted"
+/// for all of them named the wrong cause where it mattered most. On a 16,754-commit
+/// history filtered to 32 rows, the ordering pass was **209ms of 3.8s**; the rest was a
+/// commit-vs-parent diff per walked commit, which is what a pathspec costs
+/// (`commit_touches_paths`). The sentence also quoted the rows KEPT, so a
+/// 16,754-commit walk read as a 32-commit one — which is precisely why "125ms per
+/// commit" looked inexplicable in the perf log for as long as it did.
+///
+/// The distinction earns its keep because the two differ in whether the reader has a
+/// lever. Ordering the graph is every scope's floor and is inherent to the problem;
+/// diffing every commit in history is the price of the pathspec they typed, and
+/// bounding the revisions is a thing they can do about it. The line stays one sentence
+/// and does not spell that out — it names the cause, which is enough to look.
+#[derive(Clone, Copy)]
+pub enum WalkCost {
+    /// The ordering pass, with the provisional list it just replaced already on screen.
+    ///
+    /// That replacement earns its own clause where the other variants have none,
+    /// because it is the one consequence the reader can SEE: rows they were already
+    /// reading have been swapped underneath them.
+    OrderingAfterProvisional,
+    /// The ordering pass, with nothing shown until it landed. `--all`, a rev scope, a
+    /// reflog: no stand-in was possible, so the list is appearing for the first time
+    /// and nothing changed under anyone.
+    Ordering,
+    /// A commit-vs-parent diff per walked commit — what a pathspec costs.
+    ///
+    /// `walked` is how many were EXAMINED, which is the honest denominator; the row
+    /// count beside it is only what survived the filter.
+    ///
+    /// Never combines with a provisional list, which is why this is one enum rather
+    /// than a variant plus a bool: `provisional_scope` requires an empty pathspec, so
+    /// the heap walk — which reproduces neither the filter nor its parent rewrite — is
+    /// not available to a scope that reaches here.
+    PathFilter { walked: usize },
+}
+
+impl WalkCost {
+    /// Which of the three a finished walk was. `walked` is `Some` only from the
+    /// path-filter branch of `load_commits_inner`, which is the one that counts what it
+    /// examined — so the pathspec case cannot be constructed without its denominator.
+    const fn of(scope: &cli::Scope, walked: Option<usize>) -> Self {
+        match walked {
+            Some(walked) => Self::PathFilter { walked },
+            None if provisional_scope(scope) => Self::OrderingAfterProvisional,
+            None => Self::Ordering,
+        }
+    }
+}
+
+/// The sentence, split from the logging for the reason `should_note_slow_walk` is: so
+/// the three phrasings are testable without capturing output. Each is one the reader
+/// stares at while wondering whether gitkay has lost the repo.
+fn slow_walk_message(elapsed: std::time::Duration, rows: usize, cost: WalkCost) -> String {
+    match cost {
+        WalkCost::OrderingAfterProvisional => format!(
+            "best-effort pass rendered the first {rows} commits; the final result \
+             needed the whole history walked and sorted, which took {elapsed:.1?} — the \
+             displayed commits may have changed"
+        ),
+        WalkCost::Ordering => format!(
+            "no best-effort pass for this scope: the first {rows} commits needed the \
+             whole history walked and sorted, which took {elapsed:.1?}"
+        ),
+        WalkCost::PathFilter { walked } => format!(
+            "no best-effort pass for this scope: every one of {walked} commits had to be \
+             diffed against the path filter to find these {rows}, which took {elapsed:.1?}"
+        ),
+    }
+}
+
 /// Explain a slow history walk, once per process.
 ///
 /// `warn`, so it shows on a plain run: the delay is visible and otherwise
 /// unattributable — the window is up and responsive, which makes it look like
 /// gitkay has lost the repo rather than like work in progress.
 ///
-/// **One sentence.** Nothing here is actionable, so anything beyond "what happened,
-/// why, and what it did to the view" is a lecture in a log file — earlier versions
-/// also explained that the window had not blocked and that later loads are faster,
-/// which made the line unreadable. It does not name libgit2 either: that reads as
-/// blame, and wrongly, since ordering the graph is inherent to the problem.
+/// **One sentence.** Anything beyond "what happened, why, and what it did to the view"
+/// is a lecture in a log file — earlier versions also explained that the window had not
+/// blocked and that later loads are faster, which made the line unreadable. It does not
+/// name libgit2 either: that reads as blame, and wrongly, since ordering the graph is
+/// inherent to the problem.
 ///
-/// `replaced_rows` earns its clause where the others did not, because it is the one
-/// consequence the reader can SEE: rows they were already reading have just been
-/// swapped underneath them. Appended only when a provisional list was possible for
-/// this scope — under `--all` or a path filter there is no stand-in, the list is
-/// appearing for the first time, and nothing changed.
-pub fn note_slow_history_walk(elapsed: std::time::Duration, rows: usize, replaced_rows: bool) {
+/// **The why-clause is `WalkCost`'s, not a constant** — see there for what a single
+/// phrasing got wrong.
+pub fn note_slow_history_walk(elapsed: std::time::Duration, rows: usize, cost: WalkCost) {
     if !should_note_slow_walk(elapsed, &SLOW_WALK_REPORTED) {
         return;
     }
-    if replaced_rows {
-        log::warn!(
-            "best-effort pass rendered the first {rows} commits; the final result \
-             needed the whole history walked and sorted, which took {elapsed:.1?} — the \
-             displayed commits may have changed"
-        );
-    } else {
-        log::warn!(
-            "no best-effort pass for this scope: the first {rows} commits needed the \
-             whole history walked and sorted, which took {elapsed:.1?}"
-        );
-    }
+    log::warn!("{}", slow_walk_message(elapsed, rows, cost));
 }
 
 /// How long the real walk gets before the provisional one is shown instead.
@@ -1633,6 +1699,73 @@ mod tests {
         // line per watcher reload would bury every other log.
         assert!(!should_note_slow_walk(Duration::from_secs(5), &latch));
         assert!(!should_note_slow_walk(Duration::from_mins(1), &latch));
+    }
+
+    /// A path-filtered walk must be explained by what it actually did: a diff per
+    /// commit EXAMINED. One phrasing served all three scopes and blamed "the whole
+    /// history walked and sorted" — 209ms of a measured 3.8s — while quoting the rows
+    /// KEPT, so a 16,754-commit walk read as a 32-commit one.
+    #[test]
+    fn a_path_filtered_walk_is_explained_by_the_filter_and_counts_what_it_examined() {
+        use std::time::Duration;
+        let msg = slow_walk_message(
+            Duration::from_millis(3800),
+            32,
+            WalkCost::PathFilter { walked: 16754 },
+        );
+        assert!(msg.contains("16754"), "{msg}");
+        assert!(msg.contains("path filter"), "{msg}");
+        assert!(
+            !msg.contains("sorted"),
+            "the sort is 209ms of this and must not be named as the cause: {msg}"
+        );
+        // The rows kept are still there — they are what the reader is looking at — but
+        // as the numerator, not as the size of the walk.
+        assert!(msg.contains("these 32"), "{msg}");
+    }
+
+    /// The other two keep the ordering pass as their cause, and only the one that
+    /// replaced a provisional list says rows moved — that is the sole consequence the
+    /// reader can see.
+    #[test]
+    fn an_unfiltered_walk_is_still_explained_by_the_ordering_pass() {
+        use std::time::Duration;
+        let of = |cost| slow_walk_message(Duration::from_millis(1600), 200, cost);
+        let plain = of(WalkCost::Ordering);
+        let after = of(WalkCost::OrderingAfterProvisional);
+        for msg in [&plain, &after] {
+            assert!(msg.contains("walked and sorted"), "{msg}");
+            assert!(msg.contains("200"), "{msg}");
+        }
+        assert!(after.contains("may have changed"), "{after}");
+        assert!(
+            !plain.contains("may have changed"),
+            "nothing was on screen to change: {plain}"
+        );
+    }
+
+    /// Which sentence a walk gets is decided by what it did, not by re-reading the
+    /// scope: only the branch that counts what it examined can produce the pathspec
+    /// case, and a provisional list is impossible there.
+    #[test]
+    fn walk_cost_picks_the_case_from_what_the_walk_produced() {
+        let filtered = cli::Scope {
+            paths: vec!["src".into()],
+            ..cli::Scope::default()
+        };
+        assert!(matches!(
+            WalkCost::of(&filtered, Some(4)),
+            WalkCost::PathFilter { walked: 4 }
+        ));
+        assert!(matches!(
+            WalkCost::of(&cli::Scope::default(), None),
+            WalkCost::OrderingAfterProvisional
+        ));
+        let all = cli::Scope {
+            all: true,
+            ..cli::Scope::default()
+        };
+        assert!(matches!(WalkCost::of(&all, None), WalkCost::Ordering));
     }
 
     #[test]
