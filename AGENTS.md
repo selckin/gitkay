@@ -352,6 +352,22 @@ The big picture, ahead of the detail sections below:
   under `--all` (which git itself answers in 3.1s). Every other scope, and every
   repo without the file, falls back to the `git2` revwalk. Both produce `git log
   --graph`'s order — see **The commit order** below. Precomputed ref map either way
+- **A path filter is its own walk on top of that one** (`filtered_walk`, driven by
+  `lazy_filtered_walk` then `sorted_filtered_walk`): keep the commits whose diff
+  against their FIRST parent touches the pathspec, then rewrite each survivor's parents
+  to its nearest surviving ancestor, or every kept commit lands on its own lane. The
+  two drivers differ only in where the oids come from, so the kept rows are the same
+  subsequence either way — which is what makes the lazy one a speed change and nothing
+  else. **That rule is neither of git's**, and the plan this came from said it was:
+  `--full-history` keeps a commit differing from ANY parent (so it keeps a merge whose
+  conflict resolution took the mainline's side, which gitkay drops), and the default
+  simplification drops a merge treesame to any parent (so it drops a merge that brought
+  a change in, which gitkay keeps). Both checked against git on fixtures built for the
+  two shapes. gitkay's rule is the one that matches the DIFF PANE: every row in a
+  filtered view has a non-empty diff under that pathspec, and no row is listed whose
+  pane would be blank. The lazy driver is **bounded** (`LAZY_FILTER_SHARE`) because a
+  filter, unlike every other scope, need not stop early — see there for the four
+  measurements that set the share, and for the one case it deliberately makes slower
 - `load_commits_tail()` — incremental extension for the plain (no path filter,
   non-reflog) scope: re-runs the same deterministic walk (`history_revwalk` is the
   single walk config — both walks must order identically for the resume to be sound),
@@ -495,10 +511,13 @@ disturbs no order. Verified byte-identical to `git rev-list --topo-order` over t
 whole history of four repositories carrying 156–452 tags, and at 200/1,000/10,000
 rows on the kernel.
 
-`topo_scope` is deliberately narrow — the current-branch scope and `--all`. Nothing
-about a range or a path filter is beyond the walk; what is missing is the
-VERIFICATION. Widening it owes an oracle run against `git rev-list --topo-order` for
-that scope, not an argument.
+`topo_scope` is deliberately narrow — the current-branch scope and `--all`, with or
+without a path filter. Nothing about a range or `--follow` is beyond the walk; what is
+missing is the VERIFICATION. Widening it owes an oracle run against `git rev-list
+--topo-order` for that scope, not an argument. A path filter's own oracle is one step
+removed, since its keep-rule is not git's (see **Data Layer**): what is checked is that
+the kept oids are a SUBSEQUENCE of `git rev-list --topo-order`, and that the lazy and
+sorted drivers keep the same rows with the same rewritten parents.
 
 ### Graph Layout (`src/graph.rs`)
 - **Pipes**: `Vec<Option<(Oid, color_index)>>` — fixed column slots, `None` = empty

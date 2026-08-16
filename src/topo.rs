@@ -280,8 +280,9 @@ impl<'a> TopoWalk<'a> {
     }
 
     /// Whether the walk has genuinely run out of commits, as opposed to having
-    /// declined one.
-    fn done(&self) -> bool {
+    /// declined one. What tells a caller driving `next` itself which of the two a
+    /// `None` was — `take` asks it on the caller's behalf.
+    pub fn done(&self) -> bool {
         self.ready.is_empty() && self.frontier.is_empty()
     }
 }
