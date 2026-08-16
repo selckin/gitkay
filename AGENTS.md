@@ -191,7 +191,10 @@ One egui/eframe immediate-mode app — all app state lives in the `GitkApp`
 struct. `src/main.rs` holds that state, the frame loop and the rendering; every
 subsystem it drives has been lifted out beside it, so what remains there is the UI
 and the wiring. Those modules: `src/diff.rs` (the diff **data** layer: `DiffLine` /
-`DiffData` / `FileEntry` / `DiffSettings`, `CommitKind` + the sentinel oids,
+`DiffData` / `FileEntry` / `DiffSettings`, `PerRow` and its two aliases
+`RowSpans`/`RowEmphasis` — what the DISPLAY derives per row, held BESIDE the rows
+rather than inside them, which is what lets the row array be shared with the highlight
+worker instead of copied for it — `CommitKind` + the sentinel oids,
 `DiffSource` + `RowScope` (what a row's diff is taken over, and the pathspec —
 the one value every diff entry point receives),
 `BuildEnv` (what a build MAY use, as opposed to what it is over: the textconv
@@ -232,8 +235,9 @@ the runner and its watchdog, and reading git's own `cachetextconv` notes cache �
 one place gitkay runs an external program, and it writes nothing to the repo; see
 **Textconv**),
 `src/diff_highlight.rs` (applying a `Highlighter` to a built diff — which rows, in
-what order, on which thread, and past `MAX_HIGHLIGHT_LINES` whether at all: the
-hand-off copies the diff for the worker, which measured 12.0s on the frame loop at
+what order, on which thread, and past `MAX_HIGHLIGHT_LINES` whether at all. The worker
+SHARES the rows with the UI — two `Arc` clones and the pending-file list — where it
+used to be handed a copy of the whole diff, which measured 12.0s on the frame loop at
 76.5M lines. Separate from `highlight.rs`, which knows syntect and
 nothing about diffs: this half knows `DiffLine`, `FileEntry` and the viewport, and
 is about ORDER rather than colour),
@@ -269,8 +273,8 @@ whose rounding is the whole of it),
 resolution, window-title suffix, help/version text), and
 `src/word_diff.rs` (pure intra-line word diff: tokenizer + LCS alignment; the
 `DiffLine`-aware driver `emphasize_rows` lives in `src/diff.rs`, and is
-**lazy per viewport**: each line's `emphasis` is an `Option` (`None` = not
-computed, mirroring `spans`), and `ensure_visible_word_emphasis` fills only the
+**lazy per viewport**: each row's emphasis is a `RowEmphasis` slot (unset = not
+computed, as an unset `RowSpans` slot is), and `ensure_visible_word_emphasis` fills only the
 rows around the visible window — plus any pending scroll target — every frame.
 So the toggle-off path never pays the LCS, and no whole-diff pass ever runs
 anywhere, no matter the diff size; installs and the toggle just nudge a repaint).
@@ -694,6 +698,15 @@ The invariants:
   so the k-th file row IS `diff_files[k]`. `files`' own order is the pane's order
   — the textconv sweep's `move_to_end` and `resolve_anchor`'s rung 4 both rest on
   that — which is why the entries move with the lines rather than only the lines.
+  **The rows' SPANS move with them too**, in the same loop and not in a pass of their
+  own: `RowSpans` is indexed by row, so a row that moves without its spans paints one
+  file's colours onto another file's text. That pairing used to be structural (the
+  spans were a field of the `DiffLine`) and is now this function's to keep —
+  `order_files_moves_each_rows_spans_with_it` pins it. The row array is an `Arc`, so
+  the re-lay takes its write handle through `Arc::make_mut` and does so only **after**
+  every refusal, or an identity re-lay would clone a diff the highlight worker is
+  reading. The emphasis is dropped rather than moved: it covers one viewport and
+  refills on the next frame, where the spans beside it cost seconds to recompute.
   **A re-lay that genuinely moves rows also invalidates the highlight generation**,
   and at the permutation rather than at its callers: a highlight worker names its
   results by ROW INDEX, so an in-flight batch computed before the move would paint

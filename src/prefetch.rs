@@ -1573,7 +1573,7 @@ fn warm_row(
     if let Some(hl) = hl
         && colour
     {
-        highlight_diff(&mut data.lines, &data.files, hl);
+        highlight_diff(&data.lines, &mut data.spans, &data.files, hl);
     }
     let coloured = colour_start.elapsed();
     // What was actually applied, not what was asked for — and THREE outcomes, not two.

@@ -173,7 +173,8 @@ pub fn diff_load_job(repo: &Repository, job: DiffLoadJob) {
         // backstop. Two earlier versions bounded by the clock against
         // DIFF_PLACEHOLDER_DELAY and both failed; see PREHIGHLIGHT_CEILING.
         highlight_diff_until(
-            &mut data.lines,
+            &data.lines,
+            &mut data.spans,
             &data.files,
             &pre.hl,
             Some(t + PREHIGHLIGHT_CEILING),
@@ -188,7 +189,8 @@ pub fn diff_load_job(repo: &Repository, job: DiffLoadJob) {
         let coloured = data
             .lines
             .iter()
-            .filter(|l| l.kind.is_code() && l.spans.is_some())
+            .enumerate()
+            .filter(|(i, l)| l.kind.is_code() && data.spans.is_set(*i))
             .count();
         log::debug!(
             "diff-load: pre-highlight from file {first}: {coloured}/{code} code lines in {:?}",

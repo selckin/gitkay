@@ -218,9 +218,11 @@ const fn delta_from_tag(t: u8) -> Option<git2::Delta> {
     }
 }
 
-/// Serialise a diff's STRUCTURE. `spans` and `emphasis` are deliberately absent:
-/// spans are theme-dependent and recolouring is cheap next to the build this
-/// exists to avoid, and emphasis is computed lazily per viewport anyway.
+/// Serialise a diff's STRUCTURE. What the display derives per row — `RowSpans`, and
+/// the emphasis the UI keeps of its own — is deliberately absent: spans are
+/// theme-dependent and recolouring is cheap next to the build this exists to avoid, and
+/// emphasis is computed lazily per viewport anyway. That boundary is now the type's as
+/// well as the encoder's: neither value is part of a `DiffLine`.
 fn encode(data: &DiffData) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
@@ -228,7 +230,7 @@ fn encode(data: &DiffData) -> Vec<u8> {
     put_u64(&mut out, data.max_chars as u64);
 
     put_u64(&mut out, data.lines.len() as u64);
-    for l in &data.lines {
+    for l in data.lines.iter() {
         out.push(kind_tag(l.kind));
         put_str(&mut out, &l.text);
         // 0 stands for `None`: git's line numbers are 1-based, which is why the
@@ -238,7 +240,7 @@ fn encode(data: &DiffData) -> Vec<u8> {
     }
 
     put_u64(&mut out, data.files.len() as u64);
-    for f in &data.files {
+    for f in data.files.iter() {
         put_str(&mut out, &f.path);
         put_opt_str(&mut out, f.old_path.as_deref());
         put_bytes(&mut out, &f.path_bytes);
@@ -282,8 +284,6 @@ fn decode(bytes: &[u8]) -> Option<DiffData> {
         lines.push(DiffLine {
             text,
             kind,
-            spans: None,
-            emphasis: None,
             old_lineno,
             new_lineno,
         });
@@ -1017,16 +1017,15 @@ mod tests {
         DiffLine {
             text: Arc::new(text.to_string()),
             kind,
-            spans: None,
-            emphasis: None,
             old_lineno: NonZeroU32::new(old),
             new_lineno: NonZeroU32::new(new),
         }
     }
 
-    /// Every field the store claims to carry survives a round trip. Spans and
-    /// emphasis are deliberately NOT carried — they load as `None`, which is the
-    /// `DiffOnly` state the rest of the app already handles.
+    /// Every field the store claims to carry survives a round trip. Spans are
+    /// deliberately NOT carried — the entry decodes to blank slots, which is the
+    /// `DiffOnly` state the rest of the app already handles — and emphasis is not part
+    /// of a diff at all.
     #[test]
     fn a_diff_round_trips_through_the_codec() {
         let data = DiffData::with_max_chars(
@@ -1056,13 +1055,18 @@ mod tests {
 
         assert_eq!(back.max_chars, 77);
         assert_eq!(back.lines.len(), data.lines.len());
-        for (a, b) in back.lines.iter().zip(&data.lines) {
+        for (i, (a, b)) in back.lines.iter().zip(data.lines.iter()).enumerate() {
             assert_eq!(a.text, b.text);
             assert_eq!(a.kind, b.kind);
             assert_eq!(a.old_lineno, b.old_lineno);
             assert_eq!(a.new_lineno, b.new_lineno);
-            assert!(a.spans.is_none() && a.emphasis.is_none());
+            assert!(!back.spans.is_set(i), "an entry decodes uncoloured");
         }
+        assert_eq!(
+            back.spans.rows(),
+            back.lines.len(),
+            "and with a span slot per row, which every later writer indexes by"
+        );
         assert_eq!(back.files.len(), 1);
         let f = &back.files[0];
         assert_eq!(f.path, "x.rs");
@@ -1615,14 +1619,14 @@ mod tests {
 
         assert_eq!(back.max_chars, built.max_chars);
         assert_eq!(back.lines.len(), built.lines.len());
-        for (a, b) in back.lines.iter().zip(&built.lines) {
+        for (a, b) in back.lines.iter().zip(built.lines.iter()) {
             assert_eq!(
                 (&a.text, a.kind, a.old_lineno, a.new_lineno),
                 (&b.text, b.kind, b.old_lineno, b.new_lineno)
             );
         }
         assert_eq!(back.files.len(), built.files.len());
-        for (a, b) in back.files.iter().zip(&built.files) {
+        for (a, b) in back.files.iter().zip(built.files.iter()) {
             assert_eq!(a.path, b.path);
             assert_eq!(a.path_bytes, b.path_bytes);
             assert_eq!(a.old_path_bytes, b.old_path_bytes);
