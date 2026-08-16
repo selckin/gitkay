@@ -25,7 +25,7 @@ use crate::diff::{
 };
 use crate::highlight::Highlighter;
 use crate::history::{
-    CommitInfo, HISTORY_OID_CAP, HistoryWalk, build_commits_from_walk, build_ref_map,
+    CommitInfo, HISTORY_OID_CAP, HistoryWalk, TipPaths, build_commits_from_walk, build_ref_map,
     load_commits_tail, load_history,
 };
 use crate::prefetch::InflightClaim;
@@ -461,6 +461,9 @@ pub enum HistoryLoad {
         /// This walk's ordered oids, replacing the cached ones — see
         /// `rebuild_load`.
         oids: Option<Vec<git2::Oid>>,
+        /// What this walk's tip says about a path filter that kept nothing — the
+        /// scope notice's phrasing, recomputed with the rows it describes.
+        tip: TipPaths,
     },
 }
 
@@ -478,13 +481,14 @@ pub enum HistoryLoad {
 /// notices. Carrying the walk's own oids means the cache is replaced by the same
 /// walk that produced the rows it must agree with.
 pub fn rebuild_load(walk: HistoryWalk, count: usize) -> HistoryLoad {
-    let HistoryWalk { commits, oids } = walk;
+    let HistoryWalk { commits, oids, tip } = walk;
     let derived = Box::new(derive_from_commits(&commits));
     HistoryLoad::Rebuild {
         commits,
         count,
         derived,
         oids,
+        tip,
     }
 }
 

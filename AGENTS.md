@@ -242,8 +242,8 @@ boundary now enforces rather than merely asserting; see **Startup & timing**),
 `src/history.rs` (the commit list: walking a repo's history into the `CommitInfo`
 rows the app draws, plus the ref map that labels them — `history_revwalk` and the
 loaders, the provisional walk and its `topo_window`, the resumable tail extension,
-the local probes, `build_ref_map`, and `scope_notice` — why the list holds less
-than the scope asked for. git2-facing and egui-free, the same shape
+the local probes, `build_ref_map`, and `scope_notice` + `TipPaths` — why the list
+holds less than the scope asked for. git2-facing and egui-free, the same shape
 `diff.rs` has: everything here answers "which rows are there", never "how are they
 drawn". See **Startup & timing** for why the walk needs three strategies rather
 than one),
@@ -377,6 +377,21 @@ The invariants:
   that is still true. Recomputed at the two places a whole real list is installed
   (`install_startup_history`, the `Rebuild` arm of `drain_history_results`); an append
   can't reach one, since every case is about rows being ABSENT.
+  **The one thing it cannot read off the rows is whether a path filter is even
+  right**, and that is the reader's most likely mistake — a typo, or a file they have
+  created and never committed, looks exactly like a correct filter over a range that
+  happens not to touch it. So the WALK answers it (`TipPaths`, carried on
+  `HistoryWalk` and `HistoryLoad::Rebuild`): one `Pathspec::match_tree` against the
+  tip commit, computed only when the filter kept nothing, on the walk's own thread —
+  the frame loop has no `Repository` and opening one there is the IO this app keeps
+  off it. libgit2's own matcher, not a tree lookup, so directories and globs answer as
+  they did for the filter that selected the commits. `Missing` (all of them) replaces
+  the sentence rather than annotating it — "nothing at 'x' is tracked here" is a
+  different problem from "no commit touches it"; a partial `Missing` names only the
+  half that is wrong; `AllTracked` says the revisions are what exclude it, which is
+  the opposite conclusion; `Unknown` (no tip to look in) falls back to the plain
+  message. Phrasing stays pure — the loader supplies the fact, `scope_notice` writes
+  the sentence.
   It **takes one of two forms, decided by whether there are rows to sit above** —
   which is `commits.is_empty()`, not "did the walk find anything": a path filter can
   leave the working-tree rows behind while selecting no commit at all. With rows it is
@@ -908,9 +923,11 @@ claiming, and `warm_disposition`'s precedence),
 `history` (the walk over real temp repos: the tail extension against a full walk,
 the provisional walk's agreement with the real one and the two orderings that break
 it, the path filter's parent rewriting, `--first-parent`, `--follow`, the reflog and
-the range endpoints, and `scope_notice` over every shortfall it names — each with a
-control asserting what the list still holds, since a notice that fires on a healthy
-view is the failure worth catching — sharing `main`'s
+the range endpoints, and `scope_notice` over every shortfall it names — driven
+through a whole `load_commits_inner` (`walk_notice`), so the `TipPaths` under test is
+the one the loader really computed, and each with a control asserting what the list
+still holds, since a notice that fires on a healthy view is the failure worth
+catching — sharing `main`'s
 `scope`/`summaries`/`real_commits` fixtures rather than keeping copies that drift), `textconv` (driver resolution and its re-resolution after `invalidate`, the
 runner's argument shape, its two bounds and the fork that used to defeat them, the
 hung-driver latch and the reload that re-arms it, the reported driver CHANGE that lets

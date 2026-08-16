@@ -144,8 +144,11 @@ without opening a window. Arguments that make sense but select **nothing** — a
 path no commit touches, a range that is empty, a reflog ref that does not exist
 — open the window and say so where the commits would have been, along with the
 scope as gitkay resolved it: which token it read as a revision, which as a path,
-and what that path became relative to the repo root. So an empty window is never
-left unexplained.
+and what that path became relative to the repo root. For a path filter it also
+says *which* half is wrong — whether nothing at that path is tracked at all (a
+typo, or a file you have never committed) or whether it is tracked and the
+revisions you named are what exclude it. So an empty window is never left
+unexplained.
 
 ### Controls
 

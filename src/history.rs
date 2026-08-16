@@ -439,17 +439,15 @@ pub fn range_ends(repo: &Repository, scope: &cli::Scope) -> Option<(String, diff
 /// re-walking.
 pub const HISTORY_OID_CAP: usize = 200_000;
 
-/// `load_commits`, plus the ordered oid list the walk produced. That list is what
-/// makes page two cheap: without it every extension re-pays the whole ordering pass
-/// (1.6s on a 67k-commit repo, and again on every page, because `history_worker`
-/// opens a fresh `Repository` each time). `None` for scopes whose walk output is not
-/// a plain prefix — a path filter drops and rewrites as it goes, so draining it is
-/// neither free nor a list of what the next page holds.
-pub fn load_commits_inner(
-    repo: &Repository,
-    max: usize,
-    scope: &cli::Scope,
-) -> (Vec<CommitInfo>, Option<Vec<git2::Oid>>) {
+/// `load_commits`, plus the two things only the walk itself can report (see
+/// `HistoryWalk`).
+///
+/// The ordered oid list is what makes page two cheap: without it every extension
+/// re-pays the whole ordering pass (1.6s on a 67k-commit repo, and again on every
+/// page, because `history_worker` opens a fresh `Repository` each time). `None` for
+/// scopes whose walk output is not a plain prefix — a path filter drops and rewrites
+/// as it goes, so draining it is neither free nor a list of what the next page holds.
+pub fn load_commits_inner(repo: &Repository, max: usize, scope: &cli::Scope) -> HistoryWalk {
     let t = std::time::Instant::now();
     let ref_map = build_ref_map(repo);
     log::debug!(
@@ -519,6 +517,9 @@ pub fn load_commits_inner(
     let t = std::time::Instant::now();
     let mut real: Vec<CommitInfo> = Vec::new();
     let mut walk_oids: Option<Vec<git2::Oid>> = None;
+    // Only the path-filter branch below ever answers this; every other scope leaves it
+    // as the "nothing to say" default.
+    let mut tip_answer = TipPaths::Unknown;
     // The path filter's parent rewrite, kept so the virtual rows can be rewritten
     // through the same map once they exist (a dropped HEAD must not orphan them).
     let mut nearest_map: Option<std::collections::HashMap<git2::Oid, Vec<git2::Oid>>> = None;
@@ -615,6 +616,15 @@ pub fn load_commits_inner(
                 info.parents = rewrite_parents(&info.parents, &nearest);
             }
             real = kept;
+            // A filter that kept nothing is about to produce a notice, and the tip is
+            // the only place that can say whether the paths are wrong or the scope is
+            // (see `TipPaths`). One tree match, on the walk's thread, and only here —
+            // a filter that kept something has nothing to explain.
+            if real.is_empty()
+                && let Some((tip, _)) = walked.first()
+            {
+                tip_answer = tip_paths(repo, *tip, &scope.paths);
+            }
             nearest_map = Some(nearest);
         }
     }
@@ -656,7 +666,11 @@ pub fn load_commits_inner(
     }
     commits.extend(locals);
     commits.extend(real);
-    (commits, walk_oids)
+    HistoryWalk {
+        commits,
+        oids: walk_oids,
+        tip: tip_answer,
+    }
 }
 
 /// The commit list alone, without the cached walk. Test-only: the app always wants
@@ -664,7 +678,7 @@ pub fn load_commits_inner(
 /// reads better without unpacking a struct it does not exercise.
 #[cfg(test)]
 pub fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitInfo> {
-    load_commits_inner(repo, max, scope).0
+    load_commits_inner(repo, max, scope).commits
 }
 
 /// The index/worktree probes, running on their own thread so their cost overlaps the
@@ -1027,6 +1041,66 @@ pub fn topo_window(rows: Vec<(i64, CommitInfo)>) -> Vec<CommitInfo> {
     out
 }
 
+/// What the scope's tip tree says about a path filter that selected no commits —
+/// the difference between a filter that is WRONG and a scope that simply changes
+/// nothing under a path that is really there.
+///
+/// It is the one thing the notice cannot work out from the rows, and the one the
+/// reader most often needs: a typo, or a file they have created but never committed,
+/// both look exactly like a correct filter over a range that happens not to touch it.
+/// Answered by the loader, which has the repository and is off the frame loop; the
+/// phrasing stays pure.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub enum TipPaths {
+    /// Not asked (no path filter, or commits were found) or not answerable — a walk
+    /// that yielded no commit at all has no tip to look in.
+    #[default]
+    Unknown,
+    /// Every pathspec matches something in the tip's tree. The filter is right; the
+    /// scope is what excludes it — in practice a rev range, since over a full history
+    /// whatever added the file would have touched it.
+    AllTracked,
+    /// These pathspecs match nothing there. Never empty — build through `from_missing`.
+    Missing(Vec<String>),
+}
+
+impl TipPaths {
+    fn from_missing(missing: Vec<String>) -> Self {
+        if missing.is_empty() {
+            Self::AllTracked
+        } else {
+            Self::Missing(missing)
+        }
+    }
+}
+
+/// Which of `paths` match nothing in `tip`'s tree.
+///
+/// Uses libgit2's own pathspec matcher rather than a tree lookup, so directories,
+/// globs and case answer exactly as they did for the filter that selected the commits
+/// (`diff::pathspec_opts` feeds the same strings to the same matcher). A tree lookup
+/// would call `src` untracked in a repo whose every file lives under it.
+fn tip_paths(repo: &Repository, tip: git2::Oid, paths: &[String]) -> TipPaths {
+    let missing = || -> Result<Vec<String>, git2::Error> {
+        let tree = repo.find_commit(tip)?.tree()?;
+        let spec = git2::Pathspec::new(paths.iter().map(String::as_str))?;
+        let list = spec.match_tree(&tree, git2::PathspecFlags::FIND_FAILURES)?;
+        Ok(list
+            .failed_entries()
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect())
+    };
+    match missing() {
+        Ok(missing) => TipPaths::from_missing(missing),
+        // Only the notice's phrasing is lost — say so, and fall back to the message
+        // that names no tip at all, like the sibling diff failures above.
+        Err(e) => {
+            log::warn!("gitkay: cannot match the path filter against {tip}: {e}");
+            TipPaths::Unknown
+        }
+    }
+}
+
 /// What `scope_notice` found: the sentence, and whether it reports a FAILURE.
 ///
 /// The two are drawn differently — see `GitkApp::show_scope_notice_bar`. gitkay being
@@ -1075,7 +1149,11 @@ impl ScopeNotice {
 /// Note the paths are named as gitkay resolved them (repo-root-relative, rewritten
 /// from the run directory by `cli::token_to_pathspec`), which is the pathspec that
 /// actually matched nothing and may not be what was typed.
-pub fn scope_notice(scope: &cli::Scope, commits: &[CommitInfo]) -> Option<ScopeNotice> {
+pub fn scope_notice(
+    scope: &cli::Scope,
+    commits: &[CommitInfo],
+    tip: &TipPaths,
+) -> Option<ScopeNotice> {
     let quoted = |xs: &[String]| {
         xs.iter()
             .map(|x| format!("'{x}'"))
@@ -1105,7 +1183,44 @@ pub fn scope_notice(scope: &cli::Scope, commits: &[CommitInfo]) -> Option<ScopeN
             } else {
                 format!(" in {}", quoted(&scope.revs))
             };
-            format!("No commits{within} touch {}.", quoted(&scope.paths))
+            // Where the tip was looked in. Not the `within` clause: that one is empty
+            // for the default scope, and "nothing at 'x' is tracked" has to say where.
+            let searched = if scope.revs.is_empty() {
+                "this history".to_string()
+            } else {
+                quoted(&scope.revs)
+            };
+            match tip {
+                // A filter matching nothing at the tip either is a typo or names a
+                // file that was never committed, and both are better said outright
+                // than as a footnote to "no commits touch it".
+                TipPaths::Missing(missing) if missing.len() == scope.paths.len() => {
+                    format!("Nothing at {} is tracked in {searched}.", quoted(missing))
+                }
+                // Some of them. The base message still holds — the rest of the filter
+                // is fine — so this names only the part that is not, and points back
+                // at the revisions it already named rather than repeating them: they
+                // can be a pair of full SHAs.
+                TipPaths::Missing(missing) => format!(
+                    "No commits{within} touch {} — and nothing at {} is tracked {}.",
+                    quoted(&scope.paths),
+                    quoted(missing),
+                    if scope.revs.is_empty() {
+                        "in this history"
+                    } else {
+                        "there"
+                    }
+                ),
+                // The path is right and the revisions are what exclude it, which is
+                // the opposite conclusion from the one above.
+                TipPaths::AllTracked => format!(
+                    "No commits{within} touch {} — tracked, but unchanged in this scope.",
+                    quoted(&scope.paths)
+                ),
+                TipPaths::Unknown => {
+                    format!("No commits{within} touch {}.", quoted(&scope.paths))
+                }
+            }
         } else if !scope.revs.is_empty() {
             format!("No commits in {}.", quoted(&scope.revs))
         } else if scope.all {
@@ -1135,13 +1250,22 @@ pub fn scope_notice(scope: &cli::Scope, commits: &[CommitInfo]) -> Option<ScopeN
     None
 }
 
-/// One history walk's output: the rows to show, and the ordered oids behind them
-/// when the scope has a cacheable prefix (see `load_commits_inner`). The reflog is
-/// its own loader and caches nothing — `@{n}` numbering is a whole-list computation
-/// and reflogs are short.
+/// One history walk's output: the rows to show, the ordered oids behind them when the
+/// scope has a cacheable prefix (see `load_commits_inner`), and what its tip says
+/// about a path filter that kept nothing. The reflog is its own loader and caches
+/// nothing — `@{n}` numbering is a whole-list computation and reflogs are short.
+///
+/// The last two are here for the same reason: both are answers only the walk can
+/// give, and both would otherwise be re-derived by a caller that has to reopen the
+/// repository to do it — on the frame loop, in the notice's case.
 pub struct HistoryWalk {
     pub commits: Vec<CommitInfo>,
     pub oids: Option<Vec<git2::Oid>>,
+    /// What the walk's tip says about a path filter that kept nothing — computed
+    /// here, on the walk's own thread, because it needs the repository and only the
+    /// walk knows which commit its tip was. `Unknown` unless a filter really did
+    /// select nothing; see `TipPaths`.
+    pub tip: TipPaths,
 }
 
 /// Load the commit list for the active scope: the reflog when `--reflog` is set,
@@ -1151,10 +1275,12 @@ pub fn load_history(repo: &Repository, max: usize, scope: &cli::Scope) -> Histor
         HistoryWalk {
             commits: load_reflog(repo, max, scope),
             oids: None,
+            // `--reflog` takes no paths (`cli::validate`), so there is no filter to
+            // ask about.
+            tip: TipPaths::Unknown,
         }
     } else {
-        let (commits, oids) = load_commits_inner(repo, max, scope);
-        HistoryWalk { commits, oids }
+        load_commits_inner(repo, max, scope)
     }
 }
 
@@ -2099,6 +2225,13 @@ mod tests {
         assert!(real.iter().all(|c| c.source.range().is_none()));
     }
 
+    /// The notice a whole walk produces, exactly as the app derives it: the tip answer
+    /// under test is then the one the loader really computed, not one a test invented.
+    fn walk_notice(repo: &git2::Repository, sc: &cli::Scope) -> Option<ScopeNotice> {
+        let walk = load_commits_inner(repo, 100, sc);
+        scope_notice(sc, &walk.commits, &walk.tip)
+    }
+
     /// The notice exists for the window that looks like a working view of a repo with
     /// nothing in it, so silence on a view that IS what was asked for is half of it.
     #[test]
@@ -2108,19 +2241,23 @@ mod tests {
         commit_file(&repo, "f.txt", "a\n", "one");
 
         let sc = cli::Scope::default();
-        assert_eq!(scope_notice(&sc, &load_commits(&repo, 100, &sc)), None);
+        assert_eq!(walk_notice(&repo, &sc), None);
 
         // A path filter that matches is equally quiet.
         let sc = cli::Scope {
             paths: vec!["f.txt".to_string()],
             ..Default::default()
         };
-        assert_eq!(scope_notice(&sc, &load_commits(&repo, 100, &sc)), None);
+        assert_eq!(walk_notice(&repo, &sc), None);
     }
 
     /// A path filter matching nothing is the case that prompted this: the pathspec is
     /// named because it is the actionable part, and it is named as GITKAY resolved it
     /// (repo-root-relative), which is what actually matched nothing.
+    ///
+    /// A path that is not in the tip's tree either is a typo or was never committed,
+    /// and the message says so outright rather than leaving the reader to wonder
+    /// whether their revisions are what excluded it.
     #[test]
     fn scope_notice_names_a_path_filter_that_matches_nothing() {
         use crate::test_repo::{commit_file, temp_repo};
@@ -2131,12 +2268,55 @@ mod tests {
             paths: vec!["sub/nope.txt".to_string()],
             ..Default::default()
         };
-        let notice = scope_notice(&sc, &load_commits(&repo, 100, &sc)).expect("reported");
+        let notice = walk_notice(&repo, &sc).expect("reported");
         assert!(
             !notice.failed,
             "the scope worked; it simply selects nothing"
         );
         assert!(notice.text.contains("'sub/nope.txt'"), "{}", notice.text);
+        assert!(notice.text.contains("tracked"), "{}", notice.text);
+    }
+
+    /// The opposite conclusion from the same empty list: the path is real and it is
+    /// the REVISIONS that exclude it. Told apart by the tip's tree, which is the only
+    /// place the difference shows — the rows are equally absent either way.
+    #[test]
+    fn scope_notice_separates_a_tracked_path_from_an_untracked_one() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        let first = commit_file(&repo, "a.txt", "a\n", "add a");
+        let second = commit_file(&repo, "b.txt", "b\n", "add b");
+        // A range holding only the commit that adds b.txt: a.txt is tracked at its
+        // tip and untouched within it.
+        let range = format!("{first}..{second}");
+
+        let sc = cli::Scope {
+            revs: vec![range.clone()],
+            paths: vec!["a.txt".to_string()],
+            ..Default::default()
+        };
+        let notice = walk_notice(&repo, &sc).expect("reported");
+        assert!(notice.text.contains("tracked"), "{}", notice.text);
+        assert!(
+            !notice.text.contains("Nothing at"),
+            "the path is real — the range is what excludes it: {}",
+            notice.text
+        );
+
+        // Both in one filter: the base message still holds for the whole of it, and
+        // only the half that is wrong is named.
+        let sc = cli::Scope {
+            revs: vec![range],
+            paths: vec!["a.txt".to_string(), "nope.txt".to_string()],
+            ..Default::default()
+        };
+        let notice = walk_notice(&repo, &sc).expect("reported");
+        assert!(notice.text.contains("'nope.txt'"), "{}", notice.text);
+        assert!(
+            notice.text.matches("'a.txt'").count() == 1,
+            "a.txt is named as part of the filter, not as the missing one: {}",
+            notice.text
+        );
     }
 
     /// A range whose walk is empty leaves the range row and nothing else, so the row
@@ -2160,7 +2340,7 @@ mod tests {
             got.iter().any(|c| c.oid == diff::oid_range()),
             "control: the range row itself is still there"
         );
-        let notice = scope_notice(&sc, &got).expect("reported");
+        let notice = walk_notice(&repo, &sc).expect("reported");
         assert!(notice.text.contains(&token), "{}", notice.text);
     }
 
@@ -2187,7 +2367,7 @@ mod tests {
             got.iter().any(|c| is_real_commit(c.oid)),
             "control: the commit list itself is unaffected"
         );
-        let notice = scope_notice(&sc, &got).expect("reported");
+        let notice = walk_notice(&repo, &sc).expect("reported");
         assert!(notice.text.contains(&token), "{}", notice.text);
         assert!(
             notice.failed,
@@ -2209,7 +2389,10 @@ mod tests {
             revs: vec!["no-such-ref".to_string()],
             ..Default::default()
         };
-        let notice = scope_notice(&sc, &load_reflog(&repo, 100, &sc)).expect("reported");
+        // As `load_history` builds it: the reflog loader takes no paths, so there is
+        // no tip answer to give.
+        let notice =
+            scope_notice(&sc, &load_reflog(&repo, 100, &sc), &TipPaths::Unknown).expect("reported");
         assert!(notice.text.contains("no-such-ref"), "{}", notice.text);
     }
 
@@ -2221,7 +2404,7 @@ mod tests {
         use crate::test_repo::temp_repo;
         let (_d, repo) = temp_repo();
         let sc = cli::Scope::default();
-        let notice = scope_notice(&sc, &load_commits(&repo, 100, &sc)).expect("reported");
+        let notice = walk_notice(&repo, &sc).expect("reported");
         assert!(
             !notice.failed,
             "the scope worked; it simply selects nothing"
