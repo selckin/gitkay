@@ -2217,6 +2217,93 @@ fn body_sections(
     out
 }
 
+/// How many characters of one row the pane will lay out.
+///
+/// **The frame's vertex buffer grows with the LONGEST line, not with the viewport.**
+/// egui lays a `layout_no_wrap` line out as ONE galley row, and the tessellator culls
+/// by row rather than by glyph — so every character of that row becomes four vertices
+/// whether it is on screen or a mile off it. A single 8.3M-character line (a minified
+/// bundle) asked wgpu for a **666MB** vertex buffer against its 256MB limit and
+/// panicked the process from inside `paint_and_update_textures`, after a 3.4s frame.
+/// Nothing above the renderer bounds this: the diff pane virtualizes rows vertically
+/// and clips horizontally, and a clip rect does not reduce what is tessellated.
+///
+/// 10,000 characters is on the order of 35 screens of horizontal scrolling at a typical
+/// monospace advance, so nothing anyone can actually read is lost; what it buys is a
+/// worst case — every visible row that long — of roughly 40MB of vertices instead of an
+/// unbounded one.
+///
+/// **A RENDER cap and nothing else.** `DiffLine::text` is untouched, so search, word
+/// diff, the scroll anchor, the persistent store, the diffstat and every write action
+/// still see the whole line; only the glyphs stop. And it is never silent — see
+/// `clip_row_text`.
+const MAX_ROW_RENDER_CHARS: usize = 10_000;
+
+/// Where `text` has to be cut to fit `MAX_ROW_RENDER_CHARS`, or `None` when it fits —
+/// which is every row of every ordinary diff.
+///
+/// By CHARACTERS, so a multi-byte one is never split, and `nth` rather than a length
+/// comparison so the walk stops at the cap instead of traversing an 8M-character line
+/// to discover it is long.
+fn clip_row_text(text: &str) -> Option<usize> {
+    text.char_indices()
+        .nth(MAX_ROW_RENDER_CHARS)
+        .map(|(at, _)| at)
+}
+
+/// Spans clipped to a body cut at `at`: those starting past the cut go, and one
+/// STRADDLING it is truncated rather than dropped.
+///
+/// Dropping it would be the easy reading of `append_body`, whose `body.get(range)`
+/// answers `None` for an out-of-range span and skips it — but that path emits ONLY the
+/// spans, so a straddler taken out takes visible text with it, leaving a gap at exactly
+/// the place the reader is looking when they scroll to the cut.
+fn clip_spans(spans: &[highlight::Span], at: usize) -> Vec<highlight::Span> {
+    spans
+        .iter()
+        .filter(|(_, r)| r.start < at)
+        .map(|(c, r)| (*c, r.start..r.end.min(at)))
+        .collect()
+}
+
+/// `clip_spans` for the word-diff emphasis, which is bare ranges over the same body.
+fn clip_ranges(ranges: &[std::ops::Range<usize>], at: usize) -> Vec<std::ops::Range<usize>> {
+    ranges
+        .iter()
+        .filter(|r| r.start < at)
+        .map(|r| r.start..r.end.min(at))
+        .collect()
+}
+
+/// Say that a row was clipped, and by how much. A no-op for `cut = None`, which is
+/// every row of every ordinary diff.
+///
+/// It is never silent, for the reason nothing else here is: a line that simply STOPS
+/// reads as the line's content, and the reader has no way to tell a truncated minified
+/// bundle from one that really ends there. In the dim colour, since it is not content.
+///
+/// Bytes rather than characters because `len()` is O(1) where counting the remaining
+/// characters would walk the 8M-character tail this exists to avoid touching — once per
+/// visible row per frame.
+fn append_clip_marker(
+    job: &mut egui::text::LayoutJob,
+    font_id: &egui::FontId,
+    palette: &highlight::DiffPalette,
+    full: &str,
+    cut: Option<usize>,
+) {
+    let Some(at) = cut else { return };
+    job.append(
+        &format!(" … {} more bytes", full.len() - at),
+        0.0,
+        egui::text::TextFormat {
+            font_id: font_id.clone(),
+            color: palette.dim,
+            ..Default::default()
+        },
+    );
+}
+
 /// Append a diff line's body to `job`. `emph_bg = None` is the fast path (syntax
 /// spans, or a single base colour); `Some(bg)` splits the body at span/emphasis
 /// boundaries and paints the changed runs with `bg` (word-diff).
@@ -2314,8 +2401,13 @@ fn diff_row_job(
     }
 
     // Non-code lines (hunk/file header/meta/stat) take one flat colour in both modes.
+    // Clipped like any other row: a commit message is a header line, and nothing stops
+    // one being a single enormous paragraph.
     if !line.kind.is_code() {
-        job.append(&line.text, 0.0, fmt(kind_color(line.kind, palette)));
+        let cut = clip_row_text(&line.text);
+        let text = cut.map_or(&*line.text, |at| &line.text[..at]);
+        job.append(text, 0.0, fmt(kind_color(line.kind, palette)));
+        append_clip_marker(&mut job, font_id, palette, &line.text, cut);
         return (job, None);
     }
 
@@ -2365,15 +2457,34 @@ fn diff_row_job(
     // un-emphasized; the per-frame viewport pass fills visible lines in.
     let emphasis: &[std::ops::Range<usize>] = if word_diff { row.emphasis } else { &[] };
     let emph_bg = (!emphasis.is_empty()).then(|| emphasis_bg(line.kind, palette, backdrop));
-    append_body(
-        &mut job,
-        font_id,
-        line.body(),
-        spans,
-        base_color,
-        emphasis,
-        emph_bg,
+    // The clip, and with it the spans and emphasis that index into the body — all three
+    // have to be cut together or the ranges outlive the text they point at. The owned
+    // vectors are allocated only on a row that is actually too long, which is none of
+    // them on an ordinary diff.
+    let body = line.body();
+    let cut = clip_row_text(body);
+    // `Cow`, so the ordinary row — every row of every ordinary diff — borrows what it
+    // already has and a clipped one owns the two short vectors it had to rebuild.
+    let (body, spans, emphasis) = cut.map_or_else(
+        || {
+            (
+                body,
+                std::borrow::Cow::Borrowed(spans),
+                std::borrow::Cow::Borrowed(emphasis),
+            )
+        },
+        |at| {
+            (
+                &body[..at],
+                std::borrow::Cow::Owned(clip_spans(spans, at)),
+                std::borrow::Cow::Owned(clip_ranges(emphasis, at)),
+            )
+        },
     );
+    append_body(
+        &mut job, font_id, body, &spans, base_color, &emphasis, emph_bg,
+    );
+    append_clip_marker(&mut job, font_id, palette, line.body(), cut);
 
     let row_bg = match line.kind {
         LineKind::Add if syntax => Some(palette.added_bg),
@@ -7830,7 +7941,13 @@ impl eframe::App for GitkApp {
                     };
                     let diff_view = DiffView {
                         n_lines: self.diff_lines.len(),
-                        content_chars: self.diff_max_chars + linenos.chars(),
+                        // Capped where the rendering is: past `MAX_ROW_RENDER_CHARS`
+                        // no row draws anything, so a scroll range sized to an 8M-char
+                        // line would be tens of millions of pixels of blank to get
+                        // lost in. A row that IS laid out widens the ScrollArea itself,
+                        // which is what covers the clip marker's own few characters.
+                        content_chars: self.diff_max_chars.min(MAX_ROW_RENDER_CHARS)
+                            + linenos.chars(),
                         scroll_target: if diff_load_elapsed.is_some() {
                             None
                         } else {
@@ -8626,6 +8743,136 @@ mod tests {
         assert_eq!(bg("-x", LineKind::Del), Some(palette.deleted_bg));
         assert_eq!(bg("x", LineKind::Context), None);
         assert_eq!(bg("@@ -1 +1 @@", LineKind::Hunk), None);
+    }
+
+    /// A row is bounded in the glyphs it lays out, whatever the line is.
+    ///
+    /// egui lays a no-wrap line out as ONE galley row and the tessellator culls by row,
+    /// so every character becomes four vertices whether it is on screen or a mile off
+    /// it — a single 8.3M-character line asked wgpu for a 666MB vertex buffer against a
+    /// 256MB limit and PANICKED the process from inside the paint. Nothing above the
+    /// renderer bounds this; the clip rect does not reduce what is tessellated.
+    ///
+    /// Every row kind is checked, because the early return for structural rows is a
+    /// second path through this function and a commit message is a structural row.
+    #[test]
+    fn a_row_lays_out_a_bounded_number_of_characters() {
+        let hl = highlight::test_highlighter();
+        let palette = hl.palette().clone();
+        let fid = egui::FontId::monospace(13.0);
+        // Well past the cap, and past any viewport, in one line.
+        let huge: String = "x".repeat(MAX_ROW_RENDER_CHARS * 3);
+        for kind in [
+            LineKind::Add,
+            LineKind::Del,
+            LineKind::Context,
+            LineKind::Meta,
+            LineKind::Hunk,
+        ] {
+            let text = match kind {
+                LineKind::Add => format!("+{huge}"),
+                LineKind::Del => format!("-{huge}"),
+                _ => huge.clone(),
+            };
+            let (job, _) = diff_row_job(
+                &DiffLine::new(text.as_str(), kind),
+                RowStyle {
+                    spans: &[],
+                    emphasis: &[],
+                },
+                &palette,
+                &fid,
+                LineNoGutter::default(),
+                false,
+                true,
+            );
+            let laid_out = job.text.chars().count();
+            assert!(
+                laid_out < MAX_ROW_RENDER_CHARS + 64,
+                "{kind:?}: laid out {laid_out} of {} characters",
+                text.chars().count()
+            );
+            // ...and it SAYS so, rather than looking like a line that ends there.
+            assert!(job.text.contains(" … "), "{kind:?}: {}", &job.text[..40]);
+        }
+    }
+
+    /// An ordinary row is untouched — no marker, no clipping, and the spans it was
+    /// given are the spans it draws. The control for the test above: a cap that fired
+    /// on everything would satisfy that one and ruin every diff.
+    #[test]
+    fn an_ordinary_row_is_not_clipped() {
+        let hl = highlight::test_highlighter();
+        let palette = hl.palette().clone();
+        let fid = egui::FontId::monospace(13.0);
+        let (job, _) = diff_row_job(
+            &DiffLine::new("+let x = 1;", LineKind::Add),
+            RowStyle {
+                spans: &[(palette.foreground, 0..3)],
+                emphasis: &[],
+            },
+            &palette,
+            &fid,
+            LineNoGutter::default(),
+            false,
+            true,
+        );
+        assert!(!job.text.contains('…'), "{}", job.text);
+    }
+
+    /// The cut is by CHARACTERS, so a multi-byte one is never split — a byte cut would
+    /// panic on the slice, which is the one way this guard could itself crash the app.
+    #[test]
+    fn the_row_clip_falls_on_a_character_boundary() {
+        let hl = highlight::test_highlighter();
+        let palette = hl.palette().clone();
+        let fid = egui::FontId::monospace(13.0);
+        // Three bytes a character, so a byte-index cut lands mid-character.
+        let text = format!("+{}", "日".repeat(MAX_ROW_RENDER_CHARS * 2));
+        let (job, _) = diff_row_job(
+            &DiffLine::new(text.as_str(), LineKind::Add),
+            RowStyle {
+                spans: &[],
+                emphasis: &[],
+            },
+            &palette,
+            &fid,
+            LineNoGutter::default(),
+            false,
+            true,
+        );
+        assert!(job.text.chars().count() < MAX_ROW_RENDER_CHARS + 64);
+    }
+
+    /// A span straddling the cut is TRUNCATED, not dropped.
+    ///
+    /// `append_body`'s span path emits only the spans, so a straddler taken out takes
+    /// its visible text with it — a gap at exactly the column the reader reaches when
+    /// they scroll to the cut. `body.get(range)` answering `None` makes dropping the
+    /// easy mistake.
+    #[test]
+    fn a_span_straddling_the_clip_keeps_its_visible_half() {
+        let colour = egui::Color32::RED;
+        let spans = vec![
+            (colour, 0..10),
+            (colour, 10..MAX_ROW_RENDER_CHARS + 500),
+            (
+                colour,
+                MAX_ROW_RENDER_CHARS + 500..MAX_ROW_RENDER_CHARS + 900,
+            ),
+        ];
+        let got = clip_spans(&spans, MAX_ROW_RENDER_CHARS);
+        assert_eq!(got.len(), 2, "the span wholly past the cut goes");
+        assert_eq!(got[0].1, 0..10, "the span wholly before it is untouched");
+        assert_eq!(
+            got[1].1,
+            10..MAX_ROW_RENDER_CHARS,
+            "and the straddler keeps the half that is still drawn"
+        );
+        // Same rule for the word-diff emphasis, over the same body.
+        let emph = vec![0..10, 10..MAX_ROW_RENDER_CHARS + 500];
+        let got = clip_ranges(&emph, MAX_ROW_RENDER_CHARS);
+        assert_eq!(got, vec![0..10, 10..MAX_ROW_RENDER_CHARS]);
     }
 
     /// The gutter is prepended by the ROW builder, ahead of the structural early

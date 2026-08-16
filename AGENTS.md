@@ -1229,6 +1229,20 @@ ones that actually fail when the write is removed.
   this one field: an egui upgrade's real cost is in defaults that moved, not in
   the renames the compiler points at.
 - `layout_no_wrap` + `with_clip_rect` for text truncation (egui `layout()` wraps)
+- **A clip rect does NOT reduce what is tessellated, so a frame's vertex buffer grows
+  with the longest LINE rather than with the viewport.** `layout_no_wrap` makes a line
+  one galley row, and epaint culls by row, so every character becomes four vertices
+  whether it is on screen or a mile off it. One 8.3M-character line (a minified bundle)
+  asked wgpu for a **666MB** buffer against its 256MB limit and panicked the process
+  from inside `paint_and_update_textures` — a hard crash no amount of row
+  virtualization prevents, because the row was visible. `MAX_ROW_RENDER_CHARS` (10,000)
+  caps what `diff_row_job` lays out, and `clip_spans`/`clip_ranges` cut the spans and
+  emphasis with it, since both index into the body. A straddling span is TRUNCATED, not
+  dropped: `append_body`'s span path emits only the spans, so dropping one takes visible
+  text with it. **Render-only** — `DiffLine::text` is untouched, so search, word diff,
+  the anchor, the store and the write layer still see the whole line — and never silent
+  (`append_clip_marker`). `content_chars` is capped to match, or the horizontal scroll
+  runs tens of millions of pixels into blank.
 - egui tooltips (`show_tooltip_text` / `on_hover_*`) live on an **interactable** layer: if one lands over the pointer (likely at the right window edge, where a wide tooltip flips across the cursor), it wins the hit-test and the ScrollArea underneath silently drops wheel input until the mouse moves. The file-list path tooltip is therefore a hand-rolled `Area` with `.interactable(false)` (plus an `is_scrolling` guard so it doesn't churn mid-wheel) — don't swap it back to the convenience API
 - A bare `Area` reports a tiny `available_width`, so a default-wrapped label inside one shreds into a one-word-per-line column. Use `Label::new(..).extend()` — the file-list path tooltip and the apply status line both do
 - `Response::context_menu` commits to opening on secondary-click, and `Frame::popup` paints its fill/stroke/shadow even when the content closure draws nothing — so a menu that decides it has no items still shows an empty box. Gate the **attachment** (`row_menu_target` returning `None`), not what the closure draws
