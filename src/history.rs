@@ -1614,16 +1614,41 @@ fn slow_walk_message(elapsed: std::time::Duration, rows: usize, cost: WalkCost) 
 /// any fetch, which the walk handles: `for_repo(..).is_some()` is the test, not
 /// coverage.
 ///
-/// The number is what makes it worth acting on, and it is gitkay's own rather than
-/// git's: the same 200 rows off a 1.47M-commit kernel clone take 45s through the sorted
-/// revwalk and 1.0s once a commit-graph is there to walk lazily.
+/// The numbers are what make it worth acting on, and they are gitkay's own rather than
+/// git's: on a 1.47M-commit kernel clone the same 200 rows take 45s through the sorted
+/// revwalk and 1.0s once a commit-graph is there to walk lazily, and a path filter goes
+/// from 51s to 4.7s.
+///
+/// **Three cases, because the fix is not always the same command.** A path filter also
+/// wants the changed-path index, which `--changed-paths` writes and nothing else does —
+/// so a repository that HAS a graph without one is worth a word too, but only when a
+/// pathspec is what was slow. Asking `has_changed_paths` rather than opening the
+/// filters keeps that check free.
 pub fn commit_graph_advice(repo: &Repository, scope: &cli::Scope) -> Option<&'static str> {
-    let missing = crate::commitgraph::CommitGraph::for_repo(repo).is_none();
-    (topo_scope(scope) && missing).then_some(
-        "this repository has no commit-graph, which is what a walk needs to be lazy: \
-         `git commit-graph write --reachable` writes one (35s for 88MB on a 1.47M-commit \
-         clone) and took the same walk there from 45s to 1.0s",
-    )
+    if !topo_scope(scope) {
+        return None;
+    }
+    let graph = crate::commitgraph::CommitGraph::for_repo(repo);
+    match (&graph, scope.paths.is_empty()) {
+        (None, true) => Some(
+            "this repository has no commit-graph, which is what a walk needs to be lazy: \
+             `git commit-graph write --reachable` writes one (35s for 88MB on a 1.47M-commit \
+             clone) and took the same walk there from 45s to 1.0s",
+        ),
+        (None, false) => Some(
+            "this repository has no commit-graph, which is what a path filter needs to walk \
+             lazily and to skip commits without comparing trees: \
+             `git commit-graph write --reachable --changed-paths` writes one (5min for 109MB \
+             on a 1.47M-commit clone) and took the same filtered walk there from 51s to 4.7s",
+        ),
+        (Some(g), false) if !g.has_changed_paths() => Some(
+            "this repository's commit-graph carries no changed-path index, so every commit \
+             walked is compared against the path filter by its trees: \
+             `git commit-graph write --reachable --changed-paths` adds one, which took a \
+             filtered walk on a 1.47M-commit clone from 30s to 24s",
+        ),
+        _ => None,
+    }
 }
 
 /// Explain a slow history walk, once per process.
@@ -2714,14 +2739,26 @@ mod tests {
         let tip = merged_history(&repo).3;
         let plain = cli::Scope::default();
 
+        let filtered = cli::Scope {
+            paths: vec!["f.txt".to_string()],
+            ..Default::default()
+        };
+
         let advice = commit_graph_advice(&repo, &plain).expect("no graph, a scope that wants one");
         assert!(
             advice.contains("git commit-graph write --reachable"),
             "{advice}"
         );
         assert!(advice.contains("45s"), "the number is the point: {advice}");
+        assert!(
+            !advice.contains("--changed-paths"),
+            "a scope with no pathspec has no use for that index: {advice}"
+        );
         // `--all` walks lazily too, so it is worth advising there.
         assert!(commit_graph_advice(&repo, &scope(true, &[])).is_some());
+        // A path filter wants the changed-path index as well, and one command writes it.
+        let advice = commit_graph_advice(&repo, &filtered).expect("a path filter wants one too");
+        assert!(advice.contains("--changed-paths"), "{advice}");
         // A scope that falls back to the sorted walk whatever the repository holds.
         assert_eq!(
             commit_graph_advice(&repo, &scope(false, &["HEAD"])),
@@ -2735,6 +2772,17 @@ mod tests {
             commit_graph_advice(&repo, &plain),
             None,
             "there is one now, and nothing to advise"
+        );
+        // …but it carries no changed-path index, which only a path filter misses.
+        let advice = commit_graph_advice(&repo, &filtered).expect("no changed-path index");
+        assert!(advice.contains("--changed-paths"), "{advice}");
+
+        write_commit_graph_with_changed_paths(&repo, &[tip]);
+        let repo = open_repo(dir.path());
+        assert_eq!(
+            commit_graph_advice(&repo, &filtered),
+            None,
+            "everything a filtered walk wants is there"
         );
     }
 

@@ -431,7 +431,10 @@ The invariants:
   paid, faster, and to every other tool's benefit. The advice is gated on the scope
   actually walking lazily (`topo_scope`) as well as on the file being absent: naming a
   fix for a scope that would ignore it is a false promise, which is why the line did
-  not exist before the lazy walk did.
+  not exist before the lazy walk did. It has **three cases** for the same reason: a
+  path filter also wants the changed-path index, which only `--changed-paths` writes, so
+  a repository whose graph lacks one is worth a word — but only when a pathspec is what
+  was slow.
 - **`Sort::NONE` is WRONG — do not retry it.** ~150× faster and emits *parents before
   children* on git.git past row 252, which breaks the graph layout invariant. Test any
   ordering change against git.git at 700+ rows, checking parent-before-child.
