@@ -1265,14 +1265,31 @@ pub const fn provisional_scope(scope: &cli::Scope) -> bool {
 /// O(rows + frontier) commits where the sorted walk touches the whole history —
 /// 2ms against 2.0s for 200 rows on an 82k-commit repo.
 ///
-/// **This is an approximation and is only ever shown provisionally.** It selects
-/// exactly the same SET of commits as the sorted walk (verified at 200/700/2000
-/// rows on five repos), and the same ORDER for the first 200 everywhere tested,
-/// git.git included; past that it can diverge. Exact global order cannot be
-/// produced lazily — "no parent before all its children" needs the whole DAG,
-/// which is precisely the pass this avoids — so the caller must not extend this
-/// list on scroll (`load_commits_tail` would resume off a prefix the real walk did
-/// not produce), and must replace it with the real walk when that lands.
+/// **This is an approximation and is only ever shown provisionally**, and it now
+/// approximates an order the real walk NO LONGER USES. It produces `git rev-list
+/// --date-order`, which is what the sorted walk produced until `history_revwalk`
+/// dropped `Sort::TIME` to match `git log --graph`. On a merge-heavy repository the
+/// two disagree in both order and membership: on a 1.47M-commit kernel clone this
+/// walk's first 200 rows are exactly `--date-order` and share only **169 of 200**
+/// commits with the topological list that replaces them. On a repository whose
+/// history is nearly linear they still coincide.
+///
+/// That is a known shortfall rather than a hazard, because of where it can happen.
+/// The provisional walk is skipped entirely when the lazy topological walk is
+/// available (`topo_available`), so what is left is the plain scope on a repository
+/// with no commit-graph — exactly the case whose slow walk this exists to cover.
+/// The rows are replaced when the real list lands, which is what
+/// `WalkCost::OrderingAfterProvisional` already warns about; the replacement is
+/// simply larger than it used to be. Realigning it means giving this walk the LIFO
+/// shape `topo::TopoWalk` has instead of a time-ordered heap, which needs its own
+/// verification pass.
+///
+/// Exact global order cannot be produced lazily WITHOUT GENERATION NUMBERS — "no
+/// parent before all its children" needs the whole DAG, which is precisely the pass
+/// this avoids, and precisely what `topo::TopoWalk` sidesteps by reading a
+/// commit-graph. So the caller must not extend this list on scroll
+/// (`load_commits_tail` would resume off a prefix the real walk did not produce),
+/// and must replace it with the real walk when that lands.
 ///
 /// What it does NOT diverge on is topology, because `topo_window` settles that
 /// over the rows actually emitted. The heap alone cannot: see there.
@@ -1858,6 +1875,39 @@ mod tests {
             .map(|c| c.oid)
             .collect();
         assert_eq!(got, expected);
+    }
+
+    /// The provisional list no longer matches the real one, and what has to hold
+    /// instead is the property the graph layout rests on: **no row above its own
+    /// parent**.
+    ///
+    /// `history_revwalk` dropped `Sort::TIME` to show `git log --graph`'s order,
+    /// while this walk still approximates date order. On a merge-heavy repository
+    /// the two now disagree in both sequence and membership — measured at 169 of 200
+    /// commits in common on a kernel clone — so "the provisional rows are the real
+    /// rows, early" is no longer the guarantee. Topological validity is, because it
+    /// is what `layout_graph` needs from any list it is handed, and it is what makes
+    /// showing these rows at all defensible.
+    #[test]
+    fn the_provisional_walk_is_topologically_valid_even_where_it_differs() {
+        let (_d, repo) = temp_repo();
+        let tip = crate::tests::merged_history(&repo).3;
+        let _ = tip;
+        let rows = provisional_commits(&repo, 100, false);
+        let position: std::collections::HashMap<git2::Oid, usize> =
+            rows.iter().enumerate().map(|(i, c)| (c.oid, i)).collect();
+        assert!(rows.len() >= 4, "control: the fixture has merges and depth");
+        for (i, c) in rows.iter().enumerate() {
+            for parent in &c.parents {
+                if let Some(&j) = position.get(parent) {
+                    assert!(
+                        j > i,
+                        "row {i} ({}) is drawn above its own parent at {j}",
+                        c.summary
+                    );
+                }
+            }
+        }
     }
 
     /// Merges are the case the heap walk exists to handle cheaply, and the one where
