@@ -232,7 +232,9 @@ the runner and its watchdog, and reading git's own `cachetextconv` notes cache â
 one place gitkay runs an external program, and it writes nothing to the repo; see
 **Textconv**),
 `src/diff_highlight.rs` (applying a `Highlighter` to a built diff â€” which rows, in
-what order, on which thread. Separate from `highlight.rs`, which knows syntect and
+what order, on which thread, and past `MAX_HIGHLIGHT_LINES` whether at all: the
+hand-off copies the diff for the worker, which measured 12.0s on the frame loop at
+76.5M lines. Separate from `highlight.rs`, which knows syntect and
 nothing about diffs: this half knows `DiffLine`, `FileEntry` and the viewport, and
 is about ORDER rather than colour),
 `src/workers.rs` (the four persistent foreground workers and the three jobs they

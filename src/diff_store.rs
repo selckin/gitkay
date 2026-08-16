@@ -796,26 +796,33 @@ impl DiffStore {
     /// store's own budget that decides it: `build_or_load`'s `store_cap` is a
     /// different question (whether the CALLER will keep what it built), and the
     /// foreground load deliberately answers "no cap of my own" to it.
-    pub fn save(&self, scope: &RowScope, settings: DiffSettings, data: &DiffData) {
+    /// Returns whether the entry was WRITTEN, so the caller reports the outcome rather
+    /// than its intention: `build_or_load` logged "saving" before calling this, and a
+    /// refusal here then left two lines contradicting each other in the same log.
+    pub fn save(&self, scope: &RowScope, settings: DiffSettings, data: &DiffData) -> bool {
         let Some(key) = self.key(scope, settings) else {
-            return;
+            return false;
         };
+        // Named by the ROW, not the entry key: nothing is written on a refusal, so the
+        // key identifies nothing, while the source oid is what every other line about
+        // this diff already carries.
+        let oid = scope.source.oid();
         // Cheap first, and the order is the whole point: `encode` builds the entry in
         // memory, so refusing only afterwards would still spend the seconds and the
         // gigabytes on exactly the diffs worth refusing. `min_encoded_bytes` is a floor
         // the encoder cannot go under, so a refusal here is never a false one.
         if over_entry_cap(
-            key,
+            oid,
             min_encoded_bytes(data.lines.len(), data.files.len()),
             false,
         ) {
-            return;
+            return false;
         }
         let bytes = encode(data);
         // Then exactly, for what the floor lets through: a few very long lines encode
         // to far more than their count suggests.
-        if over_entry_cap(key, bytes.len() as u64, true) {
-            return;
+        if over_entry_cap(oid, bytes.len() as u64, true) {
+            return false;
         }
         if let Err(e) = self.write_atomic(key, &bytes) {
             // Once per store, not once per row: a whole band failing to write
@@ -826,7 +833,9 @@ impl DiffStore {
                     self.root.display()
                 );
             }
+            return false;
         }
+        true
     }
 
     /// Write to a temp file in the same directory, then rename.
@@ -917,12 +926,12 @@ const fn min_encoded_bytes(lines: usize, files: usize) -> u64 {
 /// when it is. `measured` distinguishes the floor from the real size in the log: a
 /// reader wondering why one commit rebuilds on every visit needs to know which of the
 /// two checks refused it.
-fn over_entry_cap(key: git2::Oid, bytes: u64, measured: bool) -> bool {
+fn over_entry_cap(oid: git2::Oid, bytes: u64, measured: bool) -> bool {
     if bytes <= MAX_ENTRY_BYTES {
         return false;
     }
     log::debug!(
-        "diff store: not saving {key} — {}{bytes} bytes, over the {MAX_ENTRY_BYTES}-byte entry cap",
+        "diff store: not saving {oid} — {}{bytes} bytes, over the {MAX_ENTRY_BYTES}-byte entry cap",
         if measured { "" } else { "at least " }
     );
     true

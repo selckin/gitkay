@@ -351,6 +351,26 @@ const DIFF_PLACEHOLDER_DELAY: std::time::Duration = std::time::Duration::from_mi
 /// `highlight_worker`. Small enough to switch quickly, large enough that the
 /// per-chunk overhead is negligible. Those re-checks are hints — being a chunk
 /// late costs a slightly worse ordering — so this can afford to be coarse.
+/// The largest diff worth colouring in the background at all.
+///
+/// Two costs grow with the line count and neither is bounded by what the reader can
+/// see. The hand-off copies the whole diff for the worker — measured at **12.0s on the
+/// frame loop** for a 76.5M-line diff, a freeze with the window already painted — and
+/// the tokenizing itself runs at ~3µs/line for plain text and ~60µs for a real grammar,
+/// so that same diff is four minutes of CPU at best and over an hour at worst. It
+/// never finishes; the thread simply runs until the window closes.
+///
+/// So: past this, the pane stays plain. At the cap the copy is ~0.3s (~157ns/line,
+/// dominated by first-touch page faults on the fresh allocation) and the whole-diff
+/// tokenize is minutes — already the wrong side of every trade, and a diff this large
+/// is past reading rather than past colouring. Nothing else changes: the pane, the
+/// sidebar, word diff, search and the write actions all work exactly as they do on a
+/// coloured diff.
+///
+/// The speculative path has had its own, far smaller bound for the same reason
+/// (`PREFETCH_MAX_HIGHLIGHT_LINES`); this is the displayed diff's.
+const MAX_HIGHLIGHT_LINES: usize = 2_000_000;
+
 const HIGHLIGHT_CHUNK: usize = 256;
 
 /// Lines per chunk for the deadline-bounded pre-highlight pass, which is much
@@ -1901,12 +1921,15 @@ fn build_or_load(
         && store_cap.is_none_or(|cap| data.lines.len() <= cap)
         && worth_persisting(repo, scope, &data)
     {
-        log::debug!(
-            "diff store: saving {} ({} lines, built in {built:?})",
-            scope.source.oid(),
-            data.lines.len()
-        );
-        store.save(scope, settings, &data);
+        // Reported after the fact: the store has a cap of its own and may refuse, and
+        // a line claiming a save that did not happen is worse than no line at all.
+        if store.save(scope, settings, &data) {
+            log::debug!(
+                "diff store: saved {} ({} lines, built in {built:?})",
+                scope.source.oid(),
+                data.lines.len()
+            );
+        }
     }
     data
 }
@@ -4610,6 +4633,25 @@ impl GitkApp {
         // now — line text is Arc-shared — but the worker's scan isn't.)
         if diff_fully_highlighted(&self.diff_lines, &self.diff_files) {
             self.highlight_priority = None;
+            return;
+        }
+        // Past a certain size, colouring costs more than it can possibly be worth —
+        // see `MAX_HIGHLIGHT_LINES`. Left plain, deliberately and silently to the
+        // reader: `diff_needs_highlight` is already cleared above, so this is decided
+        // once per diff rather than re-argued every frame.
+        if self.diff_lines.len() > MAX_HIGHLIGHT_LINES {
+            log::debug!(
+                "highlight: {} lines is past the {MAX_HIGHLIGHT_LINES}-line cap — left plain",
+                self.diff_lines.len()
+            );
+            self.highlight_priority = None;
+            // Nothing will colour this diff, so colouring HAS settled — say so, or the
+            // prefetch band (which waits for the foreground diff to finish colouring,
+            // via a `diff_fully_highlighted` that can now never answer true) stays shut
+            // for as long as this diff is displayed. The memo is keyed by the
+            // generation just bumped above, and only a landing batch can invalidate it
+            // — and no batch will land, there being no worker.
+            self.highlight_scan = Some((generation, true));
             return;
         }
         log::debug!(
