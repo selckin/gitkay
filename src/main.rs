@@ -18,6 +18,13 @@ use std::sync::mpsc;
 
 mod apply;
 mod cli;
+// Nothing in the binary reads this yet: its consumer is the generation-keyed history
+// walk, which is a separate change. `allow`, not `expect` — an `expect` here is
+// UNFULFILLED under `./build.sh`'s `--all-targets` (the module's own tests use every
+// item) and would fail the stricter of the two clippy gates while satisfying CI's.
+// Delete this line when the walk lands.
+#[allow(dead_code)]
+mod commitgraph;
 mod config;
 mod datefmt;
 mod diff;
