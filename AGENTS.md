@@ -263,7 +263,11 @@ one place gitkay runs an external program, and it writes nothing to the repo; se
 what order, on which thread, and how much of them one pass will colour before it
 stops (`HIGHLIGHT_LINE_BUDGET` bounds the memory it commits to, `HIGHLIGHT_TIME_BUDGET`
 its appetite for a core — a line costs 3µs or 70µs depending on the grammar, so neither
-bound stands in for the other). The worker SHARES the rows with the UI — two `Arc` clones
+bound stands in for the other. **EVERY colour pass needs both**, and the speculative one
+had only the line cap until a 5,310-line row under a 10,000-line cap coloured for
+**29.6 seconds** — 5.6ms a line, 43× the rate that cap's "~1.3s worst case" assumed. The
+rate is a property of the grammar, not of the repo, so no line count can stand in for a
+clock: see `Limits::highlight_budget`). The worker SHARES the rows with the UI — two `Arc` clones
 and the pending-file list — where it used to be handed a copy of the whole diff, which
 measured 12.0s on the frame loop at 76.5M lines; and it REPORTS its own end
 (`HighlightMsg::Settled`, from a drop guard, so a superseded or panicking pass says so
@@ -503,7 +507,13 @@ The invariants:
   known, so the column fills where the user is looking before warming where they might
   scroll. Stats **are** derived from a built `DiffData` — `diff::stats_from_data`, called by
   `cache_diff` on every real commit it caches, which is what stops the same blobs being
-  read twice (once for the column, once for the pane). Safe and not a shortcut: summing
+  read twice (once for the column, once for the pane), and by `run_stats_job` off a
+  persistent-store hit. A warm sends them ITSELF, as soon as its diff exists and
+  **before it colours**: `cache_diff` only runs when the `WarmResult` lands, on the far
+  side of a speculative pass that measured 29.6s once, so a row whose counts were known
+  at 418ms shipped them half a minute later — and a blob-heavy row, whose stats job
+  deferred on the promise that the diff would supply them, is exactly the row that takes
+  longest to colour. Safe and not a shortcut: summing
   `FileEntry` is exactly what `commit_stats` returns, pinned by
   `commit_stats_agrees_with_the_panes_own_per_file_counts` over a repo holding a binary
   change and a mode-only change, under both `detect_renames` settings. **An earlier

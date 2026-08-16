@@ -32,9 +32,10 @@ use crate::highlight::Highlighter;
 use crate::history::CommitInfo;
 use crate::workers::{StatsJob, StatsResult};
 use crate::{
-    DiffCacheKey, DiffDeps, PREFETCH_LINE_BUDGET_DIVISOR, PREFETCH_MAX_DIFF_BYTES,
-    PREFETCH_MAX_ENTRY_DIVISOR, PREFETCH_MAX_HIGHLIGHT_LINES, PREFETCH_MAX_WORKERS, build_or_load,
-    highlight_diff, mem, spawn_guarded, store_of, textconv_for,
+    DiffCacheKey, DiffDeps, PREFETCH_HIGHLIGHT_BUDGET, PREFETCH_LINE_BUDGET_DIVISOR,
+    PREFETCH_MAX_DIFF_BYTES, PREFETCH_MAX_ENTRY_DIVISOR, PREFETCH_MAX_HIGHLIGHT_LINES,
+    PREFETCH_MAX_WORKERS, build_or_load, highlight_diff_until, mem, spawn_guarded, store_of,
+    textconv_for,
 };
 
 /// How much of a prefetched row's diff gets built.
@@ -355,6 +356,30 @@ pub struct Limits {
     /// then sits alone until the next insert evicts it too. Measured: a 133,460-line
     /// diff evicted all 51 warmed entries (98,507 lines).
     pub max_entry_lines: usize,
+    /// How long a speculative colour pass may run before it stops where it is.
+    ///
+    /// **A line cap does not bound time, and assuming it did cost 29.6 seconds of one
+    /// worker.** `PREFETCH_MAX_HIGHLIGHT_LINES` was calibrated as "~1.3s at the
+    /// ~0.13ms/line this repo sees"; a 5,310-line commit — comfortably under the
+    /// 10,000-line cap — measured `build 418ms + colour 29.6s`, i.e. **5.6ms a line,
+    /// 43× the assumed rate**. Nobody is waiting on a speculative warm, so the row was
+    /// simply absent from the band, and the worker was gone with it: its
+    /// `heavy_outstanding` share, its lane slot and its `warming` claim are all held
+    /// until it reports.
+    ///
+    /// This is the same lesson the UI's own pass already carries — it takes a line
+    /// budget AND a time budget precisely because "a line costs 3µs or 70µs depending
+    /// on the grammar" — applied to the one pass that never got the second bound.
+    ///
+    /// A cut-short pass needs no special handling: `highlight_diff_until` documents a
+    /// partial result as already a legal state, and `ensure_diff_highlighted` finishes
+    /// the row on demand if the reader ever opens it. The diff itself is unaffected and
+    /// is still cached, which is what the warm was for.
+    ///
+    /// On `Limits` rather than a bare `const` so a test can set it to zero: what must
+    /// not regress is that the pass is bounded AT ALL, and a const cannot be varied to
+    /// prove it.
+    pub highlight_budget: std::time::Duration,
 }
 
 impl Limits {
@@ -417,6 +442,7 @@ impl PrefetchBudget {
             limits: Limits {
                 max_blob_bytes: PREFETCH_MAX_DIFF_BYTES,
                 max_entry_lines: cache_lines / PREFETCH_MAX_ENTRY_DIVISOR,
+                highlight_budget: PREFETCH_HIGHLIGHT_BUDGET,
             },
             line_budget: cache_lines / PREFETCH_LINE_BUDGET_DIVISOR,
         }
@@ -1695,14 +1721,51 @@ fn warm_row(
     // downgraded here however near the view it is. With syntax off there is no
     // highlighter at all and every row takes the same path;
     // `ensure_diff_highlighted` colours the landing screenful on demand regardless.
+    // The commit list's numbers, BEFORE the colour rather than after it.
+    //
+    // They are a sum over the `FileEntry` list already in hand, and they are complete
+    // the moment the build is — but the only thing that used to hand them over was
+    // `cache_diff`, which runs when the `WarmResult` lands, i.e. on the far side of a
+    // pass that exists purely to make the row prettier if it is ever opened. So a row
+    // whose counts were known at 418ms shipped them 29.6s later, and a blob-heavy row
+    // whose stats job DEFERRED on the promise that "the diff will supply the line
+    // counts" was the one kind of row that both took longest to colour and had nothing
+    // on screen in the meantime.
+    //
+    // The two drop paths above already do exactly this, for the same reason. Doing it
+    // here as well makes it the rule rather than the exception, and costs a sum and a
+    // channel send. `cache_diff` still harvests when the result lands: the values are
+    // identical, so the later one is a no-op, and it is what covers the foreground.
+    if is_real_commit(oid) {
+        send_stats_result(ctx, stats_epoch, oid, Some(diff::stats_from_data(&data)));
+    }
     let colour = target.depth == WarmDepth::Highlighted && lines <= PREFETCH_MAX_HIGHLIGHT_LINES;
     let colour_start = std::time::Instant::now();
+    // Bounded in TIME as well as in lines, because the two measure different things and
+    // the line cap's rate assumption is a property of the grammar rather than of the
+    // repo: a 5,310-line row under the 10,000-line cap coloured for 29.6s. See
+    // `Limits::highlight_budget`. Stopping early is free — a partial `RowSpans` is a
+    // legal state and `ensure_diff_highlighted` finishes the row if it is ever opened —
+    // where not stopping costs the worker, its lane slot and its in-flight claim.
+    let deadline = colour_start + ctx.limits.highlight_budget;
     if let Some(hl) = hl
         && colour
     {
-        highlight_diff(&data.lines, &mut data.spans, &data.files, hl);
+        highlight_diff_until(
+            &data.lines,
+            &mut data.spans,
+            &data.files,
+            hl,
+            Some(deadline),
+            0,
+            None,
+        );
     }
     let coloured = colour_start.elapsed();
+    // Within a chunk of the deadline means the pass stopped where it was rather than
+    // finishing. Said out loud for the reason every other cut-off here is: a row that
+    // renders half-plain otherwise looks like the highlighter simply failing on it.
+    let cut_short = colour && coloured >= ctx.limits.highlight_budget;
     // What was actually applied, not what was asked for — and THREE outcomes, not two.
     // A depth downgrade the log hid would read as syntect being mysteriously fast on an
     // enormous row; the plain-text fallback reads the same way and is worse, because it
@@ -1734,6 +1797,11 @@ fn warm_row(
             }
         }
         _ => "DiffOnly".to_owned(),
+    };
+    let applied = if cut_short {
+        format!("{applied}, cut short at the time budget")
+    } else {
+        applied
     };
     // A send failure means the UI is gone, i.e. the process is on its way out; there is
     // nothing useful left to do, but nothing to clean up either.
@@ -1936,6 +2004,7 @@ mod tests {
                 limits: Limits {
                     max_blob_bytes: 0,
                     max_entry_lines: usize::MAX,
+                    highlight_budget: PREFETCH_HIGHLIGHT_BUDGET,
                 },
                 line_budget: usize::MAX,
             },
@@ -1968,6 +2037,116 @@ mod tests {
             .expect("the heavy lane must report; a job posted to an unread mailbox never does");
         assert_eq!(got.key.oid, oid);
         drop(dir);
+    }
+
+    /// A speculative colour pass is bounded in TIME, not only in lines.
+    ///
+    /// The two do not stand in for each other — the per-line cost is a property of the
+    /// grammar — and assuming they did cost 29.6 seconds of one worker on a 5,310-line
+    /// row that was comfortably under the 10,000-line cap. Nobody is waiting on a warm,
+    /// so the row was simply missing from the band, and the worker was held with it.
+    ///
+    /// A zero budget stands in for a pathological grammar, which is the only way to
+    /// exercise this without depending on syntect being slow at something. The
+    /// assertions are the two halves that matter: the diff still comes back (a
+    /// cut-short pass is a legal state, not a failure), and it comes back UNCOLOURED
+    /// rather than the pass running to completion anyway.
+    #[test]
+    fn a_speculative_colour_pass_stops_at_its_time_budget() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_dir, repo) = temp_repo();
+        commit_file(&repo, "a.rs", "fn main() {}\n", "one");
+        let oid = commit_file(&repo, "a.rs", "fn main() {\n    todo!()\n}\n", "two");
+        let hl = highlight::test_highlighter();
+
+        let warm = |budget: std::time::Duration| {
+            let (tx, rx) = mpsc::channel();
+            let ctx = WorkerCtx {
+                id: 0,
+                limits: Limits {
+                    max_blob_bytes: u64::MAX,
+                    max_entry_lines: usize::MAX,
+                    highlight_budget: budget,
+                },
+                coord: mpsc::channel().0,
+                tx,
+                stats_tx: mpsc::channel().0,
+                ctx: egui::Context::default(),
+                deps: DiffDeps::default(),
+            };
+            let mut target = heavy_target(1);
+            target.key.oid = oid;
+            target.scope = RowScope::new(DiffSource::Commit(oid));
+            target.depth = WarmDepth::Highlighted;
+            let outcome = warm_row(&ctx, &repo, target, Some(&hl), 0);
+            let data = rx.recv().expect("the diff comes back either way").data;
+            let coloured = (0..data.lines.len())
+                .filter(|&i| data.spans.get(i).is_some())
+                .count();
+            (outcome, data.lines.len(), coloured)
+        };
+
+        let (_, lines, none) = warm(std::time::Duration::ZERO);
+        assert!(lines > 0, "control: the fixture has rows");
+        assert_eq!(
+            none, 0,
+            "an expired budget colours nothing and returns anyway"
+        );
+
+        // Control: the same row, given time, really does colour — so the assertion
+        // above is about the budget rather than about the fixture being uncolourable.
+        let (_, _, some) = warm(std::time::Duration::from_secs(30));
+        assert!(some > 0, "the same row colours when the budget allows it");
+    }
+
+    /// The commit-list numbers are handed over as soon as the diff exists, not after
+    /// the colour pass — which is speculative, can take seconds, and exists only to
+    /// make a row prettier if it is ever opened.
+    ///
+    /// The zero budget here is doing double duty: it stands in for a slow pass, and it
+    /// proves the stats do not ride on the colour finishing.
+    #[test]
+    fn a_warm_reports_its_stats_before_colouring() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_dir, repo) = temp_repo();
+        commit_file(&repo, "a.rs", "one\n", "one");
+        let oid = commit_file(&repo, "a.rs", "one\ntwo\n", "two");
+        let hl = highlight::test_highlighter();
+
+        let (tx, _rx) = mpsc::channel();
+        let (stats_tx, stats_rx) = mpsc::channel();
+        let ctx = WorkerCtx {
+            id: 0,
+            limits: Limits {
+                max_blob_bytes: u64::MAX,
+                max_entry_lines: usize::MAX,
+                highlight_budget: std::time::Duration::ZERO,
+            },
+            coord: mpsc::channel().0,
+            tx,
+            stats_tx,
+            ctx: egui::Context::default(),
+            deps: DiffDeps::default(),
+        };
+        let mut target = heavy_target(1);
+        target.key.oid = oid;
+        target.scope = RowScope::new(DiffSource::Commit(oid));
+        target.depth = WarmDepth::Highlighted;
+        warm_row(&ctx, &repo, target, Some(&hl), 7);
+
+        let sent = stats_rx
+            .try_recv()
+            .expect("the numbers are sent by the warm itself");
+        assert_eq!(sent.oid, oid);
+        assert_eq!(
+            sent.epoch, 7,
+            "under the job's own epoch, or the UI drops it"
+        );
+        assert_eq!(
+            sent.stats.expect("counted").lines,
+            LineStats::Counted(1, 0),
+            "the diff's own counts, which are what `cache_diff` would harvest later"
+        );
     }
 
     /// A bare warm target for one oid.
@@ -2566,6 +2745,7 @@ mod tests {
             limits: Limits {
                 max_blob_bytes: u64::MAX,
                 max_entry_lines: usize::MAX,
+                highlight_budget: PREFETCH_HIGHLIGHT_BUDGET,
             },
             coord: mpsc::channel().0,
             tx: mpsc::channel().0,
@@ -2659,6 +2839,7 @@ mod tests {
             limits: Limits {
                 max_blob_bytes: 0,
                 max_entry_lines: usize::MAX,
+                highlight_budget: PREFETCH_HIGHLIGHT_BUDGET,
             },
             coord: mpsc::channel().0,
             tx: mpsc::channel().0,
@@ -2747,6 +2928,7 @@ mod tests {
             limits: Limits {
                 max_blob_bytes: u64::MAX,
                 max_entry_lines: usize::MAX,
+                highlight_budget: PREFETCH_HIGHLIGHT_BUDGET,
             },
             coord: mpsc::channel().0,
             tx: mpsc::channel().0,
@@ -2810,6 +2992,7 @@ mod tests {
             limits: Limits {
                 max_blob_bytes: u64::MAX,
                 max_entry_lines: usize::MAX,
+                highlight_budget: PREFETCH_HIGHLIGHT_BUDGET,
             },
             coord: mpsc::channel().0,
             tx: mpsc::channel().0,
