@@ -1194,11 +1194,18 @@ pub fn load_commits_inner(
     // which is what makes `WalkCost::PathFilter` unconstructible without its
     // denominator.
     let mut walked_commits: Option<usize> = None;
+    // Whether the lazy walk is what answered — recorded by the branch that took it, so
+    // the report at the end names the walk that actually ran. See `WalkCost::of`.
+    let mut lazy = false;
     // A path filter is its own walk: it drops commits and rewrites the parents of what
     // is left, so neither the oid cache below nor a plain prefix means anything for it.
     // The lazy walk is tried first and falls back to the sorted one — see
     // `LAZY_FILTER_SHARE` for the budget that bounds the attempt.
     if !scope.paths.is_empty() {
+        // Armed for the duration of the walk and cancelled by falling out of this
+        // block: a filtered walk is 51s on a 1.47M-commit clone, and either driver can
+        // be the one that takes it there. See `arm_slow_walk_notice`.
+        let _notice = arm_slow_walk_notice(commit_graph_advice(repo, scope), SLOW_FILTER_NOTICE);
         if let Some(filtered) = lazy_filtered_walk(repo, scope, max, &ref_map)
             .or_else(|| sorted_filtered_walk(repo, scope, max, &ref_map))
         {
@@ -1214,6 +1221,7 @@ pub fn load_commits_inner(
     // only what was asked for — unlike the sorted walk, whose extra oids are free
     // because the ordering pass has already produced them — so it caches none.
     else if let Some(oids) = topo_oids(repo, scope, max) {
+        lazy = true;
         let mut built = HashSet::new();
         real = build_commits_from_walk(
             repo,
@@ -1233,6 +1241,10 @@ pub fn load_commits_inner(
         if let Some(go) = provisional {
             let _ = go.send(());
         }
+        // The same knowledge, said to the reader instead of to a thread — and on the
+        // same terms: only if the wait actually materialises. Cancelled by falling out
+        // of this block.
+        let _notice = arm_slow_walk_notice(commit_graph_advice(repo, scope), SLOW_ORDERING_NOTICE);
         let t_setup = std::time::Instant::now();
         let walk = history_revwalk(repo, scope);
         let setup = t_setup.elapsed();
@@ -1293,7 +1305,7 @@ pub fn load_commits_inner(
         scope,
         t.elapsed(),
         real.len(),
-        WalkCost::of(scope, walked_commits),
+        WalkCost::of(scope, walked_commits, lazy),
     );
 
     // Join the probes now — their half-second ran alongside the walk above — and put
@@ -1598,14 +1610,29 @@ pub enum WalkCost {
 }
 
 impl WalkCost {
-    /// Which of the three a finished walk was. `walked` is `Some` only from the
-    /// path-filter branch of `load_commits_inner`, which is the one that counts what it
-    /// examined — so the pathspec case cannot be constructed without its denominator.
-    const fn of(scope: &cli::Scope, walked: Option<usize>) -> Self {
+    /// Which of the three a finished walk was, or `None` for one not worth reporting.
+    ///
+    /// `walked` is `Some` only from the path-filter branch of `load_commits_inner`,
+    /// which is the one that counts what it examined — so the pathspec case cannot be
+    /// constructed without its denominator. `lazy` is likewise recorded by the branch
+    /// that took it, and not re-derived here: a commit-graph existing does not mean the
+    /// walk used it (see `ProvisionalGo` for the same distinction costing 57s).
+    ///
+    /// **A lazy walk is reported as nothing at all**, though it can cross the threshold
+    /// — 660ms for 200 rows on a 1.47M-commit clone, where what is left after the
+    /// generation numbers is reading each row's own commit out of the pack. Two reasons,
+    /// and the second is the load-bearing one: it is the fast path, so there is no lever
+    /// to name and the reader is being told about a wait they cannot shorten; and the
+    /// report is latched once per process, so a line here SPENDS that latch on the walk
+    /// with nothing to advise and silences the one that has something. This wrong
+    /// sentence was on screen — "the whole history walked and sorted" for a walk that
+    /// did neither — which is what the flag exists to stop.
+    const fn of(scope: &cli::Scope, walked: Option<usize>, lazy: bool) -> Option<Self> {
         match walked {
-            Some(walked) => Self::PathFilter { walked },
-            None if provisional_scope(scope) => Self::OrderingAfterProvisional,
-            None => Self::Ordering,
+            Some(walked) => Some(Self::PathFilter { walked }),
+            None if lazy => None,
+            None if provisional_scope(scope) => Some(Self::OrderingAfterProvisional),
+            None => Some(Self::Ordering),
         }
     }
 }
@@ -1714,21 +1741,108 @@ pub fn commit_graph_advice(repo: &Repository, scope: &cli::Scope) -> Option<&'st
 /// different claim — not what happened, but what the reader can do — and it is asked
 /// for only past the latch, since opening the graph costs ~100µs and every fast walk
 /// would otherwise pay it to answer a question nobody is going to be shown.
+///
+/// **This report is the walk's epitaph, and by itself it is too late to act on**: on a
+/// 1.47M-commit clone it arrives 57s after the window did, when the waiting it explains
+/// is over. `arm_slow_walk_notice` is what says it while it is still true; this stays
+/// because the numbers — what it cost, how many rows, whether the view was reshuffled —
+/// exist only once the walk is done.
 pub fn note_slow_history_walk(
     repo: &Repository,
     scope: &cli::Scope,
     elapsed: std::time::Duration,
     rows: usize,
-    cost: WalkCost,
+    cost: Option<WalkCost>,
 ) {
+    // Ahead of the latch, not behind it: a walk with nothing worth saying must not
+    // spend the once-per-process report on saying it. See `WalkCost::of`.
+    let Some(cost) = cost else {
+        return;
+    };
     if !should_note_slow_walk(elapsed, &SLOW_WALK_REPORTED) {
         return;
     }
     log::warn!("{}", slow_walk_message(elapsed, rows, cost));
-    if let Some(advice) = commit_graph_advice(repo, scope) {
-        log::warn!("{advice}");
-    }
+    note_graph_advice(commit_graph_advice(repo, scope), &GRAPH_ADVICE_REPORTED);
 }
+
+/// Latch for the commit-graph advice, separate from `SLOW_WALK_REPORTED`.
+///
+/// Two latches because the two lines are now emitted at different MOMENTS — the advice
+/// while the walk runs, the summary once it ends — and a single latch across both would
+/// let whichever fired first silence the other.
+pub static GRAPH_ADVICE_REPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Say what the reader can do about a slow walk, at most once per process — the advice
+/// is about the REPOSITORY, so the second walk to reach it has nothing new to say.
+///
+/// Both the early notice and the end-of-walk report go through here, which is what
+/// keeps one slow walk from printing it twice. The latch is taken only when there is
+/// something to print, so a scope with no advice cannot silence a later one that has
+/// some. Returns whether it printed, so the latch rule is testable without capturing
+/// output — the reason `should_note_slow_walk` is split out too.
+fn note_graph_advice(advice: Option<&str>, latch: &std::sync::atomic::AtomicBool) -> bool {
+    let Some(advice) = advice else {
+        return false;
+    };
+    if latch.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    log::warn!("{advice}");
+    true
+}
+
+/// Say that a walk is going to be slow WHILE it is still running, rather than once it
+/// is over — and cancel that if it is not.
+///
+/// **The wait cannot be predicted, only timed.** The same code path is 17ms on a
+/// 13k-commit repository and 57s on a 1.47M-commit one, and nothing cheap distinguishes
+/// them beforehand: the whole cost is inside libgit2's first `next()`, which is also why
+/// the walking thread cannot check a clock itself. So this is a thread that waits out
+/// `SLOW_HISTORY_WALK` — the same threshold the end-of-walk report applies, so the two
+/// agree on what "slow" means — and speaks only if the walk is still going.
+///
+/// **Dropping the guard is what says the walk finished.** The walk's own stack frame
+/// owns the sender, so every exit path cancels the notice, panics included, and there
+/// is no "remember to cancel" rule for a later reader to miss. Nothing is ever sent
+/// through the channel: the disconnect IS the signal.
+///
+/// `advice` is computed by the caller, on the walking thread, before the walk starts —
+/// it needs the `Repository`, which is not `Send`. That moves the ~100µs graph open onto
+/// every walk that arms a notice, where `note_slow_history_walk` pays it only past its
+/// latch; both branches that arm one are about to do work measured in seconds, and the
+/// branch a plain scope arms from has already established that the graph is missing or
+/// unusable, which makes the open a failed `open` rather than a parse.
+fn arm_slow_walk_notice(
+    advice: Option<&'static str>,
+    cause: &'static str,
+) -> Option<std::sync::mpsc::Sender<()>> {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::Builder::new()
+        .name("gitkay-slow-walk".to_string())
+        .spawn(move || {
+            if rx.recv_timeout(SLOW_HISTORY_WALK) != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            {
+                return; // the guard dropped: the walk beat the threshold
+            }
+            log::warn!("{cause}");
+            note_graph_advice(advice, &GRAPH_ADVICE_REPORTED);
+        })
+        .ok()
+        .map(|_| tx)
+}
+
+/// The early notice's why-clause for a walk with no path filter: the ordering pass,
+/// which is every scope's floor and the whole of the wait.
+const SLOW_ORDERING_NOTICE: &str = "still building the commit list: the whole history has to be walked and sorted \
+     before the first row can be drawn";
+
+/// The early notice's why-clause for a path-filtered walk — a different cost with a
+/// different lever, as `WalkCost` says at more length. No denominator here, unlike the
+/// report at the end: how many commits were examined is not known until they have been.
+const SLOW_FILTER_NOTICE: &str = "still building the commit list: every commit has to be diffed against the path \
+     filter to find the ones that touch it";
 
 /// How long the real walk gets before the provisional one is shown instead.
 ///
@@ -2805,6 +2919,29 @@ mod tests {
         assert!(!should_note_slow_walk(Duration::from_mins(1), &latch));
     }
 
+    /// The advice is now said by whichever of the two reporters gets there first — the
+    /// early notice while the walk runs, or the summary once it ends — so its latch has
+    /// to be about the ADVICE and not about either of them.
+    ///
+    /// The first assertion is the one with teeth: latching on a scope that had nothing
+    /// to say would silence the next scope that does, and the walk with nothing to
+    /// advise is the common one.
+    #[test]
+    fn the_graph_advice_is_said_once_and_never_by_a_walk_with_none() {
+        use std::sync::atomic::AtomicBool;
+        let latch = AtomicBool::new(false);
+
+        assert!(
+            !note_graph_advice(None, &latch),
+            "a walk with no advice must not take the latch"
+        );
+        assert!(note_graph_advice(Some("write a commit-graph"), &latch));
+        assert!(
+            !note_graph_advice(Some("write a commit-graph"), &latch),
+            "the advice is about the repository, so once is all it is worth"
+        );
+    }
+
     /// A path-filtered walk must be explained by what it actually did: a diff per
     /// commit EXAMINED. One phrasing served all three scopes and blamed "the whole
     /// history walked and sorted" — 209ms of a measured 3.8s — while quoting the rows
@@ -2944,6 +3081,11 @@ mod tests {
     /// Which sentence a walk gets is decided by what it did, not by re-reading the
     /// scope: only the branch that counts what it examined can produce the pathspec
     /// case, and a provisional list is impossible there.
+    ///
+    /// The last two are the same rule for the lazy walk, and the reason it is a
+    /// recorded fact rather than a re-derivation: the scope alone said "the whole
+    /// history walked and sorted" about a walk that did neither, and spent the
+    /// once-per-process latch saying it.
     #[test]
     fn walk_cost_picks_the_case_from_what_the_walk_produced() {
         let filtered = cli::Scope {
@@ -2951,18 +3093,34 @@ mod tests {
             ..cli::Scope::default()
         };
         assert!(matches!(
-            WalkCost::of(&filtered, Some(4)),
-            WalkCost::PathFilter { walked: 4 }
+            WalkCost::of(&filtered, Some(4), false),
+            Some(WalkCost::PathFilter { walked: 4 })
         ));
         assert!(matches!(
-            WalkCost::of(&cli::Scope::default(), None),
-            WalkCost::OrderingAfterProvisional
+            WalkCost::of(&cli::Scope::default(), None, false),
+            Some(WalkCost::OrderingAfterProvisional)
         ));
         let all = cli::Scope {
             all: true,
             ..cli::Scope::default()
         };
-        assert!(matches!(WalkCost::of(&all, None), WalkCost::Ordering));
+        assert!(matches!(
+            WalkCost::of(&all, None, false),
+            Some(WalkCost::Ordering)
+        ));
+        assert!(
+            WalkCost::of(&cli::Scope::default(), None, true).is_none(),
+            "a lazy walk is the fast path: nothing to advise, and the latch is worth \
+             more to a walk that has something"
+        );
+        assert!(
+            matches!(
+                WalkCost::of(&filtered, Some(4), true),
+                Some(WalkCost::PathFilter { walked: 4 })
+            ),
+            "a lazy walk under a path filter still pays the per-commit diff, and the \
+             changed-path index is still the lever"
+        );
     }
 
     #[test]
