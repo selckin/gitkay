@@ -584,9 +584,21 @@ The invariants:
   deltas with `Patch::from_diff(i)`, which is byte-for-byte what `Diff::print` emits for
   that delta (pinned over a binary, a rename, a typechange and an `ignore_ws`-suppressed
   delta, because git2 documents `from_diff` as returning `Ok(None)` for a binary file
-  and the fixtures say otherwise). Measured **6.4-6.8x** on eight 8MB deltas, end to end
-  through `get_diff_data`; the ceiling is `RowCostProbe::parallel_ceiling`, so a commit
-  whose bytes sit in ONE blob gains nothing however many threads there are.
+  and the fixtures say otherwise). Measured end to end through `get_diff_data` on a real
+  repository of gigabyte blobs: **80.1s → 17.9s (4.5x)** on a 37-file 3.2GB commit,
+  3.7x on a 16-file 2.5GB one, and **1.00x on a single-blob commit**, which is the shape
+  that cannot gain and does not lose.
+  **Workers CLAIM their next delta from a counter rather than taking a fixed share.**
+  Deltas differ enormously in cost — one file was 14.4s of a 54.1s pass and the next
+  14.0s — so a round-robin split loses to whichever worker draws two heavy ones: it
+  measured 2.75x where claiming measures 3.67x, on the same commit, against a floor of
+  3.76x.
+  `RowCostProbe::parallel_ceiling` is `total / max` over BYTES and is a **lower bound**
+  on what is available, not an upper one: cost tracks changed lines as much as bytes, so
+  the largest blob is not the slowest delta — measured 55.7 MB/s for an 871MB file
+  against 17.9 MB/s for a 97MB one in the same commit, which is why all three
+  multi-delta commits beat their byte ceiling. The real floor is the slowest single
+  delta.
   **Every clause of `parallel_patch_workers` is load-bearing**, and two of them are not
   obvious. A worker rebuilds the diff, so the source must be a TREE — a commit or a
   range — since a rebuild over a moving working tree could see a different delta list
