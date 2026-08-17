@@ -594,9 +594,9 @@ fn timed<T>(acc: &mut std::time::Duration, f: impl FnOnce() -> T) -> T {
 /// filter; each is its own change with its own oracle run. Everything not listed here
 /// falls back to the sorted revwalk, which is slow but correct.
 ///
-/// A path filter is a walk of its own on top of this one and is bounded separately —
-/// see `LAZY_FILTER_SHARE`, which is what keeps a cold pathspec from walking a whole
-/// repository the expensive way.
+/// A path filter is a walk of its own on top of this one — see `lazy_filtered_walk`,
+/// which runs to completion because the lazy walk is now cheaper than the sorted one at
+/// every size.
 pub const fn topo_scope(scope: &cli::Scope) -> bool {
     !scope.reflog && !scope.follow && scope.revs.is_empty()
 }
@@ -689,8 +689,8 @@ fn topo_oids(repo: &Repository, scope: &cli::Scope, want: usize) -> Option<Vec<g
 /// A walk that has stopped because it cannot answer, as opposed to having run out of
 /// commits.
 ///
-/// Only the lazy walk produces one — an ancestry-unclosed commit-graph, or a budget
-/// spent (`LAZY_FILTER_SHARE`) — and it is all-or-nothing: a partial topological prefix
+/// Only the lazy walk produces one — a commit-graph record it cannot read — and it is
+/// all-or-nothing: a partial topological prefix
 /// is indistinguishable from a complete one and would be drawn as though it were. So it
 /// rides in the item type, where the filter cannot consume an oid without handling it,
 /// rather than as a flag beside the iterator that a later reader could forget to ask
@@ -709,50 +709,6 @@ struct FilteredWalk {
     nearest: Nearest,
     tip: TipPaths,
 }
-
-/// How much of a repository the lazy walk may traverse for a path filter before the
-/// sorted revwalk becomes the cheaper way to answer.
-///
-/// **A budget is needed here and nowhere else, because a path filter is the one scope
-/// that need not stop early.** Every other scope wants `max` rows and takes the first
-/// `max` commits; a filter takes the first `max` commits that TOUCH something, and a
-/// pathspec nothing has touched lately — a file deleted years ago, or a typo — is
-/// satisfied only by the end of history.
-///
-/// The shape of the comparison is a fixed cost against a per-commit one. The sorted
-/// walk pays libgit2's ordering pass over the WHOLE repository before it yields
-/// anything — 50s on a 1.465M-commit kernel clone — and then ~79µs a commit examined;
-/// the lazy walk pays nothing up front and ~129µs a commit, since it reads each one
-/// through `find_commit` where that pass has already parsed the pack once. Those put
-/// the break-even at roughly **0.85 of the repository**, and a graph carrying
-/// changed-path filters moves it to 0.84 rather than anywhere new — the filters take
-/// work off both sides.
-///
-/// So the budget is not the break-even; it is where the LOSS is still acceptable when
-/// the walk turns out not to answer at all. A third of the repository, measured on that
-/// clone with no changed-path filters:
-///
-/// | pathspec | rows | commits walked | lazy | sorted |
-/// |---|---|---|---|---|
-/// | `MAINTAINERS` | 200 | 8.4k | **4.7s** | 50.7s |
-/// | `kernel/sched/core.c` | 200 | 51k | **11.9s** | 59.1s |
-/// | `Documentation/process/coding-style.rst` | 100 | 191k | **29.9s** | 71.5s |
-/// | the same file | 200 | 525k | over budget | 106.9s |
-/// | a mistyped path | 200 | all of it | 232s | **166s** |
-///
-/// The last row is the whole cost of being wrong: the give-up is ~38% on top of a query
-/// that was going to take minutes either way. The row above it is the cost of being too
-/// cautious — a fifth would have refused that one too, and a half would have caught it
-/// for another ~30s on the mistyped path. Both are defensible; this is the middle.
-const LAZY_FILTER_SHARE: usize = 3;
-
-/// The floor under that budget. A repository small enough to reach it answers in
-/// milliseconds either way, so this decides nothing about speed; what it decides is
-/// that the lazy filter is not a big-repository-only path that no ordinary run — and no
-/// test fixture — ever takes. Measured there it is a little SLOWER (56ms against 43ms
-/// on a 2.2k-commit repository), for the reason the table above gives: the sorted
-/// walk's per-commit cost is what a small repository makes negligible.
-const MIN_LAZY_FILTER_WALK: usize = 1_000;
 
 /// The commit-graph's changed-path Bloom filters, ready to answer for one scope's
 /// pathspec — the test `commit_touches_paths` costs ~90µs a commit on a large
@@ -1019,23 +975,33 @@ fn filtered_walk(
     })
 }
 
-/// How many commits the lazy filter may walk in a repository holding `commits`.
+/// The path filter over the LAZY walk, which runs to completion.
 ///
-/// Pure, so the arithmetic is pinned without a repository big enough to show it.
-const fn lazy_filter_budget(commits: usize) -> usize {
-    let share = commits / LAZY_FILTER_SHARE;
-    if share > MIN_LAZY_FILTER_WALK {
-        share
-    } else {
-        MIN_LAZY_FILTER_WALK
-    }
-}
-
-/// The path filter over the LAZY walk, bounded by `LAZY_FILTER_SHARE`.
+/// **It used to be bounded, and the bound is gone because its premise is.** A path
+/// filter is the one scope that need not stop early — a pathspec nothing has touched
+/// lately is satisfied only by the end of history — and the lazy walk used to cost MORE
+/// per commit than the sorted one (~129µs against ~79µs), so past a share of the
+/// repository the sorted walk's fixed ordering pass was the cheaper way to be wrong.
+/// That was the whole of `LAZY_FILTER_SHARE`.
 ///
-/// `None` when this scope or repository cannot be walked lazily at all, and when the
-/// walk declined or spent its budget — the caller then answers the slow way, having
-/// wasted at most that budget.
+/// Reading parents from `CDAT` inverted it. The per-commit work is now the same code
+/// on both drivers — a commit read, a path tested, a parent rewritten — and what
+/// differs is a fixed cost each pays once: the lazy walk's own traversal against
+/// libgit2's ordering pass. Measured on a 1.465M-commit kernel clone:
+///
+/// | graph | pathspec | commits walked | lazy | sorted |
+/// |---|---|---|---|---|
+/// | `--changed-paths` | `Documentation/process/coding-style.rst` | 191k | **9.5s** | 89.6s |
+/// | `--changed-paths` | a mistyped path | all of it | **43.1s** | 170.3s |
+/// | plain | `Documentation/process/coding-style.rst` | 191k | **31.1s** | 86.0s |
+///
+/// The walk's own term is 5.5s over 191k commits and 13.3s over all 1.465M, against an
+/// ordering pass of 59.8–72.4s whatever the answer costs. So there is no crossover left
+/// to budget for: the lazy walk wins at every size, and the row a budget existed to
+/// protect — a mistyped path, which walks everything — is the row it now wins by 4×.
+///
+/// `None` when this scope or repository cannot be walked lazily at all, or when the
+/// walk declined; the caller then answers the slow way.
 fn lazy_filtered_walk(
     repo: &Repository,
     scope: &cli::Scope,
@@ -1046,23 +1012,9 @@ fn lazy_filtered_walk(
         return None;
     }
     let graph = crate::commitgraph::CommitGraph::for_repo(repo)?;
-    let budget = lazy_filter_budget(graph.len());
-    lazy_filtered_walk_bounded(repo, scope, max, ref_map, &graph, budget)
-}
-
-/// `lazy_filtered_walk` with the budget stated, which is how a test drives the
-/// give-up path without a repository large enough to reach the real one.
-fn lazy_filtered_walk_bounded(
-    repo: &Repository,
-    scope: &cli::Scope,
-    max: usize,
-    ref_map: &std::collections::HashMap<git2::Oid, Vec<(String, RefKind)>>,
-    graph: &crate::commitgraph::CommitGraph,
-    budget: usize,
-) -> Option<FilteredWalk> {
     let tips = topo_tips(repo, scope)?;
-    let bloom = PathBloom::of(graph, scope);
-    let mut walk = crate::topo::TopoWalk::new(repo, graph, &tips, scope.first_parent);
+    let bloom = PathBloom::of(&graph, scope);
+    let mut walk = crate::topo::TopoWalk::new(repo, &graph, &tips, scope.first_parent);
     let mut taken = 0usize;
     let t = std::time::Instant::now();
     let out = filtered_walk(
@@ -1073,15 +1025,6 @@ fn lazy_filtered_walk_bounded(
         "lazy",
         bloom.as_ref(),
         std::iter::from_fn(|| {
-            if taken >= budget {
-                log::debug!(
-                    "perf: load_commits: lazy path filter stopped at its {budget}-commit \
-                     budget (a {LAZY_FILTER_SHARE}th of the {} in the commit-graph); past \
-                     that the sorted walk answers for less",
-                    graph.len()
-                );
-                return Some(Err(Declined));
-            }
             taken += 1;
             match walk.next() {
                 Some((oid, parents)) => Some(Ok((oid, Some(parents)))),
@@ -1238,8 +1181,8 @@ pub fn load_commits_inner(
     //
     // A path filter is its own walk: it drops commits and rewrites the parents of what
     // is left, so neither the oid cache below nor a plain prefix means anything for it.
-    // The lazy walk is tried first and falls back to the sorted one — see
-    // `LAZY_FILTER_SHARE` for the budget that bounds the attempt.
+    // The lazy walk is tried first and falls back to the sorted one only where it
+    // cannot answer at all — see `lazy_filtered_walk` for why it is no longer bounded.
     let walked = if !scope.paths.is_empty() {
         // Armed for the duration of the walk and cancelled by falling out of this
         // block: a filtered walk is 51s on a 1.47M-commit clone, and either driver can
@@ -3935,13 +3878,12 @@ mod tests {
     }
 
     /// A pathspec nothing near the tip touches — a file deleted years ago, or a typo —
-    /// is what the budget exists for: the lazy walk would traverse the whole repository
-    /// at more per commit than the sorted one costs, so past a share of it (see
-    /// `LAZY_FILTER_SHARE`) the sorted walk answers for less. Measured on a kernel
-    /// clone, a mistyped path costs 166s sorted and 232s with the lazy attempt in front
-    /// of it.
+    /// used to be what the budget existed for: the lazy walk would traverse the whole
+    /// repository at more per commit than the sorted one cost. It now walks the lot and
+    /// answers, which on a kernel clone is 43.1s against the sorted walk's 170.3s — the
+    /// row the budget was protecting is the row the walk now wins by 4×.
     #[test]
-    fn a_cold_pathspec_gives_the_lazy_filter_up_rather_than_walking_everything() {
+    fn a_cold_pathspec_walks_the_repository_out_rather_than_giving_up() {
         let (dir, repo) = temp_repo();
         let old = commit_file(&repo, "old.txt", "1", "the only commit touching old.txt");
         let mut tip = old;
@@ -3955,36 +3897,18 @@ mod tests {
             ..Default::default()
         };
         let ref_map = build_ref_map(&repo);
-        let graph = crate::commitgraph::CommitGraph::for_repo(&repo).unwrap();
 
-        assert!(
-            lazy_filtered_walk_bounded(&repo, &scope, 100, &ref_map, &graph, 3).is_none(),
-            "a budget the filter cannot answer within must give up, not truncate"
-        );
-        // The same walk with room to finish keeps the row, so the give-up above is the
-        // budget and not the fixture.
-        let ample = lazy_filtered_walk_bounded(&repo, &scope, 100, &ref_map, &graph, 100)
-            .expect("room to finish");
-        assert_eq!(ample.kept.len(), 1);
-        assert_eq!(ample.kept[0].oid, old);
-        // And the loader answers anyway, having fallen back.
+        // The row is at the very bottom of the history, so the walk only reaches it by
+        // examining everything above it — which is exactly what a budget would have cut
+        // short.
+        let out = lazy_filtered_walk(&repo, &scope, 100, &ref_map).expect("no budget to spend");
+        assert_eq!(out.kept.len(), 1);
+        assert_eq!(out.kept[0].oid, old);
+        assert_eq!(out.walked, 11, "every commit examined, none skipped");
         assert_eq!(
             summaries(&load_commits(&repo, 100, &scope)),
             vec!["the only commit touching old.txt".to_string()]
         );
-    }
-
-    /// The budget is a share of the repository, because what it is compared against —
-    /// the sorted walk — costs the whole repository however shallow the answer is. The
-    /// floor is not about speed (a repository that small answers in milliseconds either
-    /// way) but about the lazy filter not being a big-repository-only path that no
-    /// ordinary run and no fixture ever takes.
-    #[test]
-    fn the_lazy_filter_budget_is_a_share_of_the_repository_with_a_floor() {
-        assert_eq!(lazy_filter_budget(1_465_141), 488_380);
-        assert_eq!(lazy_filter_budget(50_000), 16_666);
-        assert_eq!(lazy_filter_budget(2_000), MIN_LAZY_FILTER_WALK);
-        assert_eq!(lazy_filter_budget(0), MIN_LAZY_FILTER_WALK);
     }
 
     /// A commit-graph that is not closed under ancestry makes the walk decline

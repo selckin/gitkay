@@ -384,9 +384,16 @@ The big picture, ahead of the detail sections below:
   a change in, which gitkay keeps). Both checked against git on fixtures built for the
   two shapes. gitkay's rule is the one that matches the DIFF PANE: every row in a
   filtered view has a non-empty diff under that pathspec, and no row is listed whose
-  pane would be blank. The lazy driver is **bounded** (`LAZY_FILTER_SHARE`) because a
-  filter, unlike every other scope, need not stop early — see there for the five
-  measurements that set the share, and for the one case it deliberately makes slower.
+  pane would be blank. The lazy driver **runs to completion**, and used to be bounded:
+  a filter, unlike every other scope, need not stop early, and the lazy walk once cost
+  more per commit than the sorted one, so past a share of the repository being wrong the
+  slow way was cheaper. Reading parents from `CDAT` inverted that — the per-commit work
+  is now the same code on both drivers, and what differs is a fixed cost each pays once
+  (the walk's own traversal, 5.5s over 191k commits and 13.3s over all 1.465M, against
+  libgit2's 59.8–72.4s ordering pass). On a kernel clone the lazy filter is 9.5s against
+  89.6s on a real path, 31.1s against 86.0s without changed-path filters, and — the row
+  the budget existed for — **43.1s against 170.3s on a mistyped path that walks
+  everything**. See `lazy_filtered_walk` for the table.
   A ruled-out commit's object is **never read**: the loop needs only its parents, for
   the rewrite to chain through, and the lazy walk hands those over with the oid
   (`TopoWalk::next`) having read them once to build the indegree. On the kernel clone
