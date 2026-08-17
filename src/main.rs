@@ -1425,6 +1425,13 @@ const WRAP_INDEX_SLOW: std::time::Duration = std::time::Duration::from_millis(5)
 /// cleared, when there was still an index to drop — rather than on every frame
 /// thereafter, which would pin the scroll offset permanently and make the pane
 /// unscrollable.
+///
+/// Called from the render and nowhere else, which is what makes it lazy in the way
+/// `diff_linenos` is: a reader who leaves soft wrap off never pays the pass, and
+/// ticking it needs no hook of its own, "off" and "not measured yet" being one `None`.
+/// Three of the four inputs that invalidate an index are compared here, inside
+/// `WrapIndex::covers`; the fourth — a different diff with the same line count — is
+/// covered by `set_diff_content` and `resync_file_layout` dropping the index outright.
 fn resync_wrap_index(
     index: &mut Option<diff::WrapIndex>,
     wrap: bool,
@@ -5910,28 +5917,6 @@ impl GitkApp {
         self.sidebar_cache = SidebarCache::default();
     }
 
-    /// Bring `diff_wrap` up to date for the pane's current width and gutter, and
-    /// say whether the row mapping MOVED — which the caller turns into a scroll
-    /// target, because a re-wrap moves every visual row below the first line that
-    /// breaks differently and would otherwise scroll the pane out from under
-    /// whoever is dragging the window edge.
-    ///
-    /// Lazy for the same reason `diff_linenos` is: a reader who leaves soft wrap off
-    /// never pays the pass, and ticking it needs no hook of its own — "off" and "not
-    /// measured yet" are the same `None`. The three inputs that invalidate an index
-    /// are compared inside `WrapIndex::covers`; the fourth, a different diff with the
-    /// same line count, is covered by `set_diff_content` and `resync_file_layout`
-    /// dropping the index outright.
-    fn ensure_wrap_index(&mut self, cols: usize, gutter: LineNoGutter) -> bool {
-        resync_wrap_index(
-            &mut self.diff_wrap,
-            self.wrap,
-            &self.diff_lines,
-            cols,
-            gutter,
-        )
-    }
-
     /// File-list row height: `FILE_ROW_H` as the floor, growing with the configured
     /// `file_list` font so larger sizes don't overlap (mirrors the commit list).
     fn file_row_h(&self, ui: &egui::Ui) -> f32 {
@@ -7067,7 +7052,7 @@ impl GitkApp {
                             // installed, so the next frame simply draws them.
                             ui.checkbox(&mut self.line_numbers, "Line numbers");
                             // Also render-only, and also needing nothing here: the
-                            // render's `ensure_wrap_index` builds an index on the
+                            // render's `resync_wrap_index` builds an index on the
                             // frame after a tick and drops it on the frame after an
                             // untick, and reports EITHER as a move — which puts the
                             // reader back on the line they were reading, so the pane
@@ -8379,7 +8364,13 @@ impl eframe::App for GitkApp {
                     // presence depends on the content height, which depends on this.
                     let font_id = self.fonts.font_id(Role::Diff);
                     let cols = wrap_cols(ui, &font_id);
-                    let rewrapped = self.ensure_wrap_index(cols, linenos);
+                    let rewrapped = resync_wrap_index(
+                        &mut self.diff_wrap,
+                        self.wrap,
+                        &self.diff_lines,
+                        cols,
+                        linenos,
+                    );
                     // Read before the `&mut` borrow the scroll target takes below.
                     let top_line = self.diff_viewport.top_line();
                     let diff_view = DiffView {
