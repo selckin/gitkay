@@ -1621,18 +1621,19 @@ fn slow_walk_message(elapsed: std::time::Duration, rows: usize, cost: WalkCost) 
 /// revwalk and 1.0s once a commit-graph is there to walk lazily, and a path filter goes
 /// from 51s to 4.7s.
 ///
-/// **Three cases, because the fix is not always the same command.** A path filter also
-/// wants the changed-path index, which `--changed-paths` writes and nothing else does —
-/// so a repository that HAS a graph without one is worth a word too, but only when a
-/// pathspec is what was slow. Asking `has_changed_paths` rather than opening the
-/// filters keeps that check free.
+/// **Four cases, because the fix is not always the same command and the reason is not
+/// always the same either.** A path filter also wants the changed-path index, which
+/// `--changed-paths` writes and nothing else does — so a repository that HAS a graph
+/// without one is worth a word too, but only when a pathspec is what was slow. Asking
+/// `has_changed_paths` rather than opening the filters keeps that check free.
 ///
-/// **And that third case is NOT gated on `topo_scope`**, where the first two are. The
-/// laziness the other two promise is only available to a scope `topo_scope` accepts,
-/// so naming it elsewhere is the false promise above; the changed-path index is not —
-/// `sorted_filtered_walk` opens the filters for ANY filtered scope, so a range or a
-/// `--follow` walk saves exactly the same tree comparisons and has the same reason to
-/// be told.
+/// **Only the LAZINESS is gated on `topo_scope`.** It is available solely to a scope
+/// `topo_scope` accepts, so promising it elsewhere is a false promise; the changed-path
+/// index is not — `sorted_filtered_walk` opens the filters for ANY filtered scope, so a
+/// range or a `--follow` walk saves exactly the same tree comparisons and has the same
+/// reason to be told. That is why a filtered scope gets an answer whether or not it
+/// would walk lazily and whether or not a graph exists: only the sentence changes, and
+/// the one it gets promises exactly what its own walk would gain.
 pub fn commit_graph_advice(repo: &Repository, scope: &cli::Scope) -> Option<&'static str> {
     let graph = crate::commitgraph::CommitGraph::for_repo(repo);
     match (&graph, scope.paths.is_empty()) {
@@ -1646,6 +1647,17 @@ pub fn commit_graph_advice(repo: &Repository, scope: &cli::Scope) -> Option<&'st
              lazily and to skip commits without comparing trees: \
              `git commit-graph write --reachable --changed-paths` writes one (5min for 109MB \
              on a 1.47M-commit clone) and took the same filtered walk there from 51s to 4.7s",
+        ),
+        // A filtered scope the lazy walk does not cover — a range, a `--follow` — in a
+        // repository with no graph at all. It gains no laziness, so this promises none;
+        // it gains the tree comparisons the changed-path index skips, exactly as the
+        // arm below does for a graph that is merely missing the index.
+        (None, false) => Some(
+            "this repository has no commit-graph, so every commit walked is compared against \
+             the path filter by its trees: \
+             `git commit-graph write --reachable --changed-paths` writes one with the index \
+             that skips them, which took a filtered walk on a 1.47M-commit clone from 30s \
+             to 24s",
         ),
         (Some(g), false) if !g.has_changed_paths() => Some(
             "this repository's commit-graph carries no changed-path index, so every commit \
@@ -2771,6 +2783,19 @@ mod tests {
             commit_graph_advice(&repo, &scope(false, &["HEAD"])),
             None,
             "a scope that would ignore the file must not be told to write one"
+        );
+        // …but the same scope WITH a path filter still gains the changed-path index,
+        // and is told so — promising the index and not the laziness it would not get.
+        let ranged_no_graph = cli::Scope {
+            revs: vec!["HEAD".to_string()],
+            ..filtered.clone()
+        };
+        let advice = commit_graph_advice(&repo, &ranged_no_graph)
+            .expect("a filtered walk saves tree comparisons whether or not it is lazy");
+        assert!(advice.contains("--changed-paths"), "{advice}");
+        assert!(
+            !advice.contains("lazy"),
+            "this scope would not walk lazily, so nothing may promise it: {advice}"
         );
 
         write_commit_graph(&repo, &[tip]);
