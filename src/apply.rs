@@ -4008,7 +4008,7 @@ mod tests {
             &repo,
             settings,
             &RowScope::new(DiffSource::Staged),
-            BuildEnv::textconv(&tc),
+            BuildEnv::of(Some(&tc)),
         );
         let file = data.files.iter().find(|f| f.path == "a.zip").unwrap();
         assert!(

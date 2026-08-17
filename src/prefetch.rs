@@ -3225,7 +3225,7 @@ mod tests {
         // And the pane's own numbers for that row really are the converted ones, which
         // is what the column would have contradicted.
         let tc = Textconv::new();
-        let data = diff::get_diff_data(&repo, &scope, job(true).settings, BuildEnv::textconv(&tc));
+        let data = diff::get_diff_data(&repo, &scope, job(true).settings, BuildEnv::of(Some(&tc)));
         assert_eq!(
             diff::stats_from_data(&data).lines,
             LineStats::Counted(1, 1),

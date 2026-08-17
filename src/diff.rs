@@ -1260,14 +1260,12 @@ impl<'a> BuildEnv<'a> {
     };
 
     /// Drivers, no progress: the prefetch pool and the stats column.
+    ///
+    /// It takes the `Option` the field holds rather than offering a `&Textconv`
+    /// overload beside it. Both spellings existed and said the same thing, and the
+    /// second one was reachable only from tests.
     pub const fn of(tc: Option<&'a Textconv>) -> Self {
         Self { tc, progress: None }
-    }
-
-    /// `of`, for a caller holding the drivers themselves rather than an `Option`.
-    #[allow(dead_code)]
-    pub const fn textconv(tc: &'a Textconv) -> Self {
-        Self::of(Some(tc))
     }
 
     /// Drivers (when configured) and a progress sink: the foreground diff load.
@@ -4573,7 +4571,7 @@ pub mod tests {
         let head = commit_two_zips(&repo);
         let scope = RowScope::new(DiffSource::Commit(head));
         let tc = Textconv::new();
-        let data = get_diff_data(&repo, &scope, conv_settings(), BuildEnv::textconv(&tc));
+        let data = get_diff_data(&repo, &scope, conv_settings(), BuildEnv::of(Some(&tc)));
         assert_eq!(
             stats_from_data(&data),
             CommitStats {
