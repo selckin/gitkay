@@ -543,16 +543,7 @@ fn write_graph_of(repo: &git2::Repository, mut order: Vec<git2::Oid>, changed_pa
     }
 
     order.sort_unstable();
-    let mut fanout = [0u32; 256];
-    for oid in &order {
-        for slot in &mut fanout[oid.as_bytes()[0] as usize..] {
-            *slot += 1;
-        }
-    }
-    let mut oidf = Vec::new();
-    for v in fanout {
-        oidf.extend_from_slice(&v.to_be_bytes());
-    }
+    let oidf = crate::commitgraph::fanout_bytes(&order);
     // Every column filled with the commit's REAL tree, parents and time, not the
     // placeholders this once wrote for the ones `commitgraph` does not read.
     //
@@ -621,7 +612,7 @@ fn write_graph_of(repo: &git2::Repository, mut order: Vec<git2::Oid>, changed_pa
         }
     }
 
-    let chunks: Vec<(&[u8; 4], &Vec<u8>)> = if changed_path_filters {
+    let chunks: Vec<(&[u8; 4], &[u8])> = if changed_path_filters {
         vec![
             (b"OIDF", &oidf),
             (b"OIDL", &oidl),
@@ -632,25 +623,13 @@ fn write_graph_of(repo: &git2::Repository, mut order: Vec<git2::Oid>, changed_pa
     } else {
         vec![(b"OIDF", &oidf), (b"OIDL", &oidl), (b"CDAT", &cdat)]
     };
-    let mut out = vec![b'C', b'G', b'P', b'H', 1, 1, chunks.len() as u8, 0];
-    let mut at = out.len() as u64 + (chunks.len() as u64 + 1) * 12;
-    for (id, chunk) in &chunks {
-        out.extend_from_slice(*id);
-        out.extend_from_slice(&at.to_be_bytes());
-        at += chunk.len() as u64;
-    }
-    out.extend_from_slice(&[0u8; 4]);
-    out.extend_from_slice(&at.to_be_bytes());
-    for (_, chunk) in &chunks {
-        out.extend_from_slice(chunk);
-    }
     // git closes the file with a SHA-1 of everything before it, and libgit2 CHECKS it.
     // Zeroes fail that check, which is what keeps a fixture from reaching libgit2's own
     // walks — computing the real one would take a SHA-1 implementation this crate does
     // not have (git2 exposes only object hashing, which prepends a type header).
     // `commitgraph` reads chunk offsets and never the trailer, so its own reader is
     // unaffected either way.
-    out.extend_from_slice(&[0u8; 20]);
+    let out = crate::commitgraph::graph_file_bytes(&chunks, 20);
 
     let info = repo.commondir().join("objects").join("info");
     std::fs::create_dir_all(&info).unwrap();

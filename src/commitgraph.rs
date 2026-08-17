@@ -489,6 +489,59 @@ pub fn bloom_filter_bytes(paths: &[String], num_hashes: u32, hash_version: u32) 
     out
 }
 
+/// The `OIDF` chunk for `sorted` — the 256 cumulative counts git indexes an oid lookup
+/// through, one per leading byte, big-endian.
+///
+/// Beside the reader for the reason `bloom_filter_bytes` is: both fixture writers need
+/// it, and it is the half of the format a wrong value corrupts SILENTLY, since a
+/// fanout that disagrees with `OIDL` sends the binary search to the wrong window rather
+/// than failing to parse.
+#[cfg(test)]
+pub fn fanout_bytes(sorted: &[git2::Oid]) -> Vec<u8> {
+    let mut fanout = [0u32; 256];
+    for oid in sorted {
+        // Every bucket from this oid's first byte upward counts it.
+        for slot in &mut fanout[oid.as_bytes()[0] as usize..] {
+            *slot += 1;
+        }
+    }
+    let mut out = Vec::with_capacity(1024);
+    for v in fanout {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    out
+}
+
+/// A whole commit-graph file: the header, the chunk table of contents with each
+/// chunk's cumulative start offset, the terminating entry naming the end, then the
+/// bodies — followed by `trailer` bytes of zeroes where the caller wants the file to
+/// have git's trailing hash slot.
+///
+/// The offset arithmetic here is what both fixture writers had a copy of, and it is
+/// the part with no safe failure: libgit2 reads this file too, so a TOC that is wrong
+/// by twelve bytes does not fail a test in `commitgraph` — it quietly truncates
+/// `git2`'s own revwalk in whatever suite happens to use the fixture. One copy, next
+/// to the reader that has to agree with it.
+#[cfg(test)]
+pub fn graph_file_bytes(chunks: &[(&[u8; 4], &[u8])], trailer: usize) -> Vec<u8> {
+    let mut out = vec![b'C', b'G', b'P', b'H', VERSION, 1, chunks.len() as u8, 0];
+    // Each entry is a 4-byte id and an 8-byte offset, and the terminating entry is one
+    // more of them — so the bodies start past `chunks.len() + 1` of the pair.
+    let mut at = out.len() as u64 + (chunks.len() as u64 + 1) * 12;
+    for (id, chunk) in chunks {
+        out.extend_from_slice(*id);
+        out.extend_from_slice(&at.to_be_bytes());
+        at += chunk.len() as u64;
+    }
+    out.extend_from_slice(&[0u8; 4]); // terminating entry: id 0, end offset
+    out.extend_from_slice(&at.to_be_bytes());
+    for (_, chunk) in chunks {
+        out.extend_from_slice(chunk);
+    }
+    out.extend(std::iter::repeat_n(0u8, trailer));
+    out
+}
+
 /// Whether every one of `key`'s bits is set in `filter` — git's `bloom_filter_contains`,
 /// with the filter's bytes as its words.
 fn bloom_contains(filter: &[u8], key: BloomKey, num_hashes: u32) -> bool {
@@ -751,17 +804,8 @@ mod tests {
         sorted.sort_by_key(|(oid, _)| *oid);
         let n = sorted.len() as u32;
 
-        let mut fanout = [0u32; 256];
-        for (oid, _) in &sorted {
-            // Every bucket from this oid's first byte upward counts it.
-            for slot in &mut fanout[oid.as_bytes()[0] as usize..] {
-                *slot += 1;
-            }
-        }
-        let mut oidf = Vec::new();
-        for v in fanout {
-            oidf.extend_from_slice(&v.to_be_bytes());
-        }
+        let oids: Vec<git2::Oid> = sorted.iter().map(|(oid, _)| *oid).collect();
+        let oidf = fanout_bytes(&oids);
         let mut oidl = Vec::new();
         let mut cdat = Vec::new();
         for (oid, generation) in &sorted {
@@ -789,7 +833,7 @@ mod tests {
             }
         }
 
-        let chunks: Vec<(&[u8; 4], &Vec<u8>)> = if bloom.is_some() {
+        let chunks: Vec<(&[u8; 4], &[u8])> = if bloom.is_some() {
             vec![
                 (CHUNK_OID_FANOUT, &oidf),
                 (CHUNK_OID_LOOKUP, &oidl),
@@ -804,19 +848,10 @@ mod tests {
                 (CHUNK_COMMIT_DATA, &cdat),
             ]
         };
-        let mut out = vec![b'C', b'G', b'P', b'H', VERSION, 1, chunks.len() as u8, 0];
-        let mut at = out.len() as u64 + (chunks.len() as u64 + 1) * 12;
-        for (id, chunk) in &chunks {
-            out.extend_from_slice(*id);
-            out.extend_from_slice(&at.to_be_bytes());
-            at += chunk.len() as u64;
-        }
-        out.extend_from_slice(&[0u8; 4]); // terminating entry: id 0, end offset
-        out.extend_from_slice(&at.to_be_bytes());
-        for (_, chunk) in &chunks {
-            out.extend_from_slice(chunk);
-        }
-        assert_eq!(n, fanout[255]);
+        // No trailer: these fixtures are read by `commitgraph` alone, which never
+        // looks at one.
+        let out = graph_file_bytes(&chunks, 0);
+        assert_eq!(n as usize, oids.len());
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::File::create(path)
             .unwrap()
