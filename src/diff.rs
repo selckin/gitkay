@@ -5490,6 +5490,21 @@ mod parallel_patch_tests {
             (took, data.lines.len())
         };
 
+        // `BENCH_ONLY=seq` / `BENCH_ONLY=split` runs one shape alone, so an external
+        // `/usr/bin/time -v` attributes its peak RSS to that shape and not to whichever
+        // phase of a mixed run happened to be largest.
+        match std::env::var("BENCH_ONLY").as_deref() {
+            Ok("seq") => {
+                run("sequential only", 0);
+                return;
+            }
+            Ok("split") => {
+                run("split only", workers.first().copied().unwrap_or(8));
+                return;
+            }
+            _ => {}
+        }
+
         let (sequential, rows) = run("sequential", 0);
         for w in workers {
             if w < 2 {
