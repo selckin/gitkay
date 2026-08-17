@@ -578,6 +578,31 @@ The invariants:
   nothing, so a commit left cold — and its stats cell left blank — was indistinguishable
   from one never queued. `report_outstanding` (queue depth, on change) plus a line for
   each way `next_heavy` declines.
+- **The patch pass splits across threads for the build a reader is waiting on**, and
+  only there. Each worker opens its own `Repository` and rebuilds the diff — git2's
+  `Diff` is not `Sync`, so there is nothing to share — then generates its share of the
+  deltas with `Patch::from_diff(i)`, which is byte-for-byte what `Diff::print` emits for
+  that delta (pinned over a binary, a rename, a typechange and an `ignore_ws`-suppressed
+  delta, because git2 documents `from_diff` as returning `Ok(None)` for a binary file
+  and the fixtures say otherwise). Measured **6.4-6.8x** on eight 8MB deltas, end to end
+  through `get_diff_data`; the ceiling is `RowCostProbe::parallel_ceiling`, so a commit
+  whose bytes sit in ONE blob gains nothing however many threads there are.
+  **Every clause of `parallel_patch_workers` is load-bearing**, and two of them are not
+  obvious. A worker rebuilds the diff, so the source must be a TREE — a commit or a
+  range — since a rebuild over a moving working tree could see a different delta list
+  and attribute one file's rows to another; and the rebuild re-runs `detect_similar`,
+  which is ~300ns on a commit of modifications and **6.29s** on one made of add/delete
+  pairs of large blobs, so the pass that just ran hands its measured cost forward
+  (`DETECT_SIMILAR_COST`) and a build that paid it does not split. The size gate is
+  **bounded** (`PARALLEL_PATCH_PROBE_DELTAS`): an odb header read per side of every
+  delta measured 26ms on a 1000-file commit whose whole build was 66ms, which is a tax
+  on the shape with nothing to gain, and stopping after 64 deltas takes it to 1.4ms.
+  A worker that cannot reproduce the delta list abandons the attempt and the sequential
+  pass runs — the only answer that cannot render the wrong file's rows.
+  Two things a split pass must carry back that the sequential one reads off the shared
+  diff afterwards: the per-file counts, and the **binary sizes** the diffstat block
+  prints, which libgit2 fills in as it loads each blob and so exist only in the copy of
+  the diff that did the loading.
 - **A diff's cost tracks bytes read, not changed lines** — a 3-line patch inside a 265MB
   file is ~11s. Rows are probed (`diff::probe_row_cost`) before being built, and a
   driven row (textconv) is costly whatever its size. **Rename detection reads those
