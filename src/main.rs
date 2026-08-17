@@ -2530,13 +2530,7 @@ fn clip_row_text(text: &str) -> Option<usize> {
 fn window_spans(spans: &[highlight::Span], w: &std::ops::Range<usize>) -> Vec<highlight::Span> {
     spans
         .iter()
-        .filter(|(_, r)| r.start < w.end && w.start < r.end)
-        .map(|(c, r)| {
-            (
-                *c,
-                r.start.max(w.start) - w.start..r.end.min(w.end) - w.start,
-            )
-        })
+        .filter_map(|(c, r)| Some((*c, clip_to_window(r, w)?)))
         .collect()
 }
 
@@ -2545,11 +2539,19 @@ fn window_ranges(
     ranges: &[std::ops::Range<usize>],
     w: &std::ops::Range<usize>,
 ) -> Vec<std::ops::Range<usize>> {
-    ranges
-        .iter()
-        .filter(|r| r.start < w.end && w.start < r.end)
-        .map(|r| r.start.max(w.start) - w.start..r.end.min(w.end) - w.start)
-        .collect()
+    ranges.iter().filter_map(|r| clip_to_window(r, w)).collect()
+}
+
+/// One range cut to `w` and rebased to it, or `None` where the two do not overlap —
+/// the half both functions above are about, written once because it is the half that
+/// is easy to get wrong: the truncation of a STRADDLING range is what keeps visible
+/// text from vanishing, and it was previously spelled out separately in each.
+fn clip_to_window(
+    r: &std::ops::Range<usize>,
+    w: &std::ops::Range<usize>,
+) -> Option<std::ops::Range<usize>> {
+    (r.start < w.end && w.start < r.end)
+        .then(|| r.start.max(w.start) - w.start..r.end.min(w.end) - w.start)
 }
 
 /// Say that a row was clipped, and by how much. A no-op for `cut = None`, which is
@@ -2695,13 +2697,20 @@ fn diff_row_job(
         job.append(&gutter, 0.0, fmt(palette.dim));
     }
 
+    // The text this row draws, derived ONCE for both exits below — two things narrow
+    // it and they compose: the wrap slice, and the `MAX_ROW_RENDER_CHARS` clip applied
+    // to whatever the slice left (so the clip is a no-op under wrapping, where a slice
+    // is already a window wide). Derived here rather than in each branch because the
+    // structural exit is the one nobody thinks about, and it is as able to carry an
+    // enormous row as a patch line is.
+    let whole = line.rendered();
+    let text = whole.get(slice.range.clone()).unwrap_or("");
+    let cut = clip_row_text(text);
+
     // Non-code lines (hunk/file header/meta/stat) take one flat colour in both modes.
     // Clipped like any other row: a commit message is a header line, and nothing stops
     // one being a single enormous paragraph.
     if !line.kind.is_code() {
-        let whole = line.rendered();
-        let text = whole.get(slice.range.clone()).unwrap_or("");
-        let cut = clip_row_text(text);
         job.append(
             cut.map_or(text, |at| &text[..at]),
             0.0,
@@ -2760,14 +2769,8 @@ fn diff_row_job(
     // un-emphasized; the per-frame viewport pass fills visible lines in.
     let emphasis: &[std::ops::Range<usize>] = if word_diff { row.emphasis } else { &[] };
     let emph_bg = (!emphasis.is_empty()).then(|| emphasis_bg(line.kind, palette, backdrop));
-    // The window this row draws, and with it the spans and emphasis that index into
-    // the body — all three have to be cut together or the ranges outlive the text
-    // they point at. Two things narrow it and they compose: the wrap slice, and the
-    // `MAX_ROW_RENDER_CHARS` clip applied to whatever the slice left (which is
-    // therefore a no-op under wrapping, where a slice is a window wide).
-    let whole = line.rendered();
-    let text = whole.get(slice.range.clone()).unwrap_or("");
-    let cut = clip_row_text(text);
+    // The spans and emphasis index into the body, so they are cut to the same window
+    // the text was — all three together, or the ranges outlive the text they point at.
     let window = slice.range.start..slice.range.start + cut.unwrap_or(text.len());
     // `Cow`, so the ordinary unwrapped row — every row of every ordinary diff —
     // borrows what it already has, and a sliced or clipped one owns the two short
