@@ -1079,6 +1079,11 @@ sorted drivers keep the same rows with the same rewritten parents.
   denominator (`Loading diff… 143/2310 files · src/…/Foo.java (11.5s)`). There was a
   third, `Summarising`, for the `Diff::stats` pass — it went when that pass did (see
   **Diffstat**) rather than staying as a state nothing can reach.
+  **A split patch pass writes into this from several threads**, which the count
+  survives unchanged (`fetch_add` over "deltas whose generation has STARTED") while the
+  NAME becomes one of the files in flight rather than the one — so the
+  file-name-says-where-the-time-is-going reading below holds for a build that did not
+  split, and a split build is by definition not stuck on one file.
   **The counter and the clock cover opposite shapes and both are needed**: a commit
   touching thousands of files advances the counter, while a three-line patch inside a
   265MB blob sits on `1/1` for eleven seconds — there the file NAME says where the time

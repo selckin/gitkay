@@ -259,6 +259,11 @@ impl WrapIndex {
     ) -> Self {
         let mut tall: Vec<Tall> = Vec::new();
         let mut starts: Vec<usize> = Vec::new();
+        // Tabbed lines the arena had no room for, which are re-walked per draw. Counted
+        // so the degradation is not silent: `MAX_WRAPPED_LINES`'s refusal says so out
+        // loud, and this one costs the same kind of thing — per-frame work nobody asked
+        // for — while looking identical from outside.
+        let mut denied = 0usize;
         let mut total_rows: usize = 0;
         let mut tabless = true;
         for (line, l) in lines.iter().enumerate() {
@@ -308,6 +313,7 @@ impl WrapIndex {
                     starts_at = u32::try_from(at).unwrap_or(NO_STARTS);
                 } else {
                     starts.truncate(at);
+                    denied += 1;
                 }
                 rows
             };
@@ -328,6 +334,13 @@ impl WrapIndex {
                 starts_at,
             });
             total_rows += rows;
+        }
+        if denied > 0 {
+            log::debug!(
+                "wrap: {denied} tabbed lines are past the {max_starts}-offset row-start \
+                 cap and are re-walked per draw ({} recorded)",
+                starts.len()
+            );
         }
         Self {
             active: true,
