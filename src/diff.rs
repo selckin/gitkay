@@ -1156,21 +1156,15 @@ pub enum DiffPhase {
 }
 
 impl DiffPhase {
-    const fn code(self) -> u8 {
-        match self {
-            Self::Preparing => 0,
-            Self::Patching => 2,
-        }
-    }
-
-    /// Anything but the codes above is unreachable — `code` is the only writer — and
-    /// resolves to the phase that claims the least. (The gap at 1 is the removed
-    /// `Summarising`; the values are private and never persisted, so closing it would
-    /// buy nothing and only invite a reader to assume they mean something.)
-    const fn of_code(code: u8) -> Self {
-        match code {
-            2 => Self::Patching,
-            _ => Self::Preparing,
+    /// The sink stores the phase as the one bit it needs — "has the patch pass
+    /// started?" — and this is where that becomes the reported phase. A third phase
+    /// would have nowhere to live, which is the point: it has to be dealt with here
+    /// rather than silently resolving to whichever value a wider code fell through to.
+    const fn of(patching: bool) -> Self {
+        if patching {
+            Self::Patching
+        } else {
+            Self::Preparing
         }
     }
 }
@@ -1190,7 +1184,11 @@ impl DiffPhase {
 /// to fill in, so both leave it `None` and pay nothing at all.
 #[derive(Default)]
 pub struct DiffProgress {
-    phase: std::sync::atomic::AtomicU8,
+    /// Has the patch pass started? One bit, because there are two phases and
+    /// `DiffPhase` says why there will not be a third. A sink belongs to one build and
+    /// only ever moves forward, so its default already IS `Preparing` and nothing has
+    /// to write that — `start_patch` is the only writer.
+    patching: std::sync::atomic::AtomicBool,
     files_done: std::sync::atomic::AtomicUsize,
     files_total: std::sync::atomic::AtomicUsize,
     /// The delta whose patch is being generated. A lock rather than an atomic because
@@ -1213,16 +1211,11 @@ pub struct DiffProgressReport {
 }
 
 impl DiffProgress {
-    fn set_phase(&self, phase: DiffPhase) {
-        self.phase
-            .store(phase.code(), std::sync::atomic::Ordering::Relaxed);
-    }
-
     /// Take a sample: phase, counts and the current path.
     pub fn report(&self) -> DiffProgressReport {
         use std::sync::atomic::Ordering::Relaxed;
         DiffProgressReport {
-            phase: DiffPhase::of_code(self.phase.load(Relaxed)),
+            phase: DiffPhase::of(self.patching.load(Relaxed)),
             files_done: self.files_done.load(Relaxed),
             files_total: self.files_total.load(Relaxed),
             file: self
@@ -1285,21 +1278,13 @@ impl<'a> BuildEnv<'a> {
         }
     }
 
-    /// The `Option` juggling lives here, once, so the build sites read as plain
-    /// statements of what stage they are at.
-    fn phase(self, phase: DiffPhase) {
-        if let Some(p) = self.progress {
-            p.set_phase(phase);
-        }
-    }
-
-    /// The patch pass is starting, over `total` deltas.
+    /// The patch pass is starting, over `total` deltas — the sink's only phase write,
+    /// the preparing one being what a fresh sink already says.
     fn start_patch(self, total: usize) {
-        if let Some(p) = self.progress {
-            p.files_total
-                .store(total, std::sync::atomic::Ordering::Relaxed);
-        }
-        self.phase(DiffPhase::Patching);
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(p) = self.progress else { return };
+        p.files_total.store(total, Relaxed);
+        p.patching.store(true, Relaxed);
     }
 
     /// A delta's patch is being generated.
@@ -1929,7 +1914,7 @@ pub fn build_diff_data<'r>(
     what: &str,
     build: impl FnOnce(&'r Repository, &mut DiffOptions) -> Result<git2::Diff<'r>, git2::Error>,
 ) -> DiffData {
-    env.phase(DiffPhase::Preparing);
+    // No phase to announce here: a sink starts at `Preparing`, and this is it.
     let diff = match scoped_diff(repo, settings, &scope.paths, build) {
         Ok(d) => d,
         Err(e) => {
