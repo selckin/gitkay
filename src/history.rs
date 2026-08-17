@@ -1443,60 +1443,74 @@ pub fn load_commits_tail(
     // ever to disagree, resuming one from the other's prefix would splice two
     // orderings and draw a parent above its own child, and the anchor check is the
     // second line rather than the first.
-    if let Some(oids) = topo_oids(repo, scope, skip + max_new) {
-        let mut iter = oids.into_iter();
-        let mut seen = HashSet::new();
-        let mut last = None;
-        let mut skipped = 0;
-        while skipped < skip {
-            let oid = iter.next()?;
-            if seen.insert(oid) {
-                last = Some(oid);
-                skipped += 1;
-            }
-        }
-        if last != Some(expect_last) {
-            return None;
-        }
-        let ref_map = build_ref_map(repo);
-        let commits =
-            build_commits_from_walk(repo, iter, &mut seen, &ref_map, max_new, scope.first_parent);
-        log::debug!(
-            "perf: load_commits_tail: +{} commits (skipped {skip}, topo) {:?}",
-            commits.len(),
-            t.elapsed()
-        );
-        return Some(commits);
-    }
-    let mut iter = history_revwalk(repo, scope)?.flatten();
-    // Skip the already-loaded prefix — oid iteration only, none of the
-    // find_commit/CommitInfo work — counting like load_commits counts (`seen`
-    // dedup is defensive parity; git2's revwalk doesn't emit duplicates).
+    let (label, commits) = match topo_oids(repo, scope, skip + max_new) {
+        Some(oids) => (
+            "topo",
+            resume_from(repo, scope, oids.into_iter(), skip, expect_last, max_new)?,
+        ),
+        None => (
+            "sorted",
+            resume_from(
+                repo,
+                scope,
+                history_revwalk(repo, scope)?.flatten(),
+                skip,
+                expect_last,
+                max_new,
+            )?,
+        ),
+    };
+    log::debug!(
+        "perf: load_commits_tail: +{} commits (skipped {skip}, {label}) {:?}",
+        commits.len(),
+        t.elapsed()
+    );
+    Some(commits)
+}
+
+/// Skip `skip` oids off `walk`, check the anchor, and build the next `max_new` rows.
+///
+/// One function for both walks, not two copies of it: the resume is only sound while
+/// the two skip, dedupe and count IDENTICALLY — which is the same reason
+/// `build_commits_from_walk` is shared — so the parity is structural here rather than
+/// something two hand-kept loops have to preserve.
+///
+/// `None` when the walk is shorter than the prefix, or when the anchor moved: either
+/// way the walk no longer reproduces the one the prefix came from (the repo changed
+/// underneath, and the debounced watcher reload follows with a full rebuild anyway).
+/// The skip itself is oid iteration only — none of the `find_commit`/`CommitInfo` work
+/// — and the `seen` dedup is defensive parity with `load_commits`; git2's revwalk does
+/// not emit duplicates and neither does `TopoWalk`.
+fn resume_from(
+    repo: &Repository,
+    scope: &cli::Scope,
+    mut walk: impl Iterator<Item = git2::Oid>,
+    skip: usize,
+    expect_last: git2::Oid,
+    max_new: usize,
+) -> Option<Vec<CommitInfo>> {
     let mut seen = HashSet::new();
     let mut last = None;
     let mut skipped = 0;
     while skipped < skip {
-        let oid = iter.next()?; // walk shorter than the prefix ⇒ repo changed
+        let oid = walk.next()?;
         if seen.insert(oid) {
             last = Some(oid);
             skipped += 1;
         }
     }
-    // The resume is only sound if this walk reproduces the one the prefix came
-    // from; a moved anchor means the repo changed underneath (the debounced
-    // watcher reload will follow with a full rebuild anyway).
     if last != Some(expect_last) {
         return None;
     }
     let ref_map = build_ref_map(repo);
-    let commits =
-        build_commits_from_walk(repo, iter, &mut seen, &ref_map, max_new, scope.first_parent);
-    log::debug!(
-        "perf: load_commits_tail: +{} commits (skipped {skip}) {:?}",
-        commits.len(),
-        t.elapsed()
-    );
-    Some(commits)
+    Some(build_commits_from_walk(
+        repo,
+        walk,
+        &mut seen,
+        &ref_map,
+        max_new,
+        scope.first_parent,
+    ))
 }
 
 /// Pathspec to scope a commit's diff to. In --follow mode it's the file's name *at
