@@ -1986,8 +1986,8 @@ fn parallel_patch_workers(
         let forced = forced.min(diff.deltas().len());
         return (forced > 1).then_some(forced);
     }
-    // LAST, because it is the only clause that costs anything, and BOUNDED, because it
-    // is paid by every build and repaid only by the ones it says yes to.
+    // LAST, because it is the only clause that costs anything — every cheap answer
+    // above gets to say no before a single odb header is read.
     if !carries_blob_bytes(repo, diff, PARALLEL_PATCH_MIN_BYTES) {
         return None;
     }
@@ -2001,36 +2001,34 @@ fn parallel_patch_workers(
     Some(workers)
 }
 
-/// Deltas the size gate will look at before giving up on a diff.
-///
-/// The gate's cost is an odb header read per side per delta, which measured **23ms on
-/// a 1000-file commit whose whole build was 70ms** — a third again on exactly the shape
-/// that gains nothing from splitting, since a thousand small files are a thousand small
-/// blobs. (Loose objects, so a packed repo is cheaper; the bound is designed against the
-/// worse case.) Unbounded, the gate is a tax on every many-file commit for a payoff only
-/// big-blob commits collect.
-///
-/// Sixty-four is past every shape this exists for: the commits that motivated it touch
-/// 1 to 53 files and carry gigabytes, so they cross the threshold within the first few
-/// deltas and stop. What it gives up is a diff whose bytes are spread thinly over
-/// hundreds of files — which is the shape with the least to gain per delta anyway.
-const PARALLEL_PATCH_PROBE_DELTAS: usize = 64;
-
-/// Do this diff's first deltas alone already carry `min_bytes` of blob?
+/// Does this diff carry `min_bytes` of blob?
 ///
 /// Deliberately NOT `probe_deltas`, which is the app's one answer to "how big is this
-/// row" and computes it exactly, over every delta, because its callers threshold on the
-/// total. This asks a bounded question and stops at the first answer that settles it —
-/// as soon as the running total is over, and in any case after
-/// `PARALLEL_PATCH_PROBE_DELTAS`.
+/// row": that computes the total exactly because its callers threshold on it, where
+/// this only has to know whether one threshold is crossed and stops the moment it is.
+/// On the commits this exists for — gigabytes in tens of files — that is two or three
+/// deltas.
 ///
-/// A header that cannot be read contributes 0, as it does there: an unreadable object
-/// will fail the build too, and the answer to "should this be split" is then no, which
-/// is the safe direction.
+/// **It reads every delta, and a delta cap was tried and removed.** The cost is an odb
+/// header read per side, which measured 5.2µs a delta on a packed repository and ~26µs
+/// on an all-loose one; capping it at 64 deltas took a 1000-file build's gate from 26ms
+/// to 1.4ms. But the cap declines any diff whose bytes are spread thinly, and that shape
+/// is not the one with nothing to gain — measured on the kernel's SPDX sweep, 11,139
+/// files and 122MB with no delta over 616KB: **3.55s sequential against 1.35s split,
+/// 2.63×**, which the cap gave up to save 58ms.
+///
+/// Unbounded the ratio is self-limiting, because the probe and the build both scale
+/// with the delta count: where the probe is expensive in absolute terms it is 1.6% of
+/// the build in front of it (that sweep), and where it is a large FRACTION the build is
+/// tens of milliseconds and so is the probe.
+///
+/// A header that cannot be read contributes 0, as it does in `probe_deltas`: an
+/// unreadable object will fail the build too, and the answer to "should this be split"
+/// is then no, which is the safe direction.
 fn carries_blob_bytes(repo: &Repository, diff: &git2::Diff<'_>, min_bytes: u64) -> bool {
     let Ok(odb) = repo.odb() else { return false };
     let mut total: u64 = 0;
-    for delta in diff.deltas().take(PARALLEL_PATCH_PROBE_DELTAS) {
+    for delta in diff.deltas() {
         for file in [delta.old_file(), delta.new_file()] {
             let id = file.id();
             if id.is_zero() {
@@ -5418,6 +5416,31 @@ mod parallel_patch_tests {
             );
             println!("  warm-up (bare print): {printed:?} ({n} rows)");
 
+            // What the size gate costs on THIS repository, capped against uncapped —
+            // the measurement that retired the cap.
+            for (label, bound) in [("first 64 deltas", 64), ("every delta", usize::MAX)] {
+                let reps = 5;
+                let t = Instant::now();
+                for _ in 0..reps {
+                    let odb = repo.odb().expect("odb");
+                    let mut total: u64 = 0;
+                    for delta in diff.deltas().take(bound) {
+                        for f in [delta.old_file(), delta.new_file()] {
+                            if !f.id().is_zero()
+                                && let Ok((size, _)) = odb.read_header(f.id())
+                            {
+                                total = total.saturating_add(size as u64);
+                            }
+                        }
+                        if total >= PARALLEL_PATCH_MIN_BYTES {
+                            break;
+                        }
+                    }
+                    std::hint::black_box(total);
+                }
+                println!("  gate probe {label}: {:?}", t.elapsed() / reps);
+            }
+
             // The ceiling above is a BYTES model, and bytes are a proxy for time rather
             // than time itself. Time each delta on its own to see what the real floor
             // is: the split cannot beat the slowest single delta, whichever that is.
@@ -5477,6 +5500,21 @@ mod parallel_patch_tests {
             let speedup = sequential.as_secs_f64() / par.as_secs_f64();
             println!("REAL {rev}: {w} workers = {speedup:.2}x");
         }
+
+        // The shipped gate, deciding for itself — including whether to split at all.
+        // On a repository of small files this is the number that matters: it is what a
+        // commit that gains nothing PAYS to find that out.
+        let repo = open();
+        let progress = DiffProgress::default();
+        let t = Instant::now();
+        let data = get_diff_data(&repo, &scope, s, BuildEnv::tracked(None, &progress));
+        let shipped = t.elapsed();
+        assert_eq!(rows, data.lines.len());
+        let ratio = sequential.as_secs_f64() / shipped.as_secs_f64();
+        println!(
+            "  as shipped: {shipped:?} ({} rows) = {ratio:.2}x",
+            data.lines.len()
+        );
     }
 
     /// GATE BENCH: what the split pass COSTS a build it will not split — the odb
@@ -5548,8 +5586,8 @@ mod parallel_patch_tests {
         .expect("diffs");
         let deltas = diff.deltas().len();
         for (label, bound) in [
-            ("bounded (what the gate does)", PARALLEL_PATCH_PROBE_DELTAS),
-            ("unbounded (what it used to)", usize::MAX),
+            ("first 64 deltas", 64),
+            ("every delta (what the gate does)", usize::MAX),
         ] {
             let t = Instant::now();
             let reps = 20;
