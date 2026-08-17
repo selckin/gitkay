@@ -268,11 +268,12 @@ impl<'a> TopoWalk<'a> {
         let mut out = Vec::with_capacity(max.min(4096));
         while out.len() < max {
             // A finished walk is success; a walk that cannot answer is not, and the
-            // two are told apart by whether anything is left to do.
-            let more = self.ready.is_empty() && self.frontier.is_empty();
+            // two are told apart by whether anything is left to do. Asked AFTER the
+            // call, which also covers the already-finished case: `next` over an empty
+            // stack and an empty frontier changes nothing, so `done` is still true.
             match self.next() {
                 Some(oid) => out.push(oid),
-                None if more || self.done() => break,
+                None if self.done() => break,
                 None => return None,
             }
         }
