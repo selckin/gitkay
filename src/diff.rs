@@ -782,6 +782,7 @@ pub type DiffParts = (
     Arc<Vec<FileEntry>>,
     usize,
     bool,
+    bool,
 );
 
 pub struct DiffData {
@@ -815,6 +816,24 @@ pub struct DiffData {
     /// installed. Deliberately absent from the store's byte layout: an entry on disk
     /// has it false by construction, since a failed one is never written.
     pub textconv_failed: bool,
+    /// Was this diff PROVEN to hold no TAB anywhere?
+    ///
+    /// `diff::wrap` has to charge a tab `TAB_COLS` columns for one byte, so an index
+    /// over a diff that might hold one is measured by walking each line's characters
+    /// instead of comparing its `len()` — a pass over the TEXT where the rest is a pass
+    /// over the LINES, ~400ms/GB against 20ms. That pass used to run on the FRAME LOOP,
+    /// inside the render, on the first frame after every install: `set_diff_content`
+    /// drops the index, so the next one is a `build` rather than a `rewidth` and the
+    /// census had nothing to inherit. The build already touches every byte of every row
+    /// it assembles, so it answers the question there instead — `DiffRows` measures it
+    /// at the same push it measures `max_chars` at, which is what makes it true of
+    /// every row rather than of the patch body alone.
+    ///
+    /// **False means "it has one" OR "nobody looked"**, never an assumption — the same
+    /// reading `WrapIndex::tabless` has, and what lets a diff assembled by hand, or
+    /// decoded from a store written before this existed, simply pay the scan as it
+    /// always did.
+    pub tabless: bool,
 }
 
 impl DiffData {
@@ -856,6 +875,7 @@ impl DiffData {
             files: Arc::new(files),
             max_chars,
             textconv_failed: false,
+            tabless: false,
         }
     }
 
@@ -875,8 +895,9 @@ impl DiffData {
             files,
             max_chars,
             textconv_failed,
+            tabless,
         } = self;
-        (lines, spans, files, max_chars, textconv_failed)
+        (lines, spans, files, max_chars, textconv_failed, tabless)
     }
 
     /// Reassemble what `into_parts` split — the stash path returning the *displayed*
@@ -890,6 +911,7 @@ impl DiffData {
         files: Arc<Vec<FileEntry>>,
         max_chars: usize,
         textconv_failed: bool,
+        tabless: bool,
     ) -> Self {
         // The one invariant the split gave up on being structural: index `i` has to mean
         // row `i` in both, so the two lengths have to agree. Every writer goes through
@@ -905,6 +927,7 @@ impl DiffData {
             files,
             max_chars,
             textconv_failed,
+            tabless,
         }
     }
 
@@ -961,6 +984,19 @@ fn widen(max: &mut usize, line: &DiffLine) {
     }
 }
 
+/// Does this row hold a TAB?
+///
+/// Over the raw `text`, where `diff::wrap` asks over `rendered()` — a superset, since
+/// the marker `rendered()` strips is `+`, `-` or a space. So a row this calls tab-free
+/// is tab-free there too, which is the direction that has to hold: the claim is only
+/// ever used to SKIP a scan.
+///
+/// `memchr` rather than a byte loop, for the reason `diff::wrap` gives: 699µs against
+/// 7.4ms over the 8.3MB single line that module exists for.
+fn holds_tab(line: &DiffLine) -> bool {
+    memchr::memchr(b'\t', line.text.as_bytes()).is_some()
+}
+
 /// The rows a diff build is accumulating, with the widest one measured as they go.
 ///
 /// `DiffData::max_chars` sizes the pane's horizontal scroll range, and `DiffData::new`
@@ -979,6 +1015,8 @@ fn widen(max: &mut usize, line: &DiffLine) {
 struct DiffRows {
     lines: Vec<DiffLine>,
     max_chars: usize,
+    /// Is every row pushed so far free of TABs? See `DiffData::tabless`.
+    tabless: bool,
 }
 
 /// A point in a `DiffRows` a build can rewind to. Carries the widest row seen at that
@@ -987,17 +1025,20 @@ struct DiffRows {
 struct RowMark {
     len: usize,
     max_chars: usize,
+    tabless: bool,
 }
 
 impl DiffRows {
     /// Start from rows the caller assembled itself — a diff's header block — measuring
     /// them: a commit message line is routinely the widest row in a small diff.
     fn new(lines: Vec<DiffLine>) -> Self {
-        let mut max_chars = 0;
-        for line in &lines {
-            widen(&mut max_chars, line);
-        }
-        Self { lines, max_chars }
+        let mut rows = Self {
+            lines: Vec::new(),
+            max_chars: 0,
+            tabless: true,
+        };
+        rows.extend(lines);
+        rows
     }
 
     const fn len(&self) -> usize {
@@ -1006,6 +1047,7 @@ impl DiffRows {
 
     fn push(&mut self, line: DiffLine) {
         widen(&mut self.max_chars, &line);
+        self.tabless &= !holds_tab(&line);
         self.lines.push(line);
     }
 
@@ -1029,6 +1071,7 @@ impl DiffRows {
     fn set(&mut self, i: usize, line: DiffLine) {
         if let Some(slot) = self.lines.get_mut(i) {
             widen(&mut self.max_chars, &line);
+            self.tabless &= !holds_tab(&line);
             *slot = line;
         }
     }
@@ -1037,6 +1080,7 @@ impl DiffRows {
         RowMark {
             len: self.lines.len(),
             max_chars: self.max_chars,
+            tabless: self.tabless,
         }
     }
 
@@ -1048,11 +1092,12 @@ impl DiffRows {
     fn rewind(&mut self, mark: RowMark) {
         self.lines.truncate(mark.len);
         self.max_chars = mark.max_chars;
+        self.tabless = mark.tabless;
     }
 
-    /// The rows and the width measured over them, for `DiffData::with_max_chars`.
-    fn finish(self) -> (Vec<DiffLine>, usize) {
-        (self.lines, self.max_chars)
+    /// The rows and what was measured over them, for `build_diff_data`.
+    fn finish(self) -> (Vec<DiffLine>, usize, bool) {
+        (self.lines, self.max_chars, self.tabless)
     }
 }
 
@@ -1945,9 +1990,10 @@ pub fn build_diff_data<'r>(
             bytes.parallel_ceiling()
         );
     }
-    let (lines, max_chars) = rows.finish();
+    let (lines, max_chars, tabless) = rows.finish();
     DiffData {
         textconv_failed: failed,
+        tabless,
         ..DiffData::with_max_chars(lines, files, max_chars)
     }
 }
@@ -3260,6 +3306,43 @@ pub mod tests {
         }
     }
 
+    /// `tabless` is a claim the wrap index SKIPS work on, so it has to be true of every
+    /// row a build emits and not merely of the patch body — a header or diffstat row
+    /// slipping past the census would have `slice` measure a tabbed line by `len()`,
+    /// which under-counts it by three columns per tab and clips text where wrapping
+    /// leaves no horizontal scroll to reach it.
+    ///
+    /// Checked against a rescan for the same reason `max_chars` is, and over a fixture
+    /// whose commit MESSAGE holds the only tab — the case a census of the patch alone
+    /// gets wrong.
+    #[test]
+    fn tabless_is_true_of_every_row_a_build_emits() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let rescan = |d: &DiffData| d.lines.iter().all(|l| !l.text.contains('\t'));
+
+        let (_d, repo, oid) = everything_repo();
+        for show_stats in [false, true] {
+            let s = DiffSettings {
+                show_stats,
+                ..base_settings()
+            };
+            let data = diff_of(&repo, oid, s, None);
+            assert_eq!(data.tabless, rescan(&data), "show_stats={show_stats}");
+        }
+
+        // A tab in the commit message and nowhere else: the patch body is clean, so a
+        // census that only watched `push_patch_line` would call this diff tab-free.
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", "a\n", "base");
+        let oid = commit_file(&repo, "f.txt", "a\nb\n", "subject\n\n\tindented body");
+        let data = diff_of(&repo, oid, base_settings(), None);
+        assert!(
+            data.lines.iter().any(|l| l.text.contains('\t')),
+            "control: the header really carries the tab"
+        );
+        assert!(!data.tabless, "and the build must not claim otherwise");
+    }
+
     /// The header block is the caller's, assembled before `append_diff_body` runs, and
     /// a commit message line is routinely the widest row in a small diff — so
     /// `DiffRows::new` measures what it is handed rather than starting at zero.
@@ -3301,7 +3384,7 @@ pub mod tests {
                 .collect();
             lines.rotate_left(widest);
             rows.extend(lines);
-            let (lines, max_chars) = rows.finish();
+            let (lines, max_chars, _) = rows.finish();
             assert_eq!(max_chars, lines.iter().map(row_chars).max().unwrap());
             assert_eq!(max_chars, 21);
         }
@@ -3321,7 +3404,7 @@ pub mod tests {
         assert!(rows.max_chars > mark.max_chars, "control: the row is wider");
         rows.rewind(mark);
         assert_eq!(rows.len(), 1);
-        let (lines, max_chars) = rows.finish();
+        let (lines, max_chars, _) = rows.finish();
         assert_eq!(max_chars, lines.iter().map(row_chars).max().unwrap());
     }
 
@@ -3335,7 +3418,7 @@ pub mod tests {
         rows.reserve_blank(2, LineKind::Stat);
         assert_eq!(rows.max_chars, 0, "an empty placeholder widens nothing");
         rows.set(1, DiffLine::new("a filled stat row", LineKind::Stat));
-        let (lines, max_chars) = rows.finish();
+        let (lines, max_chars, _) = rows.finish();
         assert_eq!(max_chars, lines.iter().map(row_chars).max().unwrap());
         assert_eq!(max_chars, "a filled stat row".len());
     }

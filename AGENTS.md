@@ -1238,6 +1238,17 @@ sorted drivers keep the same rows with the same rewritten parents.
   drag runs every frame — skips the pass entirely. `resync_wrap_index` therefore
   re-measures through `rewidth` and not `build` whenever it has an index to carry
   that census over.
+  **The census itself belongs to the BUILD, not to the render.** `set_diff_content`
+  drops the index, so the frame after every commit switch took `build` and re-read
+  every byte of the diff on the frame loop — the module's own promise ("scanned once
+  and not again while it is on screen") held only because the 8.3M-character line it
+  was written for happens to be tab-free. `DiffData::tabless` is the answer the build
+  already had: `DiffRows` folds it in at the same push it measures `max_chars` at, so
+  it covers the header and diffstat rows and not just the patch body — a row slipping
+  past would have `slice` measure a tabbed line by `len()`, the one failure mode this
+  is all about. It rides in the store's header beside `max_chars` for the same reason
+  (a store hit is the path that exists to be fast), and `false` means "has one" OR
+  "nobody looked", so an entry from an older store just pays the scan as before.
   The index is **sparse**: only the lines that wrap are stored (`line`, `first_row`,
   `rows`), because in an ordinary diff none do and the mapping is the identity. A
   prefix sum over all lines would be 306MB to describe a 76.5M-line diff in which

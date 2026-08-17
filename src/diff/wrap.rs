@@ -157,11 +157,23 @@ impl WrapIndex {
     /// Measure `lines` against a pane `cols` columns wide with `gutter`'s
     /// line-number columns in front of each patch row.
     ///
-    /// This is the one entry point that reads the diff's TEXT, to find its tabs —
-    /// see the module header for why that is the expensive half. `rewidth` is the
-    /// one to call when only the pane moved.
-    pub fn build(lines: &[DiffLine], cols: usize, gutter: LineNoGutter) -> Self {
-        Self::measure(lines, cols, gutter, false)
+    /// This is the entry point that reads the diff's TEXT, to find its tabs — see the
+    /// module header for why that is the expensive half. `rewidth` is the one to call
+    /// when only the pane moved.
+    ///
+    /// `known_tabless` is the BUILD's answer to the same question
+    /// (`DiffData::tabless`), which it gets for nothing: it is already touching every
+    /// byte of every row it assembles, on a worker, where this runs on the frame loop
+    /// inside the render. Pass `false` — "nobody looked" — and the census runs here as
+    /// it always did, which is what a hand-assembled diff and an entry from an older
+    /// store both do.
+    pub fn build(
+        lines: &[DiffLine],
+        cols: usize,
+        gutter: LineNoGutter,
+        known_tabless: bool,
+    ) -> Self {
+        Self::measure(lines, cols, gutter, known_tabless)
     }
 
     /// Re-measure the SAME diff at a new width, keeping what this index already
@@ -491,7 +503,7 @@ mod tests {
     #[test]
     fn a_diff_that_fits_the_pane_is_the_identity() {
         let lines = ctx_lines(&[0, 10, 40, 79]);
-        let idx = WrapIndex::build(&lines, 100, LineNoGutter::default());
+        let idx = WrapIndex::build(&lines, 100, LineNoGutter::default(), false);
         assert!(idx.active());
         assert_eq!(idx.total_rows(), 4);
         for l in 0..4 {
@@ -504,7 +516,7 @@ mod tests {
     fn a_line_exactly_as_wide_as_the_pane_takes_one_row_and_one_byte_more_takes_two() {
         // A context row: no gutter, one marker column, so the body gets 99 of 100.
         let lines = ctx_lines(&[99, 100]);
-        let idx = WrapIndex::build(&lines, 100, LineNoGutter::default());
+        let idx = WrapIndex::build(&lines, 100, LineNoGutter::default(), false);
         assert_eq!(idx.row_of_line(0), 0);
         assert_eq!(idx.row_of_line(1), 1); // the 99-byte line took one row
         assert_eq!(idx.total_rows(), 3); // and the 100-byte one took two
@@ -525,7 +537,7 @@ mod tests {
             .collect();
         let lines = ctx_lines(&widths);
         for cols in [20, 47, 100] {
-            let idx = WrapIndex::build(&lines, cols, LineNoGutter::default());
+            let idx = WrapIndex::build(&lines, cols, LineNoGutter::default(), false);
             let rows = brute_force(&lines, cols, LineNoGutter::default());
             let mut row = 0;
             for (l, &n) in rows.iter().enumerate() {
@@ -547,7 +559,7 @@ mod tests {
     #[test]
     fn the_slices_of_a_line_tile_it_exactly() {
         let lines = vec![line(&"abcdefghij".repeat(30), LineKind::Context)];
-        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default());
+        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default(), false);
         let rows = idx.total_rows();
         assert!(rows > 1);
         let mut at = 0;
@@ -575,7 +587,7 @@ mod tests {
         // being floored.
         let text = "日".repeat(60);
         let lines = vec![line(&text, LineKind::Context)];
-        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default());
+        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default(), false);
         let mut at = 0;
         for sub in 0..idx.total_rows() {
             let s = idx.slice(0, &lines[0], sub);
@@ -605,14 +617,14 @@ mod tests {
     #[test]
     fn a_pane_squeezed_to_nothing_still_wraps_at_a_floor() {
         let lines = ctx_lines(&[1000]);
-        let idx = WrapIndex::build(&lines, 0, LineNoGutter::default());
+        let idx = WrapIndex::build(&lines, 0, LineNoGutter::default(), false);
         assert_eq!(idx.total_rows(), 1000_usize.div_ceil(MIN_BODY_COLS));
     }
 
     #[test]
     fn an_empty_line_still_takes_one_row() {
         let lines = ctx_lines(&[0, 0]);
-        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default());
+        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default(), false);
         assert_eq!(idx.total_rows(), 2);
         assert_eq!(
             idx.slice(0, &lines[0], 0),
@@ -628,7 +640,7 @@ mod tests {
         // One line over the cap is enough to prove the shape; the cap itself is a
         // memory ceiling, not a behaviour.
         let lines = ctx_lines(&vec![200; MAX_WRAPPED_LINES + 1]);
-        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default());
+        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default(), false);
         assert!(!idx.active());
         assert_eq!(idx.total_rows(), lines.len());
         assert_eq!(idx.row_of_line(12_345), 12_345);
@@ -647,7 +659,7 @@ mod tests {
     fn covers_asks_about_all_three_inputs() {
         let lines = ctx_lines(&[10, 10]);
         let g = LineNoGutter::default();
-        let idx = WrapIndex::build(&lines, 40, g);
+        let idx = WrapIndex::build(&lines, 40, g, false);
         assert!(idx.covers(2, 40, g));
         assert!(!idx.covers(3, 40, g));
         assert!(!idx.covers(2, 41, g));
@@ -691,7 +703,7 @@ mod tests {
         let g = LineNoGutter::default();
         let lines: Vec<DiffLine> = bodies.iter().map(|b| line(b, LineKind::Context)).collect();
         for &cols in widths {
-            let idx = WrapIndex::build(&lines, cols, g);
+            let idx = WrapIndex::build(&lines, cols, g, false);
             let width = body_cols(LineKind::Context, cols, g);
             for (i, l) in lines.iter().enumerate() {
                 let rows = idx.row_of_line(i + 1) - idx.row_of_line(i);
@@ -752,7 +764,7 @@ mod tests {
         let text = format!("\t\t{}", "abcdefghij".repeat(20));
         let lines = vec![line(&text, LineKind::Context)];
         assert!(
-            WrapIndex::build(&lines, 40, LineNoGutter::default()).total_rows() > 1,
+            WrapIndex::build(&lines, 40, LineNoGutter::default(), false).total_rows() > 1,
             "the fixture has to wrap, or this asserts nothing"
         );
         check_rows(std::slice::from_ref(&text), &[40]);
@@ -770,10 +782,10 @@ mod tests {
             .collect();
         let plain = ctx_lines(&[10, 300, 10]);
         for lines in [&tabbed, &plain] {
-            let mut idx = WrapIndex::build(lines, 100, g);
+            let mut idx = WrapIndex::build(lines, 100, g, false);
             for cols in [80, 40, 20, 100] {
                 idx = idx.rewidth(lines, cols, g);
-                let fresh = WrapIndex::build(lines, cols, g);
+                let fresh = WrapIndex::build(lines, cols, g, false);
                 assert_eq!(idx.total_rows(), fresh.total_rows(), "at cols={cols}");
                 for l in 0..=lines.len() {
                     assert_eq!(idx.row_of_line(l), fresh.row_of_line(l), "at cols={cols}");
@@ -787,17 +799,17 @@ mod tests {
         }
         // A different diff that happens to reach here is measured, not assumed:
         // the carried census describes lines this one does not have.
-        let grew = WrapIndex::build(&tabbed, 100, g).rewidth(&plain, 40, g);
+        let grew = WrapIndex::build(&tabbed, 100, g, false).rewidth(&plain, 40, g);
         assert_eq!(
             grew.total_rows(),
-            WrapIndex::build(&plain, 40, g).total_rows()
+            WrapIndex::build(&plain, 40, g, false).total_rows()
         );
     }
 
     #[test]
     fn lines_of_rows_covers_the_window() {
         let lines = ctx_lines(&[10, 300, 10, 10]);
-        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default());
+        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default(), false);
         // Line 1 wraps to rows 1..=8 (300 bytes over 39 columns).
         let n = 300_usize.div_ceil(39);
         assert_eq!(idx.row_of_line(2), 1 + n);

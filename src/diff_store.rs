@@ -24,10 +24,12 @@ const MAGIC: &[u8; 8] = b"gitkayD\x00";
 /// build. 4: `FileEntry::is_converted` joined the file record — a textconv-driven
 /// file's patch names coordinates in text that exists in no blob, and the write
 /// layer refuses a hunk click on it, so an entry that lost the flag on the way to
-/// disk would come back applicable-by-hunk and fail as `Stale`. Note this guards
+/// disk would come back applicable-by-hunk and fail as `Stale`. 5: `DiffData::tabless`
+/// joined the header beside `max_chars`, so a store hit does not pay the frame-loop tab
+/// census the build path stopped paying. Note this guards
 /// the LAYOUT only — a change to what the diff BUILDER emits is invisible here,
 /// which is why `StoreContext` mixes in the crate version.
-const VERSION: u16 = 4;
+const VERSION: u16 = 5;
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
@@ -241,6 +243,11 @@ fn encode(data: &DiffData) -> Vec<u8> {
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
     put_u64(&mut out, data.max_chars as u64);
+    // Beside `max_chars`, and for the same reason: both are facts the BUILD measured
+    // that the display would otherwise re-derive by traversing the whole diff on the
+    // frame loop. Without it here a store hit — the path that exists to be fast — pays
+    // the tab census the build path no longer does. See `DiffData::tabless`.
+    out.push(u8::from(data.tabless));
 
     put_u64(&mut out, data.lines.len() as u64);
     for l in data.lines.iter() {
@@ -286,6 +293,7 @@ fn decode(bytes: &[u8]) -> Option<DiffData> {
         return None;
     }
     let max_chars = usize::try_from(r.u64()?).ok()?;
+    let tabless = r.u8()? != 0;
 
     let n_lines = r.count(LINE_MIN_BYTES)?;
     let mut lines = Vec::with_capacity(n_lines);
@@ -337,7 +345,10 @@ fn decode(bytes: &[u8]) -> Option<DiffData> {
     }
 
     // Trailing bytes mean the file is not what this version writes.
-    (r.pos == bytes.len()).then(|| DiffData::with_max_chars(lines, files, max_chars))
+    (r.pos == bytes.len()).then(|| DiffData {
+        tabless,
+        ..DiffData::with_max_chars(lines, files, max_chars)
+    })
 }
 
 /// Everything about the repository that changes a diff without changing a commit.
