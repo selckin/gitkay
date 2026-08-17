@@ -1095,6 +1095,20 @@ impl DiffRows {
         self.tabless = mark.tabless;
     }
 
+    /// Append rows ALREADY measured, with what was measured over them.
+    ///
+    /// The one way into this type that does not measure, and it does not weaken the
+    /// rule the others keep: a caller here is handing over both the rows and the two
+    /// facts a `push` would have derived from them. It exists for the parallel patch
+    /// pass, whose workers each accumulate into a `DiffRows` of their own — re-deriving
+    /// at the merge would be a second traversal of every row of the diff, on the thread
+    /// that just avoided the first.
+    fn extend_measured(&mut self, rows: Vec<DiffLine>, max_chars: usize, tabless: bool) {
+        self.max_chars = self.max_chars.max(max_chars);
+        self.tabless &= tabless;
+        self.lines.extend(rows);
+    }
+
     /// The rows and what was measured over them, for `build_diff_data`.
     fn finish(self) -> (Vec<DiffLine>, usize, bool) {
         (self.lines, self.max_chars, self.tabless)
@@ -1526,12 +1540,13 @@ fn append_diff_body(
     lines: &mut DiffRows,
     files: &mut Vec<FileEntry>,
     repo: &Repository,
-    source: DiffSource,
+    scope: &RowScope,
     diff: &git2::Diff,
     settings: DiffSettings,
     env: BuildEnv<'_>,
 ) -> bool {
     let tc = env.tc;
+    let source = scope.source;
     // Collect file stats. `FileEntry::path_bytes` is the identity key for matching
     // patch lines back to their file below — `files[i].path` is a lossy display
     // string, so two non-UTF-8 names could share one and collide.
@@ -1658,6 +1673,31 @@ fn append_diff_body(
     // The delta count is the denominator the placeholder shows. `files` is one entry
     // per delta (built above), so this is the count libgit2 is about to walk.
     env.start_patch(files.len());
+
+    // **The pass across threads, where that is both safe and worth it.** Every
+    // condition is in `parallel_patch_workers`, and the attempt is allowed to fail: a
+    // worker that cannot reproduce the delta list this build is rendering returns
+    // nothing and the sequential pass below runs instead, which is the only answer that
+    // cannot render the wrong file's rows. See `performance.md` §1.
+    if let Some(patches) = parallel_patch_workers(
+        repo,
+        scope,
+        env,
+        (0..files.len()).any(|i| driver_at(i).is_some()),
+        diff,
+    )
+    .and_then(|workers| parallel_delta_patches(repo, scope, settings, env, diff, workers))
+    {
+        let sizes: Vec<(u64, u64)> = patches.iter().map(|p| p.sizes).collect();
+        merge_delta_patches(lines, files, patches);
+        finish_stats_block(lines, files, &sizes, stats_at);
+        // The sweep below has nothing to do — it emits driven deltas the print never
+        // headed, and this path only runs where nothing is driven. `failed` likewise
+        // stays false: the one thing that could set it is a print error, and a worker
+        // that hits one abandons the attempt rather than reporting a short diff.
+        return lookup_failed || resolved.is_some_and(|r| r.failed);
+    }
+
     let printed = diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
         // The file header is BOTH the delta boundary and where a driven delta is
         // substituted, and the ordering is exact rather than lucky: `diff_print.c:604`
@@ -1776,36 +1816,11 @@ fn append_diff_body(
         failed = true;
     }
 
-    // Now the counts are final, so the reserved rows can be written. BEFORE the sweep
-    // below, which reorders `files` — the block is in delta order, as libgit2's is, and
-    // `diff.get_delta(i)` (the binary sizes) is indexed the same way. A swept file is
-    // the one case that misses its counts here, and it is a driven file, whose row this
-    // block already renders differently from libgit2 on purpose.
-    if let Some(at) = stats_at {
-        let entries: Vec<diffstat::StatFile<'_>> = files
-            .iter()
-            .enumerate()
-            .map(|(i, f)| diffstat::StatFile {
-                old_path: f.old_path.as_deref(),
-                new_path: &f.path,
-                insertions: f.additions,
-                deletions: f.deletions,
-                // The sizes are libgit2's, read off the delta the pass just generated
-                // — they are filled in as the blob is loaded, so they are only there
-                // to be read after the print.
-                binary: f.is_binary.then(|| {
-                    diff.get_delta(i)
-                        .map_or((0, 0), |d| (d.old_file().size(), d.new_file().size()))
-                }),
-            })
-            .collect();
-        for (row, text) in diffstat::block(&entries, STAT_WIDTH)
-            .into_iter()
-            .enumerate()
-        {
-            lines.set(at + row, DiffLine::new(text, LineKind::Stat));
-        }
-    }
+    let sizes: Vec<(u64, u64)> = diff
+        .deltas()
+        .map(|d| (d.old_file().size(), d.new_file().size()))
+        .collect();
+    finish_stats_block(lines, files, &sizes, stats_at);
 
     // The sweep. A delta whose hunks are ALL suppressed by `ignore_ws` never flushes
     // its header (`should_force_header` is false), so the 'F' callback never fires and
@@ -1871,6 +1886,364 @@ fn append_diff_body(
     failed || lookup_failed || resolved.is_some_and(|r| r.failed)
 }
 
+/// Blob bytes below which the patch pass is not worth splitting across threads.
+///
+/// Each worker opens its own `Repository` and rebuilds the diff — git2's `Diff` is not
+/// `Sync`, so there is nothing to share — which measured ~1.3ms apiece on a small repo.
+/// Against a build of a few milliseconds that is the whole cost and none of the
+/// benefit; against one of seconds it is noise. 64 MiB is ~3.5s of xdiff at the
+/// ~55ms/MB the cost model uses, so the split only ever runs where there are seconds to
+/// win.
+const PARALLEL_PATCH_MIN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Most threads one patch pass will split itself across.
+///
+/// The gain is bounded by `RowCostProbe::parallel_ceiling` — one delta cannot be split,
+/// so a commit whose bytes sit in one blob gains nothing however many threads there are
+/// — and the ceiling on a real repo of gigabyte blobs measured 1.0x to 3.7x. Eight is
+/// past that with room, and is what the prefetch pool already allows itself.
+const PARALLEL_PATCH_MAX_WORKERS: usize = 8;
+
+/// One delta's patch, generated on a worker: the rows, and the counts `push_patch_line`
+/// accumulated while building them.
+struct DeltaPatch {
+    rows: Vec<DiffLine>,
+    entry: FileEntry,
+    /// What the worker's own `DiffRows` measured over `rows`, so the merge appends
+    /// rather than re-measuring — see `DiffRows::extend_measured`.
+    max_chars: usize,
+    tabless: bool,
+    /// `(old, new)` blob sizes, which the diffstat block prints for a binary file.
+    ///
+    /// Read from the WORKER's delta, after its patch printed, because that is the only
+    /// copy of this diff whose blobs were ever loaded — libgit2 fills these in as it
+    /// reads them, so the main thread's delta still says `0 -> 0`. The oracle caught
+    /// exactly that: `Bin 4 -> 5 bytes` against `Bin 0 -> 0 bytes`.
+    sizes: (u64, u64),
+}
+
+/// May this build split its patch pass across threads, and into how many?
+///
+/// `None` — the usual answer — means the sequential pass. Every clause is a fact
+/// already in hand rather than a fresh measurement, because this decision sits directly
+/// in front of the pass it is deciding about.
+fn parallel_patch_workers(
+    repo: &Repository,
+    scope: &RowScope,
+    env: BuildEnv<'_>,
+    driven: bool,
+    diff: &git2::Diff<'_>,
+) -> Option<usize> {
+    // **Only the build a reader is waiting on.** The progress sink is what says so
+    // (`BuildEnv::tracked` is the foreground load and nothing else), and it is the right
+    // question twice over: the prefetch pool and the stats column are ALREADY parallel
+    // across rows, so splitting one of their builds would take cores from the other
+    // rows rather than from nobody, and it would multiply the transient blob memory the
+    // heavy lane admits each row against.
+    env.progress?;
+    // A worker rebuilds this diff from `scope.source`, so the source has to be the same
+    // thing twice. A commit and a range are trees, which are immutable; the working
+    // tree and the index are not, and a rebuild that saw a different delta LIST would
+    // attribute one file's rows to another.
+    if !matches!(scope.source, DiffSource::Commit(_) | DiffSource::Range(_)) {
+        return None;
+    }
+    // A driven delta is substituted mid-print from state the whole diff shares — the
+    // prefixes captured off the first parseable header, the `headed` set the sweep
+    // reads. All of that is sequential by construction, and a driven row is routed to
+    // the heavy lane for a cost that is a subprocess rather than bytes anyway.
+    if driven {
+        return None;
+    }
+    // What a worker pays before it can generate anything: it rebuilds the diff, and the
+    // rebuild runs `detect_similar` again. That is ~300ns on a commit of modifications
+    // and SECONDS on one made of add/delete pairs of large blobs (measured: 6.29s for
+    // eight 32MB files), where paying it per worker would cost more than the split
+    // saves. The pass that just ran timed it, so this is a fact and not an estimate.
+    if DETECT_SIMILAR_COST.with(std::cell::Cell::get) >= SLOW_DETECT_SIMILAR {
+        return None;
+    }
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let workers = cores
+        .min(PARALLEL_PATCH_MAX_WORKERS)
+        .min(diff.deltas().len());
+    // Never more workers than deltas: one delta is one unit of work, which is the same
+    // thing `parallel_ceiling` says from the other side.
+    if workers <= 1 {
+        return None;
+    }
+    // A test says "pretend this diff is big enough", and nothing else. Every clause
+    // above stays live — the fixtures really do carry a progress sink and really are
+    // commits — because a suite that bypassed the gate wholesale would prove the merge
+    // works and say nothing about when it runs. The alternative is a 64MB fixture,
+    // which is a test nobody runs.
+    #[cfg(test)]
+    if let Some(forced) = tests::forced_parallel_workers() {
+        // 0 pins the sequential pass, which a test comparing the two needs as much as
+        // it needs the split one — this fixture is otherwise big enough to trip the
+        // real gate, and a "sequential" baseline that quietly split would report a
+        // speedup of 1.0x and look like the feature doing nothing.
+        let forced = forced.min(diff.deltas().len());
+        return (forced > 1).then_some(forced);
+    }
+    // LAST, because it is the only clause that costs anything, and BOUNDED, because it
+    // is paid by every build and repaid only by the ones it says yes to.
+    if !carries_blob_bytes(repo, diff, PARALLEL_PATCH_MIN_BYTES) {
+        return None;
+    }
+    // Only when it says yes: a line per declined build would be one per commit switch,
+    // and what a reader wants to know is that a build they are waiting on was split and
+    // into how many parts.
+    log::debug!(
+        "perf: splitting the patch pass over {} deltas across {workers} threads",
+        diff.deltas().len()
+    );
+    Some(workers)
+}
+
+/// Deltas the size gate will look at before giving up on a diff.
+///
+/// The gate's cost is an odb header read per side per delta, which measured **23ms on
+/// a 1000-file commit whose whole build was 70ms** — a third again on exactly the shape
+/// that gains nothing from splitting, since a thousand small files are a thousand small
+/// blobs. (Loose objects, so a packed repo is cheaper; the bound is designed against the
+/// worse case.) Unbounded, the gate is a tax on every many-file commit for a payoff only
+/// big-blob commits collect.
+///
+/// Sixty-four is past every shape this exists for: the commits that motivated it touch
+/// 1 to 53 files and carry gigabytes, so they cross the threshold within the first few
+/// deltas and stop. What it gives up is a diff whose bytes are spread thinly over
+/// hundreds of files — which is the shape with the least to gain per delta anyway.
+const PARALLEL_PATCH_PROBE_DELTAS: usize = 64;
+
+/// Do this diff's first deltas alone already carry `min_bytes` of blob?
+///
+/// Deliberately NOT `probe_deltas`, which is the app's one answer to "how big is this
+/// row" and computes it exactly, over every delta, because its callers threshold on the
+/// total. This asks a bounded question and stops at the first answer that settles it —
+/// as soon as the running total is over, and in any case after
+/// `PARALLEL_PATCH_PROBE_DELTAS`.
+///
+/// A header that cannot be read contributes 0, as it does there: an unreadable object
+/// will fail the build too, and the answer to "should this be split" is then no, which
+/// is the safe direction.
+fn carries_blob_bytes(repo: &Repository, diff: &git2::Diff<'_>, min_bytes: u64) -> bool {
+    let Ok(odb) = repo.odb() else { return false };
+    let mut total: u64 = 0;
+    for delta in diff.deltas().take(PARALLEL_PATCH_PROBE_DELTAS) {
+        for file in [delta.old_file(), delta.new_file()] {
+            let id = file.id();
+            if id.is_zero() {
+                continue; // that side has no blob (an add, or a delete)
+            }
+            if let Ok((size, _)) = odb.read_header(id) {
+                total = total.saturating_add(size as u64);
+            }
+        }
+        if total >= min_bytes {
+            return true;
+        }
+    }
+    false
+}
+
+/// Generate every delta's patch across `workers` threads, in delta order.
+///
+/// **Returns `None` for anything surprising, and the caller then runs the sequential
+/// pass.** A worker that cannot open the repository, cannot rebuild the diff, or
+/// rebuilds one whose deltas are not the ones this build is rendering has no way to
+/// produce the right rows, and there is exactly one safe response to that: don't. The
+/// cost of the fallback is the work already done, which is why the check is the first
+/// thing a worker does rather than something the merge discovers.
+fn parallel_delta_patches(
+    repo: &Repository,
+    scope: &RowScope,
+    settings: DiffSettings,
+    env: BuildEnv<'_>,
+    diff: &git2::Diff<'_>,
+    workers: usize,
+) -> Option<Vec<DeltaPatch>> {
+    let n = diff.deltas().len();
+    // The delta list this build is rendering, as a worker has to see it again. Paths
+    // and statuses only — enough that a rebuild yielding a different set is caught
+    // before a single row is attributed to the wrong file.
+    let expected: Vec<(Vec<u8>, git2::Delta)> = diff
+        .deltas()
+        .map(|d| (delta_path_bytes(&d).to_vec(), d.status()))
+        .collect();
+    let git_dir = repo.path().to_path_buf();
+    let expected = &expected;
+
+    let chunks: Vec<Vec<usize>> = (0..workers)
+        .map(|w| (0..n).skip(w).step_by(workers).collect())
+        .collect();
+
+    let results: Vec<Option<Vec<(usize, DeltaPatch)>>> = std::thread::scope(|sc| {
+        // Collected, not chained into the join below: spawning and joining in one
+        // iterator chain would start each worker only once the previous had finished,
+        // which is this function running sequentially and saying it did not.
+        #[expect(clippy::needless_collect, reason = "the collect IS the parallelism")]
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|mine| {
+                let git_dir = git_dir.clone();
+                sc.spawn(move || {
+                    let repo = Repository::open(&git_dir).ok()?;
+                    // A worker's handle has to resolve the same diff CONFIG as the
+                    // handle whose diff it is reproducing — `diff.noprefix`,
+                    // `diff.mnemonicprefix` and the rest decide the header bytes. In
+                    // the app both handles read the same system/global/local files, so
+                    // they agree by construction. Under test they do not: `temp_repo`
+                    // REPLACES its handle's config object to keep the developer's
+                    // dotfiles out of a fixture, and a fresh handle here undoes that —
+                    // which the oracle caught as `c/added.txt c/added.txt` against the
+                    // main thread's `a/added.txt b/added.txt`, on a machine whose
+                    // global config sets `diff.mnemonicprefix`.
+                    #[cfg(test)]
+                    crate::test_repo::confine_config_to_the_repo(&repo);
+                    let mut opts = scoped_diff_opts(settings, &scope.paths);
+                    let mut diff = source_diff(&repo, scope, &mut opts).ok()?;
+                    detect_similar(&mut diff, settings);
+                    // The rebuild is the same trees under the same options, so this
+                    // holds — and if it ever does not, the whole pass is abandoned
+                    // rather than rendered wrongly.
+                    if diff.deltas().len() != expected.len()
+                        || diff
+                            .deltas()
+                            .zip(expected)
+                            .any(|(d, (p, st))| delta_path_bytes(&d) != p || d.status() != *st)
+                    {
+                        return None;
+                    }
+                    let mut out = Vec::with_capacity(mine.len());
+                    let mut buf = String::new();
+                    for i in mine {
+                        let mut rows = DiffRows::new(Vec::new());
+                        let mut entry = blank_entry();
+                        env.enter_file(delta_path_bytes(&diff.get_delta(i)?));
+                        if let Some(mut patch) = git2::Patch::from_diff(&diff, i).ok()? {
+                            let ok = patch.print(&mut |_, _, line| {
+                                push_patch_line(
+                                    &mut rows,
+                                    std::slice::from_mut(&mut entry),
+                                    Some(0),
+                                    &line,
+                                    &mut buf,
+                                );
+                                true
+                            });
+                            ok.ok()?;
+                        }
+                        let (rows, max_chars, tabless) = rows.finish();
+                        // After the print, which is when the sizes exist.
+                        let d = diff.get_delta(i)?;
+                        let sizes = (d.old_file().size(), d.new_file().size());
+                        out.push((
+                            i,
+                            DeltaPatch {
+                                rows,
+                                entry,
+                                max_chars,
+                                tabless,
+                                sizes,
+                            },
+                        ));
+                    }
+                    Some(out)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().ok().flatten())
+            .collect()
+    });
+
+    // Delta order, from whatever order the workers finished in. One slot per delta, so
+    // a missing one is a hole rather than a silent shift.
+    let mut slots: Vec<Option<DeltaPatch>> = (0..n).map(|_| None).collect();
+    for chunk in results {
+        for (i, patch) in chunk? {
+            slots[i] = Some(patch);
+        }
+    }
+    slots.into_iter().collect()
+}
+
+/// A `FileEntry` that exists only to carry one delta's counts back from a worker.
+const fn blank_entry() -> FileEntry {
+    FileEntry {
+        path: String::new(),
+        old_path: None,
+        path_bytes: Vec::new(),
+        old_path_bytes: None,
+        status: git2::Delta::Unmodified,
+        is_binary: false,
+        is_converted: false,
+        additions: 0,
+        deletions: 0,
+        diff_line_idx: None,
+    }
+}
+
+/// Lay the workers' per-delta patches down in delta order, which is the order the
+/// sequential pass emits them in.
+///
+/// Each delta's rows are contiguous and its counts are its own, so this is a
+/// concatenation and two assignments — the whole reason the pass can be split at all.
+fn merge_delta_patches(lines: &mut DiffRows, files: &mut [FileEntry], patches: Vec<DeltaPatch>) {
+    for (fi, patch) in patches.into_iter().enumerate() {
+        // A delta that printed nothing — `ignore_ws` suppressing every hunk, an
+        // unchanged file — keeps `diff_line_idx: None`, exactly as the sequential pass
+        // leaves it when the 'F' callback never fires.
+        if patch.rows.is_empty() {
+            continue;
+        }
+        files[fi].diff_line_idx = Some(lines.len());
+        files[fi].additions = patch.entry.additions;
+        files[fi].deletions = patch.entry.deletions;
+        files[fi].is_binary = patch.entry.is_binary;
+        lines.extend_measured(patch.rows, patch.max_chars, patch.tabless);
+    }
+}
+
+/// Write the diffstat rows `append_diff_body` reserved, now that the counts are final.
+///
+/// Called by both patch passes, and BEFORE the sweep, which reorders `files` — the
+/// block is in delta order, as libgit2's is, and `diff.get_delta(i)` (the binary sizes)
+/// is indexed the same way. A swept file is the one case that misses its counts here,
+/// and it is a driven file, whose row this block already renders differently from
+/// libgit2 on purpose.
+fn finish_stats_block(
+    lines: &mut DiffRows,
+    files: &[FileEntry],
+    sizes: &[(u64, u64)],
+    stats_at: Option<usize>,
+) {
+    let Some(at) = stats_at else { return };
+    let entries: Vec<diffstat::StatFile<'_>> = files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| diffstat::StatFile {
+            old_path: f.old_path.as_deref(),
+            new_path: &f.path,
+            insertions: f.additions,
+            deletions: f.deletions,
+            // The sizes are libgit2's, filled in as it loads each blob — so they are
+            // only there to be read after the print, and they belong to the diff the
+            // print actually ran over. That is not the same object on both paths, which
+            // is why they arrive as an argument rather than being read off one here.
+            binary: f.is_binary.then(|| sizes.get(i).copied().unwrap_or((0, 0))),
+        })
+        .collect();
+    for (row, text) in diffstat::block(&entries, STAT_WIDTH)
+        .into_iter()
+        .enumerate()
+    {
+        lines.set(at + row, DiffLine::new(text, LineKind::Stat));
+    }
+}
+
 /// A build slower than this reports where its bytes went.
 ///
 /// Well past anything interactive, so an ordinary repo never emits it and the stats
@@ -1925,7 +2298,21 @@ fn scoped_diff_with<'r, T>(
             settings.detect_copies
         );
     }
+    DETECT_SIMILAR_COST.with(|c| c.set(detected));
     Ok((diff, measured))
+}
+
+thread_local! {
+    /// What `detect_similar` cost the most recent `scoped_diff_with` on THIS thread.
+    ///
+    /// A thread-local rather than a return value, and that is a deliberate trade: five
+    /// signatures carry the diff out of this pipeline and only one caller wants the
+    /// number. It is read immediately after the call that set it (`append_diff_body`),
+    /// on the same thread, for one decision — whether a worker rebuilding this diff
+    /// would pay a second's rename detection to save a second's patch generation. Being
+    /// stale can only mis-schedule that, never mis-render anything.
+    static DETECT_SIMILAR_COST: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
 }
 
 /// `scoped_diff_with` for a caller that wants only the diff. See it for the pipeline.
@@ -1968,15 +2355,7 @@ pub fn build_diff_data<'r>(
     let mut rows = DiffRows::new(header);
     let mut files = Vec::new();
     let t = std::time::Instant::now();
-    let failed = append_diff_body(
-        &mut rows,
-        &mut files,
-        repo,
-        scope.source,
-        &diff,
-        settings,
-        env,
-    );
+    let failed = append_diff_body(&mut rows, &mut files, repo, scope, &diff, settings, env);
     let patched = t.elapsed();
     if patched >= SLOW_BUILD_REPORT {
         // After the pass, which is the only time the sizes are there to read.
@@ -3190,6 +3569,33 @@ pub mod tests {
         assert_eq!(common_dir_prefix_len("α/foo/", "α/bar/"), 3);
     }
 
+    thread_local! {
+        /// Set by `with_parallel_patch_pass` while a test wants the split patch pass to
+        /// run over a fixture too small to trip its size gate. Read on the thread that
+        /// decides, which is the one that set it.
+        static FORCE_PARALLEL: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// The forced worker count, if a test is asking for one.
+    pub(super) fn forced_parallel_workers() -> Option<usize> {
+        FORCE_PARALLEL.with(std::cell::Cell::get)
+    }
+
+    /// Run `f` with the patch pass split across `workers` threads whatever the diff's
+    /// size. Restores the previous setting on the way out, panic included, so one test
+    /// cannot leak the override into the next.
+    pub fn with_parallel_patch_pass<T>(workers: usize, f: impl FnOnce() -> T) -> T {
+        struct Restore(Option<usize>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FORCE_PARALLEL.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(FORCE_PARALLEL.with(std::cell::Cell::get));
+        FORCE_PARALLEL.with(|c| c.set(Some(workers)));
+        f()
+    }
+
     /// Baseline `DiffSettings` for every fixture in this module: git's default
     /// context, every toggle off. Tests override the one flag under test with
     /// struct-update syntax: `DiffSettings { ignore_ws: true, ..base_settings() }`.
@@ -3266,7 +3672,7 @@ pub mod tests {
             &mut rows,
             &mut files,
             &repo,
-            scope.source,
+            &scope,
             &diff,
             s,
             BuildEnv::of(None),
@@ -4683,5 +5089,508 @@ pub mod tests {
             },
             "if these ever agree, this test is no longer testing anything"
         );
+    }
+}
+
+#[cfg(test)]
+mod parallel_patch_tests {
+    use super::tests::{base_settings, everything_repo};
+    use super::*;
+
+    /// Every row `Diff::print` emits for delta `i`, tagged with its origin.
+    fn whole_diff_rows(diff: &git2::Diff<'_>) -> Vec<(char, String)> {
+        let mut out = Vec::new();
+        diff.print(git2::DiffFormat::Patch, |_d, _h, l| {
+            out.push((
+                l.origin(),
+                String::from_utf8_lossy(l.content()).into_owned(),
+            ));
+            true
+        })
+        .expect("prints");
+        out
+    }
+
+    /// The same rows, generated one delta at a time.
+    fn per_delta_rows(diff: &git2::Diff<'_>) -> Vec<(char, String)> {
+        let mut out = Vec::new();
+        for i in 0..diff.deltas().len() {
+            match git2::Patch::from_diff(diff, i) {
+                Ok(Some(mut p)) => {
+                    p.print(&mut |_d, _h, l| {
+                        out.push((
+                            l.origin(),
+                            String::from_utf8_lossy(l.content()).into_owned(),
+                        ));
+                        true
+                    })
+                    .expect("patch prints");
+                }
+                // Recorded rather than skipped: a delta the whole-diff pass renders and
+                // this one cannot is exactly the divergence under test.
+                Ok(None) => out.push(('!', "<NO PATCH>".into())),
+                Err(e) => out.push(('!', format!("<ERR {e}>"))),
+            }
+        }
+        out
+    }
+
+    fn diff_of(repo: &Repository, oid: git2::Oid, s: DiffSettings) -> git2::Diff<'_> {
+        let scope = RowScope::new(DiffSource::Commit(oid));
+        scoped_diff(repo, s, &scope.paths, |r, o| {
+            commit_parent_diff(r, &r.find_commit(oid)?, Some(o))
+        })
+        .expect("diffs")
+    }
+
+    /// **The whole feature rests on this.** A parallel pass generates each delta's
+    /// patch on its own, so `Patch::from_diff(i).print` has to emit exactly what
+    /// `Diff::print` emits for that delta — same rows, same origins, same bytes, and
+    /// nothing extra for a delta the whole-diff pass renders nothing for.
+    ///
+    /// `git2` documents `from_diff` as returning `Ok(None)` for a binary or unchanged
+    /// file, which reads like precisely the gap that would break this; the fixtures say
+    /// otherwise, and that is why they are here rather than the documentation being
+    /// taken at its word.
+    #[test]
+    fn a_delta_prints_the_same_alone_as_it_does_in_the_whole_diff() {
+        for detect_renames in [false, true] {
+            let (_d, repo, oid) = everything_repo();
+            let s = DiffSettings {
+                detect_renames,
+                ..base_settings()
+            };
+            let diff = diff_of(&repo, oid, s);
+            assert_eq!(
+                whole_diff_rows(&diff),
+                per_delta_rows(&diff),
+                "everything_repo (binary, rename, delete, add, mode change), \
+                 renames={detect_renames}"
+            );
+        }
+    }
+
+    /// An `ignore_ws` diff whose hunks are all suppressed: the whole-diff pass emits
+    /// NOTHING for that delta, header included (`should_force_header` is false), and
+    /// the per-delta one must not invent a header for it.
+    #[test]
+    fn a_delta_suppressed_by_ignore_ws_prints_alone_as_it_does_together() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "w.txt", "a\nb\n", "base");
+        let oid = commit_file(&repo, "w.txt", "a  \nb\t\n", "whitespace only");
+        for ignore_ws in [true, false] {
+            let diff = diff_of(
+                &repo,
+                oid,
+                DiffSettings {
+                    ignore_ws,
+                    ..base_settings()
+                },
+            );
+            assert_eq!(
+                whole_diff_rows(&diff),
+                per_delta_rows(&diff),
+                "ignore_ws={ignore_ws}"
+            );
+        }
+    }
+
+    /// **The oracle `performance.md` §1 asks for: the sequential builder is the
+    /// specification, and the split pass has to reproduce it exactly.**
+    ///
+    /// Not the rows alone — `lines` AND `files`, because half of what the pass produces
+    /// is the per-file counts and the `diff_line_idx` the sidebar, the anchor, the
+    /// gutter and the write layer all index by. A pass that got the rows right and the
+    /// offsets wrong would look perfect in a screenshot.
+    ///
+    /// Run over every fixture with a shape worth doubting, under both rename settings
+    /// and with the diffstat block on and off — the block is RESERVED before the pass
+    /// and written after it, so it is the one part whose row numbers depend on the pass
+    /// having filled in what it promised.
+    #[test]
+    fn the_split_patch_pass_builds_exactly_what_the_sequential_one_does() {
+        use crate::test_repo::{commit_file, commit_index, stage, temp_repo, write_file};
+
+        // Every fixture is a `(name, repo, oid)`, kept alive by its TempDir.
+        let (d1, r1, o1) = everything_repo();
+
+        let (d2, r2) = temp_repo();
+        commit_file(&r2, "w.txt", "a\nb\n", "base");
+        let o2 = commit_file(&r2, "w.txt", "a  \nb\t\n", "whitespace only");
+
+        let (d3, r3) = temp_repo();
+        commit_file(&r3, "t.txt", "a file\n", "base");
+        {
+            let wd = r3.workdir().unwrap().to_path_buf();
+            std::fs::remove_file(wd.join("t.txt")).unwrap();
+            std::os::unix::fs::symlink("elsewhere", wd.join("t.txt")).unwrap();
+            stage(&r3, "t.txt");
+            let mut index = r3.index().unwrap();
+            commit_index(&r3, &mut index, "file becomes a symlink");
+        }
+        let o3 = r3.head().unwrap().peel_to_commit().unwrap().id();
+
+        // More deltas than workers, so the round-robin split really interleaves and a
+        // merge that laid them down in completion order would show.
+        let (d4, r4) = temp_repo();
+        for f in 0..11 {
+            write_file(&r4, &format!("f{f}.txt"), &format!("{f} one\n{f} two\n"));
+            stage(&r4, &format!("f{f}.txt"));
+        }
+        {
+            let mut index = r4.index().unwrap();
+            commit_index(&r4, &mut index, "base");
+        }
+        for f in 0..11 {
+            write_file(
+                &r4,
+                &format!("f{f}.txt"),
+                &format!("{f} ONE\n{f} two\n{f} three\n"),
+            );
+            stage(&r4, &format!("f{f}.txt"));
+        }
+        let o4 = {
+            let mut index = r4.index().unwrap();
+            commit_index(&r4, &mut index, "touch all eleven")
+        };
+
+        let fixtures: [(&str, &Repository, git2::Oid); 4] = [
+            ("everything_repo", &r1, o1),
+            ("whitespace only", &r2, o2),
+            ("typechange", &r3, o3),
+            ("eleven files", &r4, o4),
+        ];
+
+        for (name, repo, oid) in fixtures {
+            for detect_renames in [false, true] {
+                for show_stats in [false, true] {
+                    for ignore_ws in [false, true] {
+                        let s = DiffSettings {
+                            ignore_ws,
+                            show_stats,
+                            detect_renames,
+                            ..base_settings()
+                        };
+                        let scope = RowScope::new(DiffSource::Commit(oid));
+                        let what = format!(
+                            "{name}: renames={detect_renames} stats={show_stats} ws={ignore_ws}"
+                        );
+
+                        let sequential = get_diff_data(repo, &scope, s, BuildEnv::NONE);
+                        // A progress sink, because the pass only splits for a build
+                        // someone is waiting on — so this is the real gate, minus the
+                        // size clause.
+                        let progress = DiffProgress::default();
+                        let parallel = super::tests::with_parallel_patch_pass(4, || {
+                            get_diff_data(repo, &scope, s, BuildEnv::tracked(None, &progress))
+                        });
+
+                        assert_eq!(
+                            sequential.lines.len(),
+                            parallel.lines.len(),
+                            "{what}: row count"
+                        );
+                        for (i, (a, b)) in sequential
+                            .lines
+                            .iter()
+                            .zip(parallel.lines.iter())
+                            .enumerate()
+                        {
+                            assert_eq!(
+                                (&a.text, a.kind, a.old_lineno, a.new_lineno),
+                                (&b.text, b.kind, b.old_lineno, b.new_lineno),
+                                "{what}: row {i}"
+                            );
+                        }
+                        assert_eq!(
+                            sequential.files.len(),
+                            parallel.files.len(),
+                            "{what}: file count"
+                        );
+                        for (a, b) in sequential.files.iter().zip(parallel.files.iter()) {
+                            assert_eq!(
+                                (
+                                    &a.path,
+                                    &a.old_path,
+                                    a.status,
+                                    a.is_binary,
+                                    a.additions,
+                                    a.deletions,
+                                    a.diff_line_idx
+                                ),
+                                (
+                                    &b.path,
+                                    &b.old_path,
+                                    b.status,
+                                    b.is_binary,
+                                    b.additions,
+                                    b.deletions,
+                                    b.diff_line_idx
+                                ),
+                                "{what}: file {}",
+                                a.path
+                            );
+                        }
+                        assert_eq!(
+                            sequential.max_chars, parallel.max_chars,
+                            "{what}: max_chars"
+                        );
+                        assert_eq!(sequential.tabless, parallel.tabless, "{what}: tabless");
+                    }
+                }
+            }
+        }
+        drop((d1, d2, d3, d4));
+    }
+
+    /// GATE BENCH: what the split pass COSTS a build it will not split — the odb
+    /// header read per side of every delta that `parallel_patch_workers` finishes with.
+    /// `cargo test --release bench_split_patch_gate -- --ignored --nocapture`
+    #[test]
+    #[ignore = "a benchmark; see the doc comment for how to run it"]
+    fn bench_split_patch_gate() {
+        use crate::test_repo::{commit_index, stage, temp_repo, write_file};
+        use std::time::Instant;
+
+        let n: usize = std::env::var("BENCH_FILES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1000);
+        let (_d, repo) = temp_repo();
+        for f in 0..n {
+            write_file(&repo, &format!("f{f}.txt"), &format!("{f} one\n{f} two\n"));
+            stage(&repo, &format!("f{f}.txt"));
+        }
+        {
+            let mut index = repo.index().unwrap();
+            commit_index(&repo, &mut index, "base");
+        }
+        for f in 0..n {
+            write_file(&repo, &format!("f{f}.txt"), &format!("{f} ONE\n{f} two\n"));
+            stage(&repo, &format!("f{f}.txt"));
+        }
+        let oid = {
+            let mut index = repo.index().unwrap();
+            commit_index(&repo, &mut index, "touch all")
+        };
+        let scope = RowScope::new(DiffSource::Commit(oid));
+        let s = base_settings();
+        let git_dir = repo.path().to_path_buf();
+
+        // `Some(0)` returns from the gate before the probe; `None` lets the real gate
+        // run, which on a diff this small means paying the probe and then declining.
+        let run = |label: &str, forced: Option<usize>| {
+            let repo = crate::test_repo::open_repo(&git_dir);
+            let progress = DiffProgress::default();
+            let t = Instant::now();
+            let data = forced.map_or_else(
+                || get_diff_data(&repo, &scope, s, BuildEnv::tracked(None, &progress)),
+                |w| {
+                    super::tests::with_parallel_patch_pass(w, || {
+                        get_diff_data(&repo, &scope, s, BuildEnv::tracked(None, &progress))
+                    })
+                },
+            );
+            let took = t.elapsed();
+            println!("  {label}: {took:?} ({} rows)", data.lines.len());
+            took
+        };
+        run("warm-up", Some(0));
+        let without = run("gate skipped", Some(0));
+        let with = run("gate runs (probe + decline)", None);
+        println!(
+            "{n} small files: whole build {without:?} vs {with:?} (differencing is below \
+             the noise floor at this scale; the direct measurement is below)"
+        );
+
+        // The gate itself, timed on its own — the difference of two 60ms builds cannot
+        // resolve a sub-millisecond effect.
+        let repo = crate::test_repo::open_repo(&git_dir);
+        let diff = scoped_diff(&repo, s, &scope.paths, |r, o| {
+            commit_parent_diff(r, &r.find_commit(oid)?, Some(o))
+        })
+        .expect("diffs");
+        let deltas = diff.deltas().len();
+        for (label, bound) in [
+            ("bounded (what the gate does)", PARALLEL_PATCH_PROBE_DELTAS),
+            ("unbounded (what it used to)", usize::MAX),
+        ] {
+            let t = Instant::now();
+            let reps = 20;
+            for _ in 0..reps {
+                let odb = repo.odb().unwrap();
+                let mut total: u64 = 0;
+                for delta in diff.deltas().take(bound) {
+                    for f in [delta.old_file(), delta.new_file()] {
+                        if !f.id().is_zero()
+                            && let Ok((size, _)) = odb.read_header(f.id())
+                        {
+                            total = total.saturating_add(size as u64);
+                        }
+                    }
+                    if total >= PARALLEL_PATCH_MIN_BYTES {
+                        break;
+                    }
+                }
+                std::hint::black_box(total);
+            }
+            println!(
+                "  {label}: {:?} per gate over {deltas} deltas",
+                t.elapsed() / reps
+            );
+        }
+    }
+
+    /// END-TO-END BENCH: `get_diff_data` with the split pass against without, over a
+    /// synthetic repo of large blobs.
+    /// `cargo test --release bench_split_patch_pass -- --ignored --nocapture`
+    #[test]
+    #[ignore = "a benchmark; see the doc comment for how to run it"]
+    fn bench_split_patch_pass() {
+        use crate::test_repo::{commit_index, stage, temp_repo};
+        use std::fmt::Write as _;
+        use std::time::Instant;
+
+        let n_files: usize = std::env::var("BENCH_FILES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+        let mb: usize = std::env::var("BENCH_MB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+
+        let (_d, repo) = temp_repo();
+        let wd = repo.workdir().unwrap().to_path_buf();
+        let body = |seed: usize| {
+            let mut s = String::with_capacity(mb * 1024 * 1024 + 64);
+            let mut i = seed;
+            while s.len() < mb * 1024 * 1024 {
+                i = i.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let _ = writeln!(s, "line {i:x} padding padding padding");
+            }
+            s
+        };
+        for f in 0..n_files {
+            std::fs::write(wd.join(format!("f{f}.txt")), body(f)).unwrap();
+            stage(&repo, &format!("f{f}.txt"));
+        }
+        {
+            let mut index = repo.index().unwrap();
+            commit_index(&repo, &mut index, "base");
+        }
+        for f in 0..n_files {
+            let mut b = body(f);
+            b.push_str("one more line\n");
+            std::fs::write(wd.join(format!("f{f}.txt")), b).unwrap();
+            stage(&repo, &format!("f{f}.txt"));
+        }
+        let oid = {
+            let mut index = repo.index().unwrap();
+            commit_index(&repo, &mut index, "touch all")
+        };
+
+        let scope = RowScope::new(DiffSource::Commit(oid));
+        let s = base_settings();
+        let git_dir = repo.path().to_path_buf();
+        // **A FRESH handle per run, so both sides start with a cold odb cache.** libgit2
+        // caches inflated objects per `git_repository`, and the workers each open their
+        // own — so reusing one warm handle for the sequential run compares a warm read
+        // against N cold ones and says nothing.
+        let run = |label: &str, workers: Option<usize>| {
+            let repo = crate::test_repo::open_repo(&git_dir);
+            let progress = DiffProgress::default();
+            let t = Instant::now();
+            // `None` means "let the shipped gate decide", so it must not go through the
+            // override at all — wrapping it would answer the one question this run is
+            // asking.
+            let data = workers.map_or_else(
+                || get_diff_data(&repo, &scope, s, BuildEnv::tracked(None, &progress)),
+                |w| {
+                    super::tests::with_parallel_patch_pass(w, || {
+                        get_diff_data(&repo, &scope, s, BuildEnv::tracked(None, &progress))
+                    })
+                },
+            );
+            let took = t.elapsed();
+            println!("  {label}: {took:?} ({} rows)", data.lines.len());
+            (took, data.lines.len())
+        };
+
+        run("warm-up (page cache)", Some(0));
+        let (sequential, rows) = run("sequential", Some(0));
+
+        // Head to head on ONE handle, single-threaded: is per-delta generation
+        // intrinsically dearer than the whole-diff print, or was that an artefact?
+        {
+            let repo = crate::test_repo::open_repo(&git_dir);
+            let diff = scoped_diff(&repo, s, &scope.paths, |r, o| {
+                commit_parent_diff(r, &r.find_commit(oid)?, Some(o))
+            })
+            .expect("diffs");
+            let t = Instant::now();
+            let mut n = 0usize;
+            diff.print(git2::DiffFormat::Patch, |_, _, _| {
+                n += 1;
+                true
+            })
+            .unwrap();
+            let whole = t.elapsed();
+
+            let repo2 = crate::test_repo::open_repo(&git_dir);
+            let diff2 = scoped_diff(&repo2, s, &scope.paths, |r, o| {
+                commit_parent_diff(r, &r.find_commit(oid)?, Some(o))
+            })
+            .expect("diffs");
+            let t = Instant::now();
+            let mut m = 0usize;
+            for i in 0..diff2.deltas().len() {
+                if let Ok(Some(mut p)) = git2::Patch::from_diff(&diff2, i) {
+                    p.print(&mut |_, _, _| {
+                        m += 1;
+                        true
+                    })
+                    .unwrap();
+                }
+            }
+            let per_delta = t.elapsed();
+            println!(
+                "  PRIMITIVE: Diff::print {whole:?} ({n} rows) vs per-delta {per_delta:?} ({m} rows)"
+            );
+        }
+        for w in [2usize, 4, 8] {
+            let (par, par_rows) = run(&format!("{w} workers"), Some(w));
+            assert_eq!(rows, par_rows, "the split must produce the same rows");
+            let speedup = sequential.as_secs_f64() / par.as_secs_f64();
+            println!("{n_files} x {mb}MB: {w} workers = {speedup:.2}x");
+        }
+        // The REAL gate, deciding for itself — the number that matters, since every
+        // line above bypasses the size clause the app actually ships.
+        let (real, real_rows) = run("the gate deciding for itself", None);
+        assert_eq!(rows, real_rows);
+        let speedup = sequential.as_secs_f64() / real.as_secs_f64();
+        println!("{n_files} x {mb}MB: as shipped = {speedup:.2}x");
+    }
+
+    /// A typechange, which libgit2 splits into a delete and an add sharing ONE path.
+    /// The sequential callback recovers the delta from that path by searching forward;
+    /// the parallel pass is handed the index instead, so this is where the two would
+    /// disagree if the search were doing something subtler than it looks.
+    #[test]
+    fn a_typechange_prints_alone_as_it_does_together() {
+        use crate::test_repo::{commit_file, commit_index, stage, temp_repo};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "t.txt", "a file\n", "base");
+        let wd = repo.workdir().unwrap().to_path_buf();
+        std::fs::remove_file(wd.join("t.txt")).unwrap();
+        std::os::unix::fs::symlink("elsewhere", wd.join("t.txt")).unwrap();
+        stage(&repo, "t.txt");
+        let oid = {
+            let mut index = repo.index().unwrap();
+            commit_index(&repo, &mut index, "file becomes a symlink")
+        };
+        let diff = diff_of(&repo, oid, base_settings());
+        assert_eq!(whole_diff_rows(&diff), per_delta_rows(&diff), "typechange");
     }
 }
