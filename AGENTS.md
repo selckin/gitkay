@@ -279,7 +279,13 @@ bound stands in for the other. **EVERY colour pass needs both**, and the specula
 had only the line cap until a 5,310-line row under a 10,000-line cap coloured for
 **29.6 seconds** — 5.6ms a line, 43× the rate that cap's "~1.3s worst case" assumed. The
 rate is a property of the grammar, not of the repo, so no line count can stand in for a
-clock: see `Limits::highlight_budget`. **A budget over LINES cannot bound one line
+clock: see `Limits::highlight_budget`. The three bounds are one type, `HighlightBudget`
+— lines, deadline, `until_row` — tested at one place, `exhausted`, at every pass's chunk
+boundary, so a fourth pass answers for each of them instead of inventing its own
+arithmetic; and a pass REPORTS what it did (`ColourPass`: how much it coloured and which
+bound stopped it) rather than leaving a caller to compare elapsed time against its own
+deadline or rescan the finished diff to count spans, which is what two of the three used
+to do. **A budget over LINES cannot bound one line
 either** — every pass checks its deadline between chunks of 16 or 256 lines, never
 inside one — so `highlight::MAX_TOKENIZE_CHARS` (20,000) bounds what syntect sees of a
 single line, which is what makes the clocks above mean anything: a repo of minified

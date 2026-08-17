@@ -205,8 +205,109 @@ pub fn highlight_ranges(files: &[FileEntry], total_lines: usize) -> Vec<(usize, 
         .collect()
 }
 
-/// Tokenize file by file, starting at `first_file` and wrapping, until
-/// `deadline` passes. `None` means no bound — the whole diff.
+/// How much of a diff one colour pass may do.
+///
+/// **A pass needs a bound on TIME and a bound on WORK, and neither stands in for the
+/// other.** A line costs 3µs or 70µs depending on the grammar, so a line cap is not a
+/// clock: the speculative pass had only a line cap until a 5,310-line row under a
+/// 10,000-line cap coloured for **29.6 seconds** — 5.6ms a line, 43× the rate that cap
+/// assumed. And a clock is not a work bound: a pass with only a deadline commits
+/// however much memory it can fill in the time. Which of the three fields a given pass
+/// sets is its own business, but they are named together here so a fourth pass has to
+/// answer for each rather than inventing its own vocabulary — which is what the three
+/// existing ones did, one of them in a hand-rolled loop reading two globals.
+#[derive(Clone, Copy, Default)]
+pub struct HighlightBudget {
+    /// Code lines this pass may colour before it stops where it is. Bounds the memory
+    /// it commits.
+    pub lines: Option<usize>,
+    /// When it must stop, whatever it has managed. Bounds its appetite for a core.
+    pub deadline: Option<std::time::Instant>,
+    /// A row to stop at once tokenization has passed it — "colour the landing
+    /// screenful and no more". Distinct from `lines`, which counts what this pass DID
+    /// wherever it did it; this names a place in the diff.
+    pub until_row: Option<usize>,
+}
+
+/// Why a colour pass ended.
+///
+/// Returned rather than inferred, because the callers were inferring it and getting it
+/// approximately: one compared elapsed time against its own deadline to guess whether
+/// the pass had been cut short, and the other rescanned the whole diff to count what
+/// had been coloured. The pass knows both exactly.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Stopped {
+    /// Every code line the pass was given now has spans.
+    Finished,
+    /// Out of line budget.
+    Lines,
+    /// Out of time.
+    Deadline,
+    /// Reached `until_row`.
+    Row,
+}
+
+/// What a colour pass did.
+#[derive(Clone, Copy, Debug)]
+pub struct ColourPass {
+    /// Code lines THIS pass gave spans to. Not the diff's total, and not what was
+    /// already coloured before it ran.
+    pub coloured: usize,
+    pub stopped: Stopped,
+}
+
+impl HighlightBudget {
+    /// Everything, for a pass with nothing to answer to: the UI-thread fallback and the
+    /// prefetch worker's whole-diff pass, both of which run where stopping early would
+    /// leave the only colour the row is going to get.
+    pub const UNBOUNDED: Self = Self {
+        lines: None,
+        deadline: None,
+        until_row: None,
+    };
+
+    /// Is the pass out of budget at this chunk boundary, and on which bound?
+    ///
+    /// The one place all three are tested, so a pass cannot honour two of them by
+    /// accident. `coloured` is what this pass has done; `tokenized_to` is how far it
+    /// has tokenized, which is **0 until a chunk has actually run** — `until_row` says
+    /// to stop once tokenization has PASSED that row, so a pass whose first file begins
+    /// below the bound still colours a chunk rather than returning empty-handed.
+    pub fn exhausted(&self, coloured: usize, tokenized_to: usize) -> Option<Stopped> {
+        if self.lines.is_some_and(|cap| coloured >= cap) {
+            return Some(Stopped::Lines);
+        }
+        if self
+            .deadline
+            .is_some_and(|d| std::time::Instant::now() >= d)
+        {
+            return Some(Stopped::Deadline);
+        }
+        // The rotation starts at the landing file and rows only increase from there, so
+        // this trips inside that file or shortly after it — never after wrapping to the
+        // files before it, which would already be past the point of caring.
+        if self.until_row.is_some_and(|u| tokenized_to >= u) {
+            return Some(Stopped::Row);
+        }
+        None
+    }
+
+    /// Lines between budget checks.
+    ///
+    /// A deadline is honoured only to within one chunk, so a pass carrying one steps far
+    /// more finely — see `PREHIGHLIGHT_CHUNK`. A pass bounded only by lines or by a row
+    /// overruns by at most that many lines, which costs nothing, so it keeps the coarse
+    /// chunk's lower per-chunk overhead.
+    const fn chunk(&self) -> usize {
+        if self.deadline.is_some() {
+            PREHIGHLIGHT_CHUNK
+        } else {
+            HIGHLIGHT_CHUNK
+        }
+    }
+}
+
+/// Tokenize file by file, starting at `first_file` and wrapping, within `budget`.
 ///
 /// Spans land in `spans`, indexed by row; `lines` is only read. A partial result
 /// needs no special handling anywhere because it is already a legal state:
@@ -216,48 +317,40 @@ pub fn highlight_ranges(files: &[FileEntry], total_lines: usize) -> Vec<(usize, 
 /// state, since a multi-line construct opened before the cut would otherwise
 /// mis-colour the remainder — harmlessly overwriting the prefix written here.
 ///
-/// The deadline is checked every `HIGHLIGHT_CHUNK` lines rather than once per
-/// file, so a single enormous file overruns it by at most a chunk.
-pub fn highlight_diff_until(
+/// The budget is tested at chunk boundaries rather than once per file, so a single
+/// enormous file overruns it by at most a chunk.
+pub fn highlight_diff_within(
     lines: &[DiffLine],
     spans: &mut RowSpans,
     files: &[FileEntry],
     hl: &Highlighter,
-    deadline: Option<std::time::Instant>,
+    budget: HighlightBudget,
     first_file: usize,
-    until_row: Option<usize>,
-) {
-    let expired = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
-    // A deadline is only honoured to within one chunk, so a bounded pass steps
-    // far more finely than an unbounded one — see PREHIGHLIGHT_CHUNK. An
-    // unbounded pass has nothing to overrun and keeps the coarse chunk's lower
-    // per-chunk overhead.
-    let chunk = if deadline.is_some() {
-        PREHIGHLIGHT_CHUNK
-    } else {
-        HIGHLIGHT_CHUNK
-    };
+) -> ColourPass {
+    let chunk = budget.chunk();
+    let mut coloured = 0usize;
+    // How far the pass has tokenized, as opposed to where it is about to start: 0 until
+    // a chunk has run. See `exhausted`.
+    let mut tokenized_to = 0usize;
     for (fi, start, end) in file_order(&highlight_ranges(files, lines.len()), first_file) {
         let mut state = hl.new_file_state(&files[fi].path);
         let mut pos = start;
         while pos < end {
-            if expired() {
-                return;
+            if let Some(stopped) = budget.exhausted(coloured, tokenized_to) {
+                return ColourPass { coloured, stopped };
             }
             let chunk_end = (pos + chunk).min(end);
             for (i, tokens) in tokenize_range(hl, lines, &mut state, pos, chunk_end) {
                 spans.set(i, tokens);
+                coloured += 1;
             }
             pos = chunk_end;
-            // Row bound: stop once tokenization has passed `until_row`. The
-            // rotation starts at the landing file and rows only increase from
-            // there, so this trips inside that file or shortly after it — never
-            // after wrapping to the files before it, which would already be past
-            // the point of caring.
-            if until_row.is_some_and(|u| pos >= u) {
-                return;
-            }
+            tokenized_to = chunk_end;
         }
+    }
+    ColourPass {
+        coloured,
+        stopped: Stopped::Finished,
     }
 }
 
@@ -270,7 +363,7 @@ pub fn highlight_diff(
     files: &[FileEntry],
     hl: &Highlighter,
 ) {
-    highlight_diff_until(lines, spans, files, hl, None, 0, None);
+    highlight_diff_within(lines, spans, files, hl, HighlightBudget::UNBOUNDED, 0);
 }
 
 /// Index into `pending` of the file to tokenize next, given the visible file
@@ -481,9 +574,16 @@ pub fn highlight_worker(job: HighlightJob) {
     let mut first_result = true;
     let started = std::time::Instant::now();
     let total_lines = lines.len();
-    // Rows coloured so far, against `HIGHLIGHT_LINE_BUDGET`. The bound is on the WORK,
-    // not on the diff: every diff is coloured where the reader is looking, and only the
-    // rows beyond the budget go without.
+    // The same two bounds every colour pass answers to, expressed the same way — this
+    // loop cannot call `highlight_diff_within` (it streams its results and re-picks its
+    // file every chunk), but it must not invent its own arithmetic for "out of budget"
+    // either. The bound is on the WORK, not on the diff: every diff is coloured where
+    // the reader is looking, and only the rows beyond the budget go without.
+    let budget = HighlightBudget {
+        lines: Some(HIGHLIGHT_LINE_BUDGET),
+        deadline: Some(started + HIGHLIGHT_TIME_BUDGET),
+        until_row: None,
+    };
     let mut coloured = 0usize;
     // `pending` holds only the files with unhighlighted code lines; a fully-cached diff
     // yields an empty list and the worker exits immediately with no work. It arrives on
@@ -531,18 +631,15 @@ pub fn highlight_worker(job: HighlightJob) {
                 }
             }
             pos = chunk_end;
-            // Out of budget, on either bound. Checked at a chunk boundary like
-            // everything else here, and it stops the pass rather than the file: what has
-            // been sent stays, and the reader keeps the colour around wherever
-            // `pick_file` had reached — which is where they are looking, that being the
-            // whole point of the ordering.
-            let out_of_lines = coloured >= HIGHLIGHT_LINE_BUDGET;
-            let spent = started.elapsed();
-            if out_of_lines || spent >= HIGHLIGHT_TIME_BUDGET {
+            // Out of budget. Checked at a chunk boundary like everything else here, and
+            // it stops the pass rather than the file: what has been sent stays, and the
+            // reader keeps the colour around wherever `pick_file` had reached — which is
+            // where they are looking, that being the whole point of the ordering.
+            if let Some(stopped) = budget.exhausted(coloured, pos) {
                 log::debug!(
-                    "highlight: gen {generation} stopped on the {} budget after {spent:?}: \
+                    "highlight: gen {generation} stopped on {stopped:?} after {:?}: \
                      {coloured} lines coloured, {total_lines} in the diff",
-                    if out_of_lines { "line" } else { "time" }
+                    started.elapsed()
                 );
                 return;
             }
@@ -953,7 +1050,7 @@ mod tests {
     /// A deadline already past means no work at all — the degrades-to-today
     /// case, and the one that proves the bound is real rather than decorative.
     #[test]
-    fn highlight_diff_until_does_nothing_once_the_deadline_has_passed() {
+    fn a_colour_pass_does_nothing_once_the_deadline_has_passed() {
         let hl = highlight::test_highlighter();
         let lines = vec![
             DiffLine::new("diff --git a/x.rs b/x.rs", LineKind::FileMeta),
@@ -967,11 +1064,26 @@ mod tests {
             .checked_sub(std::time::Duration::from_secs(1))
             .unwrap();
 
-        highlight_diff_until(&lines, &mut spans, &files, &hl, Some(past), 0, None);
+        let done = highlight_diff_within(
+            &lines,
+            &mut spans,
+            &files,
+            &hl,
+            HighlightBudget {
+                deadline: Some(past),
+                ..HighlightBudget::UNBOUNDED
+            },
+            0,
+        );
 
         assert!(
             (0..lines.len()).all(|i| !spans.is_set(i)),
             "an expired budget must tokenize nothing"
+        );
+        assert_eq!(
+            (done.coloured, done.stopped),
+            (0, Stopped::Deadline),
+            "and says so, rather than leaving the caller to infer it from the clock"
         );
         // And the diff is still in a legal partial state the async pass resumes from.
         assert_eq!(
@@ -984,7 +1096,7 @@ mod tests {
     /// No deadline ⇒ the whole diff, which is what the prefetch path relies on
     /// through `highlight_diff`'s delegation.
     #[test]
-    fn highlight_diff_until_colors_everything_without_a_deadline() {
+    fn a_colour_pass_colours_everything_without_a_budget() {
         let hl = highlight::test_highlighter();
         let lines = vec![
             DiffLine::new("diff --git a/x.rs b/x.rs", LineKind::FileMeta),
@@ -995,16 +1107,29 @@ mod tests {
         let files = vec![fe("x.rs", Some(0))];
         let mut spans = RowSpans::blank(lines.len());
 
-        highlight_diff_until(&lines, &mut spans, &files, &hl, None, 0, None);
+        let done = highlight_diff_within(
+            &lines,
+            &mut spans,
+            &files,
+            &hl,
+            HighlightBudget::UNBOUNDED,
+            0,
+        );
 
         assert!(pending_files(&lines, &spans, &files).is_empty());
+        assert_eq!(done.stopped, Stopped::Finished);
+        assert_eq!(
+            done.coloured,
+            lines.iter().filter(|l| l.kind.is_code()).count(),
+            "the count is what this pass coloured, and it coloured every code line"
+        );
     }
 
     /// The row bound stops the pass once tokenization passes it, so an
     /// already-blanked load colours the landing screenful instead of the whole
     /// diff. Deterministic: no clock involved, the deadline is far away.
     #[test]
-    fn highlight_diff_until_stops_at_the_row_bound() {
+    fn a_colour_pass_stops_at_the_row_bound() {
         let hl = highlight::test_highlighter();
         let mut lines = vec![DiffLine::new(
             "diff --git a/x.rs b/x.rs",
@@ -1020,9 +1145,25 @@ mod tests {
             .checked_add(std::time::Duration::from_secs(10))
             .expect("in range");
 
-        highlight_diff_until(&lines, &mut spans, &files, &hl, Some(far), 0, Some(40));
+        let done = highlight_diff_within(
+            &lines,
+            &mut spans,
+            &files,
+            &hl,
+            HighlightBudget {
+                lines: None,
+                deadline: Some(far),
+                until_row: Some(40),
+            },
+            0,
+        );
 
         let coloured = (0..lines.len()).filter(|&i| spans.is_set(i)).count();
+        assert_eq!(
+            (done.coloured, done.stopped),
+            (coloured, Stopped::Row),
+            "the pass reports which bound stopped it and how much it did"
+        );
         assert!(
             coloured > 0 && coloured < 200,
             "stops at the bound rather than colouring nothing or everything: {coloured}"
@@ -1037,11 +1178,55 @@ mod tests {
         );
     }
 
+    /// The row bound is "stop once tokenization has PASSED this row", not "start below
+    /// it": a diff whose first patch body begins under a header taller than the
+    /// viewport would otherwise be handed a bound already behind it and colour nothing
+    /// at all. `until_row` is `landing + visible_rows` and the landing defaults to 0,
+    /// so that is the ordinary no-anchor load, not a corner.
+    #[test]
+    fn a_colour_pass_below_its_row_bound_still_colours_a_chunk() {
+        let hl = highlight::test_highlighter();
+        // Forty rows of commit message, then the file — a bound of 10 rows sits well
+        // above where the first code line is.
+        let mut lines: Vec<DiffLine> = (0..40)
+            .map(|i| DiffLine::new(format!("message line {i}"), LineKind::Meta))
+            .collect();
+        lines.push(DiffLine::new(
+            "diff --git a/x.rs b/x.rs",
+            LineKind::FileMeta,
+        ));
+        // Longer than one chunk, so the bound is what stops it rather than the file
+        // simply running out — otherwise this would pass by finishing.
+        for i in 0..400 {
+            lines.push(DiffLine::new(format!("let x{i} = {i};"), LineKind::Context));
+        }
+        let files = vec![fe("x.rs", Some(40))];
+        let mut spans = RowSpans::blank(lines.len());
+
+        let done = highlight_diff_within(
+            &lines,
+            &mut spans,
+            &files,
+            &hl,
+            HighlightBudget {
+                until_row: Some(10),
+                ..HighlightBudget::UNBOUNDED
+            },
+            0,
+        );
+
+        assert!(
+            done.coloured > 0,
+            "a bound the file starts below must still colour a chunk, not nothing"
+        );
+        assert_eq!(done.stopped, Stopped::Row);
+    }
+
     /// `first_file` must not change the OUTCOME when the budget is unbounded —
     /// only the order the work happens in. A rotation that dropped or repeated a
     /// file would show up here.
     #[test]
-    fn highlight_diff_until_covers_every_file_whatever_the_start() {
+    fn a_colour_pass_covers_every_file_whatever_the_start() {
         let hl = highlight::test_highlighter();
         let build = || {
             vec![
@@ -1056,7 +1241,14 @@ mod tests {
         for first in 0..files.len() {
             let lines = build();
             let mut spans = RowSpans::blank(lines.len());
-            highlight_diff_until(&lines, &mut spans, &files, &hl, None, first, None);
+            highlight_diff_within(
+                &lines,
+                &mut spans,
+                &files,
+                &hl,
+                HighlightBudget::UNBOUNDED,
+                first,
+            );
             assert!(
                 pending_files(&lines, &spans, &files).is_empty(),
                 "starting at file {first} must still cover both files"

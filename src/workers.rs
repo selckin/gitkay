@@ -24,6 +24,7 @@ use crate::diff::{
     BuildEnv, CommitStats, DiffAnchor, DiffData, DiffProgress, DiffSettings, RowScope, StatsWant,
     anchor_hint,
 };
+use crate::diff_highlight::{HighlightBudget, highlight_diff_within};
 use crate::highlight::Highlighter;
 use crate::history::{
     CommitInfo, HISTORY_OID_CAP, HistoryWalk, TipPaths, build_commits_from_walk, build_ref_map,
@@ -33,7 +34,7 @@ use crate::prefetch::InflightClaim;
 use crate::textconv::Textconv;
 use crate::{
     DerivedHistory, DiffCacheKey, DiffDeps, Epoch, build_or_load, derive_from_commits,
-    finalize_diff_key, highlight_diff_until, store_of, textconv_for,
+    finalize_diff_key, store_of, textconv_for,
 };
 
 /// Time backstop for the pre-highlight pass. The pass is bounded by **rows** —
@@ -203,37 +204,30 @@ pub fn diff_load_job(repo: &Repository, job: DiffLoadJob) {
         // Bounded by ROWS — the landing screenful — with the clock only as a
         // backstop. Two earlier versions bounded by the clock against
         // DIFF_PLACEHOLDER_DELAY and both failed; see PREHIGHLIGHT_CEILING.
-        highlight_diff_until(
+        let done = highlight_diff_within(
             &data.lines,
             &mut data.spans,
             &data.files,
             &pre.hl,
-            Some(t + PREHIGHLIGHT_CEILING),
+            HighlightBudget {
+                lines: None,
+                deadline: Some(t + PREHIGHLIGHT_CEILING),
+                until_row: Some(landing.saturating_add(pre.visible_rows)),
+            },
             first,
-            Some(landing.saturating_add(pre.visible_rows)),
         );
-        // Report how much got coloured, not just complete-vs-partial: when the
-        // compute alone outlives the budget the pass returns having done nothing,
-        // and "partial" reads as "did some of it" for what is really "did none of
-        // it". The counts are what make that case self-explanatory in a log.
-        //
-        // Behind the level check, and one pass rather than two: this is the load a
-        // reader is sitting in front of, and counting is two traversals of rows that
-        // are cache-cold by then — the same after-the-fact rescan `DiffRows` exists to
-        // avoid, for a line a default run discards.
-        if log::log_enabled!(log::Level::Debug) {
-            let (mut code, mut coloured) = (0usize, 0usize);
-            for (i, l) in data.lines.iter().enumerate() {
-                if l.kind.is_code() {
-                    code += 1;
-                    coloured += usize::from(data.spans.is_set(i));
-                }
-            }
-            log::debug!(
-                "diff-load: pre-highlight from file {first}: {coloured}/{code} code lines in {:?}",
-                t.elapsed()
-            );
-        }
+        // How much got coloured and why it stopped, not just complete-vs-partial: when
+        // the compute alone outlives the budget the pass returns having done nothing,
+        // and "partial" reads as "did some of it" for what is really "did none of it".
+        // Both come back from the pass, which knows them exactly — this used to rescan
+        // every row of the finished diff to recover the count, cache-cold by then, the
+        // same after-the-fact traversal `DiffRows` exists to avoid.
+        log::debug!(
+            "diff-load: pre-highlight from file {first}: {} lines, {:?} in {:?}",
+            done.coloured,
+            done.stopped,
+            t.elapsed()
+        );
     }
     if tx
         .send(DiffLoadResult {
