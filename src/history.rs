@@ -1184,10 +1184,11 @@ pub fn load_commits_inner(
     // The lazy walk is tried first and falls back to the sorted one only where it
     // cannot answer at all — see `lazy_filtered_walk` for why it is no longer bounded.
     let walked = if !scope.paths.is_empty() {
+        let kind = WalkKind::Filtered;
         // Armed for the duration of the walk and cancelled by falling out of this
         // block: a filtered walk is 51s on a 1.47M-commit clone, and either driver can
         // be the one that takes it there. See `arm_slow_walk_notice`.
-        let _notice = arm_slow_walk_notice(repo, scope, SLOW_FILTER_NOTICE);
+        let _notice = arm_slow_walk_notice(repo, scope, kind.early_notice(stood_in));
         let filtered = lazy_filtered_walk(repo, scope, max, &ref_map)
             .or_else(|| sorted_filtered_walk(repo, scope, max, &ref_map));
         let examined = if let Some(filtered) = filtered {
@@ -1202,7 +1203,7 @@ pub fn load_commits_inner(
         // because the branch is what the reader was waiting on either way: leaving it
         // unrecorded there had the early notice blame the path filter and the report
         // blame the ordering pass, for one walk.
-        Walked::Filtered { examined }
+        kind.walked(examined)
     }
     // The lazy path first: when generation numbers are available this answers in
     // milliseconds what the sorted revwalk below takes 45s to answer on a large
@@ -1210,6 +1211,9 @@ pub fn load_commits_inner(
     // only what was asked for — unlike the sorted walk, whose extra oids are free
     // because the ordering pass has already produced them — so it caches none.
     else if let Some(oids) = topo_oids(repo, scope, max) {
+        // No notice armed, which is a property of the kind rather than of this branch
+        // forgetting one — see `WalkKind::early_notice`.
+        let kind = WalkKind::Lazy;
         let mut built = HashSet::new();
         real = build_commits_from_walk(
             repo,
@@ -1219,8 +1223,9 @@ pub fn load_commits_inner(
             max,
             scope.first_parent,
         );
-        Walked::Lazily
+        kind.walked(NO_DENOMINATOR)
     } else {
+        let kind = WalkKind::Sorted;
         // The lazy walk was refused — by the scope, or by a repository with no
         // commit-graph or an unusable one — so what the reader is waiting on is the
         // ordering pass below, and on a large repository they are waiting a long time
@@ -1233,7 +1238,7 @@ pub fn load_commits_inner(
         // The same knowledge, said to the reader instead of to a thread — and on the
         // same terms: only if the wait actually materialises. Cancelled by falling out
         // of this block.
-        let _notice = arm_slow_walk_notice(repo, scope, ordering_notice(stood_in));
+        let _notice = arm_slow_walk_notice(repo, scope, kind.early_notice(stood_in));
         let t_setup = std::time::Instant::now();
         let walk = history_revwalk(repo, scope);
         let setup = t_setup.elapsed();
@@ -1283,7 +1288,7 @@ pub fn load_commits_inner(
             );
             walk_oids = Some(all);
         }
-        Walked::Sorted
+        kind.walked(NO_DENOMINATOR)
     };
     log::debug!(
         "perf: load_commits: walk + build ({} real commits) {:?}",
@@ -1618,6 +1623,70 @@ enum Walked {
     Filtered { examined: usize },
 }
 
+/// Which walk a branch of `load_commits_inner` runs, declared where that branch begins.
+///
+/// **One taxonomy, asked twice at two different times.** A branch has to say which walk
+/// it is before it starts — that is what picks the sentence said WHILE it runs — and
+/// again once it has finished, which is what the report at the end is built from. Those
+/// were two independent statements: a notice string chosen by hand at the top, and a
+/// `Walked` produced fifty lines below. The series took real trouble over the second
+/// (`Walked` is a branch EXPRESSION precisely so a fourth strategy cannot inherit
+/// "sorted" from a default) and left the first as a literal.
+///
+/// Both failure modes are live and they differ. A fourth branch could arm the ordering
+/// sentence and then report a path filter, describing one walk two ways; or — the worse
+/// half, because nothing at all appears — it could arm no notice and leave the reader
+/// with a silent window for the 57s such a walk takes on a 1.47M-commit clone, which is
+/// the thing `arm_slow_walk_notice` exists to prevent. Declaring the kind once answers
+/// both, and a branch that declares none does not compile.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WalkKind {
+    Lazy,
+    Sorted,
+    Filtered,
+}
+
+impl WalkKind {
+    /// The why-clause for the notice armed while this walk runs, or `None` for a walk
+    /// worth arming none for.
+    ///
+    /// Split from the arming for the reason `slow_walk_message` is split from the
+    /// logging: so the sentences are testable without capturing output.
+    ///
+    /// **The lazy walk gets nothing, for the reason `WalkCost::of` reports nothing for
+    /// it.** It can cross the threshold on a large repository — 660ms for 200 rows —
+    /// but it is the fast path, so the sentence would name a wait with no lever to
+    /// shorten it, and it would spend the once-per-process advice latch on the one walk
+    /// with nothing to advise.
+    const fn early_notice(self, stood_in: bool) -> Option<&'static str> {
+        match self {
+            Self::Lazy => None,
+            Self::Sorted if stood_in => Some(SLOW_ORDERING_STANDIN_NOTICE),
+            Self::Sorted => Some(SLOW_ORDERING_NOTICE),
+            Self::Filtered => Some(SLOW_FILTER_NOTICE),
+        }
+    }
+
+    /// What this walk recorded, now that it has run.
+    ///
+    /// `examined` is the path filter's denominator and is read for no other kind: the
+    /// other two sentences quote the ROWS they produced, which the reporter has
+    /// already. So it is an argument here rather than a payload the unfiltered branches
+    /// would have to invent a number for — while `Walked::Filtered` still cannot be
+    /// built without one, which is what stops the pathspec sentence quoting a
+    /// denominator nobody counted.
+    const fn walked(self, examined: usize) -> Walked {
+        match self {
+            Self::Lazy => Walked::Lazily,
+            Self::Sorted => Walked::Sorted,
+            Self::Filtered => Walked::Filtered { examined },
+        }
+    }
+}
+
+/// What `WalkKind::walked` is passed by a branch with no denominator to report.
+const NO_DENOMINATOR: usize = 0;
+
 impl WalkCost {
     /// Which of the three a finished walk was, or `None` for one not worth reporting.
     ///
@@ -1871,8 +1940,12 @@ fn note_graph_advice(advice: Option<&str>, latch: &std::sync::atomic::AtomicBool
 fn arm_slow_walk_notice(
     repo: &Repository,
     scope: &cli::Scope,
-    cause: &'static str,
+    cause: Option<&'static str>,
 ) -> Option<std::sync::mpsc::Sender<()>> {
+    // A walk with nothing to warn about arms no thread at all — `WalkKind::early_notice`
+    // decides that, so the branch cannot arm the wrong sentence by having picked a
+    // literal, nor stay silent by having picked none.
+    let cause = cause?;
     let advice = (!GRAPH_ADVICE_REPORTED.load(std::sync::atomic::Ordering::Relaxed))
         .then(|| commit_graph_advice(repo, scope))
         .flatten();
@@ -1913,17 +1986,6 @@ const SLOW_ORDERING_NOTICE: &str =
 /// `WalkCost::of`.
 const SLOW_ORDERING_STANDIN_NOTICE: &str = "a best-effort order is standing in while the whole history is walked and sorted, \
      and will be replaced when it lands";
-
-/// Which of the two an unfiltered walk gets. Split from the arming for the reason
-/// `slow_walk_message` is split from the logging: so both sentences are testable
-/// without capturing output.
-const fn ordering_notice(stood_in: bool) -> &'static str {
-    if stood_in {
-        SLOW_ORDERING_STANDIN_NOTICE
-    } else {
-        SLOW_ORDERING_NOTICE
-    }
-}
 
 /// The early notice's why-clause for a path-filtered walk — a different cost with a
 /// different lever, as `WalkCost` says at more length. No denominator here, unlike the
@@ -3092,8 +3154,20 @@ mod tests {
     /// — where one was arranged — the stand-in.
     #[test]
     fn the_early_notice_names_the_work_and_never_the_window() {
-        let standin = ordering_notice(true);
-        let plain = ordering_notice(false);
+        let notice = |kind: WalkKind, stood_in| kind.early_notice(stood_in).expect("has one");
+        let standin = notice(WalkKind::Sorted, true);
+        let plain = notice(WalkKind::Sorted, false);
+        assert_eq!(notice(WalkKind::Filtered, false), SLOW_FILTER_NOTICE);
+        assert_eq!(
+            notice(WalkKind::Filtered, true),
+            SLOW_FILTER_NOTICE,
+            "a path filter cannot co-occur with a stand-in, and says the same either way"
+        );
+        assert_eq!(
+            WalkKind::Lazy.early_notice(false),
+            None,
+            "the fast path names a wait with no lever, and would spend the advice latch"
+        );
         for notice in [standin, plain, SLOW_FILTER_NOTICE] {
             assert!(
                 !notice.contains("first row") && !notice.contains("on screen"),
