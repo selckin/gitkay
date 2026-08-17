@@ -1678,10 +1678,24 @@ fn slow_walk_message(elapsed: std::time::Duration, rows: usize, cost: WalkCost) 
 /// any fetch, which the walk handles: `for_repo(..).is_some()` is the test, not
 /// coverage.
 ///
-/// The numbers are what make it worth acting on, and they are gitkay's own rather than
-/// git's: on a 1.47M-commit kernel clone the same 200 rows take 45s through the sorted
-/// revwalk and 1.0s once a commit-graph is there to walk lazily, and a path filter goes
-/// from 51s to 4.7s.
+/// **The measurements live here and not in the line.** They are what make the advice
+/// worth giving, and they are gitkay's own rather than git's: on a 1.47M-commit kernel
+/// clone the same 200 rows take 45s through the sorted revwalk and 1.0s once a
+/// commit-graph is there to walk lazily; a path filter goes from 51s to 4.7s with a
+/// graph carrying `--changed-paths`, and from 30s to 24s when only the index is added
+/// to one that already exists. Writing them costs 35s for 88MB, or 5min for 109MB with
+/// the filters. The line the reader gets says none of that: they cannot act on a file
+/// size, and a log line quoting somebody else's clone reads as diagnostics about
+/// gitkay rather than as a suggestion about their repository. What it does say is what
+/// the thing IS — a standard git index, which git writes itself during `git gc`, so a
+/// fresh clone simply has not got one yet — because "no commit-graph" is not a fault
+/// the reader caused and should not read like one.
+///
+/// Two claims in those sentences are about git's behaviour rather than gitkay's, and
+/// both were verified against git 2.55.0 rather than read off the documentation: `git
+/// gc` writes a commit-graph unasked (`gc.writeCommitGraph` defaults on), and the file
+/// it writes carries no `BIDX`/`BDAT`, so the changed-path index really is
+/// `--changed-paths` or nothing.
 ///
 /// **Four cases, because the fix is not always the same command and the reason is not
 /// always the same either.** A path filter also wants the changed-path index, which
@@ -1700,32 +1714,33 @@ pub fn commit_graph_advice(repo: &Repository, scope: &cli::Scope) -> Option<&'st
     let graph = crate::commitgraph::CommitGraph::for_repo(repo);
     match (&graph, scope.paths.is_empty()) {
         (None, true) if topo_scope(scope) => Some(
-            "this repository has no commit-graph, which is what a walk needs to be lazy: \
-             `git commit-graph write --reachable` writes one (35s for 88MB on a 1.47M-commit \
-             clone) and took the same walk there from 45s to 1.0s",
+            "this repository has no commit-graph yet. It is a standard git file — an index of \
+             the history that lets a log start without reading every commit first — and git \
+             writes one itself during `git gc`, so a fresh clone usually has none for a while. \
+             To have it now: `git commit-graph write --reachable`",
         ),
         (None, false) if topo_scope(scope) => Some(
-            "this repository has no commit-graph, which is what a path filter needs to walk \
-             lazily and to skip commits without comparing trees: \
-             `git commit-graph write --reachable --changed-paths` writes one (5min for 109MB \
-             on a 1.47M-commit clone) and took the same filtered walk there from 51s to 4.7s",
+            "this repository has no commit-graph yet. It is a standard git file — an index of \
+             the history that lets a log start without reading every commit first, and which \
+             can also record which files each commit touched, so a path filter finds them \
+             without comparing trees. git writes a plain one itself during `git gc`; for both \
+             parts: `git commit-graph write --reachable --changed-paths`",
         ),
         // A filtered scope the lazy walk does not cover — a range, a `--follow` — in a
         // repository with no graph at all. It gains no laziness, so this promises none;
         // it gains the tree comparisons the changed-path index skips, exactly as the
         // arm below does for a graph that is merely missing the index.
         (None, false) => Some(
-            "this repository has no commit-graph, so every commit walked is compared against \
-             the path filter by its trees: \
-             `git commit-graph write --reachable --changed-paths` writes one with the index \
-             that skips them, which took a filtered walk on a 1.47M-commit clone from 30s \
-             to 24s",
+            "this repository has no commit-graph yet. It is a standard git file, and it can \
+             record which files each commit touched, so a path filter finds them without \
+             comparing trees — which is most of what this walk is doing. To write one with \
+             that index: `git commit-graph write --reachable --changed-paths`",
         ),
         (Some(g), false) if !g.has_changed_paths() => Some(
-            "this repository's commit-graph carries no changed-path index, so every commit \
-             walked is compared against the path filter by its trees: \
-             `git commit-graph write --reachable --changed-paths` adds one, which took a \
-             filtered walk on a 1.47M-commit clone from 30s to 24s",
+            "this repository's commit-graph has no changed-path index — the part recording \
+             which files each commit touched, so a path filter finds them without comparing \
+             trees, which is most of what this walk is doing. `git gc` writes the graph \
+             without it; to add it: `git commit-graph write --reachable --changed-paths`",
         ),
         _ => None,
     }
@@ -3072,7 +3087,19 @@ mod tests {
             advice.contains("git commit-graph write --reachable"),
             "{advice}"
         );
-        assert!(advice.contains("45s"), "the number is the point: {advice}");
+        // It names the thing and says where it comes from, and quotes no measurement:
+        // the reader cannot act on somebody else's clone, and a line of figures about
+        // one reads as diagnostics rather than as a suggestion. See the numbers in
+        // `commit_graph_advice`'s own doc, which is where they belong.
+        assert!(advice.contains("standard git file"), "{advice}");
+        assert!(
+            advice.contains("git gc"),
+            "not a fault the reader caused: {advice}"
+        );
+        assert!(
+            !advice.contains("45s") && !advice.contains("88MB"),
+            "no measurements in the line: {advice}"
+        );
         assert!(
             !advice.contains("--changed-paths"),
             "a scope with no pathspec has no use for that index: {advice}"
@@ -3097,8 +3124,11 @@ mod tests {
         let advice = commit_graph_advice(&repo, &ranged_no_graph)
             .expect("a filtered walk saves tree comparisons whether or not it is lazy");
         assert!(advice.contains("--changed-paths"), "{advice}");
+        // The laziness is promised by one clause and only the two arms that can deliver
+        // it carry that clause — the anchor the plain-language rewrite left in place of
+        // the word "lazy", which no sentence says any more.
         assert!(
-            !advice.contains("lazy"),
+            !advice.contains("reading every commit first"),
             "this scope would not walk lazily, so nothing may promise it: {advice}"
         );
 

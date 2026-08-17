@@ -434,8 +434,15 @@ The invariants:
   one (`test_repo::write_graph_of` fills every column from the real commit).
 - **gitkay does not write a commit-graph, and keeps no generation cache of its own** —
   it says the file is absent and names the command (`commit_graph_advice`, its own
-  `warn` line under its own latch, `GRAPH_ADVICE_REPORTED`). That is a measurement, not
-  a preference: traversing the kernel's history through `git2` to compute generations
+  `warn` line under its own latch, `GRAPH_ADVICE_REPORTED`). **That line quotes no
+  measurement**: the reader cannot act on a file size, and a line of figures about
+  somebody else's clone reads as diagnostics about gitkay rather than as a suggestion
+  about their repository. It says what the thing IS — a standard git file, which `git
+  gc` writes unasked, so a fresh clone has simply not got one yet — because "no
+  commit-graph" is not a fault the reader caused. The numbers stay in that function's
+  doc, which is where they justify the advice rather than deliver it; the two claims
+  about git's own behaviour there were verified against git 2.55.0, not read off the
+  documentation. That gitkay writes none is a measurement, not a preference: traversing the kernel's history through `git2` to compute generations
   costs **62.8s** against the 45s walk it would replace, because `find_commit` parses
   every commit object out of the pack — the exact cost the format exists to eliminate,
   and what lets `git commit-graph write --reachable` do the same job in 35s. So a cache
