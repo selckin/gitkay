@@ -843,25 +843,6 @@ fn split_dir(path: &str) -> (&str, &str) {
         .map_or(("", path), |i| (&path[..=i], &path[i + 1..]))
 }
 
-/// Byte length of the leading directory segments that `a` and `b` share, ending at a
-/// `/` — whole-segment, so `x/foo/` and `x/bar/` share `x/` (2) while `src2/` and
-/// `src/` share nothing (0). Used to dim the ancestor path a directory header repeats
-/// from the header above it, and to factor the shared prefix out of a rename's
-/// old/new paths (`rename_brace`). Multibyte-safe (only ASCII `/` is a boundary, and
-/// the returned length always lands on one).
-fn common_dir_prefix_len(a: &str, b: &str) -> usize {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    let mut pfx = 0;
-    let mut i = 0;
-    while i < a.len() && i < b.len() && a[i] == b[i] {
-        if a[i] == b'/' {
-            pfx = i + 1;
-        }
-        i += 1;
-    }
-    pfx
-}
-
 /// git-style rename/copy display: the parts common to `old` and `new` are factored
 /// out at `/` boundaries, leaving the change in `{old ⇒ new}` braces. Returns
 /// `(common_dir_prefix, label)`, where `prefix + label` is the full form —
@@ -873,8 +854,8 @@ fn rename_brace(old: &str, new: &str) -> (String, String) {
     let (la, lb) = (a.len(), b.len());
 
     // Common prefix, snapped to the last shared '/' — the same whole-segment shared
-    // prefix `common_dir_prefix_len` computes for directory-header dimming.
-    let pfx = common_dir_prefix_len(old, new);
+    // prefix `diff::common_dir_prefix_len` computes for directory-header dimming.
+    let pfx = diff::common_dir_prefix_len(old, new);
 
     // Common suffix, snapped to a '/'. The floor lets the suffix reuse the slash that
     // ends the prefix (pfx > 0 ⇒ old[pfx-1] == '/'), which produces the
@@ -992,7 +973,7 @@ fn build_file_rows(files: &[(&str, Option<&str>)], layout: FileListLayout) -> Ve
             let mut prev_dir = "";
             for (dir, idxs) in by_dir {
                 rows.push(FileListRow::Header {
-                    dim_len: common_dir_prefix_len(prev_dir, dir),
+                    dim_len: diff::common_dir_prefix_len(prev_dir, dir),
                     dir: dir.to_string(),
                 });
                 prev_dir = dir;
@@ -5949,7 +5930,7 @@ impl GitkApp {
 
     /// Draw one grouped directory header, breadcrumb-style. `dim_len` is the byte
     /// length of the leading path this header shares with the header above it
-    /// (`common_dir_prefix_len`); that repeated ancestor is drawn dimmed
+    /// (`diff::common_dir_prefix_len`); that repeated ancestor is drawn dimmed
     /// (`SUBTEXT_DIM`) and the distinguishing tail in `SUBTEXT`, so a deep tree reads
     /// like an indented breadcrumb instead of a wall of repeated path.
     fn draw_dir_header(&self, ui: &mut egui::Ui, dir: &str, dim_len: usize, row_h: f32) {
@@ -11639,23 +11620,6 @@ mod tests {
                 "F:0:{foo ⇒ baz}/Bar.java:true",
             ]
         );
-    }
-
-    #[test]
-    fn common_dir_prefix_len_cases() {
-        // Sibling directories under a shared ancestor: dim the shared "x/wm/".
-        assert_eq!(
-            common_dir_prefix_len("x/wm/actions/", "x/wm/activematch/"),
-            5
-        );
-        // A child of the header above shares the whole parent.
-        assert_eq!(common_dir_prefix_len("a/", "a/b/"), 2);
-        // Nothing shared.
-        assert_eq!(common_dir_prefix_len("docs/", "src/main/"), 0);
-        // Whole-segment: "src2/" and "src/" share nothing.
-        assert_eq!(common_dir_prefix_len("src2/x/", "src/x/"), 0);
-        // Multibyte segment (α is 2 bytes); boundary is the ASCII '/'.
-        assert_eq!(common_dir_prefix_len("α/foo/", "α/bar/"), 3);
     }
 
     #[test]

@@ -915,6 +915,32 @@ impl DiffData {
     }
 }
 
+/// Byte length of the leading directory segments that `a` and `b` share, ending at a
+/// `/` — whole-segment, so `x/foo/` and `x/bar/` share `x/` (2) while `src2/` and
+/// `src/` share nothing (0). Multibyte-safe: only ASCII `/` is a boundary, and a `/`
+/// byte cannot occur inside a multi-byte UTF-8 sequence, so the result always lands on
+/// a character boundary.
+///
+/// This is libgit2's `git_fs_path_common_dirlen`, and three callers in two layers want
+/// exactly it: the diffstat block's `dir/{old => new}` factoring (a port, where
+/// agreeing with libgit2 is the requirement), the file sidebar's dimming of the
+/// ancestor a directory header repeats from the one above it, and `rename_brace`. It
+/// lives here because that is the layer both of the others already depend on — as two
+/// copies, the port and the sidebar's could have disagreed about a rename displayed one
+/// above the other in the same window.
+pub fn common_dir_prefix_len(a: &str, b: &str) -> usize {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut pfx = 0;
+    let mut i = 0;
+    while i < a.len() && i < b.len() && a[i] == b[i] {
+        if a[i] == b'/' {
+            pfx = i + 1;
+        }
+        i += 1;
+    }
+    pfx
+}
+
 /// One row's width in characters. NOT `text.len()`: that is exact for ASCII and three
 /// times too wide for CJK, and this value sizes the horizontal scroll range.
 fn row_chars(line: &DiffLine) -> usize {
@@ -3075,6 +3101,34 @@ pub mod tests {
             commit_index(&repo, &mut index, "everything at once")
         };
         (d, repo, oid)
+    }
+
+    /// The shared-directory rule, at the boundaries it actually turns on. Both of this
+    /// helper's callers had their own suite of these; the cases are the union, since a
+    /// case either of them covered is one the other's caller now depends on too.
+    #[test]
+    fn common_dir_prefix_len_is_the_last_shared_directory_separator() {
+        // Sibling directories under a shared ancestor.
+        assert_eq!(
+            common_dir_prefix_len("x/wm/actions/", "x/wm/activematch/"),
+            5
+        );
+        assert_eq!(common_dir_prefix_len("a/b/one.txt", "a/b/two.txt"), 4);
+        // A child of the path above shares the whole parent.
+        assert_eq!(common_dir_prefix_len("a/", "a/b/"), 2);
+        // Nothing shared.
+        assert_eq!(common_dir_prefix_len("a/one.txt", "b/one.txt"), 0);
+        assert_eq!(common_dir_prefix_len("docs/", "src/main/"), 0);
+        // No directory at all.
+        assert_eq!(common_dir_prefix_len("one.txt", "two.txt"), 0);
+        // Whole-segment: a shared prefix that is not a directory boundary does not
+        // count, in either direction.
+        assert_eq!(common_dir_prefix_len("abc/x", "abd/x"), 0);
+        assert_eq!(common_dir_prefix_len("src2/x/", "src/x/"), 0);
+        // The separator has to be at the same index in both.
+        assert_eq!(common_dir_prefix_len("a/b/x", "a/bb/x"), 2);
+        // Multibyte segment (α is 2 bytes); the boundary is the ASCII '/'.
+        assert_eq!(common_dir_prefix_len("α/foo/", "α/bar/"), 3);
     }
 
     /// Baseline `DiffSettings` for every fixture in this module: git's default
