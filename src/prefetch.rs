@@ -46,12 +46,13 @@ pub enum WarmDepth {
     Highlighted,
     /// Diff built and cached, no spans. An un-highlighted entry is a state the
     /// cache already supports — a superseded highlight worker's diff is stashed
-    /// exactly this way, `spans` is an `Option` per line, and
+    /// exactly this way, `RowSpans` holds an `Option` per row, and
     /// `ensure_diff_highlighted` colours it on install. Far cheaper per row in CPU
-    /// and meaningfully cheaper in memory (~170 B/line against ~370 B — see
+    /// and meaningfully cheaper in memory (~105 B/line against ~305 B — see
     /// `DIFF_CACHE_LINE_CEILING`; a `highlight::Span` is `(Color32, Range<usize>)`,
-    /// byte offsets into the line's shared `Arc<String>`, NOT an owned string per
-    /// token), which is what makes a full-window band reachable at all.
+    /// byte offsets into the line's shared `Arc<str>`, NOT an owned string per
+    /// token, and none of them is allocated at all for a `DiffOnly` entry), which is
+    /// what makes a full-window band reachable at all.
     DiffOnly,
 }
 
@@ -1420,7 +1421,7 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
     // lane; and if the entry is pruned before the warm, `warm_row` probes it itself
     // (`target.probed` being `None`) and defers it there.
     if job.want == StatsWant::FilesAndLines
-        && let Some(store) = crate::store_of(&ctx.deps.store)
+        && let Some(store) = store_of(&ctx.deps.store)
         && let Some(data) = store.load(&job.scope, job.settings)
     {
         log::debug!(
