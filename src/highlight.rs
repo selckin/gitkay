@@ -645,10 +645,11 @@ impl Highlighter {
                     .collect()
             },
         );
+        // One branch, not two: `snapshot` is `Some` exactly when `tail` is, and the two
+        // halves are one rule — a truncated line restores the parser state AND covers
+        // the tail no span reaches. Tested apart, they could drift apart.
         if let Some(before) = snapshot {
             state.restore(before);
-        }
-        if tail {
             spans.push((self.palette.foreground, head_len..code.len()));
         }
         spans
