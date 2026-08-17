@@ -748,6 +748,13 @@ pub const MAX_TOKENIZE_CHARS: usize = 20_000;
 /// `MAX_TOKENIZE_CHARS` of anything: the arithmetic is what goes wrong here, and
 /// proving it should not cost seconds of tokenizing per assertion.
 fn split_for_tokenizing(code: &str, max: usize) -> (&str, bool) {
+    // A character is never fewer bytes than one, so a line under the cap in BYTES is
+    // under it in characters and needs no walk — which is every line of every ordinary
+    // file, this being called on each of them. Only a line past the cap pays for
+    // finding the boundary.
+    if code.len() <= max {
+        return (code, false);
+    }
     code.char_indices()
         .nth(max)
         .map_or((code, false), |(at, _)| (&code[..at], true))
