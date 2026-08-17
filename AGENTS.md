@@ -218,7 +218,8 @@ display-order re-lay the file-list sidebar drives — see **Bottom panel**),
 inside the allocation, so a row costs ONE allocation on the build's hottest path
 instead of two, and `push_patch_line` assembles each row in a reused buffer rather
 than a `format!` (measured 36% off the per-line construction; the row itself grows
-8 B and the heap per row shrinks ~16 B),
+8 B and the heap per row shrinks ~24 B — the `String` header that is no longer
+between the `Arc` and the bytes — which is 1.8GB on a 76.5M-line diff),
 `DiffRows` (the rows a build is accumulating, plus the widest one measured AS THEY ARE
 PUSHED — `DiffData::max_chars` sizes the pane's horizontal scroll range and used to be
 rescanned off the finished diff, a second traversal of rows that are cache-cold by

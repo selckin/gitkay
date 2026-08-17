@@ -239,12 +239,21 @@ impl DiffViewport {
 ///   speculatively is what fixes the size: 8 × 133,460 ≈ 1.07M, rounded up here for
 ///   headroom.
 ///
-/// **Cost, measured from the structs rather than guessed:** a `DiffLine` is ~72 B, its
-/// `Arc<String>` text ~96 B, and its spans ~24 B each (`highlight::Span` is
+/// **Cost, measured from the structs rather than guessed:** a `DiffLine` is 32 B
+/// (`size_of`), its `Arc<str>` text ~72 B — a 16 B refcount header plus the bytes, with
+/// no `String` in between — and a span 24 B (`highlight::Span` is
 /// `(Color32, Range<usize>)` — byte offsets INTO the shared text, not an owned string
 /// per token, which an earlier version of this comment had wrong and priced ~3× too
-/// high). So ~370 B/line highlighted, ~170 B/line for a `DiffOnly` warm: this budget is
-/// roughly **350 MB** at a realistic mix, and ~440 MB if every entry were highlighted.
+/// high). Spans are no longer part of the row: they live in `PerRow` beside it, so a
+/// `DiffOnly` entry pays none of them. So ~305 B/line highlighted, ~105 B/line for a
+/// `DiffOnly` warm.
+///
+/// Both numbers came down when `DiffLine` did — 40 B off the row (spans moved out) and
+/// 24 B off the heap (`Arc<str>` for `Arc<String>`) — so **`BYTES_PER_CACHED_LINE` is
+/// now conservative**, and deliberately left that way: it over-states the per-line cost,
+/// which under-fills the cache rather than over-filling it, and re-cutting it is a
+/// measurement rather than an arithmetic exercise. At the figures above this budget is
+/// roughly **250 MB** at a realistic mix, and ~365 MB if every entry were highlighted.
 /// That is a deliberate trade of memory for never re-diffing, not an oversight — it is
 /// the one dial, and turning it down scales both prefetch bounds with it.
 const DIFF_CACHE_LINE_CEILING: usize = 1_200_000;
@@ -259,9 +268,11 @@ const DIFF_CACHE_LINE_FLOOR: usize = 100_000;
 /// Share of the memory budget the diff cache may hold. The rest is for everything else
 /// gitkay allocates — the live diff, the pool's transient blobs, egui's own buffers.
 const CACHE_SHARE_PERCENT: u64 = 25;
-/// Bytes one cached line costs, averaged over the highlighted (~370 B) and `DiffOnly`
-/// (~170 B) mixes measured from the structs. Only used to turn a byte budget into the
-/// cache's line-shaped one, so a rough figure is the right kind of answer.
+/// Bytes one cached line costs, averaged over the highlighted and `DiffOnly` mixes
+/// measured from the structs. Only used to turn a byte budget into the cache's
+/// line-shaped one, so a rough figure is the right kind of answer — and this one now
+/// sits above both (see `DIFF_CACHE_LINE_CEILING`), which spends less memory than the
+/// share allows rather than more.
 const BYTES_PER_CACHED_LINE: u64 = 290;
 
 /// The diff cache's line budget, from the system's memory where it will say.
@@ -3345,13 +3356,6 @@ struct GitkApp {
     /// shared claim set that stops overlapping dispatches from recomputing the
     /// same diff concurrently. See `InflightKeys`.
     inflight_diffs: InflightKeys,
-    /// Memoized `diff_fully_highlighted`: `(diff_generation, the answer)`.
-    ///
-    /// The scan is O(lines), and within one generation it can only ever go false→true —
-    /// spans are added, never removed, and everything that resets them bumps the
-    /// generation. So the answer is recomputed only when the generation moved, or when a
-    /// highlight batch has landed since a `false`.
-    ///
     /// Has colouring settled — i.e. is no highlight pass running for the displayed diff?
     ///
     /// What `band_warmable` waits on, and REPORTED by the worker
@@ -7737,7 +7741,7 @@ impl GitkApp {
                     // config reload's theme branch raced that worker, `data`'s
                     // spans were coloured under `key`'s theme/enabled but are
                     // about to be installed under `fresh`'s — wrong colours that
-                    // `diff_fully_highlighted` would then skip re-doing, and that
+                    // `pending_files` would then find nothing to re-do for, and that
                     // would get cached under the new key. Blank them exactly like
                     // `handle_config_reload`'s own re-highlight reset does for the
                     // live diff (`self.diff_spans.clear()`) so the post-install pass

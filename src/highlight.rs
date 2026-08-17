@@ -515,8 +515,8 @@ impl Highlighter {
     /// anything but one flat colour.
     ///
     /// Callers use it to report honestly: the plain-text fallback still sets spans on
-    /// every line, so nothing downstream — not `diff_fully_highlighted`, not the
-    /// prefetch's `Highlighted` log line — can tell the two apart on its own.
+    /// every line, so nothing downstream — not `pending_files`, not the prefetch's
+    /// `Highlighted` log line — can tell the two apart on its own.
     pub fn has_grammar(&self, path: &str) -> bool {
         self.syntax_for(path).is_some()
     }
