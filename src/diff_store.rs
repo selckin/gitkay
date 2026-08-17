@@ -9,7 +9,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::diff::{DiffData, DiffLine, DiffSettings, DiffSource, FileEntry, LineKind, RowScope};
+use crate::diff::{
+    CommitStats, DiffData, DiffLine, DiffSettings, DiffSource, FileEntry, LineKind, RowScope,
+    stats_of_files,
+};
 
 /// File magic. Any change to the byte layout below bumps `VERSION`; a version
 /// mismatch invalidates the whole store, which is correct and free — these are
@@ -249,16 +252,11 @@ fn encode(data: &DiffData) -> Vec<u8> {
     // the tab census the build path no longer does. See `DiffData::tabless`.
     out.push(u8::from(data.tabless));
 
-    put_u64(&mut out, data.lines.len() as u64);
-    for l in data.lines.iter() {
-        out.push(kind_tag(l.kind));
-        put_str(&mut out, &l.text);
-        // 0 stands for `None`: git's line numbers are 1-based, which is why the
-        // field is a `NonZeroU32` in the first place.
-        put_u32(&mut out, l.old_lineno.map_or(0, NonZeroU32::get));
-        put_u32(&mut out, l.new_lineno.map_or(0, NonZeroU32::get));
-    }
-
+    // **The file table comes before the rows, and that ordering is what `load_stats`
+    // is.** The commit-list column wants three integers this table already holds; with
+    // the rows in front of it, reaching them meant walking every one — which for a
+    // full `decode` means an `Arc<str>` per line, 400k allocations on a 400k-line entry
+    // to answer a question worth 24 bytes. Nothing else cares which comes first.
     put_u64(&mut out, data.files.len() as u64);
     for f in data.files.iter() {
         put_str(&mut out, &f.path);
@@ -278,6 +276,16 @@ fn encode(data: &DiffData) -> Vec<u8> {
         // silently rebuilds and rewrites the lot.
         put_u64(&mut out, f.diff_line_idx.map_or(0, |i| i as u64 + 1));
     }
+
+    put_u64(&mut out, data.lines.len() as u64);
+    for l in data.lines.iter() {
+        out.push(kind_tag(l.kind));
+        put_str(&mut out, &l.text);
+        // 0 stands for `None`: git's line numbers are 1-based, which is why the
+        // field is a `NonZeroU32` in the first place.
+        put_u32(&mut out, l.old_lineno.map_or(0, NonZeroU32::get));
+        put_u32(&mut out, l.new_lineno.map_or(0, NonZeroU32::get));
+    }
     out
 }
 
@@ -286,14 +294,7 @@ fn encode(data: &DiffData) -> Vec<u8> {
 /// always works.
 fn decode(bytes: &[u8]) -> Option<DiffData> {
     let mut r = Reader::new(bytes);
-    if r.take(MAGIC.len())? != MAGIC {
-        return None;
-    }
-    if u16::from_le_bytes(r.take(2)?.try_into().ok()?) != VERSION {
-        return None;
-    }
-    let max_chars = usize::try_from(r.u64()?).ok()?;
-    let tabless = r.u8()? != 0;
+    let (max_chars, tabless, files) = decode_head(&mut r)?;
 
     let n_lines = r.count(LINE_MIN_BYTES)?;
     let mut lines = Vec::with_capacity(n_lines);
@@ -313,6 +314,28 @@ fn decode(bytes: &[u8]) -> Option<DiffData> {
             new_lineno,
         });
     }
+
+    // Trailing bytes mean the file is not what this version writes.
+    (r.pos == bytes.len()).then(|| DiffData {
+        tabless,
+        ..DiffData::with_max_chars(lines, files, max_chars)
+    })
+}
+
+/// The header and the file table — everything an entry holds except its rows.
+///
+/// Split out for `decode_stats`, and shared with `decode` rather than written twice:
+/// the two must agree on the layout byte for byte, and the one that reads less is the
+/// one that would silently drift.
+fn decode_head(r: &mut Reader) -> Option<(usize, bool, Vec<FileEntry>)> {
+    if r.take(MAGIC.len())? != MAGIC {
+        return None;
+    }
+    if u16::from_le_bytes(r.take(2)?.try_into().ok()?) != VERSION {
+        return None;
+    }
+    let max_chars = usize::try_from(r.u64()?).ok()?;
+    let tabless = r.u8()? != 0;
 
     let n_files = r.count(FILE_MIN_BYTES)?;
     let mut files = Vec::with_capacity(n_files);
@@ -344,11 +367,22 @@ fn decode(bytes: &[u8]) -> Option<DiffData> {
         });
     }
 
-    // Trailing bytes mean the file is not what this version writes.
-    (r.pos == bytes.len()).then(|| DiffData {
-        tabless,
-        ..DiffData::with_max_chars(lines, files, max_chars)
-    })
+    Some((max_chars, tabless, files))
+}
+
+/// The commit-list column's three numbers, without decoding a single row.
+///
+/// A stats job wants `files.len()` and two sums, and getting them through `decode` cost
+/// the whole entry: one `Arc<str>` per line, materialised and dropped — 400k
+/// allocations on a 400k-line diff to produce three integers. This reads the header and
+/// the file table and stops, which is why the file table is written first.
+///
+/// It cannot disagree with the full path: `stats_of_files` is the same function
+/// `stats_from_data` runs, over the same table.
+fn decode_stats(bytes: &[u8]) -> Option<CommitStats> {
+    let mut r = Reader::new(bytes);
+    let (_, _, files) = decode_head(&mut r)?;
+    Some(stats_of_files(&files))
 }
 
 /// Everything about the repository that changes a diff without changing a commit.
@@ -815,6 +849,25 @@ impl DiffStore {
         // multi-second rebuild over bookkeeping is the wrong trade.
         let _ = touch(&path);
         Some(data)
+    }
+
+    /// The commit-list column's numbers for a stored diff, without decoding its rows.
+    ///
+    /// `load`'s shape exactly — same key, same unreadable-entry cleanup, same touch, so
+    /// a row served only through this column still counts as USED and is not pruned out
+    /// from under the pane that would want it next. What differs is that it stops after
+    /// the file table; see `decode_stats`.
+    pub fn load_stats(&self, scope: &RowScope, settings: DiffSettings) -> Option<CommitStats> {
+        let key = self.key(scope, settings)?;
+        let path = self.entry_path(key);
+        let bytes = std::fs::read(&path).ok()?;
+        let Some(stats) = decode_stats(&bytes) else {
+            log::debug!("diff store: dropping unreadable entry {key}");
+            let _ = std::fs::remove_file(&path);
+            return None;
+        };
+        let _ = touch(&path);
+        Some(stats)
     }
 
     /// Persist a diff. Silent no-op for a row with no key (the virtual rows), and for
@@ -1677,6 +1730,44 @@ mod tests {
             assert_eq!((a.additions, a.deletions), (b.additions, b.deletions));
             assert_eq!(a.diff_line_idx, b.diff_line_idx);
         }
+    }
+
+    /// `load_stats` reads less of the entry than `load` does, and the whole point is
+    /// that the commit-list column cannot tell — a hit that answered differently
+    /// depending on which one asked would put the column permanently at odds with the
+    /// pane beside it, under a key `stats_harvestable` believes is stronger than its
+    /// own rule.
+    ///
+    /// Over a diff with several files and both kinds of change, so the sums are not
+    /// trivially equal by being zero.
+    #[test]
+    fn load_stats_says_what_a_full_load_would() {
+        use crate::test_repo::{commit_index, stage, write_file};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.rs", "one\ntwo\nthree\n", "base");
+        commit_file(&repo, "b.rs", "keep\n", "add b");
+        write_file(&repo, "a.rs", "one\nTWO\n");
+        stage(&repo, "a.rs");
+        write_file(&repo, "c.rs", "new\nfile\n");
+        stage(&repo, "c.rs");
+        let oid = {
+            let mut index = repo.index().unwrap();
+            commit_index(&repo, &mut index, "edit and add")
+        };
+        let (_t, store) = temp_store(&repo);
+
+        let built = crate::diff::get_diff_data(&repo, &scope_of(oid), settings(), BuildEnv::NONE);
+        assert!(built.files.len() > 1, "control: several files");
+        store.save(&scope_of(oid), settings(), &built);
+
+        let full = store.load(&scope_of(oid), settings()).expect("hit");
+        let quick = store.load_stats(&scope_of(oid), settings()).expect("hit");
+        assert_eq!(quick, crate::diff::stats_from_data(&full));
+        assert_eq!(quick, crate::diff::stats_from_data(&built));
+        assert!(
+            matches!(quick.lines, crate::diff::LineStats::Counted(a, d) if a > 0 && d > 0),
+            "control: both sides are non-zero, so agreement is not vacuous: {quick:?}"
+        );
     }
 
     /// A rename carries `old_path` and a `Renamed` status; a bodyless file carries
