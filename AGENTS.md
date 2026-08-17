@@ -310,11 +310,15 @@ holds less than the scope asked for. git2-facing and egui-free, the same shape
 drawn". See **Startup & timing** for why the walk needs three strategies rather
 than one),
 `src/commitgraph.rs` (reading git's commit-graph file — the generation numbers
-libgit2 will not give us, and the changed-path Bloom filters a path filter asks:
-`OIDF`/`OIDL`/`CDAT` by `pread` for the first, `BIDX`/`BDAT` through `ChangedPaths`
+libgit2 will not give us, the PARENTS it will only give us by parsing a commit object,
+and the changed-path Bloom filters a path filter asks:
+`OIDF`/`OIDL`/`CDAT` by `pread` for the first two, `BIDX`/`BDAT` through `ChangedPaths`
 (which loads the oid list and filter index into memory, because that question is
-asked once per commit examined rather than a few thousand times) for the second,
-refusing anything malformed rather than guessing),
+asked once per commit examined rather than a few thousand times) for the third,
+refusing anything malformed rather than guessing. Parents are `CDAT`'s two columns plus
+`EDGE` for an octopus merge, and they are POSITIONS — **global across a split chain**,
+which is what `bases` exists for and what the old per-layer lookup did not need;
+verified against a two-layer chain git wrote),
 `src/topo.rs` (the lazy topological walk those numbers make possible — see
 **The commit order**),
 `src/graph.rs` (the commit graph's lane/pipe layout: `CommitInfo`s in, per-row
@@ -383,6 +387,11 @@ The big picture, ahead of the detail sections below:
   pane would be blank. The lazy driver is **bounded** (`LAZY_FILTER_SHARE`) because a
   filter, unlike every other scope, need not stop early — see there for the five
   measurements that set the share, and for the one case it deliberately makes slower.
+  A ruled-out commit's object is **never read**: the loop needs only its parents, for
+  the rewrite to chain through, and the lazy walk hands those over with the oid
+  (`TopoWalk::next`) having read them once to build the indegree. On the kernel clone
+  that is 190,618 of 191,485 commits. The sorted driver has none to offer and pays
+  nothing for it, libgit2's ordering pass having already parsed every commit.
   Both drivers consult the **changed-path Bloom filters** when the repo has them
   (`PathBloom` → `commitgraph::ChangedPaths`), which is what turns the per-commit tree
   comparison into a few bits: on that clone, 190,618 of 191,485 commits ruled out and
@@ -507,8 +516,8 @@ The invariants:
   an intolerably slow walk, so racing one that is both exact and fast could only
   reintroduce the reshuffle it exists to avoid — but "is the real walk the lazy one?"
   cannot be answered from the side. It was, by asking whether a commit-graph exists,
-  and existing is not the question: `TopoWalk` refuses a file that is not closed under
-  ancestry, `load_commits_inner` then falls back to the sorted revwalk, and the
+  and existing is not the question: `TopoWalk` refuses a file it cannot read a parent
+  out of, `load_commits_inner` then falls back to the sorted revwalk, and the
   stand-in had already been declined — a blank window for the 57s that walk takes on a
   1.47M-commit clone. So `load_commits_inner` sends a `ProvisionalGo` at the moment it
   enters the sorted branch, and the quick thread blocks until it arrives; a dropped
@@ -584,6 +593,22 @@ Two implementations produce it and they must not disagree:
 **Speed may depend on a cache file; order may not.** A `git gc` writing a
 commit-graph in the background must change how fast the list appears and nothing
 about what it says.
+
+**`TopoWalk` takes a commit's parents from `CDAT` where the graph holds it**, and from
+the object only for the tip region a stale graph does not cover. That is 24.1s → 4.5s of
+walking on a filtered pass over the kernel clone, `find_commit` being a commit object
+parsed out of the pack against an 8-byte read beside the generation. Verified against
+git after the change: 2,000 and 10,000 rows of the plain scope and 2,000 of `--all`
+(945 refs) byte-identical to `git rev-list --topo-order`, and a filtered walk's 100 kept
+rows a strict subsequence of git's full 1,465,159-row order.
+
+**What that gave up is the ancestry-closure check, deliberately.** Reading real parents,
+the walk could see a graph holding a commit but not its parent and decline; read from
+`CDAT` a parent is in the graph by construction, so such a file instead reads as a root
+and the walk stops there — a short list rather than the ancestor-above-descendant
+inversion the check prevented. git writes no such file, and git and libgit2 trust these
+columns the same way. A record that cannot be READ — a position past the end of the
+chain, an `EDGE` run that never ends — is still refused, all-or-nothing.
 
 **Under `--all` the tips are the order** — the walk seeds its stack with them — and
 git's are its starting points sorted by COMMITTER date, newest first
@@ -1568,11 +1593,15 @@ working tree — the diff store's key depends on it), `set_config`/`write_driver
 `driver_script` to stand up a whole textconv fixture (a `[diff "<name>"]` section, the
 `.gitattributes` line that selects it, and a `/bin/sh` script to run),
 `write_commit_graph` / `write_commit_graph_exact` /
-`write_commit_graph_with_changed_paths` to put a commit-graph beside a real repository
+`write_commit_graph_with_changed_paths` / `write_commit_graph_with_bad_parent` to put a
+commit-graph beside a real repository
 — every column filled from the real commit, because **libgit2 reads this file** and a
 fixture that lies about a commit's parents corrupts `git2`'s own revwalk (measured:
-truncated to one commit), and `_exact` deliberately writes an ancestry-UNCLOSED file,
-which is a shape no walk can be trusted over, its own included — and
+truncated to one commit); `_exact` deliberately writes an ancestry-UNCLOSED file, which
+the walk no longer refuses but merely stops at (see **The commit order**), and
+`_with_bad_parent` writes a position past the end of the chain, which it does refuse —
+that one is usable **only where nothing afterwards walks the repository through
+libgit2**, which does not truncate on a bad position but HANGS — and
 `read_file`/`index_blob`
 to assert on the worktree vs. the index separately. Add fixtures there rather than
 re-rolling them per module.

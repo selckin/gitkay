@@ -57,10 +57,33 @@
 //! the frontier expand every missing commit before any known one — exactly the order
 //! the floor rule needs.
 //!
-//! That soundness rests entirely on the closure property, so it is CHECKED rather
-//! than assumed: a known commit with an unknown parent means the file is not
-//! ancestor-closed, and the walk declines instead of emitting a parent above its own
-//! children — the one corruption its caller could not detect.
+//! Being upward-closed is also what makes the two ways of reading parents compose: the
+//! tip region comes out of the objects and everything below it out of the file, and the
+//! boundary is crossed once on the way down rather than being scattered through the
+//! walk.
+//!
+//! ## Where the parents come from, and what that cost
+//!
+//! A commit IN the graph has its parents read from `CDAT`, as positions — no oid
+//! lookup, no `find_commit`. That is the difference between 24.1s and 4.5s of walking
+//! on a filtered pass over a 1.465M-commit kernel clone, because `find_commit` parses
+//! a commit object out of the pack while this is an 8-byte read beside the generation
+//! already being fetched. A commit the graph does not hold still goes through the
+//! object; there is nowhere else its parents exist.
+//!
+//! **The columns are taken on trust, which the old implementation did not have to do.**
+//! Reading real parents, this walk could SEE an ancestry-closure violation — a commit
+//! in the graph whose parent was not — and declined, because the `u32::MAX` treatment
+//! above would otherwise draw a missing ancestor above its own descendants. Read from
+//! `CDAT` a parent is in the graph by construction, so the violation is unobservable:
+//! such a file writes `GRAPH_PARENT_NONE` in the column, the commit reads as a root,
+//! and the walk ends there. The failure mode moved from a wrong ORDER to a short list,
+//! which is the better of the two, and it is the position git and libgit2 have always
+//! been in — both trust these columns, and AGENTS.md records a hand-written fixture
+//! truncating git2's own revwalk for exactly this reason. What is still refused is a
+//! record that cannot be READ: a position past the end of the chain, or an `EDGE` run
+//! that never terminates. See `an_unclosed_graph_truncates_where_it_stops_describing_
+//! the_history` and `a_graph_naming_a_parent_it_does_not_hold_is_refused`.
 //!
 //! ## More than one tip
 //!
@@ -108,6 +131,11 @@ const EXPAND_BATCH: usize = 512;
 struct Node {
     generation: u32,
     indegree: u32,
+    /// Where this commit sits across the whole chain, or `None` for one the graph does
+    /// not hold. What decides which way `expand` reads its parents, and it is the
+    /// binary search `discover` already paid for the generation rather than a second
+    /// one.
+    pos: Option<u32>,
     /// The parents `expand` read, kept until the commit is emitted and handed to the
     /// caller with it.
     ///
@@ -196,12 +224,40 @@ impl<'a> TopoWalk<'a> {
         if self.nodes.contains_key(&oid) {
             return;
         }
-        let generation = self.graph.generation(oid).unwrap_or(u32::MAX);
+        let pos = self.graph.position(oid);
+        let generation = pos
+            .and_then(|at| self.graph.generation_at(at))
+            .unwrap_or(u32::MAX);
+        self.record(oid, pos, generation);
+    }
+
+    /// `discover` for a commit the graph named by POSITION — a parent read out of
+    /// `CDAT`, which is where all but the tip region come from.
+    ///
+    /// The saving over `discover` is the whole point of reading parents from the file:
+    /// no binary search, because the position is already known, and no `find_commit`,
+    /// because the position answers for the generation too. Two small reads against
+    /// ~13 probes plus a commit parsed out of the pack.
+    ///
+    /// Returns the oid, which the caller needs anyway and which is one of those reads.
+    fn discover_at(&mut self, at: u32) -> Option<git2::Oid> {
+        let oid = self.graph.oid_at(at)?;
+        if !self.nodes.contains_key(&oid) {
+            let generation = self.graph.generation_at(at).unwrap_or(u32::MAX);
+            self.record(oid, Some(at), generation);
+        }
+        Some(oid)
+    }
+
+    /// Enter a commit at indegree 1 and queue it for expansion — the half the two
+    /// `discover`s share, so a commit cannot be entered two different ways.
+    fn record(&mut self, oid: git2::Oid, pos: Option<u32>, generation: u32) {
         self.nodes.insert(
             oid,
             Node {
                 generation,
                 indegree: 1,
+                pos,
                 parents: None,
             },
         );
@@ -224,17 +280,30 @@ impl<'a> TopoWalk<'a> {
     /// Discover one commit's parents and count this commit as a child of each — the
     /// step that builds the indegrees Kahn's algorithm consumes.
     fn expand(&mut self, oid: git2::Oid) -> Option<()> {
-        let known = self.generation_of(oid) != u32::MAX;
-        let parents = self.parents(oid)?;
-        for &parent in &parents {
-            self.discover(parent);
-            // The ancestry-closure check. A commit the graph knows must have parents
-            // it knows; if it does not, the file is not closed under ancestry and the
-            // `u32::MAX` treatment above stops being sound — a missing ANCESTOR would
-            // outrank its own descendants and be drawn above them.
-            if known && self.generation_of(parent) == u32::MAX {
-                return None;
+        // In the graph: its parents are two columns beside the generation the walk
+        // just read, and they name positions, so each is discovered without a search.
+        // Otherwise — the tip region after a fetch — the object is the only place its
+        // parents exist.
+        let parents = if let Some(at) = self.nodes.get(&oid)?.pos {
+            let positions = self.graph.parents_at(at)?;
+            let mut out = Vec::with_capacity(positions.len());
+            for parent in positions {
+                out.push(self.discover_at(parent)?);
+                // `--first-parent` truncates where the parents are READ, exactly as
+                // `commit_parents` does on the other branch.
+                if self.first_parent {
+                    break;
+                }
             }
+            out
+        } else {
+            let parents = self.parents(oid)?;
+            for &parent in &parents {
+                self.discover(parent);
+            }
+            parents
+        };
+        for &parent in &parents {
             self.nodes.get_mut(&parent)?.indegree += 1;
         }
         // Kept for the emit, which needs exactly this list and used to read it again.
@@ -360,6 +429,7 @@ mod tests {
     use super::*;
     use crate::test_repo::{
         commit_file, commit_merge, temp_repo, write_commit_graph, write_commit_graph_exact,
+        write_commit_graph_with_bad_parent,
     };
 
     /// Every commit reachable from `tips`, in a topological order produced the slow,
@@ -548,39 +618,82 @@ mod tests {
         assert_eq!(got[1], extra);
     }
 
-    /// The soundness of treating an unknown commit as maximal generation rests on
-    /// git writing graphs closed under ancestry. A file that is not closed is
-    /// refused rather than walked, because the failure it would otherwise produce —
-    /// an ancestor drawn above its own descendants — is one the caller cannot see.
+    /// A stale graph — one holding an ancestor PREFIX — is the ordinary state after a
+    /// fetch, and the walk crosses out of it into the objects without ceremony.
     #[test]
-    fn a_graph_that_is_not_closed_under_ancestry_is_refused() {
+    fn a_graph_covering_only_part_of_the_history_is_walked_through() {
         let (_dir, repo) = temp_repo();
         let root = commit_file(&repo, "a.txt", "1", "root");
         let mid = commit_file(&repo, "a.txt", "2", "mid");
         let tip = commit_file(&repo, "a.txt", "3", "tip");
 
-        // The control: a graph holding an ancestor PREFIX is closed, and walking it
-        // is sound — that is the ordinary stale-graph case, not a violation.
         write_commit_graph(&repo, &[root]);
         let graph = CommitGraph::for_repo(&repo).unwrap();
-        assert_eq!(graph.generation(mid), None);
+        assert_eq!(graph.generation(mid), None, "deliberately not in the graph");
         let mut walk = TopoWalk::new(&repo, &graph, &[tip], false);
         assert_eq!(
             walk.take(10),
             Some(vec![tip, mid, root]),
             "a prefix is fine"
         );
+    }
 
-        // The violation: a file holding a commit but not its own parent. git never
-        // writes one; a corrupt file is what this stands in for. `mid` is missing
-        // while `root` beneath it is present, so the `u32::MAX` treatment would put
-        // `mid` ABOVE `tip`, which is the inversion the guard exists to catch.
+    /// **What an ancestry-unclosed graph now does, which is not what it used to.**
+    ///
+    /// The walk reads parents out of `CDAT`, where a parent is a POSITION — so a file
+    /// holding a commit but not its parent cannot say so. It writes "no parent" in that
+    /// column, the commit reads as a root, and the walk ends there: a truncated history
+    /// rather than the refusal this used to produce.
+    ///
+    /// That is deliberate and it is the trade the `CDAT` parents bought (19.2s of a
+    /// 23.1s filtered walk on a kernel clone). git writes no such file, and both git and
+    /// libgit2 trust these columns exactly this way — AGENTS.md records a hand-written
+    /// fixture truncating git2's own revwalk to one commit for the same reason. The
+    /// failure it leaves is a SHORT list, not the ancestor-above-descendant inversion
+    /// the old guard existed to prevent, because the walk never reaches the missing
+    /// commit to misplace it.
+    ///
+    /// Asserted rather than left undocumented so the change is visible to whoever meets
+    /// it: this test passing is not a claim that the answer is right.
+    #[test]
+    fn an_unclosed_graph_truncates_where_it_stops_describing_the_history() {
+        let (_dir, repo) = temp_repo();
+        let root = commit_file(&repo, "a.txt", "1", "root");
+        let mid = commit_file(&repo, "a.txt", "2", "mid");
+        let tip = commit_file(&repo, "a.txt", "3", "tip");
+
+        // `mid` is missing while `root` beneath it is present — the shape git never
+        // writes.
         write_commit_graph_exact(&repo, &[tip, root]);
         let graph = CommitGraph::for_repo(&repo).unwrap();
         assert!(graph.generation(tip).is_some());
         assert_eq!(graph.generation(mid), None, "the hole this test is about");
         let mut walk = TopoWalk::new(&repo, &graph, &[tip], false);
-        assert!(walk.take(10).is_none(), "an unclosed graph must be refused");
+        assert_eq!(
+            walk.take(10),
+            Some(vec![tip]),
+            "the tip's parent column says 'none', so the walk ends there"
+        );
+        assert!(walk.done(), "and it ran out rather than giving up");
+    }
+
+    /// A parent column naming a position the chain does not have is a file that cannot
+    /// describe its own shape, and there is no honest reading of it — unlike the
+    /// unclosed graph above, which is merely incomplete. This is the walk's refusal
+    /// case, and it must stay all-or-nothing: a partial topological prefix is
+    /// indistinguishable from a whole answer and would be drawn as one.
+    #[test]
+    fn a_graph_naming_a_parent_it_does_not_hold_is_refused() {
+        let (_dir, repo) = temp_repo();
+        commit_file(&repo, "a.txt", "1", "root");
+        let tip = commit_file(&repo, "a.txt", "2", "tip");
+        write_commit_graph_with_bad_parent(&repo, &[tip]);
+        let graph = CommitGraph::for_repo(&repo).unwrap();
+        let mut walk = TopoWalk::new(&repo, &graph, &[tip], false);
+        assert!(
+            walk.take(10).is_none(),
+            "an unreadable parent must be refused"
+        );
         // …and it stays refused however empty the queues end up. `done` answering
         // true after a refusal is what would let `take` hand back a topological
         // PREFIX as though it were the whole answer.

@@ -2783,7 +2783,7 @@ mod tests {
     fn the_go_ahead_follows_the_walk_that_was_actually_taken() {
         let (dir, repo) = temp_repo();
         let root = commit_file(&repo, "a.txt", "1", "root");
-        let _mid = commit_file(&repo, "a.txt", "2", "mid");
+        let mid = commit_file(&repo, "a.txt", "2", "mid");
         let tip = commit_file(&repo, "a.txt", "3", "tip");
         let scope = cli::Scope::default();
         let asked = |repo: &Repository| {
@@ -2795,9 +2795,28 @@ mod tests {
         // No graph: the sorted revwalk is what the reader is left waiting on.
         assert!(asked(&repo), "a sorted walk must ask to be stood in for");
 
-        // A graph with a hole in it — `mid` missing under a `tip` that is present.
-        // Everything the old prediction asked is true of it.
-        write_commit_graph_exact(&repo, &[tip, root]);
+        // A graph the walk CAN use: exact and fast, so approximate rows ahead of it
+        // could only be rows it reorders.
+        write_commit_graph(&repo, &[tip]);
+        let repo = open_repo(dir.path());
+        assert!(topo_oids(&repo, &scope, 100).is_some());
+        assert!(!asked(&repo), "a lazy walk must not ask");
+
+        // And one it cannot finish: it covers `root` alone, so the walk crosses out of
+        // the graph into the objects — and `mid`'s object is gone, the way a pruned odb
+        // leaves it. Everything the old prediction asked is still true here: a
+        // commit-graph exists, and the scope is one `topo_scope` accepts.
+        //
+        // A graph with a LYING parent column would do it too, and used to. It is not
+        // usable in a test that then walks the repository: libgit2 reads this file as
+        // well, and on a parent position past the end of the chain it does not truncate,
+        // it hangs. This shape breaks only what gitkay reads.
+        //
+        // Last, because removing the object makes every later `write_commit_graph` walk
+        // into the hole.
+        write_commit_graph(&repo, &[root]);
+        drop(repo);
+        remove_loose_object(dir.path(), mid);
         let repo = open_repo(dir.path());
         assert!(crate::commitgraph::CommitGraph::for_repo(&repo).is_some());
         assert!(
@@ -2808,13 +2827,6 @@ mod tests {
             asked(&repo),
             "a refused graph still leaves the sorted walk to be stood in for"
         );
-
-        // And one the walk can use: exact and fast, so approximate rows ahead of it
-        // could only be rows it reorders.
-        write_commit_graph(&repo, &[tip]);
-        let repo = open_repo(dir.path());
-        assert!(topo_oids(&repo, &scope, 100).is_some());
-        assert!(!asked(&repo), "a lazy walk must not ask");
     }
 
     /// The scroll extension has to come from the SAME walk the prefix did, or it
@@ -3991,11 +4003,15 @@ mod tests {
     fn a_walk_that_declines_mid_filter_gives_up_whole() {
         let (dir, repo) = temp_repo();
         let a = commit_file(&repo, "a.txt", "1", "a-1");
-        commit_file(&repo, "b.txt", "1", "b-only");
-        let c = commit_file(&repo, "a.txt", "2", "a-2");
-        // A hole: the middle commit is missing while its own parent is present, which is
-        // the shape `TopoWalk` refuses.
-        write_commit_graph_exact(&repo, &[c, a]);
+        let b = commit_file(&repo, "b.txt", "1", "b-only");
+        commit_file(&repo, "a.txt", "2", "a-2");
+        // A graph covering `a` alone, and the object of a commit above it removed the
+        // way a pruned odb leaves one — so the walk crosses out of the graph and cannot
+        // read what it finds. Any decline will do here; what this pins is that ONE
+        // gives up the whole pass rather than handing back the prefix it had.
+        write_commit_graph(&repo, &[a]);
+        drop(repo);
+        remove_loose_object(dir.path(), b);
         let repo = open_repo(dir.path());
         let scope = cli::Scope {
             paths: vec!["a.txt".to_string()],

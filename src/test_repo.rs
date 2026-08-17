@@ -450,7 +450,7 @@ fn a_temp_repo_starts_on_a_branch_the_test_chose() {
 /// real repository, since `git fetch` does not update the file — by naming tips that
 /// leave later commits out of it.
 pub fn write_commit_graph(repo: &git2::Repository, covering: &[git2::Oid]) {
-    write_graph_of(repo, reachable_from(repo, covering), false);
+    write_graph_of(repo, reachable_from(repo, covering), false, false);
 }
 
 /// Write a commit-graph holding EXACTLY `oids` — which lets a test build a file that
@@ -458,7 +458,28 @@ pub fn write_commit_graph(repo: &git2::Repository, covering: &[git2::Oid]) {
 /// and the one whose soundness guard needs testing. git never writes such a file;
 /// a corrupt or hand-edited one is what this stands in for.
 pub fn write_commit_graph_exact(repo: &git2::Repository, oids: &[git2::Oid]) {
-    write_graph_of(repo, oids.to_vec(), false);
+    write_graph_of(repo, oids.to_vec(), false, false);
+}
+
+/// Write a commit-graph whose parent columns name a position the file does not have.
+///
+/// git never writes one; a corrupt or truncated file is what this stands in for, and it
+/// is the shape the reader must refuse rather than follow — a parent position is an
+/// index into the chain, so an out-of-range one resolves to no commit at all. This
+/// replaced the ancestry-unclosed fixture as the walk's refusal case: since parents are
+/// read from `CDAT`, an unclosed file no longer LOOKS unclosed (see `topo`), while a
+/// position past the end still cannot be read.
+///
+/// **Use it only where nothing afterwards walks the repository through libgit2.**
+/// libgit2 reads this file too and takes its parents from it, and on a position past
+/// the end of the chain it does not truncate the way it does on a "no parent" lie — it
+/// HANGS, which is how this constraint was found. `core.commitGraph=false` does not
+/// call it off. `TopoWalk` is safe to point at such a file because `CommitGraph` opens
+/// the path itself and never asks libgit2; `load_commits` is not, since its fallback is
+/// a `Revwalk`. A test that needs a walk to decline can instead cover part of the
+/// history and `remove_loose_object` above it, which breaks only what gitkay reads.
+pub fn write_commit_graph_with_bad_parent(repo: &git2::Repository, covering: &[git2::Oid]) {
+    write_graph_of(repo, reachable_from(repo, covering), false, true);
 }
 
 /// `write_commit_graph`, plus the changed-path Bloom filters that only
@@ -466,7 +487,7 @@ pub fn write_commit_graph_exact(repo: &git2::Repository, oids: &[git2::Oid]) {
 /// FIRST parent, which is what `bloom.c` records and what gitkay's path filter asks
 /// about.
 pub fn write_commit_graph_with_changed_paths(repo: &git2::Repository, covering: &[git2::Oid]) {
-    write_graph_of(repo, reachable_from(repo, covering), true);
+    write_graph_of(repo, reachable_from(repo, covering), true, false);
 }
 
 /// Every commit reachable from `tips`.
@@ -515,7 +536,12 @@ const NUM_HASHES: u32 = 7;
 /// second slot on an ordinary commit, and its first on a root.
 const GRAPH_PARENT_NONE: u32 = 0x7000_0000;
 
-fn write_graph_of(repo: &git2::Repository, mut order: Vec<git2::Oid>, changed_path_filters: bool) {
+fn write_graph_of(
+    repo: &git2::Repository,
+    mut order: Vec<git2::Oid>,
+    changed_path_filters: bool,
+    bad_parent: bool,
+) {
     let present: std::collections::HashSet<git2::Oid> = order.iter().copied().collect();
     // Topological level, resolved by repeated relaxation — the set is tiny and this
     // needs no ordering of its own to be correct.
@@ -554,6 +580,7 @@ fn write_graph_of(repo: &git2::Repository, mut order: Vec<git2::Oid>, changed_pa
     // a test is comparing against — and it does so silently, since nothing in the API
     // says the graph was consulted. The trailer below is what should keep libgit2 off
     // it; these values are what keep the fixture honest if it ever reads it anyway.
+    let order_len = order.len() as u32;
     let position: std::collections::HashMap<git2::Oid, u32> = order
         .iter()
         .enumerate()
@@ -564,7 +591,15 @@ fn write_graph_of(repo: &git2::Repository, mut order: Vec<git2::Oid>, changed_pa
         let commit = repo.find_commit(*oid).unwrap();
         let parents: Vec<u32> = commit
             .parent_ids()
-            .map(|p| position.get(&p).copied().unwrap_or(GRAPH_PARENT_NONE))
+            .map(|p| {
+                if bad_parent {
+                    // Past the end of the chain, so the reader can resolve it to
+                    // nothing whatever it does with the number.
+                    order_len + 1000
+                } else {
+                    position.get(&p).copied().unwrap_or(GRAPH_PARENT_NONE)
+                }
+            })
             .collect();
         // A third parent lives in the EDGE chunk, which this writer does not emit —
         // better to refuse the fixture than to describe an octopus merge wrongly.

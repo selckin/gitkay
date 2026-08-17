@@ -31,16 +31,23 @@
 //! for what asks. The filter is computed against a commit's FIRST parent, which is
 //! exactly the question gitkay's path filter asks.
 //!
-//! ## What is deliberately NOT parsed
+//! ## The third question: who a commit's parents are
 //!
-//! `EDGE` (a third and further parent) and `GDA2` (corrected commit dates) are not
-//! read: git2 already supplies parents, trees and timestamps, and reading them twice
-//! could only introduce a disagreement.
+//! `CDAT`'s two parent columns and the `EDGE` chunk behind them, read by `parents_at`.
+//! git2 supplies parents too, but it parses the commit object out of the pack to do it,
+//! and that was the whole cost of a lazy walk: 24.1s of a 29.0s filtered pass over a
+//! 1.465M-commit clone, against 4.5s reading them here. `GDA2` (corrected commit dates)
+//! is still not read — git2 supplies times, and reading them twice could only introduce
+//! a disagreement.
 //!
-//! That also means the **split chain needs no position arithmetic**: a commit lives in
-//! exactly one layer, so a lookup asks each layer in turn and the first hit wins. The
-//! global-position mapping that a parent-reading implementation would need does not
-//! arise, and the Bloom chunks are per-layer for the same reason.
+//! **Parents are POSITIONS, and they are global across a split chain.** That is what
+//! makes the position arithmetic necessary: a layer's `OIDL` holds only its own
+//! commits, so an upper layer could not otherwise name a parent in the base. Layers are
+//! numbered in chain-file order, base first, each starting at the running total below
+//! it (`bases`). Verified against a two-layer chain git wrote, where the upper layer's
+//! oldest commit names its parent as global 0 — a commit living in the base layer.
+//! An oid LOOKUP still asks each layer in turn and takes the first hit; only the
+//! parent columns need the mapping.
 //!
 //! ## Reading strategy
 //!
@@ -68,11 +75,14 @@
 //! ## libgit2 reads this file too
 //!
 //! Not for ORDERING — that measurement stands, 45.1s without the file and 45.3s with —
-//! but its revwalk does take parents from it. Measured while building the test
-//! fixtures: a hand-written graph whose parent columns said "no parent" truncated
-//! `git2`'s own walk to a single commit. Nothing in this module depends on that, but
-//! any fixture written for it must describe the commits truthfully, or the walk a test
-//! compares against is the one that is wrong.
+//! but its revwalk does take parents from it, exactly as `parents_at` now does.
+//! Measured while building the test fixtures: a hand-written graph whose parent columns
+//! said "no parent" truncated `git2`'s own walk to a single commit. So any fixture
+//! written for this module must describe its commits truthfully, or the walk a test
+//! compares against is the one that is wrong — and a fixture that lies about a
+//! POSITION is worse still: `write_commit_graph_with_bad_parent` names one past the end
+//! of the chain, and libgit2 does not truncate on that, it hangs. It is usable only
+//! where nothing afterwards walks the repository through libgit2.
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -88,6 +98,28 @@ const CHUNK_OID_LOOKUP: &[u8; 4] = b"OIDL";
 const CHUNK_COMMIT_DATA: &[u8; 4] = b"CDAT";
 const CHUNK_BLOOM_INDEX: &[u8; 4] = b"BIDX";
 const CHUNK_BLOOM_DATA: &[u8; 4] = b"BDAT";
+/// `EDGE`: an octopus merge's parents past the first, which do not fit `CDAT`'s two
+/// columns. Optional — a repository with no octopus merge has no such chunk.
+const CHUNK_EXTRA_EDGES: &[u8; 4] = b"EDGE";
+
+/// A parent column holding no parent: the second column of an ordinary commit, both
+/// columns of a root.
+pub const GRAPH_PARENT_NONE: u32 = 0x7000_0000;
+/// Set on the SECOND parent column when the parents past the first live in `EDGE`,
+/// the rest of the word being the index they start at.
+const GRAPH_EXTRA_EDGES: u32 = 0x8000_0000;
+/// Set on the last `EDGE` entry of one commit's list — the only thing that ends it.
+const GRAPH_EDGE_LAST: u32 = 0x8000_0000;
+/// The position in an `EDGE` entry, once the terminator bit is taken off.
+const GRAPH_EDGE_MASK: u32 = 0x7fff_ffff;
+
+/// How many parents this reader will follow before refusing the record.
+///
+/// git sets no limit and an octopus merge is small in practice (the largest in the
+/// kernel is 66). The cap is here because the list is terminated by a BIT IN THE FILE:
+/// a corrupt `EDGE` chunk whose terminator never arrives would otherwise be read to the
+/// end of the chunk, and a repository is untrusted input.
+const MAX_PARENTS: usize = 256;
 
 /// `BDAT` opens with three 4-byte settings — hash version, hash count, bits per entry
 /// — and the filters follow them.
@@ -144,6 +176,9 @@ struct Layer {
     /// File offsets of the two chunks a lookup reads.
     oid_lookup: u64,
     commit_data: u64,
+    /// `EDGE`, when the file carries one: start and end, so a read past the list can
+    /// be refused rather than wander into the next chunk.
+    extra_edges: Option<(u64, u64)>,
     bloom: Option<Bloom>,
 }
 
@@ -232,6 +267,13 @@ impl Layer {
         // was going to do anyway, where a wrong answer silently drops commits from a
         // filtered view.
         let bloom = Self::open_bloom(&file, &find, commits, size);
+        // Absent unless the repository has an octopus merge, so its absence says
+        // nothing is wrong — but a chunk that runs past the file is a file that cannot
+        // be trusted about anything, which is the rule the three above follow.
+        let extra_edges = match find(CHUNK_EXTRA_EDGES) {
+            Some((at, end)) if end > size || end < at => return None,
+            found => found,
+        };
 
         Some(Self {
             file,
@@ -240,6 +282,7 @@ impl Layer {
             commits,
             oid_lookup,
             commit_data,
+            extra_edges,
             bloom,
         })
     }
@@ -300,6 +343,33 @@ impl Layer {
             self.oid_at(at, slot)?;
             Some((*slot).cmp(oid))
         })
+    }
+
+    /// The two parent columns of the commit at `pos`, verbatim — `GRAPH_PARENT_NONE`,
+    /// a position, or (in the second) an `EDGE` index with `GRAPH_EXTRA_EDGES` set.
+    fn parent_words(&self, pos: u32) -> Option<(u32, u32)> {
+        let at = self.commit_data
+            + u64::from(pos) * (self.hash_len + CDAT_AFTER_TREE) as u64
+            + self.hash_len as u64;
+        let mut buf = [0u8; 8];
+        self.file.read_exact_at(&mut buf, at).ok()?;
+        Some((
+            u32::from_be_bytes(buf[0..4].try_into().ok()?),
+            u32::from_be_bytes(buf[4..8].try_into().ok()?),
+        ))
+    }
+
+    /// One `EDGE` entry, bounds-checked against the chunk rather than the file: past
+    /// its end is a malformed record, not a parent belonging to the next chunk.
+    fn extra_edge(&self, idx: u32) -> Option<u32> {
+        let (start, end) = self.extra_edges?;
+        let at = start.checked_add(u64::from(idx).checked_mul(4)?)?;
+        if at.checked_add(4)? > end {
+            return None;
+        }
+        let mut buf = [0u8; 4];
+        self.file.read_exact_at(&mut buf, at).ok()?;
+        Some(u32::from_be_bytes(buf))
     }
 
     /// The generation number recorded for the commit at `pos`.
@@ -560,6 +630,14 @@ fn bloom_contains(filter: &[u8], key: BloomKey, num_hashes: u32) -> bool {
 pub struct CommitGraph {
     /// Base layer first, as the chain file lists them. A commit is in exactly one.
     layers: Vec<Layer>,
+    /// Each layer's first GLOBAL position — the running total of the commits below it.
+    ///
+    /// The parent columns name a position across the WHOLE chain, not within a layer,
+    /// and they have to: a layer's `OIDL` holds only its own commits, so a commit in an
+    /// upper layer could not otherwise name a parent in the base. Verified against a
+    /// two-layer chain git wrote, where the upper layer's oldest commit names its
+    /// parent as global 0 — a commit that lives in the base layer.
+    bases: Vec<u32>,
 }
 
 impl CommitGraph {
@@ -573,9 +651,7 @@ impl CommitGraph {
     /// nor `git fetch` writes one by default.
     pub fn open(info_dir: &Path) -> Option<Self> {
         if let Some(single) = Layer::open(&info_dir.join("commit-graph")) {
-            return Some(Self {
-                layers: vec![single],
-            });
+            return Some(Self::of(vec![single]));
         }
         let split = info_dir.join("commit-graphs");
         let chain = std::fs::read_to_string(split.join("commit-graph-chain")).ok()?;
@@ -590,7 +666,106 @@ impl CommitGraph {
             }
             layers.push(Layer::open(&split.join(format!("graph-{name}.graph")))?);
         }
-        (!layers.is_empty()).then_some(Self { layers })
+        (!layers.is_empty()).then(|| Self::of(layers))
+    }
+
+    /// Layers in chain order, with the position each one starts at accumulated once.
+    fn of(layers: Vec<Layer>) -> Self {
+        let mut bases = Vec::with_capacity(layers.len());
+        let mut at: u32 = 0;
+        for layer in &layers {
+            bases.push(at);
+            at = at.saturating_add(layer.commits);
+        }
+        Self { layers, bases }
+    }
+
+    /// The layer holding global position `at`, and its position within that layer.
+    fn locate(&self, at: u32) -> Option<(&Layer, u32)> {
+        // Linear over the layers, which are one in the ordinary case and a handful in
+        // a split chain — the search that matters is the one INSIDE a layer.
+        self.layers
+            .iter()
+            .zip(&self.bases)
+            .rev()
+            .find(|(layer, base)| at >= **base && at - **base < layer.commits)
+            .map(|(layer, base)| (layer, at - *base))
+    }
+
+    /// Where `oid` sits across the whole chain, or `None` when the graph does not hold
+    /// it — which is the ordinary post-fetch state, not an error.
+    pub fn position(&self, oid: git2::Oid) -> Option<u32> {
+        let bytes = oid.as_bytes();
+        self.layers
+            .iter()
+            .zip(&self.bases)
+            .find_map(|(layer, base)| layer.position(bytes).map(|pos| base + pos))
+    }
+
+    /// The commit at a global position.
+    pub fn oid_at(&self, at: u32) -> Option<git2::Oid> {
+        let (layer, pos) = self.locate(at)?;
+        let mut buf = [0u8; 32];
+        let slot = &mut buf[..layer.hash_len];
+        layer.oid_at(pos, slot)?;
+        git2::Oid::from_bytes(slot).ok()
+    }
+
+    /// The generation recorded at a global position — `None` for the pre-2.19 zero
+    /// marker, exactly as `generation`.
+    pub fn generation_at(&self, at: u32) -> Option<u32> {
+        let (layer, pos) = self.locate(at)?;
+        layer.generation(pos)
+    }
+
+    /// The parents of the commit at a global position, as global positions.
+    ///
+    /// **This is what makes a lazy walk cheap**: the alternative is `find_commit`, which
+    /// parses the commit object out of the pack, and on a filtered walk over a
+    /// 1.465M-commit clone that was 19.2s of a 23.1s answer. Here it is one 8-byte read
+    /// of two columns already beside the generation the walk just asked for.
+    ///
+    /// `None` is a MALFORMED record — a position past the end of the chain, an `EDGE`
+    /// list running past its chunk or never terminating — and the caller declines
+    /// rather than walking a graph that cannot describe its own shape. An empty `Vec`
+    /// is the honest answer for a root commit.
+    ///
+    /// **The parents are taken on trust, as git and libgit2 take them.** A commit named
+    /// here is in the graph by construction, so a file that is not closed under ancestry
+    /// can no longer be caught the way it used to be — it writes `GRAPH_PARENT_NONE` for
+    /// the parent it is missing, which reads as a root and truncates the walk. git never
+    /// writes such a file; see `topo`'s module header for what that changed.
+    pub fn parents_at(&self, at: u32) -> Option<Vec<u32>> {
+        let (layer, pos) = self.locate(at)?;
+        let (first, second) = layer.parent_words(pos)?;
+        let mut out = Vec::new();
+        if first == GRAPH_PARENT_NONE {
+            // A second parent without a first is a record that contradicts itself.
+            return (second == GRAPH_PARENT_NONE).then_some(out);
+        }
+        out.push(first);
+        if second == GRAPH_PARENT_NONE {
+            return Some(out);
+        }
+        if second & GRAPH_EXTRA_EDGES == 0 {
+            out.push(second);
+            return Some(out);
+        }
+        // Three or more parents: the rest are a run in `EDGE`, ended by a bit on the
+        // last entry rather than by a count.
+        let mut idx = second & GRAPH_EDGE_MASK;
+        loop {
+            let entry = layer.extra_edge(idx)?;
+            out.push(entry & GRAPH_EDGE_MASK);
+            if entry & GRAPH_EDGE_LAST != 0 {
+                break;
+            }
+            if out.len() >= MAX_PARENTS {
+                return None;
+            }
+            idx = idx.checked_add(1)?;
+        }
+        Some(out)
     }
 
     /// `open` for a repository, looking beside its object database.
@@ -624,11 +799,14 @@ impl CommitGraph {
     /// generation for it. A caller ordering a walk by this must treat `None` as
     /// "cannot order exactly" rather than substituting a value: a commit assumed
     /// newest that is not would be drawn above its own children.
+    ///
+    /// The walk asks `position` and `generation_at` separately, because it keeps the
+    /// position to read the commit's parents with; this is the same pair for a caller
+    /// that wants only the number. `#[allow(dead_code)]` because that caller is the
+    /// suite — the app goes through the walk.
+    #[allow(dead_code)]
     pub fn generation(&self, oid: git2::Oid) -> Option<u32> {
-        let bytes = oid.as_bytes();
-        self.layers
-            .iter()
-            .find_map(|l| l.position(bytes).and_then(|pos| l.generation(pos)))
+        self.generation_at(self.position(oid)?)
     }
 }
 
