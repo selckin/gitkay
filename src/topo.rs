@@ -118,6 +118,14 @@ pub struct TopoWalk<'a> {
     ready: Vec<git2::Oid>,
     /// Commits already handed out, so a diamond cannot emit one twice.
     emitted: std::collections::HashSet<git2::Oid>,
+    /// Whether this walk has GIVEN UP — an unclosed commit-graph, or a commit whose
+    /// object the odb would not hand back part-way through. Latched, and what makes
+    /// `done` mean "ran out" rather than "stopped": both are a `None` from `next`, and
+    /// the two queues do not tell them apart. A refusal can empty them (the last commit
+    /// popped off `ready`, the frontier already spent), and `take` reading that as the
+    /// end would hand back a topological PREFIX indistinguishable from a complete
+    /// answer — which is exactly the shape `take` is all-or-nothing to avoid.
+    declined: bool,
 }
 
 impl<'a> TopoWalk<'a> {
@@ -141,6 +149,7 @@ impl<'a> TopoWalk<'a> {
             generation: HashMap::new(),
             ready: Vec::new(),
             emitted: std::collections::HashSet::new(),
+            declined: false,
         };
         // Seeded in reverse so the FIRST tip ends up on top of the LIFO stack and is
         // emitted first, matching `git log`'s treatment of the order its tips were
@@ -239,8 +248,13 @@ impl<'a> TopoWalk<'a> {
                 if !self.emitted.insert(top) {
                     continue;
                 }
-                for parent in self.parents(top)? {
-                    let d = self.indegree.get_mut(&parent)?;
+                let Some(parents) = self.parents(top) else {
+                    return self.decline();
+                };
+                for parent in parents {
+                    let Some(d) = self.indegree.get_mut(&parent) else {
+                        return self.decline();
+                    };
                     *d -= 1;
                     if *d == 1 {
                         self.ready.push(parent);
@@ -256,9 +270,18 @@ impl<'a> TopoWalk<'a> {
                 let Some(ByGeneration(_, oid)) = self.frontier.pop() else {
                     break;
                 };
-                self.expand(oid)?;
+                if self.expand(oid).is_none() {
+                    return self.decline();
+                }
             }
         }
+    }
+
+    /// Latch the refusal and answer `None`. Every bail-out goes through here, so
+    /// "gave up" cannot be reported as "ran out" by a path that forgot to say so.
+    const fn decline(&mut self) -> Option<git2::Oid> {
+        self.declined = true;
+        None
     }
 
     /// The next `max` commits, or `None` if the walk had to give up part-way — an
@@ -283,8 +306,11 @@ impl<'a> TopoWalk<'a> {
     /// Whether the walk has genuinely run out of commits, as opposed to having
     /// declined one. What tells a caller driving `next` itself which of the two a
     /// `None` was — `take` asks it on the caller's behalf.
+    ///
+    /// The empty queues are not enough on their own: a refusal can leave them empty
+    /// too (see `declined`), and the two answers are then the same shape.
     pub fn done(&self) -> bool {
-        self.ready.is_empty() && self.frontier.is_empty()
+        !self.declined && self.ready.is_empty() && self.frontier.is_empty()
     }
 }
 
@@ -514,6 +540,11 @@ mod tests {
         assert_eq!(graph.generation(mid), None, "the hole this test is about");
         let mut walk = TopoWalk::new(&repo, &graph, &[tip], false);
         assert!(walk.take(10).is_none(), "an unclosed graph must be refused");
+        // …and it stays refused however empty the queues end up. `done` answering
+        // true after a refusal is what would let `take` hand back a topological
+        // PREFIX as though it were the whole answer.
+        assert!(!walk.done(), "a walk that gave up has not run out");
+        assert!(walk.take(10).is_none(), "and it does not change its mind");
     }
 
     #[test]
