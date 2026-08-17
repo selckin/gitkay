@@ -585,7 +585,8 @@ The invariants:
   that delta (pinned over a binary, a rename, a typechange and an `ignore_ws`-suppressed
   delta, because git2 documents `from_diff` as returning `Ok(None)` for a binary file
   and the fixtures say otherwise). Measured end to end through `get_diff_data` on a real
-  repository of gigabyte blobs: **80.1s → 17.9s (4.5x)** on a 37-file 3.2GB commit,
+  repository of gigabyte blobs — and in the running app, where the build
+  `performance.md` records at 74.1s now takes **17.4s**: **80.1s → 17.9s (4.5x)** on a 37-file 3.2GB commit,
   3.7x on a 16-file 2.5GB one, and **1.00x on a single-blob commit**, which is the shape
   that cannot gain and does not lose.
   **Workers CLAIM their next delta from a counter rather than taking a fixed share.**
