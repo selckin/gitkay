@@ -1480,6 +1480,35 @@ fn resync_wrap_index(
     true
 }
 
+/// Where the diff pane scrolls this frame: a pending target if one is due, else the
+/// pin that holds the reader's place across a re-wrap.
+///
+/// A free function over the pending `Option` rather than a method, for the reason
+/// `resync_wrap_index` above it is one — the transitions are then testable without a
+/// `GitkApp`, and the one that was wrong here is invisible from the call site.
+///
+/// `loading` suppresses the pending TARGET and not the pin. What is transient while a
+/// diff loads is the CONTENT, not the reader's place in it: the pane is still drawing
+/// the previous diff (the placeholder returns before this, and a same-oid rebuild never
+/// blanks at all), so a resize mid-load moves those rows under whoever is resizing
+/// exactly as it does otherwise. And `rewrapped` is a ONE-SHOT report —
+/// `resync_wrap_index` answers `true` for the frame the mapping moved and never again —
+/// so dropping it does not defer the pin, it loses it, and the pane stays where the
+/// re-wrap left it.
+fn diff_scroll_target(
+    pending: &mut Option<DiffScrollTo>,
+    loading: bool,
+    rewrapped: bool,
+    top_line: usize,
+) -> Option<DiffScrollTo> {
+    let pin = || rewrapped.then_some(DiffScrollTo::Line(top_line));
+    if loading {
+        pin()
+    } else {
+        pending.take().or_else(pin)
+    }
+}
+
 /// How many monospace columns the diff pane has for content, for soft wrapping.
 ///
 /// The pane's width less what a solid vertical scrollbar takes. Subtracted
@@ -8364,6 +8393,8 @@ impl eframe::App for GitkApp {
                     let font_id = self.fonts.font_id(Role::Diff);
                     let cols = wrap_cols(ui, &font_id);
                     let rewrapped = self.ensure_wrap_index(cols, linenos);
+                    // Read before the `&mut` borrow the scroll target takes below.
+                    let top_line = self.diff_viewport.top_line();
                     let diff_view = DiffView {
                         n_lines: self.diff_lines.len(),
                         wrap: self.diff_wrap.as_ref(),
@@ -8380,24 +8411,13 @@ impl eframe::App for GitkApp {
                         // dragging the window edge scrolls the pane out from under
                         // whoever is resizing it. `top_line` is a frame behind,
                         // which is exactly right: it is the pre-resize position.
-                        //
-                        // The in-flight case suppresses the pending TARGET and not the
-                        // pin. What is transient there is the content, not the reader's
-                        // place in it: the pane is still drawing the previous diff (the
-                        // placeholder returned above, and a same-oid rebuild never
-                        // blanks at all), so a resize mid-load moves those rows under
-                        // whoever is resizing exactly as it does otherwise. And the pin
-                        // is a ONE-SHOT report — `resync_wrap_index` answers `true` for
-                        // the frame the mapping moved and never again — so dropping it
-                        // here does not defer the pin, it loses it, and the pane stays
-                        // where the re-wrap left it.
-                        scroll_target: if diff_load_elapsed.is_some() {
-                            rewrapped.then(|| DiffScrollTo::Line(self.diff_viewport.top_line()))
-                        } else {
-                            self.diff_scroll_to.take().or_else(|| {
-                                rewrapped.then(|| DiffScrollTo::Line(self.diff_viewport.top_line()))
-                            })
-                        },
+                        // Why a load suppresses only half of that is stated there.
+                        scroll_target: diff_scroll_target(
+                            &mut self.diff_scroll_to,
+                            diff_load_elapsed.is_some(),
+                            rewrapped,
+                            top_line,
+                        ),
                         // Deepest file-start line (None ⇒ no files). `file_line_starts`
                         // is sorted by start, so the last entry is the largest — an
                         // O(1) read, derived here rather than mirrored in a field
@@ -9439,6 +9459,51 @@ mod tests {
             drawn.push_str(text);
         }
         assert_eq!(drawn, body, "every byte of the line is drawn exactly once");
+    }
+
+    /// What a re-wrap's pin survives, and specifically that **an in-flight diff load
+    /// does not eat it**.
+    ///
+    /// The load suppresses the pending TARGET, because the content under it is about to
+    /// be replaced and the incoming diff wants that target. The pin is the opposite
+    /// question — where the reader is in the content still on screen — and the pane IS
+    /// still drawing it: the placeholder returns before this, and a same-oid rebuild
+    /// never blanks at all. Suppressing it too was silent, and permanently so, because
+    /// `resync_wrap_index` reports a move for exactly one frame: dropping the report
+    /// does not defer the pin, it loses it.
+    #[test]
+    fn a_diff_load_suppresses_the_pending_scroll_target_but_not_the_re_wrap_pin() {
+        let pinned = Some(DiffScrollTo::Line(12));
+        let pending = || Some(DiffScrollTo::Row(99));
+
+        // Settled: a pending target wins, and is consumed.
+        let mut p = pending();
+        assert_eq!(diff_scroll_target(&mut p, false, true, 12), pending());
+        assert_eq!(p, None, "a target that fired must not fire again");
+
+        // Settled, nothing pending: the pin holds the reader's line.
+        let mut p = None;
+        assert_eq!(diff_scroll_target(&mut p, false, true, 12), pinned);
+        // …and with no re-wrap either, the pane is left alone.
+        assert_eq!(diff_scroll_target(&mut None, false, false, 12), None);
+
+        // Loading: the pending target is PRESERVED for the incoming diff…
+        let mut p = pending();
+        assert_eq!(diff_scroll_target(&mut p, true, false, 12), None);
+        assert_eq!(p, pending(), "the incoming diff still opens where asked");
+
+        // …and the pin still fires, over the diff that is on screen right now.
+        let mut p = pending();
+        assert_eq!(
+            diff_scroll_target(&mut p, true, true, 12),
+            pinned,
+            "resizing mid-load must not scroll the pane out from under the reader"
+        );
+        assert_eq!(
+            p,
+            pending(),
+            "and must still leave the target for the arrival"
+        );
     }
 
     /// Every transition of the wrap index, and specifically that **dropping one
