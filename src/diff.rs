@@ -2733,16 +2733,21 @@ pub fn order_files(
     }
     *lines = out;
 
-    let mut ranked: Vec<(usize, FileEntry)> = std::mem::take(files)
-        .into_iter()
-        .enumerate()
-        .map(|(i, mut f)| {
+    // The entries take the same walk the rows just did — `for &i in order` — and are
+    // moved out of a source buffer the same way, for the same reason. Tagging each with
+    // its rank and sorting back into it re-derives an order already in hand, at
+    // O(n log n) and a `FileEntry` move per comparison.
+    let mut src_files: Vec<Option<FileEntry>> =
+        std::mem::take(files).into_iter().map(Some).collect();
+    files.reserve_exact(n);
+    for &i in order {
+        // Every slot is taken exactly once: `order` was checked to be a permutation
+        // above, which is also what makes `start[i]` this entry's own body.
+        if let Some(mut f) = src_files[i].take() {
             f.diff_line_idx = start[i];
-            (rank[i], f)
-        })
-        .collect();
-    ranked.sort_unstable_by_key(|&(k, _)| k);
-    files.extend(ranked.into_iter().map(|(_, f)| f));
+            files.push(f);
+        }
+    }
     true
 }
 
