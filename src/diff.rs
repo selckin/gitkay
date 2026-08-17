@@ -1346,6 +1346,15 @@ impl<'a> BuildEnv<'a> {
     }
 
     /// A delta's patch is being generated.
+    ///
+    /// **Called from several threads at once when the pass is split**, which changes
+    /// what each half of the placeholder means. The COUNT is unharmed — it was always
+    /// "deltas whose patch generation has started", and `fetch_add` keeps that true
+    /// however many workers there are. The NAME becomes *a* file being worked on rather
+    /// than *the* one, so the "a three-line patch inside a 265MB blob sits on 1/1 for
+    /// eleven seconds and the name says where the time is going" reading holds only for
+    /// a build that did not split — and a split build is by definition not sitting on
+    /// one file. Both are still honest; neither is precise in the way it was.
     fn enter_file(self, path: &[u8]) {
         let Some(p) = self.progress else { return };
         p.files_done
@@ -1687,8 +1696,23 @@ fn append_diff_body(
         (0..files.len()).any(|i| driver_at(i).is_some()),
         diff,
     )
-    .and_then(|workers| parallel_delta_patches(repo, scope, settings, env, diff, workers))
-    {
+    .and_then(|workers| {
+        let patches = parallel_delta_patches(repo, scope, settings, env, diff, workers);
+        if patches.is_none() {
+            // The line above already said the pass was being split, and it is about to
+            // run sequentially instead — the same two-contradicting-lines shape
+            // `diff_store::save` was changed to return a `bool` to avoid, arriving here
+            // because a worker cannot always finish what the gate admitted. Silence
+            // would be worse: the reader would see a split announced and a build that
+            // took the sequential time, with nothing to connect them.
+            log::debug!(
+                "perf: abandoned the split over {} deltas — a worker could not reproduce \
+                 this diff; building it sequentially",
+                diff.deltas().len()
+            );
+        }
+        patches
+    }) {
         let sizes: Vec<(u64, u64)> = patches.iter().map(|p| p.sizes).collect();
         merge_delta_patches(lines, files, patches);
         finish_stats_block(lines, files, &sizes, stats_at);
