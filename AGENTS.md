@@ -611,6 +611,18 @@ The invariants:
   on the shape with nothing to gain, and stopping after 64 deltas takes it to 1.4ms.
   A worker that cannot reproduce the delta list abandons the attempt and the sequential
   pass runs — the only answer that cannot render the wrong file's rows.
+  **The split doubles peak memory, and `workers_within_memory` is what scales that
+  with the machine.** Measured on a 2.49GB commit: 3.82GB resident sequential against
+  7.59GB split, because the workers hold their deltas' blobs at once where the
+  sequential pass holds one at a time — and the foreground build is deliberately not
+  admitted against memory, being the row the reader clicked, which was safe while it
+  read one delta at a time. Every worker is charged the largest delta doubled, against
+  the same live `mem::usable_bytes` reading the heavy lane uses, so a constrained
+  machine degrades toward the sequential pass. **It is not a cap on the peak**: six
+  workers and eight both peaked at 7.59GB there, the commit's bytes sitting in three
+  dominant deltas that any worker count above three has in flight together. Capping
+  that needs admission per DELTA, which is `heavy_fits`'s shape and wants its own
+  measurement.
   **The size gate reads every delta, and a 64-delta cap was tried and removed.** It
   looked free — the probe is an odb header read per side, and capping took an all-loose
   1000-file fixture's gate from 26ms to 1.4ms — but it declines any diff whose bytes are
