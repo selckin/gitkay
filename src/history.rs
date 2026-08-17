@@ -1624,18 +1624,22 @@ fn slow_walk_message(elapsed: std::time::Duration, rows: usize, cost: WalkCost) 
 /// so a repository that HAS a graph without one is worth a word too, but only when a
 /// pathspec is what was slow. Asking `has_changed_paths` rather than opening the
 /// filters keeps that check free.
+///
+/// **And that third case is NOT gated on `topo_scope`**, where the first two are. The
+/// laziness the other two promise is only available to a scope `topo_scope` accepts,
+/// so naming it elsewhere is the false promise above; the changed-path index is not —
+/// `sorted_filtered_walk` opens the filters for ANY filtered scope, so a range or a
+/// `--follow` walk saves exactly the same tree comparisons and has the same reason to
+/// be told.
 pub fn commit_graph_advice(repo: &Repository, scope: &cli::Scope) -> Option<&'static str> {
-    if !topo_scope(scope) {
-        return None;
-    }
     let graph = crate::commitgraph::CommitGraph::for_repo(repo);
     match (&graph, scope.paths.is_empty()) {
-        (None, true) => Some(
+        (None, true) if topo_scope(scope) => Some(
             "this repository has no commit-graph, which is what a walk needs to be lazy: \
              `git commit-graph write --reachable` writes one (35s for 88MB on a 1.47M-commit \
              clone) and took the same walk there from 45s to 1.0s",
         ),
-        (None, false) => Some(
+        (None, false) if topo_scope(scope) => Some(
             "this repository has no commit-graph, which is what a path filter needs to walk \
              lazily and to skip commits without comparing trees: \
              `git commit-graph write --reachable --changed-paths` writes one (5min for 109MB \
@@ -2775,6 +2779,16 @@ mod tests {
         );
         // …but it carries no changed-path index, which only a path filter misses.
         let advice = commit_graph_advice(&repo, &filtered).expect("no changed-path index");
+        assert!(advice.contains("--changed-paths"), "{advice}");
+        // And that one is NOT gated on the scope walking lazily: `sorted_filtered_walk`
+        // reads the filters whatever the scope, so a rev-scoped filter saves the same
+        // tree comparisons and is told the same thing. Only the two "no graph at all"
+        // sentences, which promise laziness, are withheld from such a scope.
+        let ranged = cli::Scope {
+            revs: vec!["HEAD".to_string()],
+            ..filtered.clone()
+        };
+        let advice = commit_graph_advice(&repo, &ranged).expect("the index helps here too");
         assert!(advice.contains("--changed-paths"), "{advice}");
 
         write_commit_graph_with_changed_paths(&repo, &[tip]);
