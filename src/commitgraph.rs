@@ -294,25 +294,13 @@ impl Layer {
 
     /// Where `oid` sits in this layer, or `None` when it is not in it.
     fn position(&self, oid: &[u8]) -> Option<u32> {
-        let first = *oid.first()? as usize;
-        let mut lo = if first == 0 {
-            0
-        } else {
-            self.fanout[first - 1]
-        };
-        let mut hi = self.fanout[first];
         let mut buf = [0u8; 32];
-        let buf = &mut buf[..self.hash_len];
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            self.oid_at(mid, buf)?;
-            match buf[..].cmp(oid) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal => return Some(mid),
-            }
-        }
-        None
+        let hash_len = self.hash_len;
+        position_by(&self.fanout, oid, |at| {
+            let slot = &mut buf[..hash_len];
+            self.oid_at(at, slot)?;
+            Some((*slot).cmp(oid))
+        })
     }
 
     /// The generation number recorded for the commit at `pos`.
@@ -333,6 +321,35 @@ impl Layer {
         let generation = u32::from_be_bytes(buf) >> 2;
         (generation != 0).then_some(generation)
     }
+}
+
+/// Binary-search `OIDL` for `oid`, narrowed to the commits sharing its first byte by
+/// `fanout`, with `cmp` supplying the oid at a position.
+///
+/// One search for both readers, which hold the same sorted list two different ways —
+/// `Layer` `pread`s it, `ChangedPaths` keeps it in memory (see the module header for
+/// why). The bounds and the fanout indexing are exactly what a second copy could get
+/// subtly wrong, and a wrong `position` is a wrong generation or a wrong filter, both
+/// of which read as data rather than as an error.
+///
+/// `None` from `cmp` — an unreadable record — takes the whole lookup with it.
+fn position_by(
+    fanout: &[u32; 256],
+    oid: &[u8],
+    mut cmp: impl FnMut(u32) -> Option<std::cmp::Ordering>,
+) -> Option<u32> {
+    let first = *oid.first()? as usize;
+    let mut lo = if first == 0 { 0 } else { fanout[first - 1] };
+    let mut hi = fanout[first];
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match cmp(mid)? {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+            std::cmp::Ordering::Equal => return Some(mid),
+        }
+    }
+    None
 }
 
 /// The two 32-bit hashes git derives a Bloom key from — `fill_bloom_key`, which then
@@ -677,23 +694,10 @@ impl<'a> ChangedPaths<'a> {
 impl LoadedLayer<'_> {
     /// `Layer::position`, over the oid list in memory.
     fn position(&self, oid: &[u8]) -> Option<u32> {
-        let first = *oid.first()? as usize;
-        let mut lo = if first == 0 {
-            0
-        } else {
-            self.fanout[first - 1]
-        };
-        let mut hi = self.fanout[first];
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let at = mid as usize * self.hash_len;
-            match self.oids.get(at..at + self.hash_len)?.cmp(oid) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal => return Some(mid),
-            }
-        }
-        None
+        position_by(&self.fanout, oid, |at| {
+            let at = at as usize * self.hash_len;
+            Some(self.oids.get(at..at + self.hash_len)?.cmp(oid))
+        })
     }
 
     /// This commit's filter bytes, or `None` for the zero-length span git records for a
