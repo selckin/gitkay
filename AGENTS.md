@@ -106,20 +106,29 @@ cp target/release/gitkay ~/.local/bin/   # install
   `%check`, `PKGBUILD`'s `check()` and `debian/rules`. Those verify the artifact;
   CI is the gate that has to hold the assertions. Note `./build.sh` runs no tests
   at all, so CI is the only place either profile's suite runs automatically.
-- Release (`.github/workflows/release.yml`): pushing a `v*` tag builds
+- Release (`.github/workflows/release.yml`): **Actions ▸ Release ▸ Run workflow**
+  with a version, or a hand-pushed `vMAJOR.MINOR.PATCH` tag — two entry points
+  into one pipeline, which is why the version a job builds comes from the
+  `version` job's outputs and never from `github.ref_name`. Either way it builds
   x86_64 + aarch64 Linux tarballs, repacks the x86_64 binary into an RPM and a
-  deb, and uploads all four to the GitHub release. The workflow embeds its own
-  binary-repack RPM spec / deb control — deliberately distinct from the
-  source-build `packaging/` files (`gitkay.spec`, `debian/`, `PKGBUILD`), but
-  keep the shared metadata (Summary, description, URL, maintainer) in sync.
+  deb, and uploads all four to the GitHub release.
+  **The two repacks are `packaging/build-rpm.sh` and `packaging/build-deb.sh`,
+  not the workflow.** They are still deliberately distinct from the source-build
+  files (`rpmbuild` over `gitkay.spec`, `dpkg-buildpackage` over `debian/`,
+  `PKGBUILD`) — a prebuilt binary wrapped in a package has no `%build`, no
+  `%check` and no `BuildRequires` — but the metadata around it is **read** from
+  those files rather than restated: Summary, License, URL and `%description`
+  out of `packaging/gitkay.spec`, Section, Priority, Maintainer, Homepage and
+  Description out of `packaging/debian/control`. So there is nothing left to
+  keep in sync, and both can be run and their output inspected without pushing
+  a tag, which is what a YAML heredoc could never offer.
   Neither repack gets its dependencies for free, and both used to declare
   **none**, so the package installed onto a system missing the libraries and
   failed at launch instead of at install. The deb computes `Depends` with
   `dpkg-shlibdeps` off the actual ELF and **dies** rather than shipping an
   empty one; the RPM leaves rpm's auto-requires on (no `AutoReq: no`), whose
-  SONAME requires resolve on any target distro. Both are only exercised by a
-  tag push.
-  **Reading the ELF is not enough, and that half was missing from all four
+  SONAME requires resolve on any target distro.
+  **Reading the ELF is not enough, and that half was once missing from all four
   packaging files.** winit/glutin/wayland-sys **dlopen** everything
   windowing-related, so the binary's `NEEDED` entries are just glibc and libgcc
   — `dpkg-shlibdeps` and rpm's auto-requires both compute a dependency list
@@ -127,33 +136,83 @@ cp target/release/gitkay ~/.local/bin/   # install
   cleanly on a minimal desktop and aborts at launch on
   `dlopen("libxkbcommon.so.0")`. That is the same failure the paragraph above
   describes, arriving by a route neither generator can see, so the sonames the
-  binary actually names (`strings target/release/gitkay`) are stated by hand in
-  **all four**: the two repacks in `release.yml` and the source-build
-  `packaging/gitkay.spec` + `packaging/debian/control`. Wayland + EGL +
+  binary actually names (`strings target/release/gitkay`) are stated by hand —
+  and now in **two** places rather than four, the repack scripts having become
+  readers of `packaging/gitkay.spec` and `packaging/debian/control` instead of
+  second copies of them. An empty result from that reading is a **refusal**, not
+  a package with fewer dependencies: it means the parser stopped early, and the
+  package it would produce is precisely the one that installs and then aborts.
+  Wayland + EGL +
   xkbcommon are `Depends`/`Requires`; the X11 set is the fallback backend and is
-  `Recommends`, so a Wayland-only system is not made to pull it in. The rpm side
-  states **sonames**, not package names — those differ per distro
+  `Recommends`, so a Wayland-only system is not made to pull it in. The two
+  lists cannot be collapsed into one, which is why this is two and not one: the
+  rpm side states **sonames**, not package names — those differ per distro
   (`libwayland-client` on Fedora, `libwayland-client0` on openSUSE) while every
   rpm distro's auto-PROVIDES emits the soname — and hardcodes the `()(64bit)`
   suffix, which is part of the provide's name on a 64-bit build and has no macro
-  that renders both widths correctly. Keep the four lists in step.
+  that renders both widths correctly.
 - **Versioning: this fork numbers from 0.0.1, below the original project's 1.x
   line.** The version lives in five places that must move together —
   `Cargo.toml`, `Cargo.lock`, `packaging/gitkay.spec`, `packaging/PKGBUILD`,
   `packaging/debian/changelog`. **Never edit them by hand:**
   `./packaging/set-version.sh <version>` rewrites all five (and generates both
   changelog entries from the commit subjects since the previous tag, so the two
-  formats cannot tell different stories). Then commit and tag. `Cargo.lock` is
+  formats cannot tell different stories). **The release workflow's dispatch path
+  runs that script itself**, commits what it wrote and pushes it, so cutting a
+  release is one button and the bump cannot be the step that was forgotten;
+  running the script by hand, committing and tagging is still supported and is
+  what the tag trigger is for. `Cargo.lock` is
   in that list because it pins `gitkay`'s own version: bump `Cargo.toml` alone
   and every `--locked` build fails, which is why "just `sed` it in CI" does not
-  work.
+  work. It is also the reason the `version` job carries a toolchain and a
+  `cargo fetch` that no other step there needs: `Cargo.lock` is rewritten by
+  `cargo update -p gitkay --offline`, and offline resolution reads the registry
+  INDEX cache — empty on a fresh runner, so the resolve fails on the first
+  dependency and the dispatch dies before anything builds. `ci.yml` never meets
+  this because it caches `~/.cargo/registry`. The toolchain is pinned there like
+  the build jobs' rather than inherited from the image, since the lock file that
+  job writes is the one they then have to accept under `--locked`.
   The release workflow derives the .rpm/.deb version from the **tag**, so the
   committed sites drifting from it is silent — v0.0.1–v0.0.4 all shipped a
   binary reporting `gitkay 1.2.0`. The `version` job is what makes it loud:
-  it runs `set-version.sh --check "${REF_NAME#v}"` and every other job needs
-  it, so a mismatched tag fails in seconds rather than producing a bad
-  release. One script owns both directions, so "where the version lives"
+  it runs `set-version.sh --check` against the version it resolved, and every
+  other job needs it, so a mismatched tag fails in seconds rather than producing
+  a bad release. One script owns both directions, so "where the version lives"
   cannot be listed correctly in one place and wrongly in the other.
+  **The dispatch path closes that gap from the other side rather than checking
+  it faster**: it bumps before it builds, so there is no hand step left to skip.
+  It runs on the **default branch and nowhere else** — read off the repository
+  rather than named in the file, so a rename cannot leave the guard pointing at
+  a branch that is gone. Two things rest on that. The run ends by pushing a
+  commit and tagging it, so a side branch would publish a version built from
+  unreviewed work; and `workflow_dispatch` takes the WORKFLOW FILE from the ref
+  it was started on, so without the guard the dispatch is itself the way around
+  whatever the default branch requires.
+  **Nothing is written until every build has passed** — not the tag, and not
+  the bump commit either. The `version` job COMPUTES the bump and emits it as a
+  patch artifact; every job that builds checks out the pre-bump sha and applies
+  that patch (`.github/actions/apply-version-bump`, one composite action rather
+  than a copy per job — a job added later that forgot it would build the version
+  the release is moving off, and that ships rather than failing); the `release`
+  job applies it once more, commits, pushes the branch and only then creates the
+  tag with `gh release create --target`. So a
+  failure anywhere leaves the repository exactly as it was — no commit to
+  revert, no tag to delete, and re-dispatching is simply the same run again.
+  Three consequences worth knowing. The patch is generated **once** and handed
+  on verbatim, because each job re-running `set-version.sh` would stamp its
+  changelog entries with its own `date -R` and the tree that compiled would not
+  be the tree that gets committed; the two are instead reconstructed
+  independently and tied together by both running `--check` against the same
+  version, and they were verified byte-identical (one git tree hash) when this
+  landed. The push is **not forced**: a branch that moved mid-build means the
+  artifacts describe a tree that is no longer its tip, so the push is refused
+  and the answer is to re-dispatch. And the whole write half now lives in one
+  job, so the jobs that compile third-party build scripts hold no credentials
+  at all — `contents: write` and a persisted token exist only in `release`.
+  A tree that ALREADY says the requested version is not an error: there is no
+  patch, nothing is committed, and the release job simply tags that sha. That
+  is what the hand flow leaves behind (`set-version.sh`, commit, no tag), so
+  dispatching after a manual bump releases what is on the branch.
   The drift is not only cosmetic — `CARGO_PKG_VERSION` is folded into
   `StoreContext` (`diff_store.rs`) precisely so a release invalidates the
   persistent diff store, and a version that never moves leaves that lever dead
