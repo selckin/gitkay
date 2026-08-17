@@ -658,15 +658,15 @@ impl Highlighter {
 /// that into one line is scrolling through minified noise.
 ///
 /// **Deliberately not `MAX_ROW_RENDER_CHARS`**, though today that would be tighter and
-/// still correct. That cap is about the VERTEX count of an unwrapped row and is
-/// expected to loosen or disappear when soft wrapping lands (`docs/plans/soft-wrap.md`),
-/// at which point a whole long line does get drawn — a tokenizing bound has to stand on
-/// its own cost argument, and this one does.
+/// still correct. That cap is about the VERTEX count of an UNWRAPPED row, and soft
+/// wrapping is the toolbar toggle that removes it: with wrapping on the whole long line
+/// does get drawn, a window at a time. A tokenizing bound has to stand on its own cost
+/// argument, and this one does.
 ///
 /// The tail is not left blank: it takes a single flat span in the foreground colour,
-/// which is what an untokenized row renders as anyway. What is lost is colour past
-/// 100,000 characters of one line, in exchange for a bound that makes every budget above
-/// it mean something.
+/// which is what an untokenized row renders as anyway. What is lost is colour past the
+/// first 20,000 characters of one line, in exchange for a bound that makes every budget
+/// above it mean something.
 pub const MAX_TOKENIZE_CHARS: usize = 20_000;
 
 /// `code` split into the part syntect sees and whether anything was held back.
