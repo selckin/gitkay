@@ -2074,18 +2074,22 @@ fn parallel_delta_patches(
     let git_dir = repo.path().to_path_buf();
     let expected = &expected;
 
-    let chunks: Vec<Vec<usize>> = (0..workers)
-        .map(|w| (0..n).skip(w).step_by(workers).collect())
-        .collect();
+    // **Workers CLAIM their next delta rather than being handed a share up front.**
+    // Deltas differ enormously in cost — on the commit this was measured against, one
+    // file is 14.4s of a 54.1s pass and the next is 14.0s — so any fixed split loses to
+    // whichever worker draws two heavy ones. Round-robin measured 2.75x on that commit
+    // against a floor of 3.76x, and the gap was entirely one worker holding the tail.
+    // A counter costs an atomic increment per delta and needs no cost model at all.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let next = &next;
 
     let results: Vec<Option<Vec<(usize, DeltaPatch)>>> = std::thread::scope(|sc| {
         // Collected, not chained into the join below: spawning and joining in one
         // iterator chain would start each worker only once the previous had finished,
         // which is this function running sequentially and saying it did not.
         #[expect(clippy::needless_collect, reason = "the collect IS the parallelism")]
-        let handles: Vec<_> = chunks
-            .into_iter()
-            .map(|mine| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
                 let git_dir = git_dir.clone();
                 sc.spawn(move || {
                     let repo = Repository::open(&git_dir).ok()?;
@@ -2115,9 +2119,13 @@ fn parallel_delta_patches(
                     {
                         return None;
                     }
-                    let mut out = Vec::with_capacity(mine.len());
+                    let mut out = Vec::new();
                     let mut buf = String::new();
-                    for i in mine {
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= expected.len() {
+                            break;
+                        }
                         let mut rows = DiffRows::new(Vec::new());
                         let mut entry = blank_entry();
                         env.enter_file(delta_path_bytes(&diff.get_delta(i)?));
@@ -5342,6 +5350,133 @@ mod parallel_patch_tests {
             }
         }
         drop((d1, d2, d3, d4));
+    }
+
+    /// REAL-REPO BENCH: the split pass against a commit in a repository on disk.
+    ///
+    /// The synthetic bench measures eight equal deltas, which is the best case by
+    /// construction; `performance.md`'s own header warns that such a number does not
+    /// project. Point this at a real commit instead:
+    ///
+    /// ```text
+    /// BENCH_REPO=/path/to/repo BENCH_REV=<rev> BENCH_WORKERS=1,2,4 \
+    ///   cargo test --release bench_real_repo -- --ignored --nocapture
+    /// ```
+    ///
+    /// It prints the commit's `parallel_ceiling` first, because that is the number the
+    /// speedup has to be read against — a commit whose bytes sit in one blob cannot go
+    /// faster than 1.0x however many threads there are.
+    #[test]
+    #[ignore = "a benchmark; see the doc comment for how to run it"]
+    fn bench_real_repo() {
+        use std::time::Instant;
+
+        let Ok(path) = std::env::var("BENCH_REPO") else {
+            println!("set BENCH_REPO (and BENCH_REV) — see the doc comment");
+            return;
+        };
+        let rev = std::env::var("BENCH_REV").unwrap_or_else(|_| "HEAD".to_string());
+        let workers: Vec<usize> = std::env::var("BENCH_WORKERS")
+            .unwrap_or_else(|_| "1,2,4".to_string())
+            .split(',')
+            .filter_map(|w| w.trim().parse().ok())
+            .collect();
+
+        let open = || Repository::open(&path).expect("opens the repo");
+        let oid = {
+            let repo = open();
+            repo.revparse_single(&rev)
+                .expect("resolves BENCH_REV")
+                .peel_to_commit()
+                .expect("is a commit")
+                .id()
+        };
+        let scope = RowScope::new(DiffSource::Commit(oid));
+        let s = base_settings();
+
+        {
+            let repo = open();
+            let diff = scoped_diff(&repo, s, &scope.paths, |r, o| {
+                commit_parent_diff(r, &r.find_commit(oid)?, Some(o))
+            })
+            .expect("diffs");
+            let t = Instant::now();
+            let mut n = 0usize;
+            diff.print(git2::DiffFormat::Patch, |_, _, _| {
+                n += 1;
+                true
+            })
+            .expect("prints");
+            let printed = t.elapsed();
+            let cost = RowCostProbe::from_built_sizes(&diff);
+            println!(
+                "{rev} ({oid:.8}): {} deltas, {} bytes, largest delta {} — ceiling {:.2}x",
+                cost.deltas,
+                cost.total_blob_bytes,
+                cost.max_delta_bytes,
+                cost.parallel_ceiling()
+            );
+            println!("  warm-up (bare print): {printed:?} ({n} rows)");
+
+            // The ceiling above is a BYTES model, and bytes are a proxy for time rather
+            // than time itself. Time each delta on its own to see what the real floor
+            // is: the split cannot beat the slowest single delta, whichever that is.
+            if std::env::var("BENCH_PER_DELTA").is_ok() {
+                let repo = open();
+                let diff = scoped_diff(&repo, s, &scope.paths, |r, o| {
+                    commit_parent_diff(r, &r.find_commit(oid)?, Some(o))
+                })
+                .expect("diffs");
+                let mut timed: Vec<(std::time::Duration, u64, String)> = Vec::new();
+                for i in 0..diff.deltas().len() {
+                    let t = Instant::now();
+                    if let Ok(Some(mut patch)) = git2::Patch::from_diff(&diff, i) {
+                        patch.print(&mut |_, _, _| true).expect("prints");
+                    }
+                    let d = diff.get_delta(i).expect("delta");
+                    timed.push((
+                        t.elapsed(),
+                        d.old_file().size().saturating_add(d.new_file().size()),
+                        String::from_utf8_lossy(delta_path_bytes(&d)).into_owned(),
+                    ));
+                }
+                let total: std::time::Duration = timed.iter().map(|(t, _, _)| *t).sum();
+                timed.sort_by_key(|(t, _, _)| std::cmp::Reverse(*t));
+                println!("  per-delta, slowest first (total {total:?}):");
+                for (t, bytes, path) in timed.iter().take(5) {
+                    println!("    {t:?}  {bytes} bytes  {path}");
+                }
+                let slowest = timed.first().map_or(total, |(t, _, _)| *t);
+                println!(
+                    "  TIME ceiling {:.2}x (against the BYTE ceiling {:.2}x)",
+                    total.as_secs_f64() / slowest.as_secs_f64(),
+                    cost.parallel_ceiling()
+                );
+            }
+        }
+
+        let run = |label: &str, forced: usize| {
+            let repo = open();
+            let progress = DiffProgress::default();
+            let t = Instant::now();
+            let data = super::tests::with_parallel_patch_pass(forced, || {
+                get_diff_data(&repo, &scope, s, BuildEnv::tracked(None, &progress))
+            });
+            let took = t.elapsed();
+            println!("  {label}: {took:?} ({} rows)", data.lines.len());
+            (took, data.lines.len())
+        };
+
+        let (sequential, rows) = run("sequential", 0);
+        for w in workers {
+            if w < 2 {
+                continue;
+            }
+            let (par, par_rows) = run(&format!("{w} workers"), w);
+            assert_eq!(rows, par_rows, "the split must produce the same rows");
+            let speedup = sequential.as_secs_f64() / par.as_secs_f64();
+            println!("REAL {rev}: {w} workers = {speedup:.2}x");
+        }
     }
 
     /// GATE BENCH: what the split pass COSTS a build it will not split — the odb
