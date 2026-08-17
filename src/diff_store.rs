@@ -914,7 +914,22 @@ fn touch(path: &Path) -> std::io::Result<()> {
 /// bands in practice.
 pub const DEFAULT_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
-/// The largest entry the store will write: an eighth of the budget.
+/// The share of a cache's budget one entry may take: an eighth.
+///
+/// **Two caches, two budgets, one rule — and this is where the rule lives.** The split
+/// is right: this module bounds BYTES on disk, the prefetch cache bounds LINES in
+/// memory, and neither number means anything in the other's unit. The share does not
+/// differ, and it used to be written twice — a literal `8` here and a
+/// `PREFETCH_MAX_ENTRY_DIVISOR` in `main.rs` — so moving it meant finding both, and
+/// finding one meant the two caches disagreed with nothing to say so.
+///
+/// An eighth rather than the whole, so one outsized entry cannot evict the band of
+/// small ones a cache exists to hold: a measured band was 21 entries under 1MB, so the
+/// 32MB this yields on disk already allows an entry thirty times that whole working
+/// set.
+pub const MAX_ENTRY_DIVISOR: usize = 8;
+
+/// The largest entry the store will write.
 ///
 /// An entry larger than the budget itself cannot survive the next prune, so writing
 /// one is pure waste — and not small waste. Measured on a repo of large data blobs:
@@ -922,15 +937,10 @@ pub const DEFAULT_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 /// further 9s, encoding gigabytes into `~/.cache/gitkay/diffs` to produce a file the
 /// next launch deletes unread.
 ///
-/// An eighth rather than the whole, so one outsized entry cannot evict the band of
-/// small ones the store exists to hold: a measured band was 21 entries under 1MB, so
-/// 32MB already allows an entry thirty times that whole working set. The same
-/// reasoning, and the same divisor, as the prefetch cache's `max_entry_lines`.
-///
 /// The cost of refusing is that such a diff is rebuilt on every visit. That is the
 /// right trade at this size — a diff this large has no fast path anyway (its INSTALL
 /// alone takes seconds), and the alternative spends the whole store on it.
-pub const MAX_ENTRY_BYTES: u64 = DEFAULT_BUDGET_BYTES / 8;
+pub const MAX_ENTRY_BYTES: u64 = DEFAULT_BUDGET_BYTES / MAX_ENTRY_DIVISOR as u64;
 
 /// A floor on what `encode` will produce for a diff of this shape: the fixed
 /// per-line and per-file fields, before a byte of text. Pure and count-based so the

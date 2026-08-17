@@ -28,14 +28,14 @@ use crate::diff::{
     self, BuildEnv, CommitStats, DiffData, DiffSettings, RowScope, StatsWant, commit_stats,
     is_real_commit,
 };
+use crate::diff_store::MAX_ENTRY_DIVISOR;
 use crate::highlight::Highlighter;
 use crate::history::CommitInfo;
 use crate::workers::{StatsJob, StatsResult};
 use crate::{
     DiffCacheKey, DiffDeps, PREFETCH_HIGHLIGHT_BUDGET, PREFETCH_LINE_BUDGET_DIVISOR,
-    PREFETCH_MAX_DIFF_BYTES, PREFETCH_MAX_ENTRY_DIVISOR, PREFETCH_MAX_HIGHLIGHT_LINES,
-    PREFETCH_MAX_WORKERS, build_or_load, highlight_diff_until, mem, spawn_guarded, store_of,
-    textconv_for,
+    PREFETCH_MAX_DIFF_BYTES, PREFETCH_MAX_HIGHLIGHT_LINES, PREFETCH_MAX_WORKERS, build_or_load,
+    highlight_diff_until, mem, spawn_guarded, store_of, textconv_for,
 };
 
 /// How much of a prefetched row's diff gets built.
@@ -356,6 +356,17 @@ pub struct Limits {
     /// `DiffCache::insert` keeps at least one entry, so the row evicts everything and
     /// then sits alone until the next insert evicts it too. Measured: a 133,460-line
     /// diff evicted all 51 warmed entries (98,507 lines).
+    ///
+    /// A FRACTION of the cache (`diff_store::MAX_ENTRY_DIVISOR`, the share the
+    /// persistent store applies to its own budget) rather than a tuned line count: what
+    /// makes a row too big is how much of the band it displaces, so the cap has to
+    /// track the cache. At the current budget that is 150,000 lines, which **admits**
+    /// the 133,460-line diff above rather than dropping it — the cache is now big
+    /// enough to hold it beside a full band, so refusing an entry is the fallback for a
+    /// repo that outgrows even this and not the normal path.
+    ///
+    /// The **display** path is deliberately unbounded: a diff the reader actually
+    /// opened is theirs to cache however large, because they are looking at it.
     pub max_entry_lines: usize,
     /// How long a speculative colour pass may run before it stops where it is.
     ///
@@ -442,7 +453,7 @@ impl PrefetchBudget {
         Self {
             limits: Limits {
                 max_blob_bytes: PREFETCH_MAX_DIFF_BYTES,
-                max_entry_lines: cache_lines / PREFETCH_MAX_ENTRY_DIVISOR,
+                max_entry_lines: cache_lines / MAX_ENTRY_DIVISOR,
                 highlight_budget: PREFETCH_HIGHLIGHT_BUDGET,
             },
             line_budget: cache_lines / PREFETCH_LINE_BUDGET_DIVISOR,
