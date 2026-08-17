@@ -9546,6 +9546,125 @@ mod tests {
         assert!(!resync_wrap_index(&mut index, false, &lines, 30, g));
     }
 
+    /// A diff row's context-menu id follows the LINE it draws, not the visual row.
+    ///
+    /// The id was the visual row until soft wrapping made the two different things, and
+    /// under wrapping a visual row names a different line after every re-wrap — so an
+    /// open menu survived a window resize by silently re-pointing at another line, and
+    /// this menu writes: stage, unstage, revert.
+    ///
+    /// The id is not reachable from outside the pane, so it is isolated rather than
+    /// reconstructed: `menu_salt` is the one input nothing else in the pane depends on,
+    /// so the single id that changes with it, among those under the pointer, is the
+    /// row's. And the pointer's y is not computed from a guessed layout — the sweep
+    /// reads the rows off in the order they are drawn, which needs no geometry at all.
+    #[test]
+    fn a_diff_rows_menu_id_follows_its_line_across_a_re_wrap() {
+        let g = LineNoGutter::default();
+        let lines = vec![
+            DiffLine::new("commit abc", LineKind::Meta),
+            DiffLine::new("x".repeat(400), LineKind::Context),
+            DiffLine::new("tail", LineKind::Context),
+        ];
+
+        // The ids under the pointer at `y`, for one wrap index and one salt.
+        let ids_at =
+            |wrap: &diff::WrapIndex, salt: u64, y: f32| -> std::collections::HashSet<egui::Id> {
+                let ctx = egui::Context::default();
+                let input = egui::RawInput {
+                    events: vec![egui::Event::PointerMoved(egui::pos2(20.0, y))],
+                    ..headless_screen(600.0, 400.0)
+                };
+                // Twice, with the same input: egui resolves what contains the pointer
+                // against the widget rects of the pass BEFORE, so one pass registers the
+                // rows and the second is the one that can answer.
+                let pass = |input: egui::RawInput| {
+                    ctx.run_ui(input, |ui| {
+                        let fid = egui::FontId::monospace(13.0);
+                        show_virtualized_diff(
+                            ui,
+                            &fid,
+                            DiffView {
+                                n_lines: 3,
+                                wrap: Some(wrap),
+                                content_chars: 0,
+                                scroll_target: None,
+                                last_top_anchor: None,
+                                menu_salt: salt,
+                            },
+                            |_| {},
+                            |_, _| (egui::text::LayoutJob::default(), None, egui::Color32::WHITE),
+                            |_| Some(0), // every row gets a menu, so every row registers
+                            |_, _, _| {},
+                        );
+                    })
+                    .drop_without_applying_deltas();
+                };
+                pass(input.clone());
+                pass(input);
+                ctx.interaction_snapshot(|s| s.contains_pointer.iter().copied().collect())
+            };
+
+        // The row widget is the only thing under the pointer whose id moves with the
+        // salt, so the difference of the two sets is exactly it.
+        let row_id_at = |wrap: &diff::WrapIndex, y: f32| -> Option<egui::Id> {
+            let (a, b) = (ids_at(wrap, 1, y), ids_at(wrap, 2, y));
+            let mut only_a = a.difference(&b);
+            let id = only_a.next().copied();
+            assert!(
+                only_a.next().is_none(),
+                "the salt must move ONE id, at y={y}"
+            );
+            id
+        };
+
+        // The rows in the order they are drawn, read off by sweeping the pointer down
+        // the pane: each row is a contiguous band, so a change of id is the next row.
+        let row_ids = |cols: usize| -> Vec<egui::Id> {
+            let wrap = diff::WrapIndex::build(&lines, cols, g);
+            let mut out: Vec<egui::Id> = Vec::new();
+            for step in 0..200 {
+                if let Some(id) = row_id_at(&wrap, step as f32 * 2.0)
+                    && out.last() != Some(&id)
+                {
+                    out.push(id);
+                }
+            }
+            out
+        };
+
+        let (narrow, wide) = (40, 200);
+        let (in_, iw) = (
+            diff::WrapIndex::build(&lines, narrow, g),
+            diff::WrapIndex::build(&lines, wide, g),
+        );
+        // Control: the re-wrap has to actually move the last line to another row, and
+        // leave a different line on the row it came from.
+        let (rn, rw) = (in_.row_of_line(2), iw.row_of_line(2));
+        assert_ne!(rn, rw, "the fixture must re-wrap line 2 onto another row");
+        assert_ne!(
+            in_.line_of_row(rw).0,
+            2,
+            "and put another line where it lands"
+        );
+
+        let (narrow_ids, wide_ids) = (row_ids(narrow), row_ids(wide));
+        assert!(
+            narrow_ids.len() > rn && wide_ids.len() > rw,
+            "both rows must be on screen: {} and {} rows drawn",
+            narrow_ids.len(),
+            wide_ids.len()
+        );
+        assert_eq!(
+            narrow_ids[rn], wide_ids[rw],
+            "line 2's menu must keep its id when a re-wrap moves it to another row"
+        );
+        assert_ne!(
+            narrow_ids[rw], wide_ids[rw],
+            "and a fixed visual row must NOT keep one, since it is another line now"
+        );
+    }
+
     /// The pane's virtualization under soft wrapping, end to end: `show_rows`
     /// scrolls over VISUAL rows, and every callback above the renderer is handed the
     /// LINE that row belongs to.
