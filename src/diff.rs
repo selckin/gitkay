@@ -628,6 +628,16 @@ pub const MAX_WORD_DIFF_LINE: usize = 2048;
 /// only), because a pair straddling the window edge needs the true run lengths to
 /// pair correctly.
 ///
+/// **The LCS is bounded by the window; the block SCAN is bounded by the block.** Those
+/// are different bounds and only the first is O(window). A change block is `Del* Add*`,
+/// so an added file is one block covering the whole file, and a viewport parked inside
+/// it walks that block's full length in kind checks every frame — the run lengths on
+/// both sides of the window are exactly what decides whether the pairs align, so
+/// nothing local can answer it. Bounding that too means recording each block's
+/// boundaries once per diff (the sparse shape `wrap::WrapIndex` uses) and binary
+/// searching them; it is a per-diff index and an invalidation site, not a tweak here.
+/// The guard below removes the case that does not need the walk at all.
+///
 /// `lines` is read, never written: emphasis lands in `emph`, indexed by row.
 pub fn emphasize_rows(lines: &[DiffLine], emph: &mut RowEmphasis, rows: std::ops::Range<usize>) {
     let (lo, hi) = (rows.start.min(lines.len()), rows.end.min(lines.len()));
@@ -635,6 +645,18 @@ pub fn emphasize_rows(lines: &[DiffLine], emph: &mut RowEmphasis, rows: std::ops
         return;
     }
     let in_window = |idx: usize| lo <= idx && idx < hi;
+    // Nothing changed on screen ⇒ nothing to emphasize, and the block walk below can be
+    // skipped whole. A pair is only ever written when one of its two rows is IN the
+    // window, and both of those rows are `Del`/`Add` by construction — so if the window
+    // holds neither kind, every pair the extension could reach would be discarded after
+    // being found. Without this, a viewport sitting in ordinary context next to a large
+    // change block still walked that entire block, every frame.
+    if !lines[lo..hi]
+        .iter()
+        .any(|l| matches!(l.kind, LineKind::Del | LineKind::Add))
+    {
+        return;
+    }
     let mut i = lo;
     while i > 0 && matches!(lines[i - 1].kind, LineKind::Del | LineKind::Add) {
         i -= 1;
@@ -1878,7 +1900,6 @@ fn append_diff_body(
             let (Some(drivers), Some(delta)) = (driver_at(fi), diff.get_delta(fi)) else {
                 continue;
             };
-            files[fi].diff_line_idx = Some(lines.len());
             let ctx = ConvertCtx {
                 repo,
                 tc,
@@ -1890,14 +1911,12 @@ fn append_diff_body(
             let header = HeaderOf::Missing {
                 prefixes: (&prefixes.0, &prefixes.1),
             };
+            // `diff_line_idx` is `emit_converted`'s to set and to take back — it means
+            // exactly "this call wrote rows", which only that function knows.
             match emit_converted(lines, files, ctx, fi, &delta, header) {
                 Substitution::Done => swept.push(fi),
-                // Nothing was written, so the entry has no body after all.
-                Substitution::Unconvertible => files[fi].diff_line_idx = None,
-                Substitution::Failed => {
-                    files[fi].diff_line_idx = None;
-                    failed = true;
-                }
+                Substitution::Unconvertible => {}
+                Substitution::Failed => failed = true,
             }
         }
         move_to_end(files, &swept);
@@ -2686,6 +2705,25 @@ pub fn commit_diff_against<'r>(
 pub enum StatsWant {
     FilesOnly,
     FilesAndLines,
+}
+
+impl StatsWant {
+    /// Does answering this want mean reading blob CONTENT?
+    ///
+    /// The property three of `run_stats_job`'s decisions actually turn on — whether to
+    /// consult the persistent store, whether to run the cost probe, and whether a
+    /// driven row must withhold rather than convert. Each used to spell it
+    /// `want == FilesAndLines`, so a third variant would be classified "needs no
+    /// content" by all three with no compile error, and would then take the cheap path
+    /// while asking for counts that read every blob — on the commit-list column's path,
+    /// which is the one place a driver must never run. A `match`, so adding one is a
+    /// build error instead.
+    pub const fn needs_line_counts(self) -> bool {
+        match self {
+            Self::FilesOnly => false,
+            Self::FilesAndLines => true,
+        }
+    }
 }
 
 /// One commit-list row's change counts.

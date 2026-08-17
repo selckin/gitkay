@@ -20,10 +20,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use git2::Repository;
 
 use crate::cli;
-use crate::diff::{
-    BuildEnv, CommitStats, DiffAnchor, DiffData, DiffProgress, DiffSettings, RowScope, StatsWant,
-    anchor_hint,
-};
+use crate::diff::{BuildEnv, DiffAnchor, DiffData, DiffProgress, RowScope, anchor_hint};
 use crate::diff_highlight::{HighlightBudget, highlight_diff_within};
 use crate::highlight::Highlighter;
 use crate::history::{
@@ -422,6 +419,16 @@ pub fn foreground_worker(repo_path: &str, rx: &Arc<Mutex<mpsc::Receiver<Foregrou
     }
 }
 
+/// Did `f` actually run to completion over a repository?
+///
+/// `false` covers the two ways it might not have — no repo to run it against, and a
+/// panic inside it — because the caller owes the UI the same thing either way: a
+/// report, since a silent exit strands the loading state. Stated once so the two
+/// reporting arms below cannot spell it differently, which is what they did.
+fn ran(repo: Option<&Repository>, f: impl FnOnce(&Repository)) -> bool {
+    repo.is_some_and(|r| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(r))).is_ok())
+}
+
 /// Run one job, catching a panic so a bad row costs that job rather than the worker
 /// — and still reporting it, since a silent exit strands the UI's loading state.
 pub fn run_foreground_job(repo: Option<&Repository>, job: ForegroundJob) {
@@ -430,22 +437,14 @@ pub fn run_foreground_job(repo: Option<&Repository>, job: ForegroundJob) {
             let _claim = claim; // released when this job ends, panic included
             let (tx, epoch, key, ctx) =
                 (job.tx.clone(), job.epoch, job.key.clone(), job.ctx.clone());
-            let ran = repo.is_some_and(|r| {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| diff_load_job(r, job)))
-                    .is_ok()
-            });
-            if !ran {
+            if !ran(repo, |r| diff_load_job(r, job)) {
                 log::warn!("diff-load did not complete; reporting the load as failed");
                 report_failed_diff_load(&tx, epoch, key, &ctx);
             }
         }
         ForegroundJob::History(job) => {
             let (tx, epoch, ctx) = (job.tx.clone(), job.epoch, job.ctx.clone());
-            let ran = repo.is_some_and(|r| {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| history_job(r, job)))
-                    .is_ok()
-            });
-            if !ran {
+            if !ran(repo, |r| history_job(r, job)) {
                 log::warn!("history-load did not complete; reporting it as failed");
                 let _ = tx.send(HistoryResult { epoch, load: None });
                 ctx.request_repaint();
@@ -613,34 +612,6 @@ pub fn history_job(repo: &Repository, job: HistoryJob) {
     {
         ctx.request_repaint();
     }
-}
-
-/// One commit's finished stats, worker → UI. `stats: None` means the diff could
-/// not be computed — recorded as a failure rather than left unknown, or the
-/// dispatcher would ask again every frame.
-pub struct StatsResult {
-    pub epoch: u64,
-    pub oid: git2::Oid,
-    pub stats: Option<CommitStats>,
-}
-
-/// One row's commit-list stats to compute.
-///
-/// Per row, not per batch. The batch was an artefact of the single dedicated worker
-/// this used to have: it made one slow commit block every row behind it, and gated
-/// re-dispatch until the whole batch landed, so scrolling past a large commit left the
-/// following small ones blank. As a queue item among others, a slow row occupies one
-/// worker and nothing else.
-pub struct StatsJob {
-    /// Per-oid scope: under `--follow` each commit is asked about the name the file
-    /// had AT that commit, matching the diff the pane would show; the range row is
-    /// asked about its endpoints.
-    pub scope: RowScope,
-    pub settings: DiffSettings,
-    pub want: StatsWant,
-    /// The `stats_epoch` this was queued under; a result from before an invalidation
-    /// is dropped on arrival.
-    pub epoch: u64,
 }
 
 #[cfg(test)]

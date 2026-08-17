@@ -143,6 +143,15 @@ const CDAT_AFTER_TREE: usize = 16;
 /// measured from the end of the tree oid.
 const CDAT_GENERATION_AT: usize = 8;
 
+/// Bytes per `CDAT` record: the tree oid, then everything after it.
+///
+/// Stated once because a wrong stride does not fail — it reads a NEIGHBOURING
+/// commit's parents or generation, which is a plausible answer to every caller.
+/// Free rather than a method, since `open` computes it before there is a `Layer`.
+const fn cdat_stride(hash_len: usize) -> u64 {
+    (hash_len + CDAT_AFTER_TREE) as u64
+}
+
 /// One layer's changed-path Bloom filters: where they are, and how they were hashed.
 ///
 /// Present only when the graph was written with `--changed-paths`, which is not what
@@ -257,7 +266,7 @@ impl Layer {
         if oid_end.checked_sub(oid_lookup)? < need {
             return None;
         }
-        let need = u64::from(commits) * (hash_len + CDAT_AFTER_TREE) as u64;
+        let need = u64::from(commits) * cdat_stride(hash_len);
         if data_end.checked_sub(commit_data)? < need {
             return None;
         }
@@ -345,12 +354,18 @@ impl Layer {
         })
     }
 
+    /// Where a field sits in the `CDAT` record of the commit at `pos`, with `field`
+    /// measured from the end of that record's tree oid.
+    fn cdat_at(&self, pos: u32, field: usize) -> u64 {
+        self.commit_data
+            + u64::from(pos) * cdat_stride(self.hash_len)
+            + (self.hash_len + field) as u64
+    }
+
     /// The two parent columns of the commit at `pos`, verbatim — `GRAPH_PARENT_NONE`,
     /// a position, or (in the second) an `EDGE` index with `GRAPH_EXTRA_EDGES` set.
     fn parent_words(&self, pos: u32) -> Option<(u32, u32)> {
-        let at = self.commit_data
-            + u64::from(pos) * (self.hash_len + CDAT_AFTER_TREE) as u64
-            + self.hash_len as u64;
+        let at = self.cdat_at(pos, 0);
         let mut buf = [0u8; 8];
         self.file.read_exact_at(&mut buf, at).ok()?;
         Some((
@@ -380,9 +395,7 @@ impl Layer {
     /// every root, which is precisely the parent-above-child inversion this exists
     /// to rule out.
     fn generation(&self, pos: u32) -> Option<u32> {
-        let at = self.commit_data
-            + u64::from(pos) * (self.hash_len + CDAT_AFTER_TREE) as u64
-            + (self.hash_len + CDAT_GENERATION_AT) as u64;
+        let at = self.cdat_at(pos, CDAT_GENERATION_AT);
         let mut buf = [0u8; 4];
         self.file.read_exact_at(&mut buf, at).ok()?;
         // The upper 30 bits are the generation; the low 2 are the commit time's

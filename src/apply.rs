@@ -408,28 +408,47 @@ fn action_diff<'r>(
     req: &ApplyRequest,
     settings: DiffSettings,
     ignore_ws: bool,
-) -> Result<(git2::Diff<'r>, ApplyLocation, bool), ApplyError> {
+) -> Result<(git2::Diff<'r>, ActionTarget<'r>, bool), ApplyError> {
     let action = ApplyAction::of(req.source.oid());
     let reversed = !matches!(action, ApplyAction::Stage);
     let mut opts = action_diff_opts(req, settings, reversed, ignore_ws);
-    let (mut diff, location) = match action {
-        ApplyAction::Stage => (worktree_git_diff(repo, &mut opts)?, ApplyLocation::Index),
+    let (mut diff, target) = match action {
+        ApplyAction::Stage => (worktree_git_diff(repo, &mut opts)?, ActionTarget::Index),
         ApplyAction::Unstage => (
             staged_diff_against(repo, head_tree_for_write(repo)?.as_ref(), &mut opts)?,
-            ApplyLocation::Index,
+            ActionTarget::Index,
         ),
         ApplyAction::Revert => {
-            // Same resolution path `revert_file` uses, so a range and a commit reach
-            // the diff builder identically. The trees are dropped at the end of this
-            // arm: the returned `Diff` borrows the repo, not them.
+            // The tree pair travels OUT with the diff rather than being dropped here
+            // and rebuilt by whoever applies it — see `ActionTarget`.
             let trees = RevertTrees::of_request(repo, req)?;
-            (trees.diff(repo, &mut opts)?, ApplyLocation::WorkDir)
+            let diff = trees.diff(repo, &mut opts)?;
+            (diff, ActionTarget::WorkDir(trees))
         }
     };
     // Rename/copy coalescing is a post-pass, not a DiffOptions flag — run the same
     // one the pane ran so file identity matches the sidebar entry.
     detect_similar(&mut diff, settings);
-    Ok((diff, location, reversed))
+    Ok((diff, target, reversed))
+}
+
+/// Where an action's diff is applied — and, for the one route that writes the
+/// worktree, the trees it must be applied THROUGH.
+///
+/// The pair rides in the variant rather than being rebuilt by each consumer.
+/// `RevertTrees::of_request` promises that "the modes a guard decides on can never be
+/// read off a different pair of trees than the deltas came from", and with a separate
+/// call in `action_diff`, in `revert_file` and again on the hunk path that held only
+/// because all three happened to be handed the same `req` — its own doc named two
+/// callers where there were three. Carried here it is the same pair by construction,
+/// and it costs two tree resolutions less per revert.
+///
+/// It also makes "only a revert may write the worktree" structural instead of a
+/// comment plus a `matches!` on the routing enum: `Index` has no trees to write one
+/// with, and `WorkDir` cannot be built without them.
+enum ActionTarget<'r> {
+    Index,
+    WorkDir(RevertTrees<'r>),
 }
 
 /// Stage a whole file: record its current worktree state in the index, or drop the
@@ -683,9 +702,11 @@ struct RevertTrees<'r> {
 }
 
 impl<'r> RevertTrees<'r> {
-    /// The ONE place a request becomes a tree pair. `action_diff` and `revert_file`
-    /// both call it, so the modes a guard decides on can never be read off a different
-    /// pair of trees than the deltas came from.
+    /// The ONE place a request becomes a tree pair — and, since the pair travels out
+    /// on `ActionTarget::WorkDir`, called exactly once per revert, by `action_diff`.
+    /// So the modes a guard decides on cannot be read off a different pair of trees
+    /// than the deltas came from; that used to rest on three separate calls happening
+    /// to be handed the same `req`.
     ///
     /// Dispatches on `CommitKind` exhaustively, like `get_diff_data`, so a new row kind
     /// cannot silently fall through to the commit path.
@@ -1104,7 +1125,7 @@ fn revert_file(
     req: &ApplyRequest,
     settings: DiffSettings,
 ) -> Result<(), ApplyError> {
-    let (diff, _, _) = action_diff(repo, req, settings, false)?;
+    let (diff, target, _) = action_diff(repo, req, settings, false)?;
     if diff.deltas().len() == 0 {
         // The regenerated, pathspec-filtered action diff has nothing for this
         // request at all. Mirrors the hunk path's `best_hunk_fit` pre-check:
@@ -1112,9 +1133,13 @@ fn revert_file(
         // `Ok(())` for a write that touched nothing.
         return Err(ApplyError::Stale);
     }
-    // The same trees `action_diff` built the diff from, resolved through the same
-    // function — the modes the routes below decide on live there, not in the diff.
-    let trees = RevertTrees::of_request(repo, req)?;
+    // The very trees `action_diff` built this diff from — the modes the routes below
+    // decide on live there, not in the diff. `Index` is unreachable (this function is
+    // only entered on the revert route, which `ApplyAction::of` decides), but refusing
+    // is the only answer that cannot write the worktree without them.
+    let ActionTarget::WorkDir(trees) = target else {
+        return Err(ApplyError::Unsupported);
+    };
     let binary: Vec<_> = diff.deltas().filter(|d| delta_is_binary(repo, d)).collect();
     if binary.is_empty() {
         return apply_revert_to_workdir(repo, &trees, &diff, None);
@@ -1286,7 +1311,7 @@ pub fn apply_request(
     if req.converted {
         return Err(ApplyError::TextconvNotApplicable);
     }
-    let (diff, location, reversed) = action_diff(repo, req, settings, false)?;
+    let (diff, target, reversed) = action_diff(repo, req, settings, false)?;
 
     // Decide BEFORE mutating. The hunk callback cannot be the gate: libgit2 skips
     // `git_apply__patch` — and with it the callback — whenever
@@ -1349,9 +1374,11 @@ pub fn apply_request(
         // real reason. Only on the refusal path, so the extra diff costs nothing
         // in the common case.
         HunkFit::Exceeds if settings.ignore_ws => {
-            let (as_shown, _, rev) = action_diff(repo, req, settings, true)?;
+            // `reversed` again, not a second copy of it: `action_diff` derives it from
+            // `req` alone, and this is the same `req`.
+            let (as_shown, _, _) = action_diff(repo, req, settings, true)?;
             return Err(
-                if best_hunk_fit(&as_shown, &clicked, rev, &req.path)? == HunkFit::Within {
+                if best_hunk_fit(&as_shown, &clicked, reversed, &req.path)? == HunkFit::Within {
                     ApplyError::HiddenByWhitespace
                 } else {
                     ApplyError::Stale
@@ -1387,12 +1414,13 @@ pub fn apply_request(
     });
 
     // A revert lands in the worktree, where a `Deleted` delta destroys whatever is
-    // on disk without checking it — the same guard the whole-file route needs.
-    let outcome = if matches!(location, ApplyLocation::WorkDir) {
-        let trees = RevertTrees::of_request(repo, req)?;
-        apply_revert_to_workdir(repo, &trees, &diff, Some(&mut opts))
-    } else {
-        apply_diff(repo, &diff, location, Some(&mut opts))
+    // on disk without checking it — the same guard the whole-file route needs. Which
+    // route this is, and the trees the guard reads modes off, are one answer.
+    let outcome = match &target {
+        ActionTarget::WorkDir(trees) => {
+            apply_revert_to_workdir(repo, trees, &diff, Some(&mut opts))
+        }
+        ActionTarget::Index => apply_diff(repo, &diff, ApplyLocation::Index, Some(&mut opts)),
     };
     match outcome {
         // The pre-match said a hunk matched, so the callback must have accepted one

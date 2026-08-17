@@ -59,15 +59,15 @@ use history::{
     diff_paths_for, load_history, provisional_commits, provisional_scope, scope_notice,
 };
 use prefetch::{
-    InflightClaim, InflightKeys, PoolHandle, PrefetchBudget, PrefetchTarget, WarmDisposition,
-    WarmFacts, WarmResult, lock_inflight, prefetch_targets, spawn_prefetch_pool, view_moved_enough,
-    warm_band, warm_disposition,
+    InflightClaim, InflightKeys, PoolHandle, PrefetchBudget, PrefetchTarget, StatsJob, StatsResult,
+    WarmDisposition, WarmFacts, WarmResult, lock_inflight, prefetch_targets, spawn_prefetch_pool,
+    view_moved_enough, warm_band, warm_disposition,
 };
 use textconv::Textconv;
 use workers::{
     DiffLoadJob, DiffLoadResult, ForegroundJob, HistoryJob, HistoryJobKind, HistoryLoad,
-    HistoryResult, PreHighlight, StatsJob, StatsResult, next_history_page, report_failed_diff_load,
-    run_foreground_job, spawn_foreground_workers,
+    HistoryResult, PreHighlight, next_history_page, report_failed_diff_load, run_foreground_job,
+    spawn_foreground_workers,
 };
 
 /// A monotonic supersession token shared between the UI thread and a background worker.
@@ -109,6 +109,37 @@ struct VisibleRange {
     page_hi: AtomicUsize,
 }
 
+/// One observation of `VisibleRange` — where the reader is, in file indices.
+///
+/// A named struct rather than the `(usize, usize, usize, usize)` this used to be passed
+/// around as: all four fields are the same type, so `store` destructured them
+/// positionally and `pick_file` took them as four positional parameters, where swapping
+/// `page_lo` and `page_hi` compiles cleanly and reads on screen as the worker colouring
+/// the wrong end of the diff.
+///
+/// It also gives `visible` one definition. The picker and the worker's preempt check
+/// both need it, and each spelled `(lo..=hi).contains(&fi)` out — against *different*
+/// observations of the same four atomics, so the decision to ABANDON a file was taken
+/// against a window the picker never saw. Should the band ever gain a term (the
+/// word-diff window's equivalent already adds "plus any pending scroll target"), those
+/// two would disagree and the worker would thrash between files with nothing logged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FileWindow {
+    /// First and last file on screen.
+    lo: usize,
+    hi: usize,
+    /// Extended by one viewport's worth of lines either side, for read-ahead.
+    page_lo: usize,
+    page_hi: usize,
+}
+
+impl FileWindow {
+    /// Is this file on screen right now?
+    const fn visible(&self, fi: usize) -> bool {
+        self.lo <= fi && fi <= self.hi
+    }
+}
+
 impl VisibleRange {
     /// The file-index window for a viewport covering `rows`: the files on screen,
     /// plus one viewport's worth either side for read-ahead.
@@ -121,28 +152,44 @@ impl VisibleRange {
     /// render has corrected it. At the ~0.5ms/line syntect costs on a loaded
     /// machine that is ~128ms spent colouring the wrong end of the diff, which is
     /// exactly the unstyled flash a cache hit of a part-highlighted diff shows.
-    fn window(
-        starts: &[(usize, usize)],
-        rows: std::ops::Range<usize>,
-    ) -> (usize, usize, usize, usize) {
+    fn window(starts: &[(usize, usize)], rows: std::ops::Range<usize>) -> FileWindow {
         if rows.start >= rows.end {
-            return (0, 0, 0, 0);
+            return FileWindow {
+                lo: 0,
+                hi: 0,
+                page_lo: 0,
+                page_hi: 0,
+            };
         }
         let vh = rows.end - rows.start;
-        (
-            file_index_at_line(starts, rows.start),
-            file_index_at_line(starts, rows.end - 1),
-            file_index_at_line(starts, rows.start.saturating_sub(vh)),
-            file_index_at_line(starts, rows.end - 1 + vh),
-        )
+        FileWindow {
+            lo: file_index_at_line(starts, rows.start),
+            hi: file_index_at_line(starts, rows.end - 1),
+            page_lo: file_index_at_line(starts, rows.start.saturating_sub(vh)),
+            page_hi: file_index_at_line(starts, rows.end - 1 + vh),
+        }
     }
 
     /// Publish a window for the worker to read on its next chunk boundary.
-    fn store(&self, (lo, hi, page_lo, page_hi): (usize, usize, usize, usize)) {
-        self.lo.store(lo, Ordering::Relaxed);
-        self.hi.store(hi, Ordering::Relaxed);
-        self.page_lo.store(page_lo, Ordering::Relaxed);
-        self.page_hi.store(page_hi, Ordering::Relaxed);
+    fn store(&self, w: FileWindow) {
+        self.lo.store(w.lo, Ordering::Relaxed);
+        self.hi.store(w.hi, Ordering::Relaxed);
+        self.page_lo.store(w.page_lo, Ordering::Relaxed);
+        self.page_hi.store(w.page_hi, Ordering::Relaxed);
+    }
+
+    /// Read the published window back — ONE observation, so everything decided from it
+    /// is decided against the same window. The four loads are `Relaxed` and can each
+    /// see a different `store`; that was already true and costs at most a chunk of
+    /// colour in the wrong place, where two separate reads cost a disagreement between
+    /// the picker and the preempt.
+    pub fn snapshot(&self) -> FileWindow {
+        FileWindow {
+            lo: self.lo.load(Ordering::Relaxed),
+            hi: self.hi.load(Ordering::Relaxed),
+            page_lo: self.page_lo.load(Ordering::Relaxed),
+            page_hi: self.page_hi.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -309,15 +356,6 @@ fn diff_cache_line_budget() -> usize {
     );
     budget
 }
-/// Prefetch: how far past a visible edge a row is still worth **fully colouring**.
-///
-/// Not the width of the warmed band — `warm_band` is that, and it reaches a full
-/// window each way. This is the boundary between the two `WarmDepth`s: roughly an
-/// arrow-key step's worth of rows, which is what it was always really sized for.
-/// Beyond it a row is cached un-highlighted, which is what makes the wide band
-/// affordable.
-const PREFETCH_MARGIN: usize = 8;
-
 /// Real commits loaded by the startup walk. The `all_loaded` derivation compares
 /// the loaded count against this same constant (and the watcher-reload floor
 /// reuses it), so the initial window, the fallback load, and the "is there more?"
@@ -346,6 +384,16 @@ const RELOAD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(20
 /// per step — and then refuses to cache any of them, `key_is_current` being false by
 /// the time they land. Short enough that the diff still feels immediate on settling.
 const DIFF_LOAD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// How often the frame loop looks again at a producer that cannot wake it.
+///
+/// Three threads answer over an `mpsc` with no `egui::Context` to repaint with — the
+/// prewarm (it starts in `main()`, before the window exists), the deferred fonts, and
+/// the history walks — so each polls instead. One constant rather than three literals
+/// because the reason is one reason: near a frame's worth of latency on a handover
+/// nobody is watching the clock for. Every other timer in this file is named; these
+/// three cross-referenced each other in comments instead.
+const POLL_TICK: std::time::Duration = std::time::Duration::from_millis(33);
 
 /// How long an async diff load may run before the "Loading diff…" placeholder is
 /// shown. A load that resolves faster than this (a small uncached diff) never flashes
@@ -539,7 +587,23 @@ fn elide_bsearch(
 /// string's rendered width and must be monotonic in suffix length. Pure (no
 /// egui), so it is unit-testable.
 fn left_elide(path: &str, max_width: f32, measure: impl Fn(&str) -> f32) -> String {
-    if measure(path) <= max_width {
+    left_elide_measured(path, measure(path), max_width, measure)
+}
+
+/// `left_elide` for a caller that has already measured `path`, so the fits-as-is test
+/// costs nothing.
+///
+/// `measure` lays the string out to measure it (`text_width` allocates a `String` and
+/// hits the galley cache), and `draw_dir_header` needs the tail's width anyway to
+/// budget the dimmed ancestor beside it — so without this it measured the same tail
+/// twice per directory header, every frame, unvirtualized.
+fn left_elide_measured(
+    path: &str,
+    width: f32,
+    max_width: f32,
+    measure: impl Fn(&str) -> f32,
+) -> String {
+    if width <= max_width {
         return path.to_string();
     }
     // Byte offset where each char starts, so a kept suffix slices on a char boundary.
@@ -2140,8 +2204,8 @@ fn resolve_config_visuals(cfg: &config::Config) -> (highlight::EmbeddedThemeName
 /// bools, which `clippy::fn_params_excessive_bools` refuses, and rightly: four
 /// positional bools at a call site are four chances to swap two.
 ///
-/// Not the whole of what the toolbar owns: `word_diff` and `line_numbers` are
-/// toolbar-owned and persisted too, but change no diff DATA and so are not
+/// Not the whole of what the toolbar owns: `ToolbarViewSettings` holds the rest —
+/// toolbar-owned and persisted too, but changing no diff DATA and so not
 /// `DiffSettings` fields at all.
 #[derive(Clone, Copy)]
 struct ToolbarDiffSettings {
@@ -2182,9 +2246,8 @@ impl ToolbarDiffSettings {
         }
     }
 
-    /// Persist. Keys are `diff_`-prefixed because these are `DiffSettings`
-    /// fields; `word_diff`/`line_numbers` are stored bare beside them, being
-    /// `GitkApp`'s own.
+    /// Persist. Keys are `diff_`-prefixed because these are `DiffSettings` fields;
+    /// `ToolbarViewSettings`' are stored bare beside them, being `GitkApp`'s own.
     fn save(self, storage: &mut dyn eframe::Storage) {
         let Self {
             context,
@@ -2196,6 +2259,54 @@ impl ToolbarDiffSettings {
         eframe::set_value(storage, "diff_ignore_ws", &ignore_ws);
         eframe::set_value(storage, "diff_detect_renames", &detect_renames);
         eframe::set_value(storage, "diff_detect_copies", &detect_copies);
+    }
+}
+
+/// The toolbar's RENDER-only toggles, which `App::save` persists alongside
+/// `ToolbarDiffSettings`.
+///
+/// A second struct rather than four more fields on that one, because the split is
+/// real: these change no diff DATA, so they are not `DiffSettings` fields, key
+/// neither cache, and have no config-reload branch. What they share with it is the
+/// thing that matters here — the reader flipped them while reading, so they must come
+/// back exactly as left.
+///
+/// It exists for the same reason its sibling does, and the reason is a failure this
+/// group actually had: `load` is an exhaustive struct literal and `save` an exhaustive
+/// destructure, so a fourth toggle fails to build in both directions. As three
+/// hand-written pairs it was a convention, and the convention had already slipped —
+/// `wrap` was added third and the doc comments enumerating the group still said
+/// "`word_diff` and `line_numbers`". Miss one half and the tick silently resets at
+/// every launch, with nothing to say why.
+#[derive(Clone, Copy)]
+struct ToolbarViewSettings {
+    word_diff: bool,
+    line_numbers: bool,
+    wrap: bool,
+}
+
+impl ToolbarViewSettings {
+    /// Restore from storage, or the toolbar's own defaults — all three off, so a
+    /// reader who has never touched them gets the plain pane.
+    fn load(storage: Option<&dyn eframe::Storage>) -> Self {
+        Self {
+            word_diff: stored(storage, "word_diff", false),
+            line_numbers: stored(storage, "line_numbers", false),
+            wrap: stored(storage, "wrap", false),
+        }
+    }
+
+    /// Persist. Keys are bare, these being `GitkApp`'s own rather than
+    /// `DiffSettings` fields.
+    fn save(self, storage: &mut dyn eframe::Storage) {
+        let Self {
+            word_diff,
+            line_numbers,
+            wrap,
+        } = self;
+        eframe::set_value(storage, "word_diff", &word_diff);
+        eframe::set_value(storage, "line_numbers", &line_numbers);
+        eframe::set_value(storage, "wrap", &wrap);
     }
 }
 
@@ -2313,15 +2424,10 @@ fn body_sections(
 const MAX_ROW_RENDER_CHARS: usize = 10_000;
 
 /// Where `text` has to be cut to fit `MAX_ROW_RENDER_CHARS`, or `None` when it fits —
-/// which is every row of every ordinary diff.
-///
-/// By CHARACTERS, so a multi-byte one is never split, and `nth` rather than a length
-/// comparison so the walk stops at the cap instead of traversing an 8M-character line
-/// to discover it is long.
+/// which is every row of every ordinary diff. See `highlight::char_cut` for why the
+/// walk is shared with the tokenizing bound while the number stays here.
 fn clip_row_text(text: &str) -> Option<usize> {
-    text.char_indices()
-        .nth(MAX_ROW_RENDER_CHARS)
-        .map(|(at, _)| at)
+    highlight::char_cut(text, MAX_ROW_RENDER_CHARS)
 }
 
 /// Spans restricted to the byte window one row draws, and rebased to it: those
@@ -2667,11 +2773,17 @@ struct DerivedHistory {
 }
 
 fn derive_from_commits(commits: &[CommitInfo]) -> DerivedHistory {
-    let oid_set: HashSet<git2::Oid> = commits.iter().map(|c| c.oid).collect();
-    let mut layout_state = GraphLayoutState::default();
-    let graph_rows = layout_graph_rows(commits, &oid_set, &mut layout_state);
-    let graph_max_cols = graph_rows.iter().map(|r| r.num_cols).max().unwrap_or(1);
+    // Built FIRST so the layout's in-scope test can read it: its keys are every
+    // commit's oid, which is exactly the set the layout needs, and building a
+    // `HashSet` beside it hashed the whole list a second time.
     let (commit_index_by_oid, first_child_of) = build_commit_indexes(commits);
+    let mut layout_state = GraphLayoutState::default();
+    let graph_rows = layout_graph_rows(
+        commits,
+        |oid| commit_index_by_oid.contains_key(oid),
+        &mut layout_state,
+    );
+    let graph_max_cols = graph_rows.iter().map(|r| r.num_cols).max().unwrap_or(1);
     DerivedHistory {
         graph_rows,
         graph_max_cols,
@@ -3127,9 +3239,6 @@ struct GitkApp {
     clipboard: Option<arboard::Clipboard>,
     diff_cache: DiffCache<DiffCacheKey, DiffData>, // diffs the user navigated away from
     /// The persistent diff store, once the `gitkay-cache-prune` thread has
-    /// fingerprinted the repo. Empty until then, and forever if there is no cache
-    /// directory or the repo could not be identified.
-    /// The persistent diff store, once the `gitkay-cache-prune` thread has
     /// fingerprinted the repo, and the repo's `diff.<driver>.textconv` drivers —
     /// see `DiffDeps`. The drivers are handed to each worker by `Arc` rather than
     /// published through a global, so `get_diff_data` depends on nothing a caller
@@ -3244,15 +3353,14 @@ struct GitkApp {
     diff_load_tx: mpsc::Sender<DiffLoadResult>, // worker → UI: the selected commit's finished diff
     diff_load_rx: mpsc::Receiver<DiffLoadResult>,
     diff_load_epoch: Epoch, // bumped per selection; supersedes older diff-load workers + results
-    /// Keys with a diff-load worker in flight (real commits only). A re-dispatch
-    /// for a tracked key — bouncing back to a commit whose load never finished —
-    /// skips spawning a duplicate and adopts the in-flight result instead (see
-    /// `dispatch_diff_load` / the drain's `awaiting` rule). Sound because every
-    /// diff-load worker exit path reports a `DiffLoadResult` (normal, failed,
-    /// superseded bail, panic), so the drain always clears the entry.
     /// The foreground diff loads running right now, each with the progress handle
-    /// its worker reports into — so a bounce-back adopts both the worker and what it
-    /// has to say. Real commits only; a virtual row's key moves under it.
+    /// its worker reports into — so a re-dispatch for a tracked key (bouncing back to
+    /// a commit whose load never finished) skips spawning a duplicate and adopts both
+    /// the worker and what it has to say, rather than restarting the build and
+    /// resetting the display (see `dispatch_diff_load` / the drain's `awaiting` rule).
+    /// Sound because every diff-load worker exit path reports a `DiffLoadResult`
+    /// (normal, failed, superseded bail, panic), so the drain always clears the entry.
+    /// Real commits only; a virtual row's key moves under it.
     inflight_loads: HashMap<DiffCacheKey, Arc<DiffProgress>>,
     /// Background history loads (lazy-load extension + watcher rebuild). Results
     /// return over this channel; `history_epoch` supersedes stale ones; the
@@ -3268,11 +3376,6 @@ struct GitkApp {
     // None when a load applies, fails, or is cancelled — one field, so the clock and
     // the report cannot outlive each other.
     diff_load: Option<DiffLoadState>,
-    /// Whether the in-flight load is a same-oid rebuild (`ScrollPlan::Anchor`) —
-    /// only meaningful while `diff_load` is `Some`, and rewritten by
-    /// every dispatch so a burst that changes character mid-flight (toggle the
-    /// toolbar, then arrow away before it lands) is classified by its latest
-    /// dispatch rather than its first.
     egui_ctx: egui::Context, // stored Context handle so workers can request a repaint
     /// Applies run off the frame loop (a large file's diff regeneration is not
     /// frame-budget work) and one at a time — the menus disable while in flight.
@@ -3735,9 +3838,11 @@ impl GitkApp {
         // reader's view of a diff is the one they left. The defaults are the
         // toolbar's own; there is no config key behind any of them.
         let toolbar_diff = ToolbarDiffSettings::load(cc.storage);
-        let word_diff: bool = stored(cc.storage, "word_diff", false);
-        let line_numbers: bool = stored(cc.storage, "line_numbers", false);
-        let wrap: bool = stored(cc.storage, "wrap", false);
+        let ToolbarViewSettings {
+            word_diff,
+            line_numbers,
+            wrap,
+        } = ToolbarViewSettings::load(cc.storage);
 
         // The startup diff is deferred to the first frame: empty here, filled by
         // load_selected_diff on the StartupDiff::NeedsLoad pass. With no commits
@@ -3983,15 +4088,23 @@ impl GitkApp {
         }
     }
 
-    /// Select the current search match (`search_matches[search_cursor]`) and center
-    /// it in the graph. The index is already valid for the loaded commit list, so
-    /// this selects directly — no full reload/relayout. No-op when there are no
-    /// matches.
-    fn jump_to_current_match(&mut self) {
+    /// Center the current search match (`search_matches[search_cursor]`) in the graph
+    /// and hand its row to `select`. No-op when there are no matches.
+    ///
+    /// The two ways in differ only in `select`, so where a match is and how it is
+    /// centered are decided once: a third caller, or a change to the `Align`, has one
+    /// place to reach rather than two that have to agree.
+    fn jump_to_match_with(&mut self, select: impl FnOnce(&mut Self, usize)) {
         if let Some(&idx) = self.search_matches.get(self.search_cursor) {
-            self.select_loaded(idx);
+            select(self, idx);
             self.graph_scroll_to = Some((idx, Some(egui::Align::Center)));
         }
+    }
+
+    /// Select the current search match and center it. The index is already valid for
+    /// the loaded commit list, so this selects directly — no full reload/relayout.
+    fn jump_to_current_match(&mut self) {
+        self.jump_to_match_with(Self::select_loaded);
     }
 
     /// `jump_to_current_match` with the diff load deferred behind
@@ -4002,11 +4115,10 @@ impl GitkApp {
     /// `handle_deferred_diff_load` fires the load; a direct `load_selected_diff`
     /// (click, arrow key, Enter) cancels the pending one.
     fn jump_to_current_match_deferred(&mut self) {
-        if let Some(&idx) = self.search_matches.get(self.search_cursor) {
-            self.set_selected(idx);
-            self.graph_scroll_to = Some((idx, Some(egui::Align::Center)));
-            self.defer_diff_load();
-        }
+        self.jump_to_match_with(|app, idx| {
+            app.set_selected(idx);
+            app.defer_diff_load();
+        });
     }
 
     /// Arm (or re-arm) the deferred diff load — see `DIFF_LOAD_DEBOUNCE` for which
@@ -5003,12 +5115,11 @@ impl GitkApp {
                     self.prewarm_rx = None;
                 }
                 // Still building off-thread: render plain this frame and retry —
-                // leave diff_needs_highlight set. The prewarm thread has no
-                // Context to wake us (it starts in main(), before the window
-                // exists), so poll at a modest cadence like apply_pending_fonts;
+                // leave diff_needs_highlight set. The prewarm thread has no Context to
+                // wake us (it starts in main(), before the window exists), so poll;
                 // this only runs during the brief warm-up window.
                 Some(Err(mpsc::TryRecvError::Empty)) => {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(33));
+                    ctx.request_repaint_after(POLL_TICK);
                     return;
                 }
                 // No prewarm (syntax toggled on mid-session) or the thread died:
@@ -5312,7 +5423,7 @@ impl GitkApp {
             // arrive regardless (the workers re-check at claim time; this filter is
             // just the early cut).
             let inflight = lock_inflight(&self.inflight_diffs);
-            prefetch_targets(&self.commits, sel, &view, PREFETCH_MARGIN)
+            prefetch_targets(&self.commits, sel, &view)
                 .into_iter()
                 .map(|(oid, depth)| PrefetchTarget {
                     probed: None,
@@ -5531,10 +5642,7 @@ impl GitkApp {
     /// unsound: a previously out-of-scope merge parent landing in this tail gives
     /// its (already laid-out) merge row a diagonal only a relayout can add.
     fn append_commits(&mut self, new: Vec<CommitInfo>, requested: usize) {
-        if new
-            .iter()
-            .any(|c| self.graph_layout_state.deferred_parents.contains(&c.oid))
-        {
+        if self.graph_layout_state.resume_unsound_for(&new) {
             let previous_oid = self.selected_oid();
             let previous_index = self.selected;
             self.commits.extend(new);
@@ -5547,7 +5655,11 @@ impl GitkApp {
         // topological, so a tail commit's parent is never in the prefix (see
         // layout_graph_rows).
         let tail_oids: HashSet<git2::Oid> = new.iter().map(|c| c.oid).collect();
-        let rows = layout_graph_rows(&new, &tail_oids, &mut self.graph_layout_state);
+        let rows = layout_graph_rows(
+            &new,
+            |oid| tail_oids.contains(oid),
+            &mut self.graph_layout_state,
+        );
         self.graph_max_cols = self
             .graph_max_cols
             .max(rows.iter().map(|r| r.num_cols).max().unwrap_or(1));
@@ -5764,7 +5876,7 @@ impl GitkApp {
             x += sw;
         }
         // Distinguishing tail at normal header brightness; left-elide if it overflows.
-        let tt = left_elide(tail, (right - x).max(0.0), measure);
+        let tt = left_elide_measured(tail, tail_w, (right - x).max(0.0), measure);
         let tg = ui.painter().layout_no_wrap(tt, font.clone(), SUBTEXT);
         let ty = cy - tg.size().y / 2.0;
         ui.painter().galley(egui::pos2(x, ty), tg, SUBTEXT);
@@ -6583,6 +6695,14 @@ impl GitkApp {
                             egui::Sense::click(),
                         );
                         let top_left = response.rect.min;
+                        // The pointer, read ONCE per frame rather than once per visible
+                        // row — the same hoist `show_virtualized_diff` makes, for the
+                        // same reason. `Response::hover_pos` takes a `memory()` lock
+                        // (for the layer transform) and an `input()` lock, and both the
+                        // response and the pointer are the same for every row here, so
+                        // ~30 rows × 2 `Context` locks a frame answered a question one
+                        // point settles.
+                        let hover = response.hover_pos();
 
                         self.handle_commit_click(
                             &response,
@@ -6640,7 +6760,7 @@ impl GitkApp {
                                 painter.rect_filled(bar, 0.0, YELLOW);
                             }
                             if self.selected != Some(idx)
-                                && response.hover_pos().is_some_and(|p| row_rect.contains(p))
+                                && hover.is_some_and(|p| row_rect.contains(p))
                             {
                                 painter.rect_filled(row_rect, 0.0, mauve(12));
                             }
@@ -7087,9 +7207,8 @@ impl GitkApp {
                 ctx,
             );
         }
-        // Poll rather than block: neither walk has an egui Context to wake us with,
-        // the same shape as apply_pending_fonts.
-        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        // Poll rather than block: neither walk has an egui Context to wake us with.
+        ctx.request_repaint_after(POLL_TICK);
     }
 
     /// Install a startup commit list, real or provisional.
@@ -7254,7 +7373,7 @@ impl GitkApp {
                     log::debug!("perf: deferred fonts applied");
                 }
                 Err(mpsc::TryRecvError::Empty) => {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(33));
+                    ctx.request_repaint_after(POLL_TICK);
                 }
                 Err(mpsc::TryRecvError::Disconnected) => self.pending_fonts = None, // builder died; keep defaults
             }
@@ -7905,9 +8024,12 @@ impl eframe::App for GitkApp {
         // is owned by the place they flipped it, and one that a config reload could
         // overwrite is one they would have to set twice.
         ToolbarDiffSettings::of(self.diff_settings).save(storage);
-        eframe::set_value(storage, "word_diff", &self.word_diff);
-        eframe::set_value(storage, "line_numbers", &self.line_numbers);
-        eframe::set_value(storage, "wrap", &self.wrap);
+        ToolbarViewSettings {
+            word_diff: self.word_diff,
+            line_numbers: self.line_numbers,
+            wrap: self.wrap,
+        }
+        .save(storage);
     }
 
     /// eframe calls this after `save`, before dropping us — the last point the app
@@ -8932,6 +9054,16 @@ mod tests {
         assert_eq!(diff_pad_rows(100, Some(99), 30), 29); // 1 below, need 30
     }
 
+    /// A `FileWindow` from its four bounds, in `VisibleRange::window`'s own order.
+    const fn fw(lo: usize, hi: usize, page_lo: usize, page_hi: usize) -> FileWindow {
+        FileWindow {
+            lo,
+            hi,
+            page_lo,
+            page_hi,
+        }
+    }
+
     /// The window the highlight worker prioritises by. The load-bearing case is
     /// the last one: a viewport deep in the diff must NOT produce file 0, because
     /// a zeroed window is what made the worker colour the wrong end first and
@@ -8945,18 +9077,18 @@ mod tests {
         // reaches file 1 above and file 3 below.
         assert_eq!(
             VisibleRange::window(starts, 210..260),
-            (2, 2, 1, 3),
+            fw(2, 2, 1, 3),
             "deep viewport must prioritise its own file, never file 0"
         );
         // Straddling a boundary reports both files as on-screen.
-        assert_eq!(VisibleRange::window(starts, 90..110).0, 0);
-        assert_eq!(VisibleRange::window(starts, 90..110).1, 1);
+        assert_eq!(VisibleRange::window(starts, 90..110).lo, 0);
+        assert_eq!(VisibleRange::window(starts, 90..110).hi, 1);
         // At the top, the read-ahead below still reaches forward.
-        assert_eq!(VisibleRange::window(starts, 0..50), (0, 0, 0, 0));
-        assert_eq!(VisibleRange::window(starts, 0..150), (0, 1, 0, 2));
+        assert_eq!(VisibleRange::window(starts, 0..50), fw(0, 0, 0, 0));
+        assert_eq!(VisibleRange::window(starts, 0..150), fw(0, 1, 0, 2));
         // An empty range has no window to report and must not panic.
-        assert_eq!(VisibleRange::window(starts, 10..10), (0, 0, 0, 0));
-        assert_eq!(VisibleRange::window(&[], 0..50), (0, 0, 0, 0));
+        assert_eq!(VisibleRange::window(starts, 10..10), fw(0, 0, 0, 0));
+        assert_eq!(VisibleRange::window(&[], 0..50), fw(0, 0, 0, 0));
     }
 
     #[test]
@@ -8970,7 +9102,7 @@ mod tests {
         // The file index that gets picked next, for the given remaining set:
         let picked = |fis: &[usize]| -> usize {
             let pend = p(fis);
-            pend[pick_file(&pend, 3, 4, 1, 6)].0
+            pend[pick_file(&pend, &fw(3, 4, 1, 6))].0
         };
         assert_eq!(picked(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]), 3); // visible top
         assert_eq!(picked(&[0, 1, 2, 4, 5, 6, 7, 8, 9]), 4); // visible
@@ -8982,7 +9114,7 @@ mod tests {
         assert_eq!(picked(&[0, 8, 9]), 8);
         assert_eq!(picked(&[0]), 0); // rest above
         // Stale range past all files: no panic, picks something.
-        assert_eq!(pick_file(&p(&[3, 4]), 9, 9, 9, 9), 1);
+        assert_eq!(pick_file(&p(&[3, 4]), &fw(9, 9, 9, 9)), 1);
     }
 
     /// `pick_file` reads `pending` as sorted, so the preempt path has to put a file
@@ -9005,7 +9137,7 @@ mod tests {
         // Viewport at 10..=12 with everything below it: the "page above" band must
         // answer with 8, the file the reader is scrolling back towards. Appended, 5
         // would sit last and win the `rposition` instead.
-        assert_eq!(pending[pick_file(&pending, 10, 12, 0, 20)].0, 8);
+        assert_eq!(pending[pick_file(&pending, &fw(10, 12, 0, 20))].0, 8);
 
         // Both ends: a file that belongs first, and one that belongs last.
         let mut pending = p(&[4, 6]);

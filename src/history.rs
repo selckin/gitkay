@@ -119,52 +119,46 @@ pub enum RefKind {
 /// endpoint is resolved with `revparse_single` (so `HEAD~3`, `@{u}`, tags, etc.
 /// all work); lookup failures are logged and skipped.
 pub fn push_rev_token(revwalk: &mut git2::Revwalk, repo: &Repository, tok: &str) {
-    let resolve = |s: &str| repo.revparse_single(s).map(|o| o.id());
+    // Resolving and REPORTING are one move, so an arm cannot use a rev without having
+    // logged a failure to resolve it: a typo contributing zero commits to the walk is
+    // visible rather than silently dropped. It was six hand-paired calls across four
+    // arms that each spelled the same resolve-check-warn block out.
+    //
+    // The two-endpoint arms still report BOTH bad endpoints, because both operands of
+    // the tuple are evaluated before the pattern is matched.
+    let resolve = |s: &str| {
+        let r = repo.revparse_single(s).map(|o| o.id());
+        if let Err(e) = &r {
+            log::warn!("gitkay: bad revision '{s}': {e}");
+        }
+        r.ok()
+    };
     match cli::rev_token_kind(tok) {
         cli::RevTokenKind::Single(s) => {
-            let r = resolve(&s);
-            if let Ok(id) = &r {
-                revwalk.push(*id).ok();
+            if let Some(id) = resolve(&s) {
+                revwalk.push(id).ok();
             }
-            warn_bad_rev(&s, &r);
         }
         cli::RevTokenKind::Exclude(s) => {
-            let r = resolve(&s);
-            if let Ok(id) = &r {
-                revwalk.hide(*id).ok();
+            if let Some(id) = resolve(&s) {
+                revwalk.hide(id).ok();
             }
-            warn_bad_rev(&s, &r);
         }
         cli::RevTokenKind::Range(a, b) => {
-            let (ra, rb) = (resolve(&a), resolve(&b));
-            if let (Ok(ia), Ok(ib)) = (&ra, &rb) {
-                revwalk.hide(*ia).ok();
-                revwalk.push(*ib).ok();
+            if let (Some(ia), Some(ib)) = (resolve(&a), resolve(&b)) {
+                revwalk.hide(ia).ok();
+                revwalk.push(ib).ok();
             }
-            warn_bad_rev(&a, &ra);
-            warn_bad_rev(&b, &rb);
         }
         cli::RevTokenKind::Symmetric(a, b) => {
-            let (ra, rb) = (resolve(&a), resolve(&b));
-            if let (Ok(ia), Ok(ib)) = (&ra, &rb) {
-                revwalk.push(*ia).ok();
-                revwalk.push(*ib).ok();
-                if let Ok(base) = repo.merge_base(*ia, *ib) {
+            if let (Some(ia), Some(ib)) = (resolve(&a), resolve(&b)) {
+                revwalk.push(ia).ok();
+                revwalk.push(ib).ok();
+                if let Ok(base) = repo.merge_base(ia, ib) {
                     revwalk.hide(base).ok();
                 }
             }
-            warn_bad_rev(&a, &ra);
-            warn_bad_rev(&b, &rb);
         }
-    }
-}
-
-/// Log a `<rev>` token that failed to resolve, so a typo — a single rev or a
-/// range endpoint — contributing zero commits to the walk is visible in the log
-/// rather than silently dropped. A no-op on `Ok`.
-pub fn warn_bad_rev(rev: &str, result: &Result<git2::Oid, git2::Error>) {
-    if let Err(e) = result {
-        log::warn!("gitkay: bad revision '{rev}': {e}");
     }
 }
 
@@ -2055,6 +2049,20 @@ pub const fn provisional_scope(scope: &cli::Scope) -> bool {
 /// what this walk has always risked.
 const PROVISIONAL_LOOKAHEAD: usize = 5_000;
 
+/// One commit the provisional walk has discovered.
+///
+/// One map and not two, for the reason `topo::TopoWalk::nodes` gives about the
+/// identical algorithm: the key and the indegree are written together and have the
+/// same key set forever after, so two maps are a second copy of every walked oid
+/// plus a second hash on every lookup, kept in step by convention alone.
+struct ProvisionalNode {
+    /// Committer time, clamped strictly below the child that discovered it.
+    key: i64,
+    /// git's convention, as `topo::TopoWalk` uses: the row itself plus each
+    /// discovered child, so a row is ready to emit at exactly 1.
+    indegree: u32,
+}
+
 /// A lazy newest-first walk: a heap keyed by committer time (libgit2's own sort
 /// key), seeded from HEAD, popping rows and pushing only their parents. Touches
 /// O(rows + frontier) commits where the sorted walk touches the whole history —
@@ -2105,24 +2113,24 @@ pub fn provisional_commits(repo: &Repository, max: usize, first_parent: bool) ->
     // floor — nothing left to expand can be a child of a row keyed above it.
     let mut frontier: std::collections::BinaryHeap<(i64, git2::Oid)> =
         std::collections::BinaryHeap::new();
-    // git's indegree convention, as `topo::TopoWalk` uses: the row itself plus each
-    // discovered child, so a row is ready to emit at exactly 1.
-    let mut indegree: HashMap<git2::Oid, u32> = HashMap::new();
-    // Each row's committer time, clamped strictly below the child that discovered it.
-    let mut key: HashMap<git2::Oid, i64> = HashMap::new();
+    let mut nodes: HashMap<git2::Oid, ProvisionalNode> = HashMap::new();
     // Ready to emit, LIFO — the queue discipline that produces the grouping.
     let mut ready: Vec<git2::Oid> = Vec::new();
     let mut emitted: HashSet<git2::Oid> = HashSet::new();
 
     let head_key = head.time().seconds();
     frontier.push((head_key, head.id()));
-    key.insert(head.id(), head_key);
-    indegree.insert(head.id(), 1);
+    nodes.insert(
+        head.id(),
+        ProvisionalNode {
+            key: head_key,
+            indegree: 1,
+        },
+    );
     ready.push(head.id());
 
     let expand = |frontier: &mut std::collections::BinaryHeap<(i64, git2::Oid)>,
-                  indegree: &mut HashMap<git2::Oid, u32>,
-                  key: &mut HashMap<git2::Oid, i64>|
+                  nodes: &mut HashMap<git2::Oid, ProvisionalNode>|
      -> bool {
         let Some((k, oid)) = frontier.pop() else {
             return false;
@@ -2131,7 +2139,7 @@ pub fn provisional_commits(repo: &Repository, max: usize, first_parent: bool) ->
             return true;
         };
         for p in commit_parents(&commit, first_parent) {
-            if let std::collections::hash_map::Entry::Vacant(slot) = indegree.entry(p) {
+            if let std::collections::hash_map::Entry::Vacant(slot) = nodes.entry(p) {
                 let Ok(pc) = repo.find_commit(p) else {
                     continue;
                 };
@@ -2140,12 +2148,14 @@ pub fn provisional_commits(repo: &Repository, max: usize, first_parent: bool) ->
                 // tie; and an amend or cherry-pick can date a parent NEWER than its
                 // child, which this absorbs.
                 let pk = pc.time().seconds().min(k.saturating_sub(1));
-                key.insert(p, pk);
-                slot.insert(1);
+                slot.insert(ProvisionalNode {
+                    key: pk,
+                    indegree: 1,
+                });
                 frontier.push((pk, p));
             }
-            if let Some(d) = indegree.get_mut(&p) {
-                *d += 1;
+            if let Some(n) = nodes.get_mut(&p) {
+                n.indegree += 1;
             }
         }
         true
@@ -2153,26 +2163,25 @@ pub fn provisional_commits(repo: &Repository, max: usize, first_parent: bool) ->
 
     let mut out: Vec<CommitInfo> = Vec::with_capacity(max);
     while out.len() < max {
-        let Some(&top) = ready.last() else {
-            if !expand(&mut frontier, &mut indegree, &mut key) {
+        // The next row to emit, if the walk knows enough to emit it. Safe when nothing
+        // left to expand outranks it — and when the walk has discovered
+        // `PROVISIONAL_LOOKAHEAD` more commits than it has emitted, which is what
+        // covers a child found later than its own parent (see the constant). A row
+        // sits in the frontier at its own key until expanded, so it blocks its own
+        // emission and can never be emitted before its parents are known.
+        let emit = ready.last().copied().filter(|top| {
+            let floor_clear = frontier.peek().is_none_or(|&(f, _)| f < nodes[top].key);
+            let looked_ahead =
+                frontier.is_empty() || nodes.len() >= out.len() + PROVISIONAL_LOOKAHEAD;
+            floor_clear && looked_ahead
+        });
+        // Nothing ready, or not yet safe: both mean the same thing, expand and retry.
+        let Some(top) = emit else {
+            if !expand(&mut frontier, &mut nodes) {
                 break;
             }
             continue;
         };
-        // Safe when nothing left to expand outranks this row — and when the walk has
-        // discovered `PROVISIONAL_LOOKAHEAD` more commits than it has emitted, which
-        // is what covers a child found later than its own parent (see the constant).
-        // A row sits in the frontier at its own key until expanded, so it blocks its
-        // own emission and can never be emitted before its parents are known.
-        let floor_clear = frontier.peek().is_none_or(|&(f, _)| f < key[&top]);
-        let looked_ahead =
-            frontier.is_empty() || indegree.len() >= out.len() + PROVISIONAL_LOOKAHEAD;
-        if !(floor_clear && looked_ahead) {
-            if !expand(&mut frontier, &mut indegree, &mut key) {
-                break;
-            }
-            continue;
-        }
         ready.pop();
         if !emitted.insert(top) {
             continue;
@@ -2182,9 +2191,9 @@ pub fn provisional_commits(repo: &Repository, max: usize, first_parent: bool) ->
         };
         let parents = commit_parents(&commit, first_parent);
         for p in &parents {
-            if let Some(d) = indegree.get_mut(p) {
-                *d -= 1;
-                if *d == 1 {
+            if let Some(n) = nodes.get_mut(p) {
+                n.indegree -= 1;
+                if n.indegree == 1 {
                     ready.push(*p);
                 }
             }

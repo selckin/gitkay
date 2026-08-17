@@ -19,12 +19,11 @@
 //! (`highlight_ranges`) rather than merely skipped by the pass that writes spans. See
 //! **Diff prefetch** and the missing-grammar note in AGENTS.md.
 
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
 
 use crate::diff::{DiffLine, FileEntry, RowSpans, file_line_ranges};
 use crate::highlight::{self, DiffBg, FileState, Highlighter};
-use crate::{Epoch, VisibleRange, config, spawn_guarded};
+use crate::{Epoch, FileWindow, VisibleRange, config, spawn_guarded};
 
 /// Prewarm: most files scanned in the HEAD tree to rank languages by frequency.
 /// Frequencies converge long before this, so the top languages are the same on a
@@ -374,16 +373,11 @@ pub fn highlight_diff(
 /// far ends. `pending` is in file order, so position/rposition pick the nearest
 /// in each band — `requeue_file` is what keeps it so past a preempt. Falls back to
 /// the first remaining file if `lo`/`hi` are stale.
-pub fn pick_file(
-    pending: &[(usize, usize, usize)],
-    lo: usize,
-    hi: usize,
-    page_lo: usize,
-    page_hi: usize,
-) -> usize {
+pub fn pick_file(pending: &[(usize, usize, usize)], w: &FileWindow) -> usize {
+    let (lo, hi, page_lo, page_hi) = (w.lo, w.hi, w.page_lo, w.page_hi);
     pending
         .iter()
-        .position(|&(fi, _, _)| (lo..=hi).contains(&fi)) // visible
+        .position(|&(fi, _, _)| w.visible(fi))
         .or_else(|| {
             pending
                 .iter()
@@ -596,14 +590,11 @@ pub fn highlight_worker(job: HighlightJob) {
             );
             return;
         }
-        let lo = priority.lo.load(Ordering::Relaxed);
-        let hi = priority.hi.load(Ordering::Relaxed);
-        let page_lo = priority.page_lo.load(Ordering::Relaxed);
-        let page_hi = priority.page_hi.load(Ordering::Relaxed);
+        let window = priority.snapshot();
         // Binary files are already absent — `pending_files` derives from
         // `highlight_ranges`, so no skip is needed (or wanted: one here would let
         // `pending_files` disagree without failing to compile).
-        let (fi, start, end) = pending.remove(pick_file(&pending, lo, hi, page_lo, page_hi));
+        let (fi, start, end) = pending.remove(pick_file(&pending, &window));
         let mut state = hl.new_file_state(&files[fi].path);
         let mut pos = start;
         while pos < end {
@@ -654,10 +645,11 @@ pub fn highlight_worker(job: HighlightJob) {
                 // before `pos` would otherwise mis-colour the remainder, and back
                 // into FILE order, which is what `pick_file` reads) and switch.
                 // The already-sent prefix is harmlessly overwritten.
-                let lo = priority.lo.load(Ordering::Relaxed);
-                let hi = priority.hi.load(Ordering::Relaxed);
-                let visible = |x: usize| (lo..=hi).contains(&x);
-                if !visible(fi) && pending.iter().any(|&(f, _, _)| visible(f)) {
+                // Re-read, because the reader may have scrolled since this file was
+                // picked — but through the same `visible` rule the picker used, so the
+                // decision to abandon cannot contradict the decision to choose.
+                let now = priority.snapshot();
+                if !now.visible(fi) && pending.iter().any(|&(f, _, _)| now.visible(f)) {
                     requeue_file(&mut pending, (fi, start, end));
                     break;
                 }

@@ -211,13 +211,18 @@ impl WrapIndex {
     /// inside the render. Pass `false` — "nobody looked" — and the census runs here as
     /// it always did, which is what a hand-assembled diff and an entry from an older
     /// store both do.
+    ///
+    /// One `len()` comparison per line in the common case, plus a pass over the text of
+    /// any line that could hold a tab. O(lines) otherwise: on a diff of tens of millions
+    /// of rows it is tens of milliseconds, which is why the caller only builds one when
+    /// wrapping is actually switched on.
     pub fn build(
         lines: &[DiffLine],
         cols: usize,
         gutter: LineNoGutter,
         known_tabless: bool,
     ) -> Self {
-        Self::measure(lines, cols, gutter, known_tabless)
+        Self::measure_capped(lines, cols, gutter, known_tabless, MAX_ROW_STARTS)
     }
 
     /// Re-measure the SAME diff at a new width, keeping what this index already
@@ -230,24 +235,16 @@ impl WrapIndex {
     /// same thing `covers` asks, and a caller that reaches here with a different
     /// diff gets a full measure rather than a wrong one.
     pub fn rewidth(&self, lines: &[DiffLine], cols: usize, gutter: LineNoGutter) -> Self {
-        Self::measure(
+        Self::measure_capped(
             lines,
             cols,
             gutter,
             self.tabless && self.n_lines == lines.len(),
+            MAX_ROW_STARTS,
         )
     }
 
-    /// One `len()` comparison per line in the common case, plus a pass over the
-    /// text of any line that could hold a tab (see the module header). O(lines)
-    /// otherwise: on a diff of tens of millions of rows it is tens of
-    /// milliseconds, which is why the caller only builds one when wrapping is
-    /// actually switched on.
-    fn measure(lines: &[DiffLine], cols: usize, gutter: LineNoGutter, known_tabless: bool) -> Self {
-        Self::measure_capped(lines, cols, gutter, known_tabless, MAX_ROW_STARTS)
-    }
-
-    /// `measure` with the row-start arena's ceiling as a parameter, so a test can set it
+    /// `build` with the row-start arena's ceiling as a parameter, so a test can set it
     /// to zero and prove what must not regress: that a line the arena could not take is
     /// sliced exactly as one it could. A `const` cannot be varied to show that.
     fn measure_capped(

@@ -172,6 +172,8 @@ fn summary(files: &[StatFile<'_>]) -> String {
     row
 }
 
+/// `datefmt` has the same three lines over `i64`; see the note there for why they stay
+/// two functions rather than one generic.
 const fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }

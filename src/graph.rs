@@ -34,11 +34,28 @@ pub struct GraphLayoutState {
     pipes: Vec<Option<(git2::Oid, usize)>>,
     next_color: usize,
     /// Second+ merge parents skipped because they were beyond the laid-out
-    /// window (no lane to draw the merge diagonal to). If a later extension
-    /// loads one of these, the full layout would give its merge row the
-    /// diagonal a pure resume can't add retroactively — the resume is unsound
-    /// then and the caller must relayout from scratch (see `append_commits`).
-    pub deferred_parents: HashSet<git2::Oid>,
+    /// window (no lane to draw the merge diagonal to). Private like its siblings:
+    /// the question callers actually have is `resume_unsound_for`.
+    deferred_parents: HashSet<git2::Oid>,
+}
+
+impl GraphLayoutState {
+    /// Whether resuming this state over `tail` would draw a graph the full layout
+    /// would not — in which case the caller must relayout from scratch.
+    ///
+    /// It is unsound exactly when `tail` loads a merge parent this state had to skip
+    /// for being beyond the laid-out window: the full layout gives that merge row a
+    /// diagonal, and a resume cannot add one to a row it has already emitted.
+    ///
+    /// The rule lives HERE, with the state it reads, rather than at `append_commits`.
+    /// Spelled at the consumer it was a rule by convention — the field had to be `pub`
+    /// for it, `layout_resume_matches_full_layout` pinned a copy of the check rather
+    /// than the check, so the test could not fail on the production rule changing, and
+    /// a second source of unsoundness meant finding both spellings by hand with no
+    /// compile error and a silently missing diagonal as the symptom.
+    pub fn resume_unsound_for(&self, tail: &[CommitInfo]) -> bool {
+        tail.iter().any(|c| self.deferred_parents.contains(&c.oid))
+    }
 }
 
 /// Place `slot` in the first empty pipe (reusing a freed lane) or append a new one,
@@ -59,19 +76,30 @@ fn alloc_lane(pipes: &mut Vec<Option<(git2::Oid, usize)>>, slot: (git2::Oid, usi
 #[cfg(test)]
 fn layout_graph(commits: &[CommitInfo]) -> Vec<GraphRow> {
     let oid_set: HashSet<git2::Oid> = commits.iter().map(|c| c.oid).collect();
-    layout_graph_rows(commits, &oid_set, &mut GraphLayoutState::default())
+    layout_graph_rows(
+        commits,
+        |oid| oid_set.contains(oid),
+        &mut GraphLayoutState::default(),
+    )
 }
 
 /// Lay out `commits` as the rows following whatever `state` already describes —
 /// the whole list when `state` is fresh (`layout_graph`), or an appended tail
-/// resuming from the stored end-of-list state. `oid_set` is the in-scope set for
-/// THESE commits only: the walk is topological (a parent never precedes a child),
-/// so a tail commit's parent can never be in the already-laid-out prefix, and the
-/// tail's own oids answer "will this parent get a row?" exactly like the full
-/// list's set would.
+/// resuming from the stored end-of-list state.
+///
+/// `in_scope` answers "will this parent get a row?" for THESE commits only: the walk
+/// is topological (a parent never precedes a child), so a tail commit's parent can
+/// never be in the already-laid-out prefix, and the tail's own oids answer it exactly
+/// as the full list's would.
+///
+/// A predicate rather than the set itself, because membership is the whole of what is
+/// asked and every caller already holds something that answers it: the full layout has
+/// `build_commit_indexes`' oid → index map, which used to be built beside a `HashSet`
+/// with the identical key set — a second hash of every commit and a second table, on
+/// the startup install and every watcher rebuild.
 pub fn layout_graph_rows(
     commits: &[CommitInfo],
-    oid_set: &HashSet<git2::Oid>,
+    in_scope: impl Fn(&git2::Oid) -> bool,
     state: &mut GraphLayoutState,
 ) -> Vec<GraphRow> {
     let GraphLayoutState {
@@ -158,7 +186,7 @@ pub fn layout_graph_rows(
             // Second+ parent. Out of scope is decided first: the in-scope arms below
             // are the only readers of the lane scan, so an unloaded parent never pays
             // for it.
-            if !oid_set.contains(parent_oid) {
+            if !in_scope(parent_oid) {
                 // Second+ parent out of scope: skip (can't draw a merge to an
                 // unloaded row) — but remember it, so a later append that loads
                 // this parent knows a pure resume would miss this row's merge
@@ -264,14 +292,15 @@ mod tests {
                 let (prefix, tail) = commits.split_at(split);
                 let prefix_oids: HashSet<git2::Oid> = prefix.iter().map(|c| c.oid).collect();
                 let mut state = GraphLayoutState::default();
-                let prefix_rows = layout_graph_rows(prefix, &prefix_oids, &mut state);
-                // The same check append_commits performs.
-                if tail.iter().any(|c| state.deferred_parents.contains(&c.oid)) {
+                let prefix_rows =
+                    layout_graph_rows(prefix, |oid| prefix_oids.contains(oid), &mut state);
+                // The check append_commits performs, asked of the same function.
+                if state.resume_unsound_for(tail) {
                     saw_unsound = true;
                     continue;
                 }
                 let tail_oids: HashSet<git2::Oid> = tail.iter().map(|c| c.oid).collect();
-                let tail_rows = layout_graph_rows(tail, &tail_oids, &mut state);
+                let tail_rows = layout_graph_rows(tail, |oid| tail_oids.contains(oid), &mut state);
                 assert_eq!(
                     prefix_rows,
                     full[..split].to_vec(),

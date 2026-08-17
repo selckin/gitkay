@@ -19,7 +19,6 @@
 //! See `docs/superpowers/specs/2026-08-10-textconv-design.md`.
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -632,33 +631,29 @@ impl Textconv {
     /// the "served for weeks after the driver works" outcome `DiffData::textconv_failed`
     /// exists to prevent, reached by the one route that sets nothing.
     fn drivers(&self, repo: &Repository) -> (Arc<Drivers>, bool) {
-        let failed = || {
-            self.warn_resolve_failed();
-            (Arc::new(Drivers::new()), true)
-        };
-        let Ok(mut slot) = self.drivers.lock() else {
-            // A poisoned lock re-resolves rather than killing the diff, exactly as a
-            // poisoned `warned` drops its report — but it must still REPORT what it
-            // resolved to. Skipping `note_fingerprint` here left `changed` unset for
-            // the rest of the process, so after one poisoning an edited
-            // `diff.<name>.textconv` re-resolved while `drivers_changed` kept answering
-            // `None`: neither cache was dropped and the fix needed a restart, which is
-            // the whole failure the fingerprint exists to remove.
-            let Some((map, fingerprint)) = resolve_drivers(repo) else {
-                return failed();
-            };
-            self.note_fingerprint(fingerprint);
-            return (Arc::new(map), false);
-        };
-        if let Some(drivers) = slot.as_ref() {
+        // A poisoned lock re-resolves rather than killing the diff, exactly as a
+        // poisoned `warned` drops its report: it simply has nothing to read a memo
+        // from and nowhere to write one back. That is the ONLY thing it changes —
+        // resolving, reporting the fingerprint and warning on failure are one path
+        // below, because they were once two and the poisoned copy was missing
+        // `note_fingerprint`. After a single poisoning, an edited
+        // `diff.<name>.textconv` then re-resolved while `drivers_changed` kept
+        // answering `None`: neither cache was dropped and the fix needed a restart,
+        // which is the whole failure the fingerprint exists to remove.
+        let mut slot = self.drivers.lock().ok();
+        if let Some(drivers) = slot.as_deref().and_then(Option::as_ref) {
             return (Arc::clone(drivers), false);
         }
         let Some((resolved, fingerprint)) = resolve_drivers(repo) else {
-            return failed();
+            self.warn_resolve_failed();
+            return (Arc::new(Drivers::new()), true);
         };
         self.note_fingerprint(fingerprint);
         let resolved = Arc::new(resolved);
-        *slot = Some(Arc::clone(&resolved));
+        if let Some(slot) = slot.as_deref_mut() {
+            *slot = Some(Arc::clone(&resolved));
+        }
+        drop(slot);
         (resolved, false)
     }
 
@@ -1141,9 +1136,7 @@ fn run(cmd: &str, file: &Path, cwd: Option<&Path>) -> Result<Vec<u8>, RunFailure
         }
         Ran::TooBig => {
             reap(&mut child);
-            return Err(RunFailure::other(format!(
-                "it produced more than {TEXTCONV_MAX_OUTPUT} bytes"
-            )));
+            return Err(RunFailure::too_big());
         }
     }
     // No rewind: `out` is this process's OWN open file description, still at offset 0
@@ -1156,9 +1149,7 @@ fn run(cmd: &str, file: &Path, cwd: Option<&Path>) -> Result<Vec<u8>, RunFailure
         .read_to_end(&mut buf)
         .map_err(|e| RunFailure::other(format!("its output could not be read: {e}")))?;
     if buf.len() > TEXTCONV_MAX_OUTPUT {
-        return Err(RunFailure::other(format!(
-            "it produced more than {TEXTCONV_MAX_OUTPUT} bytes"
-        )));
+        return Err(RunFailure::too_big());
     }
     Ok(buf)
 }
@@ -1190,6 +1181,13 @@ impl RunFailure {
             why: format!("it did not finish within {TEXTCONV_TIMEOUT:?}"),
             timed_out: true,
         }
+    }
+
+    /// The output ceiling, which two independent routes detect — the poll that stops a
+    /// running driver, and the read that catches a last write landing after it. Both
+    /// describe one bound, so they say so with one sentence.
+    fn too_big() -> Self {
+        Self::other(format!("it produced more than {TEXTCONV_MAX_OUTPUT} bytes"))
     }
 }
 
@@ -1356,7 +1354,6 @@ struct TempBlob {
 impl TempBlob {
     fn write(name: &[u8], content: &[u8]) -> std::io::Result<Self> {
         use std::io::Write;
-        use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
         let mut last = None;
         for _ in 0..TEMP_TRIES {
@@ -1367,7 +1364,7 @@ impl TempBlob {
                 last = Some(e);
                 continue;
             }
-            let file = dir.join(OsStr::from_bytes(name));
+            let file = dir.join(path_from_bytes(name));
             // Built before the write, so a failed write still removes the directory.
             let me = Self { dir, file };
             OpenOptions::new()
