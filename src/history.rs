@@ -1189,31 +1189,37 @@ pub fn load_commits_inner(
     // The path filter's parent rewrite, kept so the virtual rows can be rewritten
     // through the same map once they exist (a dropped HEAD must not orphan them).
     let mut nearest_map: Option<Nearest> = None;
-    // How many commits the path filter EXAMINED, which is the number the slow-walk
-    // warning has to quote: `real.len()` is what survived it. Only that branch sets it,
-    // which is what makes `WalkCost::PathFilter` unconstructible without its
-    // denominator.
-    let mut walked_commits: Option<usize> = None;
-    // Whether the lazy walk is what answered — recorded by the branch that took it, so
-    // the report at the end names the walk that actually ran. See `WalkCost::of`.
-    let mut lazy = false;
+    // Whether a stand-in was arranged for THIS walk — read once, by both reporters, so
+    // the sentence said while it runs and the one said when it ends cannot disagree.
+    let stood_in = provisional.is_some();
+    // Which walk answered, as an expression the branches must each produce: a `let mut`
+    // default above them is a fact recorded by CONVENTION, and a fourth strategy added
+    // later would inherit "sorted" for free and report itself as an ordering pass. That
+    // is the same class of mistake as reading it off the scope, arriving from the
+    // default instead of the inference — see `WalkCost::of`.
+    //
     // A path filter is its own walk: it drops commits and rewrites the parents of what
     // is left, so neither the oid cache below nor a plain prefix means anything for it.
     // The lazy walk is tried first and falls back to the sorted one — see
     // `LAZY_FILTER_SHARE` for the budget that bounds the attempt.
-    if !scope.paths.is_empty() {
+    let walked = if !scope.paths.is_empty() {
         // Armed for the duration of the walk and cancelled by falling out of this
         // block: a filtered walk is 51s on a 1.47M-commit clone, and either driver can
         // be the one that takes it there. See `arm_slow_walk_notice`.
-        let _notice = arm_slow_walk_notice(commit_graph_advice(repo, scope), SLOW_FILTER_NOTICE);
-        if let Some(filtered) = lazy_filtered_walk(repo, scope, max, &ref_map)
-            .or_else(|| sorted_filtered_walk(repo, scope, max, &ref_map))
-        {
-            walked_commits = Some(filtered.walked);
+        let _notice = arm_slow_walk_notice(repo, scope, SLOW_FILTER_NOTICE);
+        let filtered = lazy_filtered_walk(repo, scope, max, &ref_map)
+            .or_else(|| sorted_filtered_walk(repo, scope, max, &ref_map));
+        let examined = filtered.as_ref().map_or(0, |f| f.walked);
+        if let Some(filtered) = filtered {
             tip_answer = filtered.tip;
             nearest_map = Some(filtered.nearest);
             real = filtered.kept;
         }
+        // Recorded even when neither driver answered (an unborn HEAD under a pathspec),
+        // because the branch is what the reader was waiting on either way: leaving it
+        // unrecorded there had the early notice blame the path filter and the report
+        // blame the ordering pass, for one walk.
+        Walked::Filtered { examined }
     }
     // The lazy path first: when generation numbers are available this answers in
     // milliseconds what the sorted revwalk below takes 45s to answer on a large
@@ -1221,7 +1227,6 @@ pub fn load_commits_inner(
     // only what was asked for — unlike the sorted walk, whose extra oids are free
     // because the ordering pass has already produced them — so it caches none.
     else if let Some(oids) = topo_oids(repo, scope, max) {
-        lazy = true;
         let mut built = HashSet::new();
         real = build_commits_from_walk(
             repo,
@@ -1231,6 +1236,7 @@ pub fn load_commits_inner(
             max,
             scope.first_parent,
         );
+        Walked::Lazily
     } else {
         // The lazy walk was refused — by the scope, or by a repository with no
         // commit-graph or an unusable one — so what the reader is waiting on is the
@@ -1242,13 +1248,9 @@ pub fn load_commits_inner(
             let _ = go.send(());
         }
         // The same knowledge, said to the reader instead of to a thread — and on the
-        // same terms: only if the wait actually materialises. Which sentence is the
-        // same question the report at the end asks, answered from the same fact.
-        // Cancelled by falling out of this block.
-        let _notice = arm_slow_walk_notice(
-            commit_graph_advice(repo, scope),
-            ordering_notice(provisional.is_some()),
-        );
+        // same terms: only if the wait actually materialises. Cancelled by falling out
+        // of this block.
+        let _notice = arm_slow_walk_notice(repo, scope, ordering_notice(stood_in));
         let t_setup = std::time::Instant::now();
         let walk = history_revwalk(repo, scope);
         let setup = t_setup.elapsed();
@@ -1298,7 +1300,8 @@ pub fn load_commits_inner(
             );
             walk_oids = Some(all);
         }
-    }
+        Walked::Sorted
+    };
     log::debug!(
         "perf: load_commits: walk + build ({} real commits) {:?}",
         real.len(),
@@ -1309,7 +1312,7 @@ pub fn load_commits_inner(
         scope,
         t.elapsed(),
         real.len(),
-        WalkCost::of(walked_commits, lazy, provisional.is_some()),
+        WalkCost::of(walked, stood_in),
     );
 
     // Join the probes now — their half-second ran alongside the walk above — and put
@@ -1613,16 +1616,33 @@ pub enum WalkCost {
     PathFilter { walked: usize },
 }
 
+/// Which walk answered, recorded by the branch that ran it.
+///
+/// One value rather than the two correlated locals this started as — a `walked:
+/// Option<usize>` beside a `lazy: bool`, whose `(Some, true)` pairing was unreachable
+/// and had to be given behaviour anyway, and a test to pin the behaviour of a state
+/// that could not arise. The count rides INSIDE the filtered case for the reason
+/// `WalkCost::PathFilter` carries it: the pathspec sentence quotes a denominator, and
+/// a variant that owns it cannot be built without one.
+#[derive(Clone, Copy)]
+enum Walked {
+    /// Generation numbers answered it — the fast path, and the one with no lever.
+    Lazily,
+    /// The ordering pass over the whole history.
+    Sorted,
+    /// A commit-vs-parent diff per commit EXAMINED, which is what a pathspec costs.
+    /// `examined` is the honest denominator; the rows kept are only what survived.
+    Filtered { examined: usize },
+}
+
 impl WalkCost {
     /// Which of the three a finished walk was, or `None` for one not worth reporting.
     ///
-    /// **Every input is a fact the walk recorded, and the scope is not one of them.**
-    /// `walked` is `Some` only from the path-filter branch of `load_commits_inner`,
-    /// which is the one that counts what it examined — so the pathspec case cannot be
-    /// constructed without its denominator. `lazy` is recorded by the branch that took
-    /// it: a commit-graph existing does not mean the walk used it (see `ProvisionalGo`
-    /// for the same distinction costing 57s). And `stood_in` is whether a provisional
-    /// list was actually arranged for THIS walk, which `provisional_scope(scope)` only
+    /// **Both inputs are facts the walk recorded, and the scope is not one of them.**
+    /// `walked` is set by the branch that ran, so a commit-graph existing cannot be
+    /// mistaken for the walk having used it (see `ProvisionalGo` for the same
+    /// distinction costing 57s). And `stood_in` is whether a provisional list was
+    /// actually arranged for THIS walk, which `provisional_scope(scope)` only
     /// approximates — it is equally true of a watcher rebuild, where no stand-in runs
     /// and the previous list is what stays on screen, so the report claimed a
     /// best-effort pass that never happened.
@@ -1636,12 +1656,12 @@ impl WalkCost {
     /// with nothing to advise and silences the one that has something. This wrong
     /// sentence was on screen — "the whole history walked and sorted" for a walk that
     /// did neither — which is what the flag exists to stop.
-    const fn of(walked: Option<usize>, lazy: bool, stood_in: bool) -> Option<Self> {
+    const fn of(walked: Walked, stood_in: bool) -> Option<Self> {
         match walked {
-            Some(walked) => Some(Self::PathFilter { walked }),
-            None if lazy => None,
-            None if stood_in => Some(Self::OrderingAfterProvisional),
-            None => Some(Self::Ordering),
+            Walked::Filtered { examined } => Some(Self::PathFilter { walked: examined }),
+            Walked::Lazily => None,
+            Walked::Sorted if stood_in => Some(Self::OrderingAfterProvisional),
+            Walked::Sorted => Some(Self::Ordering),
         }
     }
 }
@@ -1713,38 +1733,53 @@ fn slow_walk_message(elapsed: std::time::Duration, rows: usize, cost: WalkCost) 
 pub fn commit_graph_advice(repo: &Repository, scope: &cli::Scope) -> Option<&'static str> {
     let graph = crate::commitgraph::CommitGraph::for_repo(repo);
     match (&graph, scope.paths.is_empty()) {
-        (None, true) if topo_scope(scope) => Some(
-            "this repository has no commit-graph yet. It is a standard git file — an index of \
-             the history that lets a log start without reading every commit first — and git \
-             writes one itself during `git gc`, so a fresh clone usually has none for a while. \
-             To have it now: `git commit-graph write --reachable`",
-        ),
-        (None, false) if topo_scope(scope) => Some(
-            "this repository has no commit-graph yet. It is a standard git file — an index of \
-             the history that lets a log start without reading every commit first, and which \
-             can also record which files each commit touched, so a path filter finds them \
-             without comparing trees. git writes a plain one itself during `git gc`; for both \
-             parts: `git commit-graph write --reachable --changed-paths`",
-        ),
+        (None, true) if topo_scope(scope) => Some(ADVICE_NO_GRAPH),
+        (None, false) if topo_scope(scope) => Some(ADVICE_NO_GRAPH_FILTERED),
         // A filtered scope the lazy walk does not cover — a range, a `--follow` — in a
         // repository with no graph at all. It gains no laziness, so this promises none;
         // it gains the tree comparisons the changed-path index skips, exactly as the
         // arm below does for a graph that is merely missing the index.
-        (None, false) => Some(
-            "this repository has no commit-graph yet. It is a standard git file, and it can \
-             record which files each commit touched, so a path filter finds them without \
-             comparing trees — which is most of what this walk is doing. To write one with \
-             that index: `git commit-graph write --reachable --changed-paths`",
-        ),
-        (Some(g), false) if !g.has_changed_paths() => Some(
-            "this repository's commit-graph has no changed-path index — the part recording \
-             which files each commit touched, so a path filter finds them without comparing \
-             trees, which is most of what this walk is doing. `git gc` writes the graph \
-             without it; to add it: `git commit-graph write --reachable --changed-paths`",
-        ),
+        (None, false) => Some(ADVICE_NO_GRAPH_FILTER_ONLY),
+        (Some(g), false) if !g.has_changed_paths() => Some(ADVICE_NO_CHANGED_PATHS),
         _ => None,
     }
 }
+
+/// The four sentences, named so a caller — and a test — can say WHICH one it got.
+///
+/// They were four literals inside the match, which left the suite grepping prose to
+/// tell them apart: `!advice.contains("reading every commit first")` stood in for "this
+/// arm must not promise laziness", and any wording pass over the clause that phrase
+/// belongs to would have turned that assertion into a tautology with nothing failing.
+/// Named, they are compared by identity and a reword cannot change what a test means.
+///
+/// The prose stays one whole literal per case rather than assembled from shared
+/// fragments: the four differ deliberately, and a builder would keep them in step at
+/// the cost of the thing being kept in step — a sentence someone can read.
+const ADVICE_NO_GRAPH: &str = "this repository has no commit-graph yet. It is a standard git file — an index of \
+     the history that lets a log start without reading every commit first — and git \
+     writes one itself during `git gc`, so a fresh clone usually has none for a while. \
+     To have it now: `git commit-graph write --reachable`";
+
+/// `ADVICE_NO_GRAPH` for a scope that would ALSO use the changed-path index.
+const ADVICE_NO_GRAPH_FILTERED: &str = "this repository has no commit-graph yet. It is a standard git file — an index of \
+     the history that lets a log start without reading every commit first, and which \
+     can also record which files each commit touched, so a path filter finds them \
+     without comparing trees. git writes a plain one itself during `git gc`; for both \
+     parts: `git commit-graph write --reachable --changed-paths`";
+
+/// A filtered scope that would not walk lazily even with a graph, so this promises the
+/// index and — deliberately — nothing about starting sooner.
+const ADVICE_NO_GRAPH_FILTER_ONLY: &str = "this repository has no commit-graph yet. It is a standard git file, and it can \
+     record which files each commit touched, so a path filter finds them without \
+     comparing trees — which is most of what this walk is doing. To write one with \
+     that index: `git commit-graph write --reachable --changed-paths`";
+
+/// A graph that exists but was written without `--changed-paths` — what `git gc` leaves.
+const ADVICE_NO_CHANGED_PATHS: &str = "this repository's commit-graph has no changed-path index — the part recording \
+     which files each commit touched, so a path filter finds them without comparing \
+     trees, which is most of what this walk is doing. `git gc` writes the graph \
+     without it; to add it: `git commit-graph write --reachable --changed-paths`";
 
 /// Explain a slow history walk, once per process.
 ///
@@ -1832,29 +1867,33 @@ fn note_graph_advice(advice: Option<&str>, latch: &std::sync::atomic::AtomicBool
 /// is no "remember to cancel" rule for a later reader to miss. Nothing is ever sent
 /// through the channel: the disconnect IS the signal.
 ///
-/// `advice` is computed by the caller, on the walking thread, before the walk starts —
-/// it needs the `Repository`, which is not `Send`. That moves the ~100µs graph open onto
-/// every walk that arms a notice, where `note_slow_history_walk` pays it only past its
-/// latch; both branches that arm one are about to do work measured in seconds, and the
-/// branch a plain scope arms from has already established that the graph is missing or
-/// unusable, which makes the open a failed `open` rather than a parse.
+/// The advice is resolved HERE, before the spawn, because it needs the `Repository` and
+/// that is not `Send` — but only while the latch it feeds is unspent, since a resolved
+/// string the thread cannot print is a graph opened for nothing. What is left on a
+/// second slow walk is one relaxed load.
 fn arm_slow_walk_notice(
-    advice: Option<&'static str>,
+    repo: &Repository,
+    scope: &cli::Scope,
     cause: &'static str,
 ) -> Option<std::sync::mpsc::Sender<()>> {
+    let advice = (!GRAPH_ADVICE_REPORTED.load(std::sync::atomic::Ordering::Relaxed))
+        .then(|| commit_graph_advice(repo, scope))
+        .flatten();
     let (tx, rx) = std::sync::mpsc::channel::<()>();
-    std::thread::Builder::new()
-        .name("gitkay-slow-walk".to_string())
-        .spawn(move || {
+    crate::spawn_guarded(
+        "gitkay-slow-walk",
+        "slow-walk notice thread panicked",
+        move || {
             if rx.recv_timeout(SLOW_HISTORY_WALK) != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
             {
                 return; // the guard dropped: the walk beat the threshold
             }
-            log::warn!("{cause}");
+            log::warn!("still building the commit list: {cause}");
             note_graph_advice(advice, &GRAPH_ADVICE_REPORTED);
-        })
-        .ok()
-        .map(|_| tx)
+        },
+    )
+    .ok()
+    .map(|_| tx)
 }
 
 /// The early notice's why-clause for a walk with no path filter: the ordering pass,
@@ -1868,15 +1907,15 @@ fn arm_slow_walk_notice(
 /// which of those the reader is looking at. So the sentence names the arrangement — a
 /// stand-in was arranged, or none was — which is a fact the walk holds, and the reader
 /// can see their own screen.
-const SLOW_ORDERING_NOTICE: &str = "still building the commit list: the whole history has to be walked and sorted \
-     before its order is known";
+const SLOW_ORDERING_NOTICE: &str =
+    "the whole history has to be walked and sorted before its order is known";
 
 /// `SLOW_ORDERING_NOTICE` where a provisional list was arranged, so the rows the reader
 /// gets in the meantime are the approximate ones and the walk will replace them. Told
 /// apart by whether a stand-in was actually ARMED, never by re-reading the scope — see
 /// `WalkCost::of`.
-const SLOW_ORDERING_STANDIN_NOTICE: &str = "still building the commit list: a best-effort order is standing in while the whole \
-     history is walked and sorted, and will be replaced when it lands";
+const SLOW_ORDERING_STANDIN_NOTICE: &str = "a best-effort order is standing in while the whole history is walked and sorted, \
+     and will be replaced when it lands";
 
 /// Which of the two an unfiltered walk gets. Split from the arming for the reason
 /// `slow_walk_message` is split from the logging: so both sentences are testable
@@ -1892,8 +1931,8 @@ const fn ordering_notice(stood_in: bool) -> &'static str {
 /// The early notice's why-clause for a path-filtered walk — a different cost with a
 /// different lever, as `WalkCost` says at more length. No denominator here, unlike the
 /// report at the end: how many commits were examined is not known until they have been.
-const SLOW_FILTER_NOTICE: &str = "still building the commit list: every commit has to be diffed against the path \
-     filter to find the ones that touch it";
+const SLOW_FILTER_NOTICE: &str =
+    "every commit has to be diffed against the path filter to find the ones that touch it";
 
 /// How long the real walk gets before the provisional one is shown instead.
 ///
@@ -3048,10 +3087,6 @@ mod tests {
         let plain = ordering_notice(false);
         for notice in [standin, plain, SLOW_FILTER_NOTICE] {
             assert!(
-                notice.starts_with("still building the commit list:"),
-                "{notice}"
-            );
-            assert!(
                 !notice.contains("first row") && !notice.contains("on screen"),
                 "an early notice may not claim what is displayed: {notice}"
             );
@@ -3065,6 +3100,34 @@ mod tests {
             !plain.contains("best-effort"),
             "nothing was arranged to stand in: {plain}"
         );
+    }
+
+    /// Every sentence names a command to run and quotes no measurement — the reader
+    /// cannot act on somebody else's clone, and a line of figures reads as diagnostics
+    /// about gitkay rather than as a suggestion about their repository. The numbers
+    /// live in `commit_graph_advice`'s own doc, which is where they justify the advice
+    /// instead of delivering it. The three "no graph" sentences also say what the file
+    /// IS, since not having one is not a fault the reader caused.
+    #[test]
+    fn the_advice_names_a_command_and_quotes_no_measurement() {
+        let no_graph = [
+            ADVICE_NO_GRAPH,
+            ADVICE_NO_GRAPH_FILTERED,
+            ADVICE_NO_GRAPH_FILTER_ONLY,
+        ];
+        for advice in no_graph.iter().chain(&[ADVICE_NO_CHANGED_PATHS]) {
+            assert!(
+                advice.contains("`git commit-graph write --reachable"),
+                "{advice}"
+            );
+            assert!(
+                !advice.contains("45s") && !advice.contains("MB") && !advice.contains("1.47M"),
+                "no measurements in the line: {advice}"
+            );
+        }
+        for advice in no_graph {
+            assert!(advice.contains("standard git file"), "{advice}");
+        }
     }
 
     /// The second line names a fix, so it may only appear where the fix works: this
@@ -3082,33 +3145,19 @@ mod tests {
             ..Default::default()
         };
 
-        let advice = commit_graph_advice(&repo, &plain).expect("no graph, a scope that wants one");
-        assert!(
-            advice.contains("git commit-graph write --reachable"),
-            "{advice}"
-        );
-        // It names the thing and says where it comes from, and quotes no measurement:
-        // the reader cannot act on somebody else's clone, and a line of figures about
-        // one reads as diagnostics rather than as a suggestion. See the numbers in
-        // `commit_graph_advice`'s own doc, which is where they belong.
-        assert!(advice.contains("standard git file"), "{advice}");
-        assert!(
-            advice.contains("git gc"),
-            "not a fault the reader caused: {advice}"
-        );
-        assert!(
-            !advice.contains("45s") && !advice.contains("88MB"),
-            "no measurements in the line: {advice}"
-        );
-        assert!(
-            !advice.contains("--changed-paths"),
-            "a scope with no pathspec has no use for that index: {advice}"
+        assert_eq!(
+            commit_graph_advice(&repo, &plain),
+            Some(ADVICE_NO_GRAPH),
+            "no graph, a scope that wants one"
         );
         // `--all` walks lazily too, so it is worth advising there.
         assert!(commit_graph_advice(&repo, &scope(true, &[])).is_some());
         // A path filter wants the changed-path index as well, and one command writes it.
-        let advice = commit_graph_advice(&repo, &filtered).expect("a path filter wants one too");
-        assert!(advice.contains("--changed-paths"), "{advice}");
+        assert_eq!(
+            commit_graph_advice(&repo, &filtered),
+            Some(ADVICE_NO_GRAPH_FILTERED),
+            "a path filter wants one too"
+        );
         // A scope that falls back to the sorted walk whatever the repository holds.
         assert_eq!(
             commit_graph_advice(&repo, &scope(false, &["HEAD"])),
@@ -3121,15 +3170,13 @@ mod tests {
             revs: vec!["HEAD".to_string()],
             ..filtered.clone()
         };
-        let advice = commit_graph_advice(&repo, &ranged_no_graph)
-            .expect("a filtered walk saves tree comparisons whether or not it is lazy");
-        assert!(advice.contains("--changed-paths"), "{advice}");
-        // The laziness is promised by one clause and only the two arms that can deliver
-        // it carry that clause — the anchor the plain-language rewrite left in place of
-        // the word "lazy", which no sentence says any more.
-        assert!(
-            !advice.contains("reading every commit first"),
-            "this scope would not walk lazily, so nothing may promise it: {advice}"
+        // Named, so "which sentence" is compared by identity: the laziness lives in one
+        // clause of the two arms that can deliver it, and asserting the ABSENCE of that
+        // prose was an anchor any wording pass could quietly turn into a tautology.
+        assert_eq!(
+            commit_graph_advice(&repo, &ranged_no_graph),
+            Some(ADVICE_NO_GRAPH_FILTER_ONLY),
+            "the index, and deliberately not the laziness this scope would not get"
         );
 
         write_commit_graph(&repo, &[tip]);
@@ -3140,8 +3187,11 @@ mod tests {
             "there is one now, and nothing to advise"
         );
         // …but it carries no changed-path index, which only a path filter misses.
-        let advice = commit_graph_advice(&repo, &filtered).expect("no changed-path index");
-        assert!(advice.contains("--changed-paths"), "{advice}");
+        assert_eq!(
+            commit_graph_advice(&repo, &filtered),
+            Some(ADVICE_NO_CHANGED_PATHS),
+            "no changed-path index"
+        );
         // And that one is NOT gated on the scope walking lazily: `sorted_filtered_walk`
         // reads the filters whatever the scope, so a rev-scoped filter saves the same
         // tree comparisons and is told the same thing. Only the two "no graph at all"
@@ -3150,8 +3200,11 @@ mod tests {
             revs: vec!["HEAD".to_string()],
             ..filtered.clone()
         };
-        let advice = commit_graph_advice(&repo, &ranged).expect("the index helps here too");
-        assert!(advice.contains("--changed-paths"), "{advice}");
+        assert_eq!(
+            commit_graph_advice(&repo, &ranged),
+            Some(ADVICE_NO_CHANGED_PATHS),
+            "the index helps here too"
+        );
 
         write_commit_graph_with_changed_paths(&repo, &[tip]);
         let repo = open_repo(dir.path());
@@ -3179,36 +3232,28 @@ mod tests {
     /// scope: only the branch that counts what it examined can produce the pathspec
     /// case, and a provisional list is impossible there.
     ///
-    /// The lazy and stand-in cases are why every input is a recorded fact: read off the
+    /// The lazy and stand-in cases are why both inputs are recorded facts: read off the
     /// scope instead, this said "the whole history walked and sorted" about a walk that
     /// did neither and spent the once-per-process latch saying it, and promised a
     /// "best-effort pass" to a rebuild that ran none.
     #[test]
     fn walk_cost_picks_the_case_from_what_the_walk_produced() {
         assert!(matches!(
-            WalkCost::of(Some(4), false, false),
+            WalkCost::of(Walked::Filtered { examined: 4 }, false),
             Some(WalkCost::PathFilter { walked: 4 })
         ));
         assert!(matches!(
-            WalkCost::of(None, false, true),
+            WalkCost::of(Walked::Sorted, true),
             Some(WalkCost::OrderingAfterProvisional)
         ));
         assert!(matches!(
-            WalkCost::of(None, false, false),
+            WalkCost::of(Walked::Sorted, false),
             Some(WalkCost::Ordering),
         ));
         assert!(
-            WalkCost::of(None, true, true).is_none(),
+            WalkCost::of(Walked::Lazily, true).is_none(),
             "a lazy walk is the fast path: nothing to advise, and the latch is worth \
              more to a walk that has something"
-        );
-        assert!(
-            matches!(
-                WalkCost::of(Some(4), true, false),
-                Some(WalkCost::PathFilter { walked: 4 })
-            ),
-            "a lazy walk under a path filter still pays the per-commit diff, and the \
-             changed-path index is still the lever"
         );
     }
 

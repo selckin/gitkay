@@ -666,7 +666,6 @@ mod tests {
     /// and under wrapping there is no horizontal scroll to reach the tail with.
     #[test]
     fn no_row_of_a_tab_indented_line_draws_past_the_pane() {
-        let g = LineNoGutter::default();
         // One, two and three levels of tab indent, at lengths that straddle the
         // column budget from both sides — the one-row case included, which is where
         // a byte measure is wrong without ever wrapping.
@@ -677,21 +676,46 @@ mod tests {
             format!("\t{}\t{}", "x".repeat(50), "y".repeat(50)),
             "\t\t\t\t\t\t\t\t".to_string(),
         ];
+        check_rows(&bodies, &[20, 40, 100, 104]);
+    }
+
+    /// Everything every row of every line must satisfy: the slices tile the line
+    /// exactly, no row draws past the pane's columns, and only the first row says it
+    /// is first.
+    ///
+    /// One helper because those are one contract, and the three tests around it differ
+    /// only in the fixture they aim at it — each used to assert its own subset, so a
+    /// fixture built for one shape silently skipped the other checks it would also
+    /// have answered.
+    fn check_rows(bodies: &[String], widths: &[usize]) {
+        let g = LineNoGutter::default();
         let lines: Vec<DiffLine> = bodies.iter().map(|b| line(b, LineKind::Context)).collect();
-        for cols in [20, 40, 100, 104] {
+        for &cols in widths {
             let idx = WrapIndex::build(&lines, cols, g);
             let width = body_cols(LineKind::Context, cols, g);
             for (i, l) in lines.iter().enumerate() {
                 let rows = idx.row_of_line(i + 1) - idx.row_of_line(i);
+                let mut at = 0;
                 for sub in 0..rows {
                     let s = idx.slice(i, l, sub);
+                    assert_eq!(
+                        s.range.start, at,
+                        "line {i} row {sub} at cols={cols} starts where the last ended"
+                    );
+                    assert_eq!(s.first, sub == 0, "line {i} row {sub} at cols={cols}");
                     let drawn = &l.rendered()[s.range.clone()];
                     assert!(
                         cols_of(drawn) <= width,
                         "line {i} row {sub} at cols={cols} drew {} columns into {width}: {drawn:?}",
                         cols_of(drawn),
                     );
+                    at = s.range.end;
                 }
+                assert_eq!(
+                    at,
+                    l.rendered().len(),
+                    "line {i} at cols={cols} lost its tail"
+                );
             }
         }
     }
@@ -705,7 +729,6 @@ mod tests {
     /// with no horizontal scroll to reach it under wrapping.
     #[test]
     fn every_line_is_drawn_whole_across_its_rows() {
-        let g = LineNoGutter::default();
         // Straddling the boundary from both sides, with tabs, multi-byte characters
         // and a mixture — the shapes that make the byte measure and the column
         // measure disagree.
@@ -721,40 +744,18 @@ mod tests {
             "日".repeat(14),
             format!("\t{}", "日".repeat(20)),
         ];
-        let lines: Vec<DiffLine> = bodies.iter().map(|b| line(b, LineKind::Context)).collect();
-        for cols in [17, 20, 41, 100] {
-            let idx = WrapIndex::build(&lines, cols, g);
-            for (i, l) in lines.iter().enumerate() {
-                let rows = idx.row_of_line(i + 1) - idx.row_of_line(i);
-                let mut at = 0;
-                for sub in 0..rows {
-                    let s = idx.slice(i, l, sub);
-                    assert_eq!(s.range.start, at, "line {i} row {sub} at cols={cols}");
-                    at = s.range.end;
-                }
-                assert_eq!(
-                    at,
-                    l.rendered().len(),
-                    "line {i} at cols={cols} lost its tail"
-                );
-            }
-        }
+        check_rows(&bodies, &[17, 20, 41, 100]);
     }
 
     #[test]
     fn the_slices_of_a_tabbed_line_tile_it_exactly() {
         let text = format!("\t\t{}", "abcdefghij".repeat(20));
         let lines = vec![line(&text, LineKind::Context)];
-        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default());
-        assert!(idx.total_rows() > 1);
-        let mut at = 0;
-        for sub in 0..idx.total_rows() {
-            let s = idx.slice(0, &lines[0], sub);
-            assert_eq!(s.range.start, at, "row {sub} starts where the last ended");
-            assert_eq!(s.first, sub == 0);
-            at = s.range.end;
-        }
-        assert_eq!(at, text.len(), "the last row reaches the end");
+        assert!(
+            WrapIndex::build(&lines, 40, LineNoGutter::default()).total_rows() > 1,
+            "the fixture has to wrap, or this asserts nothing"
+        );
+        check_rows(std::slice::from_ref(&text), &[40]);
     }
 
     /// The census `rewidth` carries over is an optimisation, so the only thing that
