@@ -498,7 +498,14 @@ The invariants:
   earlier, while a watcher rebuild leaves the PREVIOUS list up for the whole walk — and
   the thread reporting knows neither. It shipped saying "before the first row can be
   drawn" over a list that was already on screen. What each sentence names is the work,
-  plus the stand-in where one was arranged (`ordering_notice`).
+  plus the stand-in where one was arranged.
+  **Which sentence, and whether there is one at all, is the WALK KIND's answer rather
+  than the branch's.** A branch declares a `WalkKind` where it begins; that arms the
+  notice (`early_notice`, `None` for the lazy walk) and it is what the branch's `Walked`
+  is built from at the end. Those were two independent statements — a literal chosen by
+  hand at the top, a variant produced fifty lines below — so one walk could be described
+  two ways, or, worse, a branch could arm nothing and leave the window silent for the
+  whole 57s. A branch that declares no kind now fails to compile.
 - **Every input to the report is a fact the walk RECORDED, and the scope is not one of
   them.** `WalkCost::of` takes a `Walked` and `stood_in`; reading either back off the
   scope has been wrong in a way that reached the screen. `Walked` is **produced by the
