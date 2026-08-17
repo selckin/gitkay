@@ -101,6 +101,16 @@ struct ByGeneration(u32, git2::Oid);
 /// second round.
 const EXPAND_BATCH: usize = 512;
 
+/// What the walk knows about one discovered commit: its generation as the walk sees it
+/// (`u32::MAX` for one the graph does not hold), and its indegree in git's convention
+/// (1 = ready). The generation is kept rather than re-read because a lookup is a binary
+/// search through a file, and the walk asks repeatedly.
+#[derive(Clone, Copy)]
+struct Node {
+    generation: u32,
+    indegree: u32,
+}
+
 /// The state of one lazy topological walk.
 pub struct TopoWalk<'a> {
     repo: &'a git2::Repository,
@@ -109,11 +119,12 @@ pub struct TopoWalk<'a> {
     /// Commits discovered but not yet expanded, highest generation first. Its peak
     /// generation is the floor below which indegrees are not yet final.
     frontier: BinaryHeap<ByGeneration>,
-    /// Every commit discovered, with git's indegree convention (1 = ready).
-    indegree: HashMap<git2::Oid, u32>,
-    /// Generations, kept because the walk asks for them repeatedly and a lookup is a
-    /// binary search through a file.
-    generation: HashMap<git2::Oid, u32>,
+    /// Every commit discovered. One map and not two: the generation and the indegree
+    /// are written together in `discover` and have the same key set forever after, so
+    /// two maps would be a second copy of every walked oid — tens of MB on the
+    /// 1.47M-commit clone this walk exists for — plus a second hash on every lookup,
+    /// keeping in step by convention alone.
+    nodes: HashMap<git2::Oid, Node>,
     /// Ready to emit, LIFO — see the module docs.
     ready: Vec<git2::Oid>,
     /// Commits already handed out, so a diamond cannot emit one twice.
@@ -145,8 +156,7 @@ impl<'a> TopoWalk<'a> {
             graph,
             first_parent,
             frontier: BinaryHeap::new(),
-            indegree: HashMap::new(),
-            generation: HashMap::new(),
+            nodes: HashMap::new(),
             ready: Vec::new(),
             emitted: std::collections::HashSet::new(),
             declined: false,
@@ -171,19 +181,24 @@ impl<'a> TopoWalk<'a> {
     /// A commit the graph has never heard of is taken as `u32::MAX`; see the module
     /// docs for why that is sound and where the assumption behind it is checked.
     fn discover(&mut self, oid: git2::Oid) {
-        if self.indegree.contains_key(&oid) {
+        if self.nodes.contains_key(&oid) {
             return;
         }
         let generation = self.graph.generation(oid).unwrap_or(u32::MAX);
-        self.generation.insert(oid, generation);
-        self.indegree.insert(oid, 1);
+        self.nodes.insert(
+            oid,
+            Node {
+                generation,
+                indegree: 1,
+            },
+        );
         self.frontier.push(ByGeneration(generation, oid));
     }
 
     /// This commit's generation as the walk sees it — `u32::MAX` for one the graph
     /// does not hold.
     fn generation_of(&self, oid: git2::Oid) -> u32 {
-        self.generation.get(&oid).copied().unwrap_or(u32::MAX)
+        self.nodes.get(&oid).map_or(u32::MAX, |n| n.generation)
     }
 
     /// This commit's parents, honouring `--first-parent` exactly as the sorted walk
@@ -206,7 +221,7 @@ impl<'a> TopoWalk<'a> {
             if known && self.generation_of(parent) == u32::MAX {
                 return None;
             }
-            *self.indegree.get_mut(&parent)? += 1;
+            self.nodes.get_mut(&parent)?.indegree += 1;
         }
         Some(())
     }
@@ -242,7 +257,7 @@ impl<'a> TopoWalk<'a> {
                 // to be another tip's ancestor. Drop it; the child's emission pushes it
                 // back. Every entry pushed by that route arrives at exactly 1 and, being
                 // safe to emit, can gain no further child, so this filters tips alone.
-                if self.indegree.get(&top) != Some(&1) {
+                if self.nodes.get(&top).map(|n| n.indegree) != Some(1) {
                     continue;
                 }
                 if !self.emitted.insert(top) {
@@ -252,11 +267,11 @@ impl<'a> TopoWalk<'a> {
                     return self.decline();
                 };
                 for parent in parents {
-                    let Some(d) = self.indegree.get_mut(&parent) else {
+                    let Some(node) = self.nodes.get_mut(&parent) else {
                         return self.decline();
                     };
-                    *d -= 1;
-                    if *d == 1 {
+                    node.indegree -= 1;
+                    if node.indegree == 1 {
                         self.ready.push(parent);
                     }
                 }
