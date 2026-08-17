@@ -3003,6 +3003,18 @@ struct DiffLoadState {
     /// by the placeholder. Shared with the worker, and with `inflight_loads` so a
     /// bounce-back can adopt it.
     progress: Arc<DiffProgress>,
+    /// Whether this load rebuilds the diff of the commit already on screen.
+    ///
+    /// Suppresses the "Loading diff…" placeholder: on a rebuild the outgoing diff is
+    /// the SAME commit in a different shape, so holding it says more than blanking
+    /// does, and pre-highlighting deliberately pushes these loads past the threshold
+    /// (measured 118–154ms) in order to arrive coloured. A commit switch still blanks —
+    /// there the outgoing content is a different commit.
+    ///
+    /// In here for the reason the two fields above are: it is meaningful only while a
+    /// load is running, and beside the `Option` as a bare `bool` it was a third thing
+    /// to reset in lockstep with them.
+    is_rebuild: bool,
 }
 
 /// Drives the one-time deferral of the startup diff. `GitkApp::new` runs during
@@ -3449,13 +3461,6 @@ struct GitkApp {
     /// every dispatch so a burst that changes character mid-flight (toggle the
     /// toolbar, then arrow away before it lands) is classified by its latest
     /// dispatch rather than its first.
-    ///
-    /// Suppresses the "Loading diff…" placeholder: on a rebuild the outgoing diff
-    /// is the SAME commit in a different shape, so holding it says more than
-    /// blanking does, and pre-highlighting deliberately pushes these loads past
-    /// the threshold (measured 118–154ms) in order to arrive coloured. A commit
-    /// switch still blanks — there the outgoing content is a different commit.
-    diff_load_is_rebuild: bool,
     egui_ctx: egui::Context, // stored Context handle so workers can request a repaint
     /// Applies run off the frame loop (a large file's diff regeneration is not
     /// frame-budget work) and one at a time — the menus disable while in flight.
@@ -4125,7 +4130,6 @@ impl GitkApp {
             diff_load_rx,
             diff_load_epoch: Epoch::default(),
             diff_load: None,
-            diff_load_is_rebuild: false,
             history_load_tx,
             history_load_rx,
             history_epoch: Epoch::default(),
@@ -4812,14 +4816,22 @@ impl GitkApp {
     /// navigation is one wait to the reader: resetting it per dispatch would keep the
     /// placeholder from ever appearing while they arrow through cold history. The
     /// progress handle is replaced, the newest job being the one they are now waiting
-    /// on. One field, so neither half can be armed without the other.
-    fn arm_diff_load(&mut self, progress: Arc<DiffProgress>) {
+    /// on. One field, so no part can be armed without the rest.
+    ///
+    /// `is_rebuild` is likewise rewritten on every dispatch and not just the first of a
+    /// burst, so a load that changes character mid-flight is classified by its latest
+    /// dispatch.
+    fn arm_diff_load(&mut self, progress: Arc<DiffProgress>, is_rebuild: bool) {
         match &mut self.diff_load {
-            Some(state) => state.progress = progress,
+            Some(state) => {
+                state.progress = progress;
+                state.is_rebuild = is_rebuild;
+            }
             None => {
                 self.diff_load = Some(DiffLoadState {
                     started: std::time::Instant::now(),
                     progress,
+                    is_rebuild,
                 });
             }
         }
@@ -4833,12 +4845,6 @@ impl GitkApp {
     /// rare case).
     fn dispatch_diff_load(&mut self, key: DiffCacheKey, scope: RowScope, same_oid_rebuild: bool) {
         let epoch = self.diff_load_epoch.bump();
-        // Drives both the pre-highlight gate below and the placeholder suppression
-        // in the render. Written on every dispatch, not just the first of a burst,
-        // so a load that changes character mid-flight is classified by its latest
-        // dispatch.
-        self.diff_load_is_rebuild = same_oid_rebuild;
-
         // A worker for this exact key is already in flight — the user bounced back
         // to a commit whose load never finished. Don't stack an identical worker:
         // stay in the loading state and adopt the in-flight result when it lands
@@ -4855,7 +4861,7 @@ impl GitkApp {
             && let Some(running) = self.inflight_loads.get(&key).map(Arc::clone)
         {
             log::debug!("diff-load: adopt in-flight worker for {}", key.oid);
-            self.arm_diff_load(running);
+            self.arm_diff_load(running, same_oid_rebuild);
             return;
         }
         let progress = Arc::new(DiffProgress::default());
@@ -4863,7 +4869,7 @@ impl GitkApp {
         // The render path only blanks to the "Loading diff…" placeholder once the load
         // outlives DIFF_PLACEHOLDER_DELAY, so a fast uncached load swaps straight to the
         // new diff without a blank / sidebar-collapse strobe.
-        self.arm_diff_load(Arc::clone(&progress));
+        self.arm_diff_load(Arc::clone(&progress), same_oid_rebuild);
 
         let oid = key.oid;
         // The job owns its inputs: paths and key are moved in (not cloned) — on the
@@ -8281,7 +8287,7 @@ impl eframe::App for GitkApp {
                 // whole feature exists to remove for a placeholder flash instead.
                 // A commit switch still blanks: there the outgoing content belongs
                 // to a different commit, and holding it longer is the worse lie.
-                let can_blank = !self.diff_load_is_rebuild;
+                let can_blank = !self.diff_load.as_ref().is_some_and(|l| l.is_rebuild);
                 let showing_placeholder =
                     can_blank && diff_load_elapsed.is_some_and(|e| e >= DIFF_PLACEHOLDER_DELAY);
 

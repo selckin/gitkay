@@ -979,10 +979,15 @@ sorted drivers keep the same rows with the same rewritten parents.
   (`LOADING_TICK`): the worker only repaints when it FINISHES, and a long build
   produces no input, so without it the counter freezes at whatever the blanking frame
   read — precisely the "is it stuck?" impression it exists to remove. And the handle
-  lives on `GitkApp::diff_load` (`DiffLoadState`) **beside the start instant, in one
-  `Option`**, so "a diff is loading" stays one answer; `inflight_loads` maps each
-  running key to its handle so a bounce-back adopts the worker AND its progress
-  instead of resetting the display to "comparing trees".
+  lives on `GitkApp::diff_load` (`DiffLoadState`) **beside the start instant and the
+  is-this-a-rebuild flag, in one `Option`**, so "a diff is loading" stays one answer;
+  `inflight_loads` maps each running key to its handle so a bounce-back adopts the
+  worker AND its progress instead of resetting the display to "comparing trees". The
+  rebuild flag (which suppresses the placeholder — see the delay above) belongs in
+  there for the same reason the other two do: it is meaningful only while a load runs,
+  and as a bare `bool` beside the `Option` it was a third thing to reset in lockstep.
+  `arm_diff_load` writes all three, on every dispatch rather than the first of a burst,
+  so a load that changes character mid-flight is classified by its latest dispatch.
 - **Diffstat block** (`src/diffstat.rs`): the `--stat` summary drawn above the patch,
   formatted from counts the build already has instead of asked of libgit2. `Diff::stats`
   is a COMPLETE second pass — it regenerates every patch, takes its line counts and
