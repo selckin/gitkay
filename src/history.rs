@@ -2509,13 +2509,14 @@ mod tests {
     /// instead is the property the graph layout rests on: **no row above its own
     /// parent**.
     ///
-    /// `history_revwalk` dropped `Sort::TIME` to show `git log --graph`'s order,
-    /// while this walk still approximates date order. On a merge-heavy repository
-    /// the two now disagree in both sequence and membership — measured at 169 of 200
-    /// commits in common on a kernel clone — so "the provisional rows are the real
-    /// rows, early" is no longer the guarantee. Topological validity is, because it
-    /// is what `layout_graph` needs from any list it is handed, and it is what makes
-    /// showing these rows at all defensible.
+    /// `provisional_commits` is Kahn's algorithm under a TIME floor, and measures
+    /// byte-identical to `git rev-list --topo-order` on the repositories it has been
+    /// run against — but *empirically*, where `topo::TopoWalk` is exact by
+    /// construction (see its own doc). So the two lists agreeing is not something a
+    /// test can pin, and "the provisional rows are the real rows, early" is not the
+    /// guarantee on offer. Topological validity is, because it is what `layout_graph`
+    /// needs from any list it is handed, and it is what makes showing these rows at
+    /// all defensible.
     #[test]
     fn the_provisional_walk_is_topologically_valid_even_where_it_differs() {
         let (_d, repo) = temp_repo();

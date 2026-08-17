@@ -270,9 +270,9 @@ pub fn file_fully_highlighted(
 /// used to get. `GitkApp` has no highlighter until `ensure_diff_highlighted` collects
 /// the prewarmed one, which needs a diff to have arrived; the first dispatch fires
 /// before that, off the scroll trigger, because `prefetched_view` starts empty. And it
-/// gets past the settled check because `diff_fully_highlighted` is **vacuously true
-/// over an empty pane** — `.all()` on no files — so the predicate reads "nothing left to
-/// colour" at the one moment it means "there is no diff yet". Measured: 25 rows warmed
+/// gets past the settled check because `highlight_settled` is **true over an empty
+/// pane** — no diff, so no pass to be running — and so reads "nothing left to colour"
+/// at the one moment it means "there is no diff yet". Measured: 25 rows warmed
 /// uncoloured at startup, the eight heavy ones after 11.5s of building each.
 ///
 /// Waiting costs a few tens of milliseconds of cold band once; dispatching early costs
@@ -769,7 +769,7 @@ mod tests {
     /// dispatch (`diff_cache.contains`), so dispatching one frame early costs those rows
     /// their colour for the whole session. At startup this fired for the entire band,
     /// because the scroll trigger goes off before the first diff has arrived and
-    /// `diff_fully_highlighted` is vacuously true over the empty pane it leaves behind.
+    /// `highlight_settled` is true over the empty pane it leaves behind.
     #[test]
     fn a_band_is_not_warmed_before_it_can_be_coloured() {
         assert!(

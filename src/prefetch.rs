@@ -1835,7 +1835,7 @@ fn warm_row(
     // A depth downgrade the log hid would read as syntect being mysteriously fast on an
     // enormous row; the plain-text fallback reads the same way and is worse, because it
     // looks like a success. Nothing else can tell them apart: the fallback still sets a
-    // span on every line, so `diff_fully_highlighted` is true, the diff is never
+    // span on every line, so `pending_files` comes back empty, the diff is never
     // re-tokenized, and it renders in one flat colour for the rest of the session.
     // `PlainText` here is the only place that shows up. (Measured: a whole band of
     // `.oml` rows logged `Highlighted` at ~3µs/line against ~60µs/line for the rows that
