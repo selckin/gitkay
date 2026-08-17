@@ -25,8 +25,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use git2::Repository;
 
 use crate::diff::{
-    self, BuildEnv, CommitStats, DiffData, DiffSettings, FileEntry, RowScope, StatsWant,
-    commit_stats, is_real_commit,
+    self, BuildEnv, CommitStats, DiffData, DiffSettings, RowScope, StatsWant, commit_stats,
+    is_real_commit,
 };
 use crate::highlight::Highlighter;
 use crate::history::CommitInfo;
@@ -1841,34 +1841,42 @@ fn warm_row(
     // `PlainText` here is the only place that shows up. (Measured: a whole band of
     // `.oml` rows logged `Highlighted` at ~3µs/line against ~60µs/line for the rows that
     // really tokenized — the ratio was the only clue.)
-    let applied = match hl {
-        // A COUNT, not `any`: one .rs beside 500 .oml files would otherwise read
-        // as "Highlighted", which is the exact "looks like a success" reading the
-        // PlainText label exists to remove. `any` also called an empty diff
-        // PlainText, though nothing had been left uncoloured.
-        Some(hl) if colour => {
-            // Binary files are not part of the denominator: the highlighter skips
-            // them, so counting them as un-highlighted would report a commit that
-            // only touches a .png as "PlainText" — a coverage gap that isn't one.
-            let candidates: Vec<&FileEntry> = data.files.iter().filter(|f| !f.is_binary).collect();
-            let with = candidates
-                .iter()
-                .filter(|f| hl.has_grammar(&f.path))
-                .count();
-            match (with, candidates.len()) {
-                (_, 0) => "Highlighted (no files)".to_owned(),
-                (w, n) if w == n => "Highlighted".to_owned(),
-                (0, _) => "PlainText".to_owned(),
-                (w, n) => format!("Highlighted {w}/{n}, rest PlainText"),
+    //
+    // Derived here because `data` is moved into the send below, but only when the line
+    // it feeds will actually be printed: `has_grammar` lower-cases the extension into a
+    // fresh `String` and then scans the whole syntax set, so on a 1317-delta commit this
+    // is ~1300 allocations and ~1300 linear scans on a pool thread, discarded at the
+    // default level.
+    let applied = log::log_enabled!(log::Level::Debug).then(|| {
+        let applied = match hl {
+            // A COUNT, not `any`: one .rs beside 500 .oml files would otherwise read
+            // as "Highlighted", which is the exact "looks like a success" reading the
+            // PlainText label exists to remove. `any` also called an empty diff
+            // PlainText, though nothing had been left uncoloured.
+            Some(hl) if colour => {
+                // Binary files are not part of the denominator: the highlighter skips
+                // them, so counting them as un-highlighted would report a commit that
+                // only touches a .png as "PlainText" — a coverage gap that isn't one.
+                let (mut with, mut candidates) = (0usize, 0usize);
+                for f in data.files.iter().filter(|f| !f.is_binary) {
+                    candidates += 1;
+                    with += usize::from(hl.has_grammar(&f.path));
+                }
+                match (with, candidates) {
+                    (_, 0) => "Highlighted (no files)".to_owned(),
+                    (w, n) if w == n => "Highlighted".to_owned(),
+                    (0, _) => "PlainText".to_owned(),
+                    (w, n) => format!("Highlighted {w}/{n}, rest PlainText"),
+                }
             }
+            _ => "DiffOnly".to_owned(),
+        };
+        if cut_short {
+            format!("{applied}, cut short at the time budget")
+        } else {
+            applied
         }
-        _ => "DiffOnly".to_owned(),
-    };
-    let applied = if cut_short {
-        format!("{applied}, cut short at the time budget")
-    } else {
-        applied
-    };
+    });
     // A send failure means the UI is gone, i.e. the process is on its way out; there is
     // nothing useful left to do, but nothing to clean up either.
     if ctx
@@ -1884,9 +1892,11 @@ fn warm_row(
     // Logged only after the result actually reached the UI for caching. Build and colour
     // are reported separately so a slow row says WHICH half was slow — git2 walking a
     // big tree and syntect tokenizing are different problems with different fixes.
-    log::debug!(
-        "prefetch: done {oid} ({lines} lines, {applied}) build {built:?} + colour {coloured:?}"
-    );
+    if let Some(applied) = applied {
+        log::debug!(
+            "prefetch: done {oid} ({lines} lines, {applied}) build {built:?} + colour {coloured:?}"
+        );
+    }
     ctx.ctx.request_repaint();
     Outcome::Warmed { lines }
 }

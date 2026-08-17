@@ -185,17 +185,24 @@ pub fn diff_load_job(repo: &Repository, job: DiffLoadJob) {
         // compute alone outlives the budget the pass returns having done nothing,
         // and "partial" reads as "did some of it" for what is really "did none of
         // it". The counts are what make that case self-explanatory in a log.
-        let code = data.lines.iter().filter(|l| l.kind.is_code()).count();
-        let coloured = data
-            .lines
-            .iter()
-            .enumerate()
-            .filter(|(i, l)| l.kind.is_code() && data.spans.is_set(*i))
-            .count();
-        log::debug!(
-            "diff-load: pre-highlight from file {first}: {coloured}/{code} code lines in {:?}",
-            t.elapsed()
-        );
+        //
+        // Behind the level check, and one pass rather than two: this is the load a
+        // reader is sitting in front of, and counting is two traversals of rows that
+        // are cache-cold by then — the same after-the-fact rescan `DiffRows` exists to
+        // avoid, for a line a default run discards.
+        if log::log_enabled!(log::Level::Debug) {
+            let (mut code, mut coloured) = (0usize, 0usize);
+            for (i, l) in data.lines.iter().enumerate() {
+                if l.kind.is_code() {
+                    code += 1;
+                    coloured += usize::from(data.spans.is_set(i));
+                }
+            }
+            log::debug!(
+                "diff-load: pre-highlight from file {first}: {coloured}/{code} code lines in {:?}",
+                t.elapsed()
+            );
+        }
     }
     if tx
         .send(DiffLoadResult {
