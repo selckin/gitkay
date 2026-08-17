@@ -200,8 +200,17 @@ impl WrapIndex {
                 memchr::memchr_iter(b'\t', content.as_bytes()).count()
             };
             tabless &= tabs == 0;
-            // The worst this line can draw. Under it there is nothing to walk for:
-            // one row, whatever the tabs do inside it.
+            // The columns this line draws, which is exactly what `column_rows` charges
+            // it: every character costs its own byte length except a tab, which costs
+            // `TAB_COLS`. Under the width there is nothing to walk for — one row,
+            // whatever the tabs do inside it.
+            //
+            // **This is the ONLY way out of `tall`, and it has to be**: a line the loop
+            // skips is one `slice` answers for by arithmetic, and that arithmetic gives
+            // back the whole line only while `content.len() <= width` (which this test
+            // implies). A second escape hatch for a line measured at one row would hand
+            // `slice` a line longer than the row it draws, and the tail would be cut
+            // where no horizontal scroll exists to reach it.
             if content.len() + (TAB_COLS - 1) * tabs <= width {
                 total_rows += 1;
                 continue;
@@ -211,12 +220,6 @@ impl WrapIndex {
             } else {
                 column_rows(content, width).count()
             };
-            // A wide character can be charged more bytes than it draws columns, so
-            // the bound above can send a line here that still takes a single row.
-            if rows <= 1 {
-                total_rows += 1;
-                continue;
-            }
             if tall.len() >= MAX_WRAPPED_LINES {
                 log::warn!(
                     "wrap: {} of {} lines are wider than the pane ({cols} columns) — over the \
@@ -689,6 +692,51 @@ mod tests {
                         cols_of(drawn),
                     );
                 }
+            }
+        }
+    }
+
+    /// Every line's rows tile the WHOLE of it, whether or not the index tracks it.
+    ///
+    /// The property the single escape hatch in `measure` rests on: a line left out of
+    /// `tall` is answered for by arithmetic, and that arithmetic returns the whole
+    /// line only while it really fits one row. A second way out — a line measured at
+    /// one row after the width test rejected it — would cut the tail off silently,
+    /// with no horizontal scroll to reach it under wrapping.
+    #[test]
+    fn every_line_is_drawn_whole_across_its_rows() {
+        let g = LineNoGutter::default();
+        // Straddling the boundary from both sides, with tabs, multi-byte characters
+        // and a mixture — the shapes that make the byte measure and the column
+        // measure disagree.
+        let bodies = [
+            String::new(),
+            "short".to_string(),
+            "x".repeat(39),
+            "x".repeat(40),
+            "x".repeat(41),
+            format!("\t{}", "x".repeat(35)),
+            format!("\t\t{}", "x".repeat(31)),
+            "日".repeat(13),
+            "日".repeat(14),
+            format!("\t{}", "日".repeat(20)),
+        ];
+        let lines: Vec<DiffLine> = bodies.iter().map(|b| line(b, LineKind::Context)).collect();
+        for cols in [17, 20, 41, 100] {
+            let idx = WrapIndex::build(&lines, cols, g);
+            for (i, l) in lines.iter().enumerate() {
+                let rows = idx.row_of_line(i + 1) - idx.row_of_line(i);
+                let mut at = 0;
+                for sub in 0..rows {
+                    let s = idx.slice(i, l, sub);
+                    assert_eq!(s.range.start, at, "line {i} row {sub} at cols={cols}");
+                    at = s.range.end;
+                }
+                assert_eq!(
+                    at,
+                    l.rendered().len(),
+                    "line {i} at cols={cols} lost its tail"
+                );
             }
         }
     }
