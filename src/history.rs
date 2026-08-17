@@ -875,8 +875,17 @@ fn filtered_walk(
     // say different things — a slow start is the size of the DAG, a slow rest is the
     // odb underneath.
     let mut prepared: Option<std::time::Duration> = None;
+    // What the WALK itself costs, per oid, separately from what this loop does with
+    // one. It used to fall into `iterate`'s residual, and that hid the lazy walk's
+    // whole per-commit cost: `TopoWalk::expand` reads each commit through
+    // `find_commit`, so the term that dominates a filtered walk on a large repository
+    // was being reported as unaccounted-for bookkeeping — which is how it came to be
+    // attributed to this loop's own `find_commit` instead, a call the odb cache mostly
+    // serves. A residual is only honest while every real cost above it is named.
+    let mut walk = std::time::Duration::ZERO;
     let t_walk = std::time::Instant::now();
-    for item in oids {
+    let mut oids = oids;
+    while let Some(item) = timed(&mut walk, || oids.next()) {
         // A walk that cannot answer takes the whole pass with it; see `Declined`.
         let (oid, walked_parents) = item.ok()?;
         if prepared.is_none() {
@@ -902,15 +911,6 @@ fn filtered_walk(
             bloom.is_some_and(|b| b.definitely_unchanged(oid))
         });
         ruled_out += usize::from(ruled);
-        let test = if ruled {
-            Touch {
-                touched: false,
-                by_diff: false,
-            }
-        } else {
-            tested += 1;
-            timed(&mut touch, || {
-                follow_path.as_ref().map_or_else(
         if ruled && let Some(parents) = walked_parents {
             walked.push((oid, parents));
             continue;
@@ -920,6 +920,15 @@ fn filtered_walk(
         };
         let parents = walked_parents.unwrap_or_else(|| commit_parents(&commit, scope.first_parent));
         walked.push((oid, parents.clone()));
+        let test = if ruled {
+            Touch {
+                touched: false,
+                by_diff: false,
+            }
+        } else {
+            tested += 1;
+            timed(&mut touch, || {
+                follow_path.as_ref().map_or_else(
                     || commit_touches_paths(repo, &commit, &scope.paths),
                     |p| commit_touches_paths(repo, &commit, std::slice::from_ref(p)),
                 )
@@ -951,11 +960,13 @@ fn filtered_walk(
         }
     }
     let start = prepared.unwrap_or_default();
-    // What the loop cost that none of the four accounted for: the walk's own per-oid
-    // work, and the bookkeeping around it.
+    // What the loop cost that none of the terms above accounted for — its own
+    // bookkeeping. `walk` covers the oids' own production and `start` the first of
+    // them, so what is left here is this function's per-commit overhead and nothing
+    // else.
     let iterate = t_walk
         .elapsed()
-        .saturating_sub(start + find + touch + build + trace);
+        .saturating_sub(start + walk + find + touch + build + trace);
     let t_rewrite = std::time::Instant::now();
     // 2. nearest[oid] = its nearest kept ancestors. `walked` is topological (each
     //    child precedes its parents), so a single oldest→newest pass resolves every
@@ -984,7 +995,8 @@ fn filtered_walk(
     }
     log::debug!(
         "perf: load_commits: {label} path filter over {} commits — first oid {start:?}, \
-         iterate {iterate:?}, find_commit {find:?}, path test ({diffed}/{tested} by diff, \
+         walk {walk:?}, iterate {iterate:?}, find_commit {find:?}, \
+         path test ({diffed}/{tested} by diff, \
          {ruled_out} ruled out by changed-path filters) {touch:?}, build ({} rows) {build:?}, \
          rename trace {trace:?}, parent rewrite {:?}",
         walked.len(),
@@ -3763,27 +3775,27 @@ mod tests {
     /// same topological order, so the filter keeps the same subsequence of it — which is
     /// the whole argument, and this is what checks it over a merge that touches the path
     /// on one side only.
-    #[test]
-    fn the_lazy_and_sorted_path_filters_keep_the_same_rows() {
-        let (dir, repo) = temp_repo();
-        let (_root, _main_c, _side_c, tip) = merged_history(&repo);
-        commit_file(&repo, "g.txt", "later", "g again");
-        let tip2 = commit_file(&repo, "f.txt", "later", "f again");
-        let scope = cli::Scope {
-            paths: vec!["g.txt".to_string()],
-            ..Default::default()
-        };
     ///
     /// **Run against both graph shapes, because they take different code paths through
     /// the filter loop.** With changed-path filters a ruled-out commit never has its
     /// object read at all — the loop takes its parents from the walk, which is where
     /// the rewrite chains through — so a fixture with only a plain graph would assert
     /// the parents of a path this no longer exercises.
+    #[test]
+    fn the_lazy_and_sorted_path_filters_keep_the_same_rows() {
+        let (dir, repo) = temp_repo();
+        let (_root, _main_c, _side_c, tip) = merged_history(&repo);
         // A commit the filter DROPS, sitting between two it keeps. Without one the
         // parent rewrite has no work to do — every kept row's parent is either kept
         // or the bottom of history — and the rewritten parents this test compares are
         // then the same however badly the walk reported them.
         commit_file(&repo, "f.txt", "middle", "f middle");
+        commit_file(&repo, "g.txt", "later", "g again");
+        let tip2 = commit_file(&repo, "f.txt", "later", "f again");
+        let scope = cli::Scope {
+            paths: vec!["g.txt".to_string()],
+            ..Default::default()
+        };
         let rows = |w: &FilteredWalk| -> Vec<(String, Vec<git2::Oid>)> {
             w.kept
                 .iter()
