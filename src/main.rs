@@ -1447,7 +1447,13 @@ fn resync_wrap_index(
         return false;
     }
     let t = std::time::Instant::now();
-    let built = diff::WrapIndex::build(lines, cols, gutter);
+    // `rewidth` where there is an index to carry the diff's tab census over, which is
+    // exactly the resize case below: the drag changes the width and nothing else, and
+    // re-finding the tabs is the one part of the measure that reads the text.
+    let built = index.as_ref().map_or_else(
+        || diff::WrapIndex::build(lines, cols, gutter),
+        |old| old.rewidth(lines, cols, gutter),
+    );
     let took = t.elapsed();
     // One `len()` comparison a line, but still O(lines) — and a window resize runs it
     // every frame of the drag, which is the shape worth seeing in a log before anyone
@@ -8421,7 +8427,7 @@ impl eframe::App for GitkApp {
                             let line = &lines[i];
                             let slice = wrap.map_or_else(
                                 || diff::RowSlice::whole(line),
-                                |w| w.slice(line, sub),
+                                |w| w.slice(i, line, sub),
                             );
                             let (job, row_bg) = diff_row_job(
                                 line,
@@ -9383,7 +9389,7 @@ mod tests {
         assert_eq!(rows, body.len().div_ceil(cols - prefix_len));
         let mut drawn = String::new();
         for sub in 0..rows {
-            let slice = idx.slice(&lines[0], sub);
+            let slice = idx.slice(0, &lines[0], sub);
             let (job, _) = diff_row_job(
                 &lines[0],
                 RowStyle {

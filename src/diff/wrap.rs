@@ -30,7 +30,7 @@
 //! enough to predict its row count — is a reimplementation that would drift on the
 //! next upgrade.
 //!
-//! ## Widths are counted in BYTES
+//! ## Widths are counted in COLUMNS, and bytes stand in for them everywhere but one
 //!
 //! `content.len()`, never `chars().count()`. In UTF-8 a character's byte length is
 //! never less than the columns it occupies in a monospace font — 1 byte ⇒ 1
@@ -39,15 +39,38 @@
 //! never overflow the pane, which is the safe direction: the failure mode is a
 //! short-looking row in a non-ASCII file, not text running under the scrollbar.
 //!
-//! What it buys is that the whole index is built without reading a single
-//! character: one `len()` comparison per line decides whether that line wraps, and
-//! a slice boundary is arithmetic plus at most three bytes of walking back to a
-//! character boundary. On an all-ASCII diff — including the minified one this
-//! exists for — bytes and columns are the same number anyway.
+//! **TAB is the one character that breaks that, and it breaks it the unsafe way**:
+//! one byte, `TAB_COLS` columns. A tab-indented line measured by `len()` is
+//! recorded as fitting a row it overflows by three columns per tab — and under
+//! wrapping there is no horizontal scroll to reach the tail with, so what runs off
+//! the right edge is clipped where nothing can bring it back. A line holding a tab
+//! is therefore measured and sliced by a walk over its characters (`column_rows`),
+//! which charges a tab its real width and lets a character that would straddle the
+//! edge start the next row instead of overflowing it.
+//!
+//! Finding the tabs is the whole cost of that, and it is a pass over the TEXT where
+//! everything else here is a pass over the LINES: measured at ~400ms per GB of
+//! short lines, against 20ms to take their `len()`s. Two things keep it off the
+//! paths that matter. A line whose worst case already fits — `len() + 3×tabs ≤
+//! width` — takes one row with no walk, which is every ordinary source line. And a
+//! diff proven to hold no tab anywhere records that (`tabless`), so `rewidth` — the
+//! rebuild a window drag runs on every frame of the drag — skips the pass entirely
+//! and is the same `len()` arithmetic it always was. The 8.3M-character minified
+//! line this module exists for is scanned once, at `memchr` speed (699µs), and not
+//! again while it is on screen.
 
 use std::ops::Range;
 
 use super::{DiffLine, LineKind, LineNoGutter};
+
+/// The columns a TAB draws, which is **not** its one byte.
+///
+/// epaint overrides the shaped advance of `'\t'` with `FontTweak::tab_size ×
+/// space_width` — a fixed advance rather than a stop at the next multiple — and
+/// gitkay sets no `FontTweak`, so this is that default. It is the one number the
+/// measure here and the renderer have to agree on: too low and a row overflows the
+/// pane, too high and it breaks early.
+const TAB_COLS: usize = 4;
 
 /// The narrowest content column count a row is wrapped at, whatever the pane's
 /// width. A pane dragged down to a few columns would otherwise turn one long line
@@ -58,7 +81,7 @@ const MIN_BODY_COLS: usize = 16;
 /// How many wrapped lines one index will track before giving up and behaving as
 /// though wrapping were off.
 ///
-/// An entry is 24 bytes, so this is a 24MB ceiling on a diff whose lines are
+/// An entry is 32 bytes, so this is a 32MB ceiling on a diff whose lines are
 /// *mostly* longer than the window — the shape a repo of minified sources has. The
 /// refusal is logged and is not silent in any other sense either: the pane falls
 /// back to the horizontal-scroll rendering, which is exactly what `wrap = false`
@@ -75,6 +98,12 @@ struct Tall {
     line: usize,
     first_row: usize,
     rows: usize,
+    /// Whether this line holds a tab, and so has to be SLICED by the same walk
+    /// that counted its rows. Recorded here rather than re-derived per draw
+    /// because the alternative is scanning the line on every visible row of every
+    /// frame — which on the minified line this module exists for is megabytes a
+    /// row, to answer a question that cannot change while the index lives.
+    tabbed: bool,
 }
 
 /// Which slice of a logical line one visual row draws, and whether that row is the
@@ -116,6 +145,11 @@ pub struct WrapIndex {
     gutter: LineNoGutter,
     n_lines: usize,
     total_rows: usize,
+    /// Whether this diff was PROVEN to hold no tab — never merely assumed. False
+    /// covers both "it has one" and "nobody looked", which is what lets a refused
+    /// build (whose scan stopped at the cap) hand back `false` and have `rewidth`
+    /// do the honest thing rather than inherit a claim about lines it never read.
+    tabless: bool,
     tall: Vec<Tall>,
 }
 
@@ -123,17 +157,63 @@ impl WrapIndex {
     /// Measure `lines` against a pane `cols` columns wide with `gutter`'s
     /// line-number columns in front of each patch row.
     ///
-    /// One `len()` comparison per line in the common case, so this is cheap enough
-    /// to redo whenever the pane's width changes. It is still O(lines): on a diff
-    /// of tens of millions of rows it is tens of milliseconds, which is why the
-    /// caller only builds one when wrapping is actually switched on.
+    /// This is the one entry point that reads the diff's TEXT, to find its tabs —
+    /// see the module header for why that is the expensive half. `rewidth` is the
+    /// one to call when only the pane moved.
     pub fn build(lines: &[DiffLine], cols: usize, gutter: LineNoGutter) -> Self {
+        Self::measure(lines, cols, gutter, false)
+    }
+
+    /// Re-measure the SAME diff at a new width, keeping what this index already
+    /// learned about its text.
+    ///
+    /// Where the tabs are cannot move while the diff does not, so a diff already
+    /// proven tab-free is re-measured on `len()` arithmetic alone — which is what
+    /// keeps a window drag over a huge diff as cheap as it was before tabs were
+    /// counted at all. The line count is checked rather than trusted: it is the
+    /// same thing `covers` asks, and a caller that reaches here with a different
+    /// diff gets a full measure rather than a wrong one.
+    pub fn rewidth(&self, lines: &[DiffLine], cols: usize, gutter: LineNoGutter) -> Self {
+        Self::measure(
+            lines,
+            cols,
+            gutter,
+            self.tabless && self.n_lines == lines.len(),
+        )
+    }
+
+    /// One `len()` comparison per line in the common case, plus a pass over the
+    /// text of any line that could hold a tab (see the module header). O(lines)
+    /// otherwise: on a diff of tens of millions of rows it is tens of
+    /// milliseconds, which is why the caller only builds one when wrapping is
+    /// actually switched on.
+    fn measure(lines: &[DiffLine], cols: usize, gutter: LineNoGutter, known_tabless: bool) -> Self {
         let mut tall: Vec<Tall> = Vec::new();
         let mut total_rows: usize = 0;
+        let mut tabless = true;
         for (line, l) in lines.iter().enumerate() {
             let width = body_cols(l.kind, cols, gutter);
-            let len = l.rendered().len();
-            if len <= width {
+            let content = l.rendered();
+            let tabs = if known_tabless {
+                0
+            } else {
+                memchr::memchr_iter(b'\t', content.as_bytes()).count()
+            };
+            tabless &= tabs == 0;
+            // The worst this line can draw. Under it there is nothing to walk for:
+            // one row, whatever the tabs do inside it.
+            if content.len() + (TAB_COLS - 1) * tabs <= width {
+                total_rows += 1;
+                continue;
+            }
+            let rows = if tabs == 0 {
+                content.len().div_ceil(width)
+            } else {
+                column_rows(content, width).count()
+            };
+            // A wide character can be charged more bytes than it draws columns, so
+            // the bound above can send a line here that still takes a single row.
+            if rows <= 1 {
                 total_rows += 1;
                 continue;
             }
@@ -146,11 +226,11 @@ impl WrapIndex {
                 );
                 return Self::inactive(lines.len(), cols, gutter);
             }
-            let rows = len.div_ceil(width);
             tall.push(Tall {
                 line,
                 first_row: total_rows,
                 rows,
+                tabbed: tabs > 0,
             });
             total_rows += rows;
         }
@@ -160,12 +240,17 @@ impl WrapIndex {
             gutter,
             n_lines: lines.len(),
             total_rows,
+            tabless,
             tall,
         }
     }
 
     /// An index that maps every line to itself — the shape a refused build takes,
     /// so "we gave up" needs no second code path anywhere above this module.
+    ///
+    /// `tabless: false` because the scan stopped where the refusal did: this index
+    /// has read only a prefix of the diff and is in no position to tell `rewidth`
+    /// anything about the rest.
     const fn inactive(n_lines: usize, cols: usize, gutter: LineNoGutter) -> Self {
         Self {
             active: false,
@@ -173,6 +258,7 @@ impl WrapIndex {
             gutter,
             n_lines,
             total_rows: n_lines,
+            tabless: false,
             tall: Vec::new(),
         }
     }
@@ -236,23 +322,94 @@ impl WrapIndex {
         lo..hi.max(lo)
     }
 
-    /// Which slice of `line` the `sub`-th of its visual rows draws.
+    /// Which slice of logical line `line_idx` the `sub`-th of its visual rows
+    /// draws.
     ///
     /// The boundaries are floored to character boundaries, and consecutive rows
     /// therefore tile the line exactly: row `k`'s end and row `k+1`'s start are the
     /// same expression.
-    pub fn slice(&self, line: &DiffLine, sub: usize) -> RowSlice {
+    ///
+    /// A tabbed line is sliced by the same walk that counted its rows, because for
+    /// it the two cannot be derived from each other — a tab spends four columns for
+    /// its one byte, so where row `k` ends is a fact about the text before it and
+    /// not about `k`. The index is asked which lines those are (`tabbed`) rather
+    /// than the line itself, so a tab-free line — every line of the minified diff
+    /// this module exists for — keeps the arithmetic and reads no text at all.
+    pub fn slice(&self, line_idx: usize, line: &DiffLine, sub: usize) -> RowSlice {
         if !self.active {
             return RowSlice::whole(line);
         }
         let content = line.rendered();
         let width = body_cols(line.kind, self.cols, self.gutter);
-        let start = floor_boundary(content, sub.saturating_mul(width));
-        let end = floor_boundary(content, sub.saturating_add(1).saturating_mul(width));
+        let range = if self.tall_of(line_idx).is_some_and(|t| t.tabbed) {
+            column_rows(content, width)
+                .nth(sub)
+                .unwrap_or(content.len()..content.len())
+        } else {
+            let start = floor_boundary(content, sub.saturating_mul(width));
+            let end = floor_boundary(content, sub.saturating_add(1).saturating_mul(width));
+            start..end
+        };
         RowSlice {
-            range: start..end,
+            range,
             first: sub == 0,
         }
+    }
+
+    /// This line's entry, if it is one of the ones that wrap.
+    fn tall_of(&self, line: usize) -> Option<&Tall> {
+        let i = self.tall.partition_point(|t| t.line < line);
+        self.tall.get(i).filter(|t| t.line == line)
+    }
+}
+
+/// The byte range each visual row of `s` draws at `width` columns, charging a tab
+/// `TAB_COLS` and every other character its own byte length — the same charge
+/// `measure` counts rows by, so a row's boundaries and the count of them cannot
+/// disagree about where a row ends.
+///
+/// A character that would straddle the right edge starts the next row rather than
+/// overflowing it, which is the direction the pane can survive: breaking early
+/// leaves a short row, breaking late puts text where no scroll can reach it.
+const fn column_rows(s: &str, width: usize) -> ColumnRows<'_> {
+    ColumnRows {
+        s,
+        width,
+        at: 0,
+        done: false,
+    }
+}
+
+struct ColumnRows<'a> {
+    s: &'a str,
+    width: usize,
+    at: usize,
+    done: bool,
+}
+
+impl Iterator for ColumnRows<'_> {
+    type Item = Range<usize>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let start = self.at;
+        let mut spent = 0usize;
+        for (i, c) in self.s[start..].char_indices() {
+            let w = if c == '\t' { TAB_COLS } else { c.len_utf8() };
+            // `spent > 0` keeps a character wider than the whole column from
+            // stalling the walk on an empty row — it takes the row and overflows,
+            // there being nothing narrower left to try. `MIN_BODY_COLS` puts that
+            // out of reach for a tab, but not for a caller that shrinks it.
+            if spent > 0 && spent + w > self.width {
+                self.at = start + i;
+                return Some(start..self.at);
+            }
+            spent += w;
+        }
+        self.done = true;
+        Some(start..self.s.len())
     }
 }
 
@@ -298,6 +455,14 @@ mod tests {
             .collect()
     }
 
+    /// The columns `s` draws — the measure the pane is held to, computed the
+    /// obvious slow way rather than through anything the index shares.
+    fn cols_of(s: &str) -> usize {
+        s.chars()
+            .map(|c| if c == '\t' { TAB_COLS } else { c.len_utf8() })
+            .sum()
+    }
+
     /// Rows per line, computed the obvious slow way, for the mappings to be
     /// checked against.
     fn brute_force(lines: &[DiffLine], cols: usize, gutter: LineNoGutter) -> Vec<usize> {
@@ -305,7 +470,17 @@ mod tests {
             .iter()
             .map(|l| {
                 let w = body_cols(l.kind, cols, gutter);
-                l.rendered().len().div_ceil(w).max(1)
+                let mut rows = 1;
+                let mut spent = 0;
+                for c in l.rendered().chars() {
+                    let cw = if c == '\t' { TAB_COLS } else { c.len_utf8() };
+                    if spent > 0 && spent + cw > w {
+                        rows += 1;
+                        spent = 0;
+                    }
+                    spent += cw;
+                }
+                rows
             })
             .collect()
     }
@@ -374,7 +549,7 @@ mod tests {
         assert!(rows > 1);
         let mut at = 0;
         for sub in 0..rows {
-            let s = idx.slice(&lines[0], sub);
+            let s = idx.slice(0, &lines[0], sub);
             assert_eq!(
                 s.range.start,
                 at,
@@ -400,7 +575,7 @@ mod tests {
         let idx = WrapIndex::build(&lines, 40, LineNoGutter::default());
         let mut at = 0;
         for sub in 0..idx.total_rows() {
-            let s = idx.slice(&lines[0], sub);
+            let s = idx.slice(0, &lines[0], sub);
             assert_eq!(s.range.start, at);
             // The slice must be indexable — the whole point of flooring.
             let _ = &lines[0].rendered()[s.range.clone()];
@@ -437,7 +612,7 @@ mod tests {
         let idx = WrapIndex::build(&lines, 40, LineNoGutter::default());
         assert_eq!(idx.total_rows(), 2);
         assert_eq!(
-            idx.slice(&lines[0], 0),
+            idx.slice(0, &lines[0], 0),
             RowSlice {
                 range: 0..0,
                 first: true
@@ -457,7 +632,7 @@ mod tests {
         assert_eq!(idx.line_of_row(12_345), (12_345, 0));
         // And an inactive index hands back whole lines, not slices.
         assert_eq!(
-            idx.slice(&lines[0], 0),
+            idx.slice(0, &lines[0], 0),
             RowSlice {
                 range: 0..200,
                 first: true
@@ -480,6 +655,94 @@ mod tests {
             std::num::NonZeroU32::new(7),
         )]);
         assert!(!idx.covers(2, 40, other));
+    }
+
+    /// The property the whole module owes the pane: what a row draws fits the
+    /// columns that row was given. A tab spends four of them for its one byte, so
+    /// measuring in bytes recorded these lines as fitting a row they overflowed —
+    /// and under wrapping there is no horizontal scroll to reach the tail with.
+    #[test]
+    fn no_row_of_a_tab_indented_line_draws_past_the_pane() {
+        let g = LineNoGutter::default();
+        // One, two and three levels of tab indent, at lengths that straddle the
+        // column budget from both sides — the one-row case included, which is where
+        // a byte measure is wrong without ever wrapping.
+        let bodies = [
+            format!("\t{}", "x".repeat(96)),
+            format!("\t\t{}", "x".repeat(98)),
+            format!("\t\t\t{}", "x".repeat(300)),
+            format!("\t{}\t{}", "x".repeat(50), "y".repeat(50)),
+            "\t\t\t\t\t\t\t\t".to_string(),
+        ];
+        let lines: Vec<DiffLine> = bodies.iter().map(|b| line(b, LineKind::Context)).collect();
+        for cols in [20, 40, 100, 104] {
+            let idx = WrapIndex::build(&lines, cols, g);
+            let width = body_cols(LineKind::Context, cols, g);
+            for (i, l) in lines.iter().enumerate() {
+                let rows = idx.row_of_line(i + 1) - idx.row_of_line(i);
+                for sub in 0..rows {
+                    let s = idx.slice(i, l, sub);
+                    let drawn = &l.rendered()[s.range.clone()];
+                    assert!(
+                        cols_of(drawn) <= width,
+                        "line {i} row {sub} at cols={cols} drew {} columns into {width}: {drawn:?}",
+                        cols_of(drawn),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_slices_of_a_tabbed_line_tile_it_exactly() {
+        let text = format!("\t\t{}", "abcdefghij".repeat(20));
+        let lines = vec![line(&text, LineKind::Context)];
+        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default());
+        assert!(idx.total_rows() > 1);
+        let mut at = 0;
+        for sub in 0..idx.total_rows() {
+            let s = idx.slice(0, &lines[0], sub);
+            assert_eq!(s.range.start, at, "row {sub} starts where the last ended");
+            assert_eq!(s.first, sub == 0);
+            at = s.range.end;
+        }
+        assert_eq!(at, text.len(), "the last row reaches the end");
+    }
+
+    /// The census `rewidth` carries over is an optimisation, so the only thing that
+    /// makes it safe is producing what a full build would — over a diff with tabs,
+    /// one without, and a line count that moved under it.
+    #[test]
+    fn rewidth_agrees_with_a_full_build() {
+        let g = LineNoGutter::default();
+        let tabbed: Vec<DiffLine> = ["\tone", "\t\ttwo long enough to wrap somewhere", "three"]
+            .iter()
+            .map(|t| line(t, LineKind::Context))
+            .collect();
+        let plain = ctx_lines(&[10, 300, 10]);
+        for lines in [&tabbed, &plain] {
+            let mut idx = WrapIndex::build(lines, 100, g);
+            for cols in [80, 40, 20, 100] {
+                idx = idx.rewidth(lines, cols, g);
+                let fresh = WrapIndex::build(lines, cols, g);
+                assert_eq!(idx.total_rows(), fresh.total_rows(), "at cols={cols}");
+                for l in 0..=lines.len() {
+                    assert_eq!(idx.row_of_line(l), fresh.row_of_line(l), "at cols={cols}");
+                }
+                for r in 0..fresh.total_rows() {
+                    assert_eq!(idx.line_of_row(r), fresh.line_of_row(r), "at cols={cols}");
+                    let (l, sub) = fresh.line_of_row(r);
+                    assert_eq!(idx.slice(l, &lines[l], sub), fresh.slice(l, &lines[l], sub));
+                }
+            }
+        }
+        // A different diff that happens to reach here is measured, not assumed:
+        // the carried census describes lines this one does not have.
+        let grew = WrapIndex::build(&tabbed, 100, g).rewidth(&plain, 40, g);
+        assert_eq!(
+            grew.total_rows(),
+            WrapIndex::build(&plain, 40, g).total_rows()
+        );
     }
 
     #[test]
