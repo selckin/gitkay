@@ -1096,8 +1096,8 @@ pub fn detect_similar(diff: &mut git2::Diff, settings: DiffSettings) {
 
 /// Which stage of a diff build is running.
 ///
-/// The three are where a slow build actually spends its time, and each is one libgit2
-/// call or loop — so this is as fine as an honest report gets, and only the last of
+/// The two are where a slow build actually spends its time, and each is one libgit2
+/// call or loop — so this is as fine as an honest report gets, and only the second of
 /// them has anything to count.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum DiffPhase {
@@ -1121,8 +1121,10 @@ impl DiffPhase {
         }
     }
 
-    /// Anything but the three codes above is unreachable — `code` is the only writer —
-    /// and resolves to the phase that claims the least.
+    /// Anything but the codes above is unreachable — `code` is the only writer — and
+    /// resolves to the phase that claims the least. (The gap at 1 is the removed
+    /// `Summarising`; the values are private and never persisted, so closing it would
+    /// buy nothing and only invite a reader to assume they mean something.)
     const fn of_code(code: u8) -> Self {
         match code {
             2 => Self::Patching,

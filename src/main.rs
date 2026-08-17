@@ -1790,15 +1790,19 @@ fn stats_cell_count(cfg: config::CommitListSection) -> usize {
     usize::from(cfg.file_count) + 2 * usize::from(cfg.line_count)
 }
 
-/// Bottom-padding rows for the diff so the deepest file (`last_top_anchor`, its start
-/// line) can scroll to the top of a `viewport_rows`-tall viewport: only the rows that
-/// file leaves short of a screenful, so a last file that already fills the viewport gets
-/// none from this function. (The caller then floors the result at `BOTTOM_PAD_ROWS` for
-/// breathing room, so the rendered padding is never actually zero.) `None` ⇒ no files ⇒
-/// no padding. Pure (no egui), so the off-by-one-prone arithmetic is unit-testable.
-fn diff_pad_rows(n_lines: usize, last_top_anchor: Option<usize>, viewport_rows: usize) -> usize {
+/// Bottom-padding rows for the diff so the deepest file (`last_top_anchor`, the VISUAL
+/// ROW its start line sits on) can scroll to the top of a `viewport_rows`-tall
+/// viewport: only the rows that file leaves short of a screenful, so a last file that
+/// already fills the viewport gets none from this function. (The caller then floors the
+/// result at `BOTTOM_PAD_ROWS` for breathing room, so the rendered padding is never
+/// actually zero.) `None` ⇒ no files ⇒ no padding.
+///
+/// Every term is in visual rows — the caller maps the anchor line through the wrap
+/// index before handing it over — because what has to reach the top of the viewport is
+/// a row. Pure (no egui), so the off-by-one-prone arithmetic is unit-testable.
+fn diff_pad_rows(n_rows: usize, last_top_anchor: Option<usize>, viewport_rows: usize) -> usize {
     last_top_anchor.map_or(0, |anchor| {
-        viewport_rows.saturating_sub(n_lines.saturating_sub(anchor))
+        viewport_rows.saturating_sub(n_rows.saturating_sub(anchor))
     })
 }
 

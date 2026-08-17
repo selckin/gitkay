@@ -585,14 +585,6 @@ fn timed<T>(acc: &mut std::time::Duration, f: impl FnOnce() -> T) -> T {
     out
 }
 
-/// `load_commits`, plus the two things only the walk itself can report (see
-/// `HistoryWalk`).
-///
-/// The ordered oid list is what makes page two cheap: without it every extension
-/// re-pays the whole ordering pass (1.6s on a 67k-commit repo, and again on every
-/// page, because `history_worker` opens a fresh `Repository` each time). `None` for
-/// scopes whose walk output is not a plain prefix — a path filter drops and rewrites
-/// as it goes, so draining it is neither free nor a list of what the next page holds.
 /// Can this scope be walked with generation numbers, in `git log --graph`'s order?
 ///
 /// Deliberately narrow: the current-branch scope and `--all`, with or without a path
@@ -1109,6 +1101,15 @@ fn sorted_filtered_walk(
     )
 }
 
+/// `load_commits`, plus the two things only the walk itself can report (see
+/// `HistoryWalk`).
+///
+/// The ordered oid list is what makes page two cheap: without it every extension
+/// re-pays the whole ordering pass (1.6s on a 67k-commit repo, and again on every
+/// page, because `history_worker` opens a fresh `Repository` each time). `None` for
+/// scopes whose walk output is not a plain prefix — a path filter drops and rewrites
+/// as it goes, so draining it is neither free nor a list of what the next page holds,
+/// and the lazy walk produces only the rows it was asked for.
 pub fn load_commits_inner(repo: &Repository, max: usize, scope: &cli::Scope) -> HistoryWalk {
     let t = std::time::Instant::now();
     let ref_map = build_ref_map(repo);
@@ -1435,12 +1436,13 @@ pub fn load_commits_tail(
     }
     let t = std::time::Instant::now();
     // The lazy walk extends exactly as the sorted one does — skip the loaded prefix,
-    // check the anchor, build the rest — and it MUST be the one used whenever the
-    // prefix came from it. The two produce different orders (topological against
-    // date), so resuming one from the other's prefix would not merely be slow: it
-    // would splice two orderings together and draw a parent above its own child.
-    // The anchor check would usually catch that, but "usually" is not what the graph
-    // layout rests on.
+    // check the anchor, build the rest — and it is tried FIRST whenever the prefix
+    // could have come from it, so a page resumes off the walk that produced the rows
+    // above it. Both walks reproduce `git rev-list --topo-order` (see **The commit
+    // order**), so the fallback below is sound rather than merely anchored; were they
+    // ever to disagree, resuming one from the other's prefix would splice two
+    // orderings and draw a parent above its own child, and the anchor check is the
+    // second line rather than the first.
     if let Some(oids) = topo_oids(repo, scope, skip + max_new) {
         let mut iter = oids.into_iter();
         let mut seen = HashSet::new();
