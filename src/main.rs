@@ -8046,11 +8046,6 @@ impl GitkApp {
     }
 }
 
-/// When the window closed, so the pieces of teardown after it can be attributed.
-/// A static because the two ends live in different owners: `on_exit` is called on
-/// the app, and by the time `run_native` returns the app is gone.
-static SHUTDOWN_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-
 impl Drop for GitkApp {
     /// Hand the app's largest fields to the OS instead of freeing them line by
     /// line.
@@ -8121,7 +8116,6 @@ impl eframe::App for GitkApp {
     /// eframe calls this after `save`, before dropping us — the last point the app
     /// can say anything about its own shutdown.
     fn on_exit(&mut self) {
-        let _ = SHUTDOWN_AT.set(std::time::Instant::now());
         log::debug!("shutdown: window closed, tearing down");
     }
 
@@ -8854,7 +8848,7 @@ fn main() -> eframe::Result {
     // match window rules on app_id, and so eframe uses a stable storage dir for
     // the persisted layout regardless of which repo is open. (egui-winit 0.31
     // applies app_id only on Wayland; it does NOT set the X11 WM_CLASS.)
-    let result = eframe::run_native(
+    eframe::run_native(
         "gitkay",
         options,
         Box::new(move |cc| {
@@ -8880,15 +8874,7 @@ fn main() -> eframe::Result {
             );
             Ok(Box::new(app) as Box<dyn eframe::App>)
         }),
-    );
-    // Everything after `on_exit` that is not the app's own state: eframe's final
-    // save, the app drop (timed by `Drop for GitkApp`), and winit/glow tearing the
-    // window down. Nothing else reports on this stretch, and on a huge diff a reader
-    // sees it as the window lingering after they asked it to close.
-    if let Some(t) = SHUTDOWN_AT.get() {
-        log::debug!("shutdown: exited {:?} after the window closed", t.elapsed());
-    }
-    result
+    )
 }
 
 #[cfg(test)]
