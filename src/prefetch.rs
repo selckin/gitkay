@@ -699,11 +699,24 @@ struct Coordinator {
     line_budget: usize,
     /// The highlighter as of the last `Submit`, copied onto each warm job.
     hl: Option<Arc<Highlighter>>,
-    /// The epoch of the last `SubmitStats`, copied onto each warm job. Uniform across
-    /// a batch — the UI stamps every job in a dispatch from one `stats_epoch.current()`
-    /// — so the front job speaks for all of them. A stale one is simply dropped by the
-    /// UI's own epoch check, leaving the cell exactly as blank as it was.
+    /// The epoch of the last `SubmitStats`. Uniform across a batch — the UI stamps
+    /// every job in a dispatch from one `stats_epoch.current()` — so the front job
+    /// speaks for all of them. A stale one is simply dropped by the UI's own epoch
+    /// check, leaving the cell exactly as blank as it was.
     stats_epoch: u64,
+    /// That epoch as it stood when the CURRENT band was submitted, which is what a
+    /// warm job carries rather than the live value.
+    ///
+    /// `warm_row` sends the commit-list numbers off the diff it built, and that diff
+    /// was built under the band's `key.settings`. Those two have to be stamped from the
+    /// same moment: a band submitted under the old settings can sit in `ready` while a
+    /// toolbar toggle bumps the epoch and the next `SubmitStats` raises `stats_epoch`,
+    /// and a row claimed after that would send pre-toggle counts under the current
+    /// epoch — installed, `answered()`, and never re-asked, so the column disagrees
+    /// with the pane beside it for the session. `cache_diff` refuses exactly that
+    /// through `stats_harvestable`; this is the same rule for the route that bypasses
+    /// it.
+    band_stats_epoch: u64,
     /// One mailbox per pool worker, then one per heavy worker. Heavy ids continue
     /// straight on from the pool's, so `id >= mailboxes.len()` names the lane.
     mailboxes: Vec<mpsc::Sender<Job>>,
@@ -812,6 +825,9 @@ impl Coordinator {
     /// Split a new band into the cheap and expensive lanes, dropping what is already
     /// known too large to cache.
     fn take_band(&mut self, targets: VecDeque<PrefetchTarget>) {
+        // Stamped here, with the settings the targets carry, and not at claim time —
+        // see `band_stats_epoch`.
+        self.band_stats_epoch = self.stats_epoch;
         let (mut ready, mut deferred) = (VecDeque::new(), VecDeque::new());
         for mut target in targets {
             if self.oversized.contains(&target.key) || self.unconverted.contains(&target.key) {
@@ -1090,7 +1106,7 @@ impl Coordinator {
         self.warming.insert(id, claim);
         Some(Job::Warm {
             target,
-            stats_epoch: self.stats_epoch,
+            stats_epoch: self.band_stats_epoch,
             hl: self.hl.clone(),
         })
     }
@@ -1236,6 +1252,7 @@ pub fn spawn_prefetch_pool(
         line_budget: budget.line_budget,
         hl: None,
         stats_epoch: 0,
+        band_stats_epoch: 0,
         mailboxes,
         heavy,
         inflight,
@@ -1912,6 +1929,7 @@ mod tests {
                 line_budget: 1_000,
                 hl: None,
                 stats_epoch: 0,
+                band_stats_epoch: 0,
                 mailboxes,
                 heavy,
                 inflight: Arc::default(),
@@ -2345,19 +2363,79 @@ mod tests {
     /// still report the column's numbers. Without it that cell keeps its file count and
     /// a permanently blank `+`/`-`: the row is blob-heavy, so its stats job sent a file
     /// count and stopped, trusting a diff that then never reaches `cache_diff`.
+    /// The `stats_epoch` on the one warm job handed out across every mailbox — which
+    /// worker got it is a scheduling detail, and the epoch is the subject.
+    fn dispatched_warm_epoch(rxs: &[mpsc::Receiver<Job>]) -> u64 {
+        let epochs: Vec<u64> = rxs
+            .iter()
+            .flat_map(|rx| rx.try_iter())
+            .filter_map(|job| match job {
+                Job::Warm { stats_epoch, .. } => Some(stats_epoch),
+                Job::Stats(_) => None,
+            })
+            .collect();
+        match epochs.as_slice() {
+            [epoch] => *epoch,
+            other => panic!("expected exactly one warm job, got {}", other.len()),
+        }
+    }
+
     #[test]
     fn a_warm_job_carries_the_epoch_a_dropped_row_needs_to_report_stats() {
         // Two workers: `run_msg` dispatches, so the stats row takes one and the warm
         // row needs the other.
-        let (mut coord, _rxs) = test_coord(2);
+        let (mut coord, rxs) = test_coord(2);
         let mut job = stats_job(1);
         job.epoch = 7;
         coord.run_msg(CoordMsg::SubmitStats(std::iter::once(job).collect()));
-        coord.ready.push_back(heavy_target(2));
-        match coord.next_pool_job() {
-            Some(Job::Warm { stats_epoch, .. }) => assert_eq!(stats_epoch, 7),
-            _ => panic!("expected a warm job"),
+        coord.run_msg(CoordMsg::Submit {
+            targets: std::iter::once(heavy_target(2)).collect(),
+            hl: None,
+        });
+        assert_eq!(dispatched_warm_epoch(&rxs), 7);
+    }
+
+    /// …and it carries the epoch the BAND was submitted under, not the live one.
+    ///
+    /// `warm_row` reports the column's numbers off the diff it built, and that diff is
+    /// built under the band's own `key.settings`. A band can sit in `ready` while a
+    /// toolbar toggle invalidates the column and the next `SubmitStats` raises the
+    /// epoch; stamped at claim time, the pre-toggle counts would then install under the
+    /// current epoch, read as `answered()`, and never be re-asked — the column
+    /// disagreeing with the pane for the session, which is exactly what
+    /// `stats_harvestable` refuses on `cache_diff`'s side.
+    #[test]
+    fn a_warm_job_keeps_the_epoch_its_band_was_submitted_under() {
+        // One pool worker, so the band's row stays queued while the toggle lands.
+        let (mut coord, rxs) = test_coord(1);
+        coord.run_msg(CoordMsg::SubmitStats(
+            std::iter::once(stats_job(1)).collect(),
+        ));
+        coord.run_msg(CoordMsg::Submit {
+            targets: std::iter::once(heavy_target(2)).collect(),
+            hl: None,
+        });
+        // The toggle: the UI clears the column, bumps the epoch and re-submits. The
+        // band is untouched — nothing re-dispatches it until the new diff installs.
+        let mut job = stats_job(3);
+        job.epoch = 9;
+        coord.run_msg(CoordMsg::SubmitStats(std::iter::once(job).collect()));
+        // The stats rows report in turn, and only then is the one worker free for the
+        // warm row the band left queued.
+        for n in [1, 3] {
+            coord.run_msg(CoordMsg::Done(
+                0,
+                Outcome::Stats {
+                    oid: oid(n),
+                    costly: None,
+                },
+            ));
         }
+        assert_eq!(
+            dispatched_warm_epoch(&rxs),
+            0,
+            "the band predates the invalidation, so its numbers must be dropped"
+        );
     }
 
     /// The live memory reading is taken lazily and at most once per dispatch, never per
