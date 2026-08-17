@@ -672,6 +672,10 @@ struct Coordinator {
     /// on a CHANGE rather than on every worker completion — `dispatch` runs once per
     /// report, and a band of 25 would otherwise log 25 times saying the same thing.
     reported_outstanding: (usize, usize),
+    /// The heavy row last reported as waiting on memory, so `next_heavy`'s refusal is
+    /// said once per row rather than once per dispatch — same reasoning as
+    /// `reported_outstanding` above.
+    reported_heavy_full: Option<git2::Oid>,
     /// Bytes each outstanding heavy row is expected to hold, by worker id. Summed by
     /// `heavy_fits` into what the lane has committed, and keyed by worker so a finishing
     /// row releases exactly what it reserved.
@@ -982,25 +986,32 @@ impl Coordinator {
     /// the queue is the coordinator's own field.
     fn next_heavy(&mut self, usable: &std::cell::OnceCell<Option<u64>>) -> Option<(Job, u64)> {
         loop {
-            let need = self.deferred.front().map(Self::heavy_need)?;
+            let front = self.deferred.front()?;
+            let (need, oid) = (Self::heavy_need(front), front.key.oid);
             if !self.heavy_fits(need, usable) {
                 // The lane is loaded and this row does not fit yet. Said out loud
                 // because it is otherwise indistinguishable from the row never having
                 // been queued: a row that RUNS logs twice, and a row that waits logged
                 // nothing at all, so a band that quietly kept one commit cold left no
                 // trace of which of the two had happened.
-                log::debug!(
-                    "prefetch: heavy lane full — {} waiting on {need} bytes, {} rows behind it",
-                    self.deferred
-                        .front()
-                        .map_or_else(|| "?".to_string(), |t| t.key.oid.to_string()),
-                    self.deferred.len().saturating_sub(1)
-                );
+                //
+                // Once per row, not once per dispatch, for the reason
+                // `report_outstanding` beside it states: `dispatch` runs on every
+                // worker report, and a lane that stays full would otherwise repeat the
+                // same line for each of them.
+                if self.reported_heavy_full != Some(oid) {
+                    self.reported_heavy_full = Some(oid);
+                    log::debug!(
+                        "prefetch: heavy lane full — {oid} waiting on {need} bytes, {} rows \
+                         behind it",
+                        self.deferred.len().saturating_sub(1)
+                    );
+                }
                 return None;
             }
+            self.reported_heavy_full = None;
             let target = self.deferred.pop_front()?;
             let id = *self.heavy_idle.last()?;
-            let oid = target.key.oid;
             if let Some(job) = self.claim_warm(id, target) {
                 return Some((job, need));
             }
@@ -1244,6 +1255,7 @@ pub fn spawn_prefetch_pool(
         idle: (0..mailboxes.len()).collect(),
         heavy_idle: (mailboxes.len()..mailboxes.len() + heavy.len()).collect(),
         reported_outstanding: (0, 0),
+        reported_heavy_full: None,
         heavy_outstanding: HashMap::new(),
         heavy_budget,
         busy_stats: HashSet::new(),
@@ -1921,6 +1933,7 @@ mod tests {
                 idle: (0..workers).collect(),
                 heavy_idle: (workers..workers + heavy.len()).collect(),
                 reported_outstanding: (0, 0),
+                reported_heavy_full: None,
                 heavy_outstanding: HashMap::new(),
                 heavy_budget: None,
                 busy_stats: HashSet::new(),
