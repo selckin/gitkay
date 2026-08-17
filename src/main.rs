@@ -48,8 +48,8 @@ use diff::{
 };
 use diff_cache::DiffCache;
 use diff_highlight::{
-    HighlightJob, HighlightMsg, band_warmable, highlight_diff, highlight_diff_until,
-    highlight_worker, pending_files, spawn_prewarm,
+    HighlightJob, HighlightMsg, band_warmable, highlight_diff, highlight_worker, pending_files,
+    spawn_prewarm,
 };
 use diff_store::DiffStore;
 use graph::{GraphLayoutState, GraphRow, layout_graph_rows};

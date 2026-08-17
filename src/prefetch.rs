@@ -28,14 +28,12 @@ use crate::diff::{
     self, BuildEnv, CommitStats, DiffData, DiffSettings, RowScope, StatsWant, commit_stats,
     is_real_commit,
 };
+use crate::diff_highlight::{ColourPass, HighlightBudget, Stopped, highlight_diff_within};
 use crate::diff_store::MAX_ENTRY_DIVISOR;
 use crate::highlight::Highlighter;
 use crate::history::CommitInfo;
 use crate::workers::{StatsJob, StatsResult};
-use crate::{
-    DiffCacheKey, DiffDeps, build_or_load, highlight_diff_until, mem, spawn_guarded, store_of,
-    textconv_for,
-};
+use crate::{DiffCacheKey, DiffDeps, build_or_load, mem, spawn_guarded, store_of, textconv_for};
 
 /// Lines one prefetch dispatch may build before it stops and drops the rest of its
 /// band.
@@ -1917,24 +1915,31 @@ fn warm_row(
     // legal state and `ensure_diff_highlighted` finishes the row if it is ever opened —
     // where not stopping costs the worker, its lane slot and its in-flight claim.
     let deadline = colour_start + ctx.limits.highlight_budget;
-    if let Some(hl) = hl
+    let pass = if let Some(hl) = hl
         && colour
     {
-        highlight_diff_until(
+        Some(highlight_diff_within(
             &data.lines,
             &mut data.spans,
             &data.files,
             hl,
-            Some(deadline),
+            HighlightBudget {
+                lines: None,
+                deadline: Some(deadline),
+                until_row: None,
+            },
             0,
-            None,
-        );
-    }
+        ))
+    } else {
+        None
+    };
     let coloured = colour_start.elapsed();
-    // Within a chunk of the deadline means the pass stopped where it was rather than
-    // finishing. Said out loud for the reason every other cut-off here is: a row that
-    // renders half-plain otherwise looks like the highlighter simply failing on it.
-    let cut_short = colour && coloured >= ctx.limits.highlight_budget;
+    // Said out loud for the reason every other cut-off here is: a row that renders
+    // half-plain otherwise looks like the highlighter simply failing on it. The pass
+    // reports which bound stopped it; this used to compare its own elapsed time against
+    // its own deadline and guess, which is the same answer arrived at less exactly and
+    // by a caller that does not own the bound.
+    let cut_short = pass.is_some_and(|p: ColourPass| p.stopped == Stopped::Deadline);
     // What was actually applied, not what was asked for — and THREE outcomes, not two.
     // A depth downgrade the log hid would read as syntect being mysteriously fast on an
     // enormous row; the plain-text fallback reads the same way and is worse, because it
