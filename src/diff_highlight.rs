@@ -368,19 +368,15 @@ pub fn top_extensions(
 /// it re-queues the rest and switches — so selecting a file never waits behind a
 /// large off-screen one. It bails as soon as a newer highlight pass supersedes it.
 ///
-/// However it ends, it says so: `SettleOnExit` reports the pass's end on the way out of
-/// this function, panic included.
+/// However it ends, it says so: `SettleOnExit` is declared first and so dropped last,
+/// reporting the pass's end on the way out — from any `return` below, and on unwind.
+/// It owns clones rather than borrows, so destructuring the job past it is fine.
 pub fn highlight_worker(job: HighlightJob) {
     let _settle = SettleOnExit {
         generation: job.generation,
         tx: job.tx.clone(),
         ctx: job.ctx.clone(),
     };
-    highlight_pass(job);
-}
-
-/// The pass itself, free to return from anywhere: its caller owns the reporting.
-fn highlight_pass(job: HighlightJob) {
     let HighlightJob {
         hl,
         lines,
