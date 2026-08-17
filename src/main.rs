@@ -3914,9 +3914,10 @@ impl GitkApp {
                 log::debug!("perf: startup: history still walking — window first, rows to follow");
                 (None, Some(history_rx))
             }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                (Some(load_history(&repo, INITIAL_COMMITS, &scope)), None)
-            }
+            Err(mpsc::TryRecvError::Disconnected) => (
+                Some(load_history(&repo, INITIAL_COMMITS, &scope, None)),
+                None,
+            ),
         };
         // The empty-list derived state, taken from the real function rather than
         // hand-written defaults, so it cannot drift from what one frame of
@@ -8746,6 +8747,17 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
+    // The go-ahead the provisional walk below waits on, and the one place the "can a
+    // provisional walk stand in for this scope at all?" question is asked: no channel
+    // means no thread and nothing for the real walk to signal. Whether it is USED is
+    // the real walk's to say, and it says so by sending — see `history::ProvisionalGo`.
+    let (go_tx, go_rx) = if provisional_scope(&scope) {
+        let (tx, rx) = mpsc::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
     // Prefetch the commit history on a background thread so its cold git I/O (index
     // + worktree stats — ~200-330ms on a cold cache, near-instant warm) overlaps
     // with eframe's window/GL initialisation, which runs on this thread inside
@@ -8763,13 +8775,16 @@ fn main() -> eframe::Result {
             move || {
                 if let Ok(repo) = Repository::discover(&repo_path) {
                     let t = std::time::Instant::now();
-                    let walk = load_history(&repo, INITIAL_COMMITS, &scope);
+                    let walk = load_history(&repo, INITIAL_COMMITS, &scope, go_tx.as_ref());
                     log::debug!(
                         "perf: startup: history prefetch (off-thread) {:?}",
                         t.elapsed()
                     );
                     let _ = history_tx.send(walk);
                 }
+                // `go_tx` drops here whatever happened — a lazy walk, a repository
+                // that would not open, a panic caught by `spawn_guarded` — and that
+                // disconnect is what releases the thread below.
             },
         )
         .is_err()
@@ -8778,34 +8793,29 @@ fn main() -> eframe::Result {
         }
     }
 
-    // The provisional walk, racing the real one above. Its result is used ONLY if
-    // the real walk is still going at PROVISIONAL_HISTORY_DELAY, so on an ordinary
-    // repo this thread's few milliseconds of work are computed and discarded — that
-    // is the design, not waste: it is what keeps a fast repo from ever showing rows
-    // it is about to reorder.
-    let (quick_tx, quick_rx) = mpsc::channel();
-    let provisional_rx = if provisional_scope(&scope) {
+    // The provisional walk. It runs only once the real walk has said it is taking the
+    // sorted revwalk, so the two never race: an exact lazy answer is never preceded by
+    // approximate rows it would reorder, and a slow walk is never left with a blank
+    // window because a graph merely existed. Waiting costs nothing — the go-ahead is
+    // sent before the ordering pass starts, so this walk overlaps the whole of it —
+    // and on a repo whose sorted walk is fast the rows are computed and discarded by
+    // PROVISIONAL_HISTORY_DELAY, which is the design rather than waste.
+    let provisional_rx = go_rx.and_then(|go| {
+        let (quick_tx, quick_rx) = mpsc::channel();
         let repo_path = repo_path.clone();
         let first_parent = scope.first_parent;
-        let scope = scope.clone();
         if spawn_guarded(
             "gitkay-history-quick",
             "provisional history thread panicked",
             move || {
+                if go.recv().is_err() {
+                    log::debug!(
+                        "perf: startup: no provisional walk — the real one never asked \
+                         to be stood in for"
+                    );
+                    return;
+                }
                 if let Ok(repo) = Repository::discover(&repo_path) {
-                    // Nothing to race when the real walk is the lazy one: it answers
-                    // in milliseconds and its answer is EXACT, so showing approximate
-                    // rows first could only introduce the reshuffle this whole
-                    // arrangement exists to avoid. Dropping the sender leaves the
-                    // deadline below with nothing to install, which is already how a
-                    // scope with no provisional walk behaves.
-                    if history::topo_available(&repo, &scope) {
-                        log::debug!(
-                            "perf: startup: skipping the provisional walk — generation \
-                             numbers make the real one exact and fast"
-                        );
-                        return;
-                    }
                     let t = std::time::Instant::now();
                     let commits = provisional_commits(&repo, INITIAL_COMMITS, first_parent);
                     log::debug!(
@@ -8824,9 +8834,7 @@ fn main() -> eframe::Result {
         } else {
             Some(quick_rx)
         }
-    } else {
-        None
-    };
+    });
 
     // Build the font set on a background thread too: fontdb's system-font scan
     // (~150ms when a font is configured by name and not yet cached) overlaps with

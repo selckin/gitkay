@@ -601,13 +601,6 @@ pub const fn topo_scope(scope: &cli::Scope) -> bool {
     !scope.reflog && !scope.follow && scope.revs.is_empty()
 }
 
-/// Whether this repository can be walked lazily right now — the scope allows it AND
-/// a readable commit-graph exists. Cheap enough to ask before deciding anything:
-/// opening the kernel's 88MB graph is ~100µs, since nothing is parsed but the header.
-pub fn topo_available(repo: &Repository, scope: &cli::Scope) -> bool {
-    topo_scope(scope) && crate::commitgraph::CommitGraph::for_repo(repo).is_some()
-}
-
 /// The commits a lazy walk starts from, in the order git starts from them — which is
 /// the order they are emitted in, since the walk seeds its stack with them.
 ///
@@ -1110,7 +1103,17 @@ fn sorted_filtered_walk(
 /// scopes whose walk output is not a plain prefix — a path filter drops and rewrites
 /// as it goes, so draining it is neither free nor a list of what the next page holds,
 /// and the lazy walk produces only the rows it was asked for.
-pub fn load_commits_inner(repo: &Repository, max: usize, scope: &cli::Scope) -> HistoryWalk {
+///
+/// `provisional` is the go-ahead for a stand-in list, sent only if this walk turns out
+/// to need the sorted revwalk — see `ProvisionalGo`. `None` for every walk nobody is
+/// staring at an empty window for: a watcher rebuild, a scroll page, the synchronous
+/// fallback in `GitkApp::new`.
+pub fn load_commits_inner(
+    repo: &Repository,
+    max: usize,
+    scope: &cli::Scope,
+    provisional: Option<&ProvisionalGo>,
+) -> HistoryWalk {
     let t = std::time::Instant::now();
     let ref_map = build_ref_map(repo);
     log::debug!(
@@ -1221,6 +1224,15 @@ pub fn load_commits_inner(repo: &Repository, max: usize, scope: &cli::Scope) -> 
             scope.first_parent,
         );
     } else {
+        // The lazy walk was refused — by the scope, or by a repository with no
+        // commit-graph or an unusable one — so what the reader is waiting on is the
+        // ordering pass below, and on a large repository they are waiting a long time
+        // (57s measured on a 1.47M-commit clone). This is the ONE place that knows
+        // that, which is why the provisional walk is told from here rather than
+        // guessing from the same inputs: see `ProvisionalGo`.
+        if let Some(go) = provisional {
+            let _ = go.send(());
+        }
         let t_setup = std::time::Instant::now();
         let walk = history_revwalk(repo, scope);
         let setup = t_setup.elapsed();
@@ -1327,7 +1339,7 @@ pub fn load_commits_inner(repo: &Repository, max: usize, scope: &cli::Scope) -> 
 /// reads better without unpacking a struct it does not exercise.
 #[cfg(test)]
 pub fn load_commits(repo: &Repository, max: usize, scope: &cli::Scope) -> Vec<CommitInfo> {
-    load_commits_inner(repo, max, scope).commits
+    load_commits_inner(repo, max, scope, None).commits
 }
 
 /// The index/worktree probes, running on their own thread so their cost overlaps the
@@ -1728,10 +1740,31 @@ pub fn note_slow_history_walk(
 /// fast path never flashes something it is about to replace.
 pub const PROVISIONAL_HISTORY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// The go-ahead a provisional walk waits for, sent by the real walk at the moment it
+/// decides the sorted revwalk is what the reader will be waiting on.
+///
+/// **A signal rather than a prediction, and that is the whole of it.** The provisional
+/// thread used to decide for itself, from the scope plus a commit-graph merely
+/// EXISTING — but existing is not the question: `TopoWalk` still declines an
+/// ancestry-unclosed graph, and `load_commits_inner` then falls back to the very walk
+/// the provisional list exists to cover, with the stand-in already refused. Measured on
+/// a 1.47M-commit clone, that is a blank window for the 57s the ordering pass takes.
+/// Only the walk knows which path it took, so only the walk says so, and nothing has to
+/// be kept in step with what makes a lazy walk possible.
+///
+/// A dropped sender is the other answer — the lazy path was taken, the scope was never
+/// eligible, or the walk died — and it ends the waiting thread having sent nothing,
+/// which is already how a scope with no provisional walk behaves.
+pub type ProvisionalGo = std::sync::mpsc::Sender<()>;
+
 /// Can this scope be walked provisionally? Only the plain one — the heap walk below
 /// reproduces neither the path filter's parent rewrite, the reflog's `@{n}`
 /// numbering, nor `--all`'s multi-tip seeding, and each of those is a whole-list
 /// computation rather than a per-row one.
+///
+/// Asked once, where the go-ahead channel is created: a walk handed a `ProvisionalGo`
+/// has already been judged eligible, and re-asking here would be the second copy of
+/// this rule that the arrangement above exists to avoid.
 pub const fn provisional_scope(scope: &cli::Scope) -> bool {
     !scope.all && !scope.reflog && !scope.follow && scope.revs.is_empty() && scope.paths.is_empty()
 }
@@ -2203,7 +2236,15 @@ pub struct HistoryWalk {
 
 /// Load the commit list for the active scope: the reflog when `--reflog` is set,
 /// otherwise the normal history walk.
-pub fn load_history(repo: &Repository, max: usize, scope: &cli::Scope) -> HistoryWalk {
+///
+/// `provisional` is passed straight through to `load_commits_inner`; the reflog has its
+/// own loader, walks no DAG and is never slow enough to need standing in for.
+pub fn load_history(
+    repo: &Repository,
+    max: usize,
+    scope: &cli::Scope,
+    provisional: Option<&ProvisionalGo>,
+) -> HistoryWalk {
     if scope.reflog {
         HistoryWalk {
             commits: load_reflog(repo, max, scope),
@@ -2213,7 +2254,7 @@ pub fn load_history(repo: &Repository, max: usize, scope: &cli::Scope) -> Histor
             tip: TipPaths::Unknown,
         }
     } else {
-        load_commits_inner(repo, max, scope)
+        load_commits_inner(repo, max, scope, provisional)
     }
 }
 
@@ -2329,13 +2370,13 @@ mod tests {
         let scope = cli::Scope::default();
 
         // No graph yet: the sorted walk answers.
-        assert!(!topo_available(&repo, &scope));
+        assert!(topo_oids(&repo, &scope, 100).is_none());
         let sorted = crate::tests::summaries(&load_commits(&repo, 100, &scope));
 
         crate::test_repo::write_commit_graph(&repo, &[tip]);
         let repo = crate::test_repo::open_repo(dir.path());
         assert!(
-            topo_available(&repo, &scope),
+            topo_oids(&repo, &scope, 100).is_some(),
             "the graph should now be found"
         );
         let lazy = crate::tests::summaries(&load_commits(&repo, 100, &scope));
@@ -2361,13 +2402,13 @@ mod tests {
             .unwrap();
         let scope = crate::tests::scope(true, &[]);
 
-        assert!(!topo_available(&repo, &scope));
+        assert!(topo_oids(&repo, &scope, 100).is_none());
         let sorted = crate::tests::summaries(&load_commits(&repo, 100, &scope));
 
         crate::test_repo::write_commit_graph(&repo, &[tip, side_c]);
         let repo = crate::test_repo::open_repo(dir.path());
         assert!(
-            topo_available(&repo, &scope),
+            topo_oids(&repo, &scope, 100).is_some(),
             "the graph should now be found"
         );
         let lazy = crate::tests::summaries(&load_commits(&repo, 100, &scope));
@@ -2439,21 +2480,18 @@ mod tests {
     /// A scope the lazy walk has not been verified against git for must keep using
     /// the sorted one, whatever the repository holds. The list is deliberately
     /// narrow, and widening it is a change that owes its own oracle run.
+    ///
+    /// `topo_scope` is the scope-side gate BOTH lazy drivers share — `topo_oids` for a
+    /// plain walk, `lazy_filtered_walk` for a path-filtered one — so it is asked here
+    /// directly rather than through a repository that would only decide the other half.
     #[test]
     fn only_verified_scopes_take_the_lazy_path() {
-        let (dir, repo) = crate::test_repo::temp_repo();
-        let tip = crate::tests::merged_history(&repo).3;
-        crate::test_repo::write_commit_graph(&repo, &[tip]);
-        let repo = crate::test_repo::open_repo(dir.path());
-        assert!(topo_available(&repo, &cli::Scope::default()));
-        assert!(topo_available(&repo, &crate::tests::scope(true, &[])));
-        assert!(topo_available(
-            &repo,
-            &cli::Scope {
-                paths: vec!["f.txt".into()],
-                ..Default::default()
-            }
-        ));
+        assert!(topo_scope(&cli::Scope::default()));
+        assert!(topo_scope(&crate::tests::scope(true, &[])));
+        assert!(topo_scope(&cli::Scope {
+            paths: vec!["f.txt".into()],
+            ..Default::default()
+        }));
         for scope in [
             crate::tests::scope(false, &["HEAD"]),
             cli::Scope {
@@ -2467,10 +2505,58 @@ mod tests {
             },
         ] {
             assert!(
-                !topo_available(&repo, &scope),
+                !topo_scope(&scope),
                 "unverified scope must fall back to the sorted walk"
             );
         }
+    }
+
+    /// The go-ahead for a provisional walk follows the walk that was actually taken,
+    /// never a prediction from what the repository holds.
+    ///
+    /// **The middle case is the whole reason for that.** A commit-graph EXISTING was
+    /// the old prediction, and here it exists, is found, and is refused: `TopoWalk`
+    /// will not walk a file that is not closed under ancestry, the loader falls back
+    /// to the sorted revwalk, and under the prediction the stand-in had already been
+    /// declined — a blank window for the whole of a walk measured at 57s on a
+    /// 1.47M-commit clone. The two cases either side of it are what the prediction got
+    /// right, and must keep working.
+    #[test]
+    fn the_go_ahead_follows_the_walk_that_was_actually_taken() {
+        let (dir, repo) = temp_repo();
+        let root = commit_file(&repo, "a.txt", "1", "root");
+        let _mid = commit_file(&repo, "a.txt", "2", "mid");
+        let tip = commit_file(&repo, "a.txt", "3", "tip");
+        let scope = cli::Scope::default();
+        let asked = |repo: &Repository| {
+            let (go, rx) = std::sync::mpsc::channel();
+            load_commits_inner(repo, 100, &scope, Some(&go));
+            rx.try_recv().is_ok()
+        };
+
+        // No graph: the sorted revwalk is what the reader is left waiting on.
+        assert!(asked(&repo), "a sorted walk must ask to be stood in for");
+
+        // A graph with a hole in it — `mid` missing under a `tip` that is present.
+        // Everything the old prediction asked is true of it.
+        write_commit_graph_exact(&repo, &[tip, root]);
+        let repo = open_repo(dir.path());
+        assert!(crate::commitgraph::CommitGraph::for_repo(&repo).is_some());
+        assert!(
+            topo_oids(&repo, &scope, 100).is_none(),
+            "the fixture must be one the lazy walk refuses"
+        );
+        assert!(
+            asked(&repo),
+            "a refused graph still leaves the sorted walk to be stood in for"
+        );
+
+        // And one the walk can use: exact and fast, so approximate rows ahead of it
+        // could only be rows it reorders.
+        write_commit_graph(&repo, &[tip]);
+        let repo = open_repo(dir.path());
+        assert!(topo_oids(&repo, &scope, 100).is_some());
+        assert!(!asked(&repo), "a lazy walk must not ask");
     }
 
     /// The scroll extension has to come from the SAME walk the prefix did, or it
@@ -2485,7 +2571,7 @@ mod tests {
         crate::test_repo::write_commit_graph(&repo, &[tip]);
         let repo = crate::test_repo::open_repo(dir.path());
         let scope = cli::Scope::default();
-        assert!(topo_available(&repo, &scope));
+        assert!(topo_oids(&repo, &scope, 100).is_some());
 
         let whole = crate::tests::real_commits(&repo, 100, &scope);
         let head = crate::tests::real_commits(&repo, 5, &scope);
@@ -3885,7 +3971,7 @@ mod tests {
     /// The notice a whole walk produces, exactly as the app derives it: the tip answer
     /// under test is then the one the loader really computed, not one a test invented.
     fn walk_notice(repo: &git2::Repository, sc: &cli::Scope) -> Option<ScopeNotice> {
-        let walk = load_commits_inner(repo, 100, sc);
+        let walk = load_commits_inner(repo, 100, sc, None);
         scope_notice(sc, &walk.commits, &walk.tip)
     }
 

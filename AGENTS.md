@@ -358,11 +358,14 @@ The big picture, ahead of the detail sections below:
 
 ### Data Layer (`src/history.rs` + `src/diff.rs`)
 - `load_commits()` — **two walks, one order**. The plain scope and `--all` go through
-  `topo::TopoWalk` when the repo has a commit-graph (`history::topo_available`):
+  `topo::TopoWalk` when the repo has a commit-graph it can use (`topo_oids`):
   generation numbers make a lazy topological walk exact, so 200 rows off a
   1.47M-commit kernel clone cost 1.0s instead of 45s, and 423ms instead of 44.8s
-  under `--all` (which git itself answers in 3.1s). Every other scope, and every
-  repo without the file, falls back to the `git2` revwalk. Both produce `git log
+  under `--all` (which git itself answers in 3.1s). Every other scope, every repo
+  without the file, and every graph the walk refuses, falls back to the `git2`
+  revwalk. **Whether the lazy path was taken is only knowable from inside that
+  choice** — a graph existing does not mean the walk accepted it — so nothing
+  predicts it from the side; see the provisional walk under **Startup & timing**. Both produce `git log
   --graph`'s order — see **The commit order** below. Precomputed ref map either way
 - **A path filter is its own walk on top of that one** (`filtered_walk`, driven by
   `lazy_filtered_walk` then `sorted_filtered_walk`): keep the commits whose diff
@@ -450,12 +453,23 @@ The invariants:
 - **`Sort::NONE` is WRONG — do not retry it.** ~150× faster and emits *parents before
   children* on git.git past row 252, which breaks the graph layout invariant. Test any
   ordering change against git.git at 700+ rows, checking parent-before-child.
-- **The provisional walk is an approximation, and is SKIPPED when the lazy walk is
-  available.** `history_is_provisional` blocks the scroll extension until the real walk
-  lands; it is deliberately unmarked in the UI. Its whole purpose is covering an
-  intolerably slow walk, so racing one that is both exact and fast could only
-  reintroduce the reshuffle it exists to avoid — the quick thread returns without
-  sending, which the deadline already handles.
+- **The provisional walk is an approximation, and it is TOLD when it is needed rather
+  than predicting it.** `history_is_provisional` blocks the scroll extension until the
+  real walk lands; it is deliberately unmarked in the UI. Its whole purpose is covering
+  an intolerably slow walk, so racing one that is both exact and fast could only
+  reintroduce the reshuffle it exists to avoid — but "is the real walk the lazy one?"
+  cannot be answered from the side. It was, by asking whether a commit-graph exists,
+  and existing is not the question: `TopoWalk` refuses a file that is not closed under
+  ancestry, `load_commits_inner` then falls back to the sorted revwalk, and the
+  stand-in had already been declined — a blank window for the 57s that walk takes on a
+  1.47M-commit clone. So `load_commits_inner` sends a `ProvisionalGo` at the moment it
+  enters the sorted branch, and the quick thread blocks until it arrives; a dropped
+  sender (lazy path taken, walk dead, scope ineligible) ends that thread having sent
+  nothing, which the deadline already handles. Waiting costs nothing — the go-ahead
+  precedes the ordering pass, so the two overlap exactly as they did when they raced.
+  Only the scope gate is asked ahead of time (`provisional_scope`, at the one place the
+  channel is created), because it is a property of the command line and not of the
+  walk.
 - **A scroll extension must come from the same walk as the prefix it extends.** Not an
   optimisation: resuming a topological prefix from a date-ordered walk would splice two
   orderings and draw a parent above its own child. `load_commits_tail` picks its walk
