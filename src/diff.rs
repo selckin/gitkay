@@ -976,7 +976,6 @@ fn widen(max: &mut usize, line: &DiffLine) {
 /// which is the direction that truncates the scroll range. And the three signatures
 /// that carry the rows (`append_diff_body`, `push_patch_line`, `emit_converted`) keep
 /// their argument counts, two of them sitting at clippy's limit already.
-#[derive(Default)]
 struct DiffRows {
     lines: Vec<DiffLine>,
     max_chars: usize,
@@ -1246,7 +1245,7 @@ impl DiffProgress {
 /// Threaded as a parameter and never a global, for the reason the drivers always
 /// were: a global would make `get_diff_data` depend on invisible process state, and
 /// the suite needs per-repo drivers.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct BuildEnv<'a> {
     /// `Some` only when the reader has left `[diff] textconv` on AND this build is
     /// allowed to run external commands; `None` means "build the diff the way we
