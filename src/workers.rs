@@ -545,11 +545,13 @@ pub fn history_job(repo: &Repository, job: HistoryJob) {
             || {
                 // Full-rebuild fallback: everything requested so far, in one walk.
                 let requested = skip + max_new;
-                rebuild_load(load_history(repo, requested, &scope), requested)
+                rebuild_load(load_history(repo, requested, &scope, None), requested)
             },
             |new| HistoryLoad::Extend { new, max_new },
         ),
-        HistoryJobKind::Rebuild { count } => rebuild_load(load_history(repo, count, &scope), count),
+        HistoryJobKind::Rebuild { count } => {
+            rebuild_load(load_history(repo, count, &scope, None), count)
+        }
     };
     // Completion log with shape + duration, like the diff-load/prefetch/highlight
     // workers — without it a wasted walk (superseded, duplicated) is invisible in
