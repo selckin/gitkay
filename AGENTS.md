@@ -661,6 +661,14 @@ sorted drivers keep the same rows with the same rewritten parents.
   change and a mode-only change, under both `detect_renames` settings. **An earlier
   version of this file claimed the two counts differ and refused the derivation on that
   basis. It was wrong, and that test was already in the tree disproving it.**
+  **That send bypasses `stats_harvestable`, so the epoch has to carry the same rule**:
+  a warm job is stamped with `Coordinator::band_stats_epoch`, the `stats_epoch` as it
+  stood when the BAND was submitted, not the live one. The two must come from the same
+  moment because the counts are summed off a diff built under the band's own
+  `key.settings` — a band can sit in `ready` while a toolbar toggle bumps the epoch and
+  the next `SubmitStats` raises `stats_epoch`, and stamping at claim time then installs
+  pre-toggle counts under the current epoch, where `answered()` stops anything
+  re-asking and the column disagrees with the pane for the session.
   Harvested only when the diff's `stats_relevant` settings match the CURRENT ones, and
   that guard is load-bearing rather than defensive: `stash_current_diff` reaches
   `cache_diff` with the **outgoing** diff, and the toolbar's rename/whitespace toggles
