@@ -295,9 +295,8 @@ impl Layer {
     /// Where `oid` sits in this layer, or `None` when it is not in it.
     fn position(&self, oid: &[u8]) -> Option<u32> {
         let mut buf = [0u8; 32];
-        let hash_len = self.hash_len;
         position_by(&self.fanout, oid, |at| {
-            let slot = &mut buf[..hash_len];
+            let slot = &mut buf[..self.hash_len];
             self.oid_at(at, slot)?;
             Some((*slot).cmp(oid))
         })

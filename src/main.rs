@@ -8747,13 +8747,62 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
-    // The go-ahead the provisional walk below waits on, and the one place the "can a
-    // provisional walk stand in for this scope at all?" question is asked: no channel
-    // means no thread and nothing for the real walk to signal. Whether it is USED is
-    // the real walk's to say, and it says so by sending — see `history::ProvisionalGo`.
-    let (go_tx, go_rx) = if provisional_scope(&scope) {
-        let (tx, rx) = mpsc::channel();
-        (Some(tx), Some(rx))
+    // The provisional walk, started FIRST because it does nothing until told: it blocks
+    // on a go-ahead the real walk sends only if it turns out to be taking the sorted
+    // revwalk, so the two never race — an exact lazy answer is never preceded by
+    // approximate rows it would reorder, and a slow walk is never left with a blank
+    // window because a graph merely existed (see `history::ProvisionalGo`). The
+    // go-ahead precedes the ordering pass, so the stand-in overlaps the whole of it;
+    // on a repo whose sorted walk is fast the rows are computed and discarded by
+    // PROVISIONAL_HISTORY_DELAY, which is the design rather than waste.
+    //
+    // Only a scope the heap walk can stand in for gets one at all (`provisional_scope`,
+    // asked here and nowhere else, being a property of the command line rather than of
+    // any walk), and the sender exists only once the thread really spawned: `Some(go)`
+    // must mean "something is waiting to stand in", or the walk reports a best-effort
+    // pass over a window where nothing was ever displayed.
+    let (go_tx, provisional_rx) = if provisional_scope(&scope) {
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (quick_tx, quick_rx) = mpsc::channel();
+        let repo_path = repo_path.clone();
+        let first_parent = scope.first_parent;
+        spawn_guarded(
+            "gitkay-history-quick",
+            "provisional history thread panicked",
+            move || {
+                // Opened BEFORE the wait, so this cold IO overlaps the real walk's
+                // own prelude — its ref map, its probes, its attempt at the lazy
+                // path — rather than landing in front of the stand-in once the
+                // go-ahead arrives. On the lazy path it is one wasted open on a
+                // thread nobody is waiting on; on the slow path it is tens of ms
+                // off a blank window with a 200ms budget.
+                let repo = Repository::discover(&repo_path);
+                if go_rx.recv().is_err() {
+                    log::debug!(
+                        "perf: startup: no provisional walk — the real one never \
+                         asked to be stood in for"
+                    );
+                    return;
+                }
+                if let Ok(repo) = repo {
+                    let t = std::time::Instant::now();
+                    let commits = provisional_commits(&repo, INITIAL_COMMITS, first_parent);
+                    log::debug!(
+                        "perf: startup: provisional history ({} rows, off-thread) {:?}",
+                        commits.len(),
+                        t.elapsed()
+                    );
+                    let _ = quick_tx.send(commits);
+                }
+            },
+        )
+        .map_or_else(
+            |_| {
+                log::warn!("provisional history thread spawn failed; no early rows");
+                (None, None)
+            },
+            |_| (Some(go_tx), Some(quick_rx)),
+        )
     } else {
         (None, None)
     };
@@ -8784,7 +8833,7 @@ fn main() -> eframe::Result {
                 }
                 // `go_tx` drops here whatever happened — a lazy walk, a repository
                 // that would not open, a panic caught by `spawn_guarded` — and that
-                // disconnect is what releases the thread below.
+                // disconnect is what releases the thread above.
             },
         )
         .is_err()
@@ -8792,49 +8841,6 @@ fn main() -> eframe::Result {
             log::warn!("history prefetch thread spawn failed; loading synchronously");
         }
     }
-
-    // The provisional walk. It runs only once the real walk has said it is taking the
-    // sorted revwalk, so the two never race: an exact lazy answer is never preceded by
-    // approximate rows it would reorder, and a slow walk is never left with a blank
-    // window because a graph merely existed. Waiting costs nothing — the go-ahead is
-    // sent before the ordering pass starts, so this walk overlaps the whole of it —
-    // and on a repo whose sorted walk is fast the rows are computed and discarded by
-    // PROVISIONAL_HISTORY_DELAY, which is the design rather than waste.
-    let provisional_rx = go_rx.and_then(|go| {
-        let (quick_tx, quick_rx) = mpsc::channel();
-        let repo_path = repo_path.clone();
-        let first_parent = scope.first_parent;
-        if spawn_guarded(
-            "gitkay-history-quick",
-            "provisional history thread panicked",
-            move || {
-                if go.recv().is_err() {
-                    log::debug!(
-                        "perf: startup: no provisional walk — the real one never asked \
-                         to be stood in for"
-                    );
-                    return;
-                }
-                if let Ok(repo) = Repository::discover(&repo_path) {
-                    let t = std::time::Instant::now();
-                    let commits = provisional_commits(&repo, INITIAL_COMMITS, first_parent);
-                    log::debug!(
-                        "perf: startup: provisional history ({} rows, off-thread) {:?}",
-                        commits.len(),
-                        t.elapsed()
-                    );
-                    let _ = quick_tx.send(commits);
-                }
-            },
-        )
-        .is_err()
-        {
-            log::warn!("provisional history thread spawn failed; no early rows");
-            None
-        } else {
-            Some(quick_rx)
-        }
-    });
 
     // Build the font set on a background thread too: fontdb's system-font scan
     // (~150ms when a font is configured by name and not yet cached) overlaps with

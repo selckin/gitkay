@@ -475,13 +475,17 @@ The invariants:
   drawn" over a list that was already on screen. What each sentence names is the work,
   plus the stand-in where one was arranged (`ordering_notice`).
 - **Every input to the report is a fact the walk RECORDED, and the scope is not one of
-  them.** `WalkCost::of` takes `walked`, `lazy` and `stood_in`; reading any of them back
-  off the scope has been wrong in a way that reached the screen. `lazy` makes it answer
-  `None` — a lazy walk crosses the 500ms threshold on a large repository (660ms for 200
-  rows on that clone, the rest being each row's own commit read out of the pack) and was
-  handed the sorted walk's sentence, "the whole history walked and sorted" for a walk
-  that did neither, SPENDING the once-per-process latch on the one case with no lever to
-  name. `stood_in` is whether a provisional list was actually arranged, where
+  them.** `WalkCost::of` takes a `Walked` and `stood_in`; reading either back off the
+  scope has been wrong in a way that reached the screen. `Walked` is **produced by the
+  branch chain as an expression**, not written into a `let mut` above it — a default
+  there is a fact held by convention, and a fourth walk strategy would inherit "sorted"
+  for free and report itself as an ordering pass, which is the same mistake as inferring
+  it, arriving from the default instead. `Walked::Lazily` makes the report answer `None`:
+  a lazy walk crosses the 500ms threshold on a large repository (660ms for 200 rows on
+  that clone, the rest being each row's own commit read out of the pack) and was handed
+  the sorted walk's sentence, "the whole history walked and sorted" for a walk that did
+  neither, SPENDING the once-per-process latch on the one case with no lever to name.
+  `stood_in` is whether a provisional list was actually arranged, where
   `provisional_scope(scope)` is equally true of a rebuild that runs none and so promised
   a "best-effort pass" that never happened. Same lesson as the provisional walk below: a
   commit-graph existing says nothing about which walk ran.
@@ -504,7 +508,13 @@ The invariants:
   precedes the ordering pass, so the two overlap exactly as they did when they raced.
   Only the scope gate is asked ahead of time (`provisional_scope`, at the one place the
   channel is created), because it is a property of the command line and not of the
-  walk.
+  walk. **The sender exists only once the quick thread really spawned**, so `Some(go)`
+  means "something is waiting to stand in" by construction: built before the spawn was
+  known to succeed, a failed spawn left the walk reporting a best-effort pass over a
+  window where nothing was ever displayed. That thread also opens its `Repository`
+  BEFORE it waits, so the open overlaps the real walk's prelude instead of landing in
+  front of the stand-in — one wasted open on the lazy path, against tens of ms off a
+  blank window with a 200ms budget.
 - **A scroll extension must come from the same walk as the prefix it extends.** Not an
   optimisation: resuming a topological prefix from a date-ordered walk would splice two
   orderings and draw a parent above its own child. `load_commits_tail` picks its walk
