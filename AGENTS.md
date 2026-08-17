@@ -461,14 +461,23 @@ The invariants:
   The advice goes to whichever reporter gets there first, which is why it has a latch of
   its own, taken only when there is something to print — latching on a scope with no
   advice would silence the next scope that has some.
-- **The report names the walk that RAN, not the one the scope suggests.** `WalkCost::of`
-  takes `lazy` as a recorded fact, and answers `None` for it: a lazy walk crosses the
-  500ms threshold on a large repository (660ms for 200 rows on that clone, the rest
-  being each row's own commit read out of the pack) and would otherwise be handed the
-  sorted walk's sentence — "the whole history walked and sorted" for a walk that did
-  neither — while SPENDING the once-per-process latch on the one case with no lever to
-  name. Same lesson as the provisional walk below: a commit-graph existing says nothing
-  about which walk ran.
+  **No early sentence may describe the window**: the notice fires at
+  `SLOW_HISTORY_WALK` and a stand-in lands at `PROVISIONAL_HISTORY_DELAY`, 300ms
+  earlier, while a watcher rebuild leaves the PREVIOUS list up for the whole walk — and
+  the thread reporting knows neither. It shipped saying "before the first row can be
+  drawn" over a list that was already on screen. What each sentence names is the work,
+  plus the stand-in where one was arranged (`ordering_notice`).
+- **Every input to the report is a fact the walk RECORDED, and the scope is not one of
+  them.** `WalkCost::of` takes `walked`, `lazy` and `stood_in`; reading any of them back
+  off the scope has been wrong in a way that reached the screen. `lazy` makes it answer
+  `None` — a lazy walk crosses the 500ms threshold on a large repository (660ms for 200
+  rows on that clone, the rest being each row's own commit read out of the pack) and was
+  handed the sorted walk's sentence, "the whole history walked and sorted" for a walk
+  that did neither, SPENDING the once-per-process latch on the one case with no lever to
+  name. `stood_in` is whether a provisional list was actually arranged, where
+  `provisional_scope(scope)` is equally true of a rebuild that runs none and so promised
+  a "best-effort pass" that never happened. Same lesson as the provisional walk below: a
+  commit-graph existing says nothing about which walk ran.
 - **`Sort::NONE` is WRONG — do not retry it.** ~150× faster and emits *parents before
   children* on git.git past row 252, which breaks the graph layout invariant. Test any
   ordering change against git.git at 700+ rows, checking parent-before-child.
