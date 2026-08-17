@@ -56,6 +56,9 @@ cp target/release/gitkay ~/.local/bin/   # install
   graphene, OpenSSL or cmake; see **Build dependencies** under CI & Release for
   why that list (inherited from the original project) matches nothing in the tree.
 - Rust deps of note: `fontdb` (system-font name → file lookup), `dirs` (XDG paths),
+  `memchr` (finding the tabs `diff::wrap` has to charge four columns for — already in
+  the tree under syntect and toml, and 10× a byte loop on the enormous single line that
+  module exists for: 699µs against 7.4ms over 8.3MB),
   `serde` + `toml` (config).
 - CLI: `gitkay [-C <dir>] [--all] [--combined] [--first-parent] [<rev>…] [-- <path>…]`,
   `gitkay --reflog [<ref>]`, `gitkay --follow [<rev>…] <path>` (`--follow` needs exactly
@@ -1063,14 +1066,30 @@ sorted drivers keep the same rows with the same rewritten parents.
   break mid-word, which for a diff is the better half of the trade: column alignment
   survives, and matching egui's word breaker closely enough to predict its row count
   is a reimplementation that would drift on the next upgrade.
-  **Widths are counted in BYTES, never characters.** In UTF-8 a character's byte
-  length is never less than the columns it occupies in a monospace font (1⇒1, 2⇒1,
-  3⇒2, 4⇒2), so a slice of `n` bytes never occupies more than `n` columns: byte
-  wrapping can only break EARLY, never overflow the pane. The failure mode is a
-  short-looking row in a CJK file, not text running under the scrollbar. What it buys
-  is that the index is built without reading a single character — one `len()`
-  comparison per line — and that a slice boundary is arithmetic plus at most three
-  bytes of walking back to a character boundary.
+  **Widths are counted in COLUMNS, and BYTES stand in for them everywhere but one.**
+  In UTF-8 a character's byte length is never less than the columns it occupies in a
+  monospace font (1⇒1, 2⇒1, 3⇒2, 4⇒2), so a slice of `n` bytes never occupies more
+  than `n` columns: byte wrapping can only break EARLY, never overflow the pane. The
+  failure mode is a short-looking row in a CJK file, not text running under the
+  scrollbar. What it buys is that the index is built without reading a single
+  character — one `len()` comparison per line — and that a slice boundary is
+  arithmetic plus at most three bytes of walking back to a character boundary.
+  **TAB is the exception and it breaks the rule the unsafe way**: one byte,
+  `TAB_COLS` (4) columns, because epaint gives `'\t'` an advance of
+  `FontTweak::tab_size × space_width` and gitkay sets no tweak. Measured by `len()` a
+  tab-indented line is recorded as fitting a row it overflows by three columns per
+  tab — and wrapping is exactly the mode with no horizontal scroll to reach the tail
+  with, so what runs off the right edge is clipped where nothing can bring it back.
+  So a line holding a tab is measured and sliced by a walk over its characters
+  (`column_rows`), which charges the tab its real width and lets a character that
+  would straddle the edge start the next row. Finding the tabs is a pass over the
+  TEXT where the rest is a pass over the LINES (~400ms/GB of short lines against 20ms
+  for their `len()`s), and two things keep it off the paths that matter: a line whose
+  worst case already fits (`len() + 3×tabs ≤ width`) takes one row with no walk, and a
+  diff proven to hold no tab records that, so `WrapIndex::rewidth` — what a window
+  drag runs every frame — skips the pass entirely. `resync_wrap_index` therefore
+  re-measures through `rewidth` and not `build` whenever it has an index to carry
+  that census over.
   The index is **sparse**: only the lines that wrap are stored (`line`, `first_row`,
   `rows`), because in an ordinary diff none do and the mapping is the identity. A
   prefix sum over all lines would be 306MB to describe a 76.5M-line diff in which
@@ -1281,7 +1300,12 @@ what stops them drifting; and `wrap`, whose two mappings are checked against a
 brute-force layout over widths that straddle the boundary in both directions, plus
 the boundary itself — a line exactly as wide as its column takes one row and one
 byte more takes two — the slices tiling a line exactly, a multi-byte line slicing on
-character boundaries, and the over-cap build falling back to the identity),
+character boundaries, the over-cap build falling back to the identity, and the two
+things TAB costs: no row of a tab-indented line drawing past the pane's columns
+(measured against an independent column count, and demonstrated to fail under a byte
+measure), and `rewidth` — which carries the tab census across a width change —
+agreeing with a full build over a tabbed diff, a tab-free one, and a line count that
+moved under it),
 `diff_cache` (LRU eviction), `diff_store`
 (codec round trips including a non-UTF-8 path and every tag, key derivation, load/save
 over real temp repos, the entry cap from both sides — the measured 76.5M-line shape

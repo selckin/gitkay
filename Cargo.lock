@@ -1495,6 +1495,7 @@ dependencies = [
  "fontdb",
  "git2",
  "log",
+ "memchr",
  "notify",
  "serde",
  "tempfile",
