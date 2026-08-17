@@ -23,7 +23,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
 
 use crate::diff::{DiffLine, FileEntry, RowSpans, file_line_ranges};
-use crate::highlight::{self, DiffBg, HighlightLines, Highlighter};
+use crate::highlight::{self, DiffBg, FileState, Highlighter};
 use crate::{
     Epoch, HIGHLIGHT_CHUNK, HIGHLIGHT_LINE_BUDGET, HIGHLIGHT_TIME_BUDGET, MAX_TREE_DEPTH,
     MAX_TREE_ENTRIES, MAX_WARM_LANGS, PREHIGHLIGHT_CHUNK, VisibleRange, config, spawn_guarded,
@@ -83,7 +83,7 @@ impl Drop for SettleOnExit {
 pub fn tokenize_range(
     hl: &Highlighter,
     lines: &[DiffLine],
-    state: &mut HighlightLines<'_>,
+    state: &mut FileState<'_>,
     start: usize,
     end: usize,
 ) -> Vec<(usize, Vec<highlight::Span>)> {

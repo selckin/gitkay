@@ -278,9 +278,14 @@ inside one — so `highlight::MAX_TOKENIZE_CHARS` (20,000) bounds what syntect s
 single line, which is what makes the clocks above mean anything: a repo of minified
 sources had a 1.5s budget overrun to 13.5s and a 20s one to 25.4s, ~750ms on ONE line.
 The tail past it takes a single flat span rather than none, because `append_body`'s span
-path emits only the spans and a body whose tail no span reaches is not drawn at all. It
-is deliberately NOT `MAX_ROW_RENDER_CHARS`, which bounds an unwrapped row's VERTICES and
-is expected to move when soft wrapping lands). The worker SHARES the rows with the UI — two `Arc` clones
+path emits only the spans and a body whose tail no span reaches is not drawn at all. The
+per-file parser state is SNAPSHOTTED across a truncated line, so what the bound costs is
+that line's colour and not the rest of the file's: advancing the state over a fragment
+leaves syntect wherever the cut landed — mid-string, mid-comment — and every later line
+of the file is then tokenized from there, which does not heal. It
+is deliberately NOT `MAX_ROW_RENDER_CHARS`, which bounds an UNWRAPPED row's VERTICES and
+is the cap soft wrapping removes — with wrapping on the whole long line does get drawn,
+a window at a time, so a tokenizing bound has to stand on its own cost argument). The worker SHARES the rows with the UI — two `Arc` clones
 and the pending-file list — where it used to be handed a copy of the whole diff, which
 measured 12.0s on the frame loop at 76.5M lines; and it REPORTS its own end
 (`HighlightMsg::Settled`, from a drop guard, so a superseded or panicking pass says so
