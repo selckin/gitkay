@@ -8369,8 +8369,19 @@ impl eframe::App for GitkApp {
                         // dragging the window edge scrolls the pane out from under
                         // whoever is resizing it. `top_line` is a frame behind,
                         // which is exactly right: it is the pre-resize position.
+                        //
+                        // The in-flight case suppresses the pending TARGET and not the
+                        // pin. What is transient there is the content, not the reader's
+                        // place in it: the pane is still drawing the previous diff (the
+                        // placeholder returned above, and a same-oid rebuild never
+                        // blanks at all), so a resize mid-load moves those rows under
+                        // whoever is resizing exactly as it does otherwise. And the pin
+                        // is a ONE-SHOT report — `resync_wrap_index` answers `true` for
+                        // the frame the mapping moved and never again — so dropping it
+                        // here does not defer the pin, it loses it, and the pane stays
+                        // where the re-wrap left it.
                         scroll_target: if diff_load_elapsed.is_some() {
-                            None
+                            rewrapped.then(|| DiffScrollTo::Line(self.diff_viewport.top_line()))
                         } else {
                             self.diff_scroll_to.take().or_else(|| {
                                 rewrapped.then(|| DiffScrollTo::Line(self.diff_viewport.top_line()))
