@@ -102,6 +102,14 @@ impl<'a> Reader<'a> {
         String::from_utf8(self.bytes()?.to_vec()).ok()
     }
 
+    /// The same run BORROWED out of the mapped entry, for a caller that is going to
+    /// copy it into its own allocation anyway. `string` would allocate a `String` for
+    /// that caller to copy out of and drop — two allocations and two copies where one
+    /// of each will do, on the per-line path the store exists to make fast.
+    fn str(&mut self) -> Option<&'a str> {
+        std::str::from_utf8(self.bytes()?).ok()
+    }
+
     /// The two `Option` levels mean different things and collapsing them would
     /// lose the distinction the whole reader is built on: the outer is "the read
     /// succeeded" (every method here is fallible), the inner is "the field was
@@ -224,7 +232,12 @@ const fn delta_from_tag(t: u8) -> Option<git2::Delta> {
 /// emphasis is computed lazily per viewport anyway. That boundary is now the type's as
 /// well as the encoder's: neither value is part of a `DiffLine`.
 fn encode(data: &DiffData) -> Vec<u8> {
-    let mut out = Vec::new();
+    // Started at the floor the caller has already computed, rather than doubling up to
+    // it from nothing: the floor is exact for the fixed fields, so this is the last
+    // reallocation the text can force rather than the twenty a large diff pays.
+    let mut out = Vec::with_capacity(
+        usize::try_from(min_encoded_bytes(data.lines.len(), data.files.len())).unwrap_or(0),
+    );
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
     put_u64(&mut out, data.max_chars as u64);
@@ -278,9 +291,11 @@ fn decode(bytes: &[u8]) -> Option<DiffData> {
     let mut lines = Vec::with_capacity(n_lines);
     for _ in 0..n_lines {
         let kind = kind_from_tag(r.u8()?)?;
-        // Into the `Arc` directly: `DiffLine::text` owns its bytes inline, so the
-        // decoded `String` would otherwise be copied and dropped a line later.
-        let text = Arc::<str>::from(r.string()?);
+        // Straight from the mapped bytes into the `Arc`: `DiffLine::text` owns its
+        // bytes inline, and `Arc<str>: From<String>` copies out of the `String` and
+        // drops it — so going through one would allocate and copy twice per line, on
+        // the path the store exists to make fast.
+        let text = Arc::<str>::from(r.str()?);
         let old_lineno = NonZeroU32::new(r.u32()?);
         let new_lineno = NonZeroU32::new(r.u32()?);
         lines.push(DiffLine {
