@@ -214,7 +214,8 @@ pub fn highlight_diff(
 /// just *below*; then one viewport *above*; then the rest downward; then the
 /// rest upward — so the next page in either scroll direction is ready before the
 /// far ends. `pending` is in file order, so position/rposition pick the nearest
-/// in each band. Falls back to the first remaining file if `lo`/`hi` are stale.
+/// in each band — `requeue_file` is what keeps it so past a preempt. Falls back to
+/// the first remaining file if `lo`/`hi` are stale.
 pub fn pick_file(
     pending: &[(usize, usize, usize)],
     lo: usize,
@@ -238,6 +239,24 @@ pub fn pick_file(
         .or_else(|| pending.iter().position(|&(fi, _, _)| fi > page_hi)) // rest below
         .or_else(|| pending.iter().rposition(|&(fi, _, _)| fi < page_lo)) // rest above
         .unwrap_or(0)
+}
+
+/// Put a preempted file back on `pending`, in file order.
+///
+/// **The order is the whole of it, and a `push` was the bug.** `pick_file` reads
+/// `pending` as sorted by file index — that is what makes `position`/`rposition` mean
+/// "the nearest file in this band" — so a file appended at the tail is answered as
+/// though it were the nearest whatever its index. The two `rposition` bands are where
+/// it shows: they take the LAST match, so a preempted file sitting at the tail beats
+/// the file actually just above the viewport, and the reader scrolling up watches a
+/// distant file colour while the one at their edge stays plain.
+///
+/// Nothing is mis-coloured or lost either way — every entry carries its own
+/// `(file, start, end)` and the loop drains until empty. What a `push` costs is
+/// exactly the priority ordering the bands exist to provide.
+pub fn requeue_file(pending: &mut Vec<(usize, usize, usize)>, file: (usize, usize, usize)) {
+    let at = pending.partition_point(|&(fi, _, _)| fi < file.0);
+    pending.insert(at, file);
 }
 
 /// True when every code line in `[start, end)` has been highlighted (`Some`).
@@ -470,13 +489,14 @@ pub fn highlight_worker(job: HighlightJob) {
                 // Preempt: if this file is no longer visible but another pending
                 // file now is, re-queue it (from its ORIGINAL start, so the
                 // resume re-derives parser state — a multi-line construct opened
-                // before `pos` would otherwise mis-colour the remainder) and
-                // switch. The already-sent prefix is harmlessly overwritten.
+                // before `pos` would otherwise mis-colour the remainder, and back
+                // into FILE order, which is what `pick_file` reads) and switch.
+                // The already-sent prefix is harmlessly overwritten.
                 let lo = priority.lo.load(Ordering::Relaxed);
                 let hi = priority.hi.load(Ordering::Relaxed);
                 let visible = |x: usize| (lo..=hi).contains(&x);
                 if !visible(fi) && pending.iter().any(|&(f, _, _)| visible(f)) {
-                    pending.push((fi, start, end));
+                    requeue_file(&mut pending, (fi, start, end));
                     break;
                 }
             }

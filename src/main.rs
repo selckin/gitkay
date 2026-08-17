@@ -8881,7 +8881,7 @@ fn main() -> eframe::Result {
 mod tests {
     use super::*;
     use crate::diff::{LineStats, RowSpans, oid_staged, oid_uncommitted};
-    use crate::diff_highlight::{file_fully_highlighted, pending_files, pick_file};
+    use crate::diff_highlight::{file_fully_highlighted, pending_files, pick_file, requeue_file};
     use crate::history::load_commits;
     use crate::test_repo::{commit_file, commit_index, commit_rename, rename_file, temp_repo};
 
@@ -9179,6 +9179,42 @@ mod tests {
         assert_eq!(picked(&[0]), 0); // rest above
         // Stale range past all files: no panic, picks something.
         assert_eq!(pick_file(&p(&[3, 4]), 9, 9, 9, 9), 1);
+    }
+
+    /// `pick_file` reads `pending` as sorted, so the preempt path has to put a file
+    /// back where it belongs rather than at the tail. The two `rposition` bands are
+    /// where a `push` shows: they take the LAST match, so the appended file answers as
+    /// the nearest one above the viewport however far away it is.
+    #[test]
+    fn a_preempted_file_is_requeued_in_file_order() {
+        let p = |fis: &[usize]| -> Vec<(usize, usize, usize)> {
+            fis.iter().map(|&fi| (fi, fi, fi + 1)).collect()
+        };
+        // File 5 was being tokenized, scrolled out of view, and is handed back.
+        let mut pending = p(&[2, 8]);
+        requeue_file(&mut pending, (5, 5, 6));
+        assert_eq!(
+            pending.iter().map(|&(fi, _, _)| fi).collect::<Vec<_>>(),
+            [2, 5, 8],
+            "a requeued file belongs at its index, not at the end"
+        );
+        // Viewport at 10..=12 with everything below it: the "page above" band must
+        // answer with 8, the file the reader is scrolling back towards. Appended, 5
+        // would sit last and win the `rposition` instead.
+        assert_eq!(pending[pick_file(&pending, 10, 12, 0, 20)].0, 8);
+
+        // Both ends: a file that belongs first, and one that belongs last.
+        let mut pending = p(&[4, 6]);
+        requeue_file(&mut pending, (1, 1, 2));
+        requeue_file(&mut pending, (9, 9, 10));
+        assert_eq!(
+            pending.iter().map(|&(fi, _, _)| fi).collect::<Vec<_>>(),
+            [1, 4, 6, 9]
+        );
+        // And an empty list is just the one file.
+        let mut pending = Vec::new();
+        requeue_file(&mut pending, (3, 3, 4));
+        assert_eq!(pending, [(3, 3, 4)]);
     }
 
     #[test]
