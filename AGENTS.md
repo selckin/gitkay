@@ -352,8 +352,16 @@ resolution, window-title suffix, help/version text), and
 **lazy per viewport**: each row's emphasis is a `RowEmphasis` slot (unset = not
 computed, as an unset `RowSpans` slot is), and `ensure_visible_word_emphasis` fills only the
 rows around the visible window — plus any pending scroll target — every frame.
-So the toggle-off path never pays the LCS, and no whole-diff pass ever runs
-anywhere, no matter the diff size; installs and the toggle just nudge a repaint).
+So the toggle-off path never pays the LCS, and no whole-diff LCS pass ever runs
+anywhere, no matter the diff size; installs and the toggle just nudge a repaint.
+**The LCS is what that bounds, and the block SCAN is a separate bound this file used
+to claim it covered.** A change block is `Del* Add*`, so an added file is ONE block
+spanning the whole file, and `emphasize_rows` must know both runs' true lengths to
+pair them — so a viewport parked inside such a block walks its full length in kind
+checks every frame. A window holding no `Del`/`Add` at all returns before the walk,
+which is the case that never needed it; bounding the rest means recording each
+block's boundaries once per diff, in the sparse shape `wrap::WrapIndex` uses, and
+that index does not exist).
 
 The big picture, ahead of the detail sections below:
 
@@ -900,7 +908,13 @@ sorted drivers keep the same rows with the same rewritten parents.
   `--follow`, `CommitInfo::follow_path`, recomputed on every rebuild) is an
   input to the cached value but is part of neither the map's key nor
   `stats_relevant`; a scope-mutating feature must classify that deliberately
-  rather than inherit this guarantee. A commit whose diff fails is recorded as
+  rather than inherit this guarantee. **`DiffCacheKey` has the same gap and it is
+  the same rule**: `diff_store::entry_key` folds `paths` in, the LRU key does not,
+  and what makes that sound is only that a plain scope's pathspec is fixed for the
+  process while a `--follow` path is a function of the oid the key already carries.
+  It is deliberately not a key field — recomputing it per key costs an O(commits)
+  `diff_paths_for` scan under `--follow`, ~54 times a dispatch, to guard a state
+  nothing can currently produce. A commit whose diff fails is recorded as
   failed, not left unknown —
   otherwise the dispatcher re-queues it every frame. `invalidate_commit_stats`
   clears the map, **the in-flight set**, and bumps the epoch: a batch running
@@ -1056,8 +1070,12 @@ sorted drivers keep the same rows with the same rewritten parents.
   and `save` an exhaustive destructure, so a fifth field fails to build in both
   directions instead of silently resetting every launch. `word_diff`,
   `line_numbers` and `wrap` sit outside that struct (they change no diff data) and
-  are still one hand-written key each — a fourth is a line in `new` and a line in
-  `save`, and forgetting either resets the tick every launch with nothing to say so.
+  have **`ToolbarViewSettings`, the same mechanism for the same reason** — two structs
+  rather than one because the split between diff-shaping and render-only is real, but
+  both `load`/`save` pairs are exhaustive, so a fourth toggle fails to build rather
+  than resetting the tick every launch with nothing to say so. They were three
+  hand-written key pairs, and the convention had already slipped: `wrap` was added
+  third and every doc comment enumerating the group still named only the first two.
   **The context width also takes the wheel**, over the whole `Context: - N +` group
   (`wheel_steps`). Four things there are load-bearing. It reads the raw `MouseWheel`
   events and **never `InputState::smooth_scroll_delta`**, which is smoothed across

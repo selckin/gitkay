@@ -32,7 +32,6 @@ use crate::diff_highlight::{ColourPass, HighlightBudget, Stopped, highlight_diff
 use crate::diff_store::MAX_ENTRY_DIVISOR;
 use crate::highlight::Highlighter;
 use crate::history::CommitInfo;
-use crate::workers::{StatsJob, StatsResult};
 use crate::{DiffCacheKey, DiffDeps, build_or_load, mem, spawn_guarded, store_of, textconv_for};
 
 /// Lines one prefetch dispatch may build before it stops and drops the rest of its
@@ -72,6 +71,18 @@ const PREFETCH_LINE_BUDGET_DIVISOR: usize = 2;
 /// so no line count can stand in for a clock. `Limits::highlight_budget` is the actual
 /// bound; this one is what keeps the memory and the pointless work down.
 const PREFETCH_MAX_HIGHLIGHT_LINES: usize = 10_000;
+/// How far past a visible edge a row is still worth **fully colouring**.
+///
+/// Not the width of the warmed band — `warm_band` is that, and it reaches a full window
+/// each way. This is the boundary between the two `WarmDepth`s: roughly an arrow-key
+/// step's worth of rows, which is what it was always really sized for. Beyond it a row
+/// is cached un-highlighted, which is what makes the wide band affordable.
+///
+/// Here rather than at the root, with the other `PREFETCH_*` bounds and the one
+/// function that enforces it. Threaded in as a parameter it had a single production
+/// caller passing a single value and five tests passing the same literal, so nothing
+/// exercised the knob it cost.
+const PREFETCH_MARGIN: usize = 8;
 /// How long a speculative colour pass may run. See `Limits::highlight_budget` for the
 /// measurement that forced it and why a line cap could not.
 ///
@@ -300,8 +311,8 @@ pub fn prefetch_targets(
     commits: &[CommitInfo],
     selected: usize,
     view: &std::ops::Range<usize>,
-    near: usize,
 ) -> Vec<(git2::Oid, WarmDepth)> {
+    let near = PREFETCH_MARGIN;
     // An empty view has no edge to clamp to, and `warm_band` has already made the
     // band empty, so this value is never read.
     let anchor = if view.is_empty() {
@@ -557,6 +568,40 @@ impl PrefetchBudget {
 /// speculative, priority-ordered — and because they compete for the same cores. Two
 /// pools could not express that the numbers on screen outrank a diff nobody has
 /// clicked; one coordinator does.
+/// One commit's finished stats, worker → UI. `stats: None` means the diff could
+/// not be computed — recorded as a failure rather than left unknown, or the
+/// dispatcher would ask again every frame.
+pub struct StatsResult {
+    pub epoch: u64,
+    pub oid: git2::Oid,
+    pub stats: Option<CommitStats>,
+}
+
+/// One row's commit-list stats to compute.
+///
+/// Per row, not per batch. The batch was an artefact of the single dedicated worker
+/// this used to have: it made one slow commit block every row behind it, and gated
+/// re-dispatch until the whole batch landed, so scrolling past a large commit left the
+/// following small ones blank. As a queue item among others, a slow row occupies one
+/// worker and nothing else.
+///
+/// Here rather than in `workers`, beside `Job::Stats` and `run_stats_job` that are its
+/// only readers — the rule `WarmResult`/`WarmFacts` follow. It was left behind by the
+/// retired dedicated `gitkay-stats` worker, which made `prefetch` depend on `workers`
+/// for a pair of types `workers` never mentions, against a module boundary whose whole
+/// content is that a foreground job is one somebody is waiting on.
+pub struct StatsJob {
+    /// Per-oid scope: under `--follow` each commit is asked about the name the file
+    /// had AT that commit, matching the diff the pane would show; the range row is
+    /// asked about its endpoints.
+    pub scope: RowScope,
+    pub settings: DiffSettings,
+    pub want: StatsWant,
+    /// The `stats_epoch` this was queued under; a result from before an invalidation
+    /// is dropped on arrival.
+    pub epoch: u64,
+}
+
 enum Job {
     /// The commit-list `+`/`-` column for one row. On screen NOW, so it outranks every
     /// speculative diff.
@@ -1053,7 +1098,7 @@ impl Coordinator {
         // it is the bound that stops a stampede.
         let usable = std::cell::OnceCell::new();
         while let Some(&id) = self.heavy_idle.last() {
-            let Some((job, need)) = self.next_heavy(&usable) else {
+            let Some((job, need)) = self.next_heavy(id, &usable) else {
                 break;
             };
             self.heavy_idle.pop();
@@ -1122,7 +1167,17 @@ impl Coordinator {
     /// whenever a worker reports, i.e. precisely when memory frees. That replaced a
     /// requeue-and-park loop with a retry interval; there is nothing to park on when
     /// the queue is the coordinator's own field.
-    fn next_heavy(&mut self, usable: &std::cell::OnceCell<Option<u64>>) -> Option<(Job, u64)> {
+    ///
+    /// `id` is the idle heavy worker this row would go to. Taken as a parameter because
+    /// the caller has already read it off `heavy_idle` to drive its loop and does not
+    /// pop until this returns — read back here, it was the same lookup twice with an
+    /// unreachable `None` branch behind it, and "only called for an idle heavy worker"
+    /// was a property of the loop's shape rather than of the signature.
+    fn next_heavy(
+        &mut self,
+        id: usize,
+        usable: &std::cell::OnceCell<Option<u64>>,
+    ) -> Option<(Job, u64)> {
         loop {
             let front = self.deferred.front()?;
             let (need, oid) = (Self::heavy_need(front), front.key.oid);
@@ -1149,7 +1204,6 @@ impl Coordinator {
             }
             self.reported_heavy_full = None;
             let target = self.deferred.pop_front()?;
-            let id = *self.heavy_idle.last()?;
             if let Some(job) = self.claim_warm(id, target) {
                 return Some((job, need));
             }
@@ -1525,7 +1579,7 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
     // `load_stats`, not `load`: this wants three integers off the entry's file table,
     // and decoding the rows to reach them meant an `Arc<str>` per line — materialised
     // and dropped, 400k of them on a 400k-line entry. Same key, same numbers.
-    if job.want == StatsWant::FilesAndLines
+    if job.want.needs_line_counts()
         && let Some(store) = store_of(&ctx.deps.store)
         && let Some(stats) = store.load_stats(&job.scope, job.settings)
     {
@@ -1546,7 +1600,7 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
     //
     let t = std::time::Instant::now();
     let tc = textconv_for(&ctx.deps.textconv, job.settings);
-    if job.want == StatsWant::FilesAndLines
+    if job.want.needs_line_counts()
         && let Ok(measured) = diff::measured_row_diff(repo, &job.scope, job.settings, tc)
     {
         let cost = measured.cost;
@@ -1616,7 +1670,7 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
         // working tree changed enough to move that row's content hash. With the
         // resolution failed the pane is built all-raw too, so the raw counts this now
         // computes are the ones the sidebar shows.
-        let withheld = cost.is_driven() && job.want == StatsWant::FilesAndLines;
+        let withheld = cost.is_driven() && job.want.needs_line_counts();
         let want = if withheld {
             StatsWant::FilesOnly
         } else {
@@ -1676,6 +1730,17 @@ fn send_stats(ctx: &WorkerCtx, job: &StatsJob, stats: Option<CommitStats>) {
 fn send_stats_result(ctx: &WorkerCtx, epoch: u64, oid: git2::Oid, stats: Option<CommitStats>) {
     if ctx.stats_tx.send(StatsResult { epoch, oid, stats }).is_ok() {
         ctx.ctx.request_repaint();
+    }
+}
+
+/// The column's numbers for a warmed row, summed off the diff in hand.
+///
+/// Real commits only, and the guard lives HERE rather than at each exit that sends
+/// them: `stats_from_data` is what `cache_diff` derives the column from and it guards
+/// the same way, so an exit added later cannot send without it.
+fn send_row_stats(ctx: &WorkerCtx, epoch: u64, oid: git2::Oid, data: &DiffData) {
+    if is_real_commit(oid) {
+        send_stats_result(ctx, epoch, oid, Some(diff::stats_from_data(data)));
     }
 }
 
@@ -1832,11 +1897,8 @@ fn warm_row(
         // diff to supply the rest — and that diff is about to be dropped uncached, so
         // `cache_diff` never harvests it. They are free here, being a sum over the
         // `FileEntry` list already in hand, and this is the exact moment the gap
-        // becomes knowable. Real commits only: `stats_from_data` is what `cache_diff`
-        // derives the column from, and it guards the same way.
-        if is_real_commit(oid) {
-            send_stats_result(ctx, stats_epoch, oid, Some(diff::stats_from_data(&data)));
-        }
+        // becomes knowable.
+        send_row_stats(ctx, stats_epoch, oid, &data);
         return Outcome::Oversized {
             key: target.key,
             lines,
@@ -1904,9 +1966,7 @@ fn warm_row(
     // here as well makes it the rule rather than the exception, and costs a sum and a
     // channel send. `cache_diff` still harvests when the result lands: the values are
     // identical, so the later one is a no-op, and it is what covers the foreground.
-    if is_real_commit(oid) {
-        send_stats_result(ctx, stats_epoch, oid, Some(diff::stats_from_data(&data)));
-    }
+    send_row_stats(ctx, stats_epoch, oid, &data);
     let colour = target.depth == WarmDepth::Highlighted && lines <= PREFETCH_MAX_HIGHLIGHT_LINES;
     let colour_start = std::time::Instant::now();
     // Bounded in TIME as well as in lines, because the two measure different things and
@@ -2068,6 +2128,16 @@ mod tests {
     /// a struct nothing else can touch, which is the point of the design.
     fn test_coord(workers: usize) -> (Coordinator, Vec<mpsc::Receiver<Job>>) {
         test_coord_n(workers, 1)
+    }
+
+    /// The heavy worker `dispatch` would hand the next row to. `next_heavy` is called
+    /// only for an idle one, and its loop reads that id before popping; a test driving
+    /// it directly states the same precondition through here.
+    fn idle_heavy(coord: &Coordinator) -> usize {
+        *coord
+            .heavy_idle
+            .last()
+            .expect("the heavy lane has an idle worker")
     }
 
     /// As `test_coord`, with an explicit heavy-lane width.
@@ -2658,7 +2728,11 @@ mod tests {
         let (mut coord, _rxs) = test_coord_n(1, 2);
         let untouched = std::cell::OnceCell::new();
         coord.deferred.push_back(measured_target(1, 1_000));
-        assert!(coord.next_heavy(&untouched).is_some(), "idle lane admits");
+        let id = idle_heavy(&coord);
+        assert!(
+            coord.next_heavy(id, &untouched).is_some(),
+            "idle lane admits"
+        );
         assert!(
             untouched.get().is_none(),
             "and did so without reading anything"
@@ -2671,8 +2745,9 @@ mod tests {
         coord.heavy_outstanding.insert(1, 1_000);
         coord.deferred.push_back(measured_target(2, 1_000)); // need = 2_000
         let seeded = std::cell::OnceCell::from(Some(500));
+        let id = idle_heavy(&coord);
         assert!(
-            coord.next_heavy(&seeded).is_none(),
+            coord.next_heavy(id, &seeded).is_none(),
             "declined against the reading it was given"
         );
     }
@@ -2699,7 +2774,8 @@ mod tests {
     fn an_idle_heavy_lane_admits_a_row_of_any_size() {
         let (mut coord, _rxs) = test_coord(1);
         coord.deferred.push_back(measured_target(1, u64::MAX / 2));
-        assert!(coord.next_heavy(&memory_reading()).is_some());
+        let id = idle_heavy(&coord);
+        assert!(coord.next_heavy(id, &memory_reading()).is_some());
     }
 
     /// A row that will not fit stays exactly where it is rather than being popped and
@@ -2711,7 +2787,11 @@ mod tests {
         let (mut coord, _rxs) = test_coord_n(1, 2);
         coord.heavy_outstanding.insert(1, 1_000); // the lane is loaded
         coord.deferred.push_back(measured_target(1, u64::MAX / 2));
-        assert!(coord.next_heavy(&memory_reading()).is_none(), "declined");
+        let id = idle_heavy(&coord);
+        assert!(
+            coord.next_heavy(id, &memory_reading()).is_none(),
+            "declined"
+        );
         assert_eq!(coord.deferred.len(), 1, "and kept, not dropped");
     }
 
@@ -2870,7 +2950,7 @@ mod tests {
         let commits: Vec<CommitInfo> = (0..9).map(|n| ci(DiffSource::Commit(oid(n)))).collect();
         // selected = 4, all 9 rows visible. Ordered by |i-4|; on a tie the row below
         // (larger index) first: 5,3, 6,2, 7,1, 8,0. Uncapped — the band is the bound.
-        let got: Vec<git2::Oid> = prefetch_targets(&commits, 4, &(0..9), 8)
+        let got: Vec<git2::Oid> = prefetch_targets(&commits, 4, &(0..9))
             .into_iter()
             .map(|(oid, _)| oid)
             .collect();
@@ -2894,7 +2974,7 @@ mod tests {
         let commits: Vec<CommitInfo> = (0..60).map(|n| ci(DiffSource::Commit(oid(n)))).collect();
         // A 10-row view at 20..30 ⇒ band 10..40. Rows outside it are never targets,
         // however close to the selection they would be under the old 8-row margin.
-        let got: Vec<git2::Oid> = prefetch_targets(&commits, 25, &(20..30), 8)
+        let got: Vec<git2::Oid> = prefetch_targets(&commits, 25, &(20..30))
             .into_iter()
             .map(|(oid, _)| oid)
             .collect();
@@ -2915,7 +2995,7 @@ mod tests {
     fn prefetch_targets_highlights_only_within_the_near_margin() {
         let commits: Vec<CommitInfo> = (0..60).map(|n| ci(DiffSource::Commit(oid(n)))).collect();
         let depth = |target: u32| {
-            prefetch_targets(&commits, 25, &(20..30), 8)
+            prefetch_targets(&commits, 25, &(20..30))
                 .into_iter()
                 .find(|(o, _)| *o == oid(target))
                 .map(|(_, d)| d)
@@ -2944,7 +3024,7 @@ mod tests {
     fn prefetch_targets_anchor_clamps_an_offscreen_selection_into_the_view() {
         let commits: Vec<CommitInfo> = (0..60).map(|n| ci(DiffSource::Commit(oid(n)))).collect();
         let first = |sel: usize| {
-            prefetch_targets(&commits, sel, &(20..30), 8)
+            prefetch_targets(&commits, sel, &(20..30))
                 .into_iter()
                 .map(|(oid, _)| oid)
                 .next()
@@ -2966,7 +3046,7 @@ mod tests {
         // selected = 2 (first real). The virtual rows at 0 and 1 are never warmed:
         // their cache key is content-hashed after the diff exists, so a prefetch
         // could not key them correctly.
-        let got: Vec<git2::Oid> = prefetch_targets(&commits, 2, &(0..7), 8)
+        let got: Vec<git2::Oid> = prefetch_targets(&commits, 2, &(0..7))
             .into_iter()
             .map(|(oid, _)| oid)
             .collect();
@@ -3363,8 +3443,9 @@ mod tests {
             "a heavy row must wait for its own lane, not occupy a worker the next \
              band needs"
         );
+        let id = idle_heavy(&coord);
         assert!(
-            coord.next_heavy(&memory_reading()).is_some(),
+            coord.next_heavy(id, &memory_reading()).is_some(),
             "and the heavy lane does take it"
         );
     }

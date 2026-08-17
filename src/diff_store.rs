@@ -832,14 +832,24 @@ impl DiffStore {
         self.root.join(key.to_string())
     }
 
-    /// A stored diff, or `None` for anything that is not a readable current
-    /// entry. A corrupt file is deleted on the way out: leaving it would fail
-    /// every future lookup for that key forever.
-    pub fn load(&self, scope: &RowScope, settings: DiffSettings) -> Option<DiffData> {
+    /// Read an entry and hand its bytes to `decode`, or `None` for anything that is
+    /// not a readable current entry.
+    ///
+    /// Both public readers go through here so the two policies below are stated once.
+    /// A corrupt file is deleted on the way out: leaving it would fail every future
+    /// lookup for that key forever. And every hit is touched, whichever reader served
+    /// it — a row served only through the commit-list column still counts as USED and
+    /// is not pruned out from under the pane that would want it next.
+    fn load_decoded<T>(
+        &self,
+        scope: &RowScope,
+        settings: DiffSettings,
+        decode: impl FnOnce(&[u8]) -> Option<T>,
+    ) -> Option<T> {
         let key = self.key(scope, settings)?;
         let path = self.entry_path(key);
         let bytes = std::fs::read(&path).ok()?;
-        let Some(data) = decode(&bytes) else {
+        let Some(value) = decode(&bytes) else {
             log::debug!("diff store: dropping unreadable entry {key}");
             let _ = std::fs::remove_file(&path);
             return None;
@@ -848,26 +858,20 @@ impl DiffStore {
         // read-only mount, say — is ignored on purpose: degrading a hit into a
         // multi-second rebuild over bookkeeping is the wrong trade.
         let _ = touch(&path);
-        Some(data)
+        Some(value)
+    }
+
+    /// A stored diff, or `None` for anything that is not a readable current entry.
+    pub fn load(&self, scope: &RowScope, settings: DiffSettings) -> Option<DiffData> {
+        self.load_decoded(scope, settings, decode)
     }
 
     /// The commit-list column's numbers for a stored diff, without decoding its rows.
     ///
-    /// `load`'s shape exactly — same key, same unreadable-entry cleanup, same touch, so
-    /// a row served only through this column still counts as USED and is not pruned out
-    /// from under the pane that would want it next. What differs is that it stops after
-    /// the file table; see `decode_stats`.
+    /// `load`'s shape exactly, by construction rather than by convention — what differs
+    /// is only that it stops after the file table; see `decode_stats`.
     pub fn load_stats(&self, scope: &RowScope, settings: DiffSettings) -> Option<CommitStats> {
-        let key = self.key(scope, settings)?;
-        let path = self.entry_path(key);
-        let bytes = std::fs::read(&path).ok()?;
-        let Some(stats) = decode_stats(&bytes) else {
-            log::debug!("diff store: dropping unreadable entry {key}");
-            let _ = std::fs::remove_file(&path);
-            return None;
-        };
-        let _ = touch(&path);
-        Some(stats)
+        self.load_decoded(scope, settings, decode_stats)
     }
 
     /// Persist a diff. Silent no-op for a row with no key (the virtual rows), and for

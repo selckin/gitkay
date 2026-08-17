@@ -740,25 +740,32 @@ impl<'a> FileState<'a> {
 /// wherever the cut landed and recolour every line after it in the file.
 pub const MAX_TOKENIZE_CHARS: usize = 20_000;
 
-/// `code` split into the part syntect sees and whether anything was held back.
+/// The byte offset `max` CHARACTERS into `s`, or `None` when it has no more than that
+/// many — which is every line of every ordinary file.
 ///
-/// By CHARACTERS, so a multi-byte one is never split — a byte cut would panic on the
-/// slice, which would be this bound crashing the pass it exists to bound.
+/// By characters, so a multi-byte one is never split: a byte cut would panic on the
+/// slice, which would be a bound crashing the pass it exists to bound.
 ///
-/// `max` is a parameter so the boundary cases are testable without feeding syntect
-/// `MAX_TOKENIZE_CHARS` of anything: the arithmetic is what goes wrong here, and
-/// proving it should not cost seconds of tokenizing per assertion.
-fn split_for_tokenizing(code: &str, max: usize) -> (&str, bool) {
-    // A character is never fewer bytes than one, so a line under the cap in BYTES is
-    // under it in characters and needs no walk — which is every line of every ordinary
-    // file, this being called on each of them. Only a line past the cap pays for
-    // finding the boundary.
-    if code.len() <= max {
-        return (code, false);
+/// Two bounds cut a string this way — `MAX_TOKENIZE_CHARS` here and
+/// `MAX_ROW_RENDER_CHARS` in the renderer — and they keep their own numbers while
+/// sharing the walk, because what is easy to get wrong is the arithmetic and not the
+/// size. `max` is a parameter for the same reason: the boundary cases are then testable
+/// without feeding syntect `MAX_TOKENIZE_CHARS` of anything.
+///
+/// The `len()` test is what keeps it off the hot paths. A character is never fewer
+/// bytes than one, so a string under the cap in BYTES is under it in characters and
+/// needs no walk at all; only one past the cap pays for finding the boundary, and then
+/// only up to it rather than over the whole 8M-character line.
+pub fn char_cut(s: &str, max: usize) -> Option<usize> {
+    if s.len() <= max {
+        return None;
     }
-    code.char_indices()
-        .nth(max)
-        .map_or((code, false), |(at, _)| (&code[..at], true))
+    s.char_indices().nth(max).map(|(at, _)| at)
+}
+
+/// `code` split into the part syntect sees and whether anything was held back.
+fn split_for_tokenizing(code: &str, max: usize) -> (&str, bool) {
+    char_cut(code, max).map_or((code, false), |at| (&code[..at], true))
 }
 
 #[cfg(test)]

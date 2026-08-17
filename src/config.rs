@@ -279,9 +279,15 @@ pub struct CacheSection {
     pub(crate) min_build_ms: u64,
 }
 
+/// Between the two modes described on `min_build_ms`, so it separates them the way
+/// any threshold in that gap would. Named because `default_template` documents it.
+const DEFAULT_MIN_BUILD_MS: u64 = 1000;
+
 impl Default for CacheSection {
     fn default() -> Self {
-        Self { min_build_ms: 1000 }
+        Self {
+            min_build_ms: DEFAULT_MIN_BUILD_MS,
+        }
     }
 }
 
@@ -507,7 +513,7 @@ fn default_template() -> String {
          # Width of the author column, in characters. Fixed rather than\n\
          # per-row, so the sha and the counts line up down the list; longer\n\
          # names are elided.\n\
-         # author_chars = 20\n\
+         # author_chars = {author_chars}\n\
          # Date column: \"absolute\" (2026-07-06 09:49) or \"relative\"\n\
          # (\"3 days ago\", worded as git log --date=relative does).\n\
          # date = \"absolute\"\n\
@@ -517,7 +523,9 @@ fn default_template() -> String {
          # blobs are huge but whose diff is small is not rebuilt every launch.\n\
          # Store a diff once building it took at least this long, in\n\
          # milliseconds. 0 stores everything; a very large value stores nothing.\n\
-         # min_build_ms = 1000\n",
+         # min_build_ms = {min_build_ms}\n",
+        author_chars = DEFAULT_AUTHOR_CHARS,
+        min_build_ms = DEFAULT_MIN_BUILD_MS,
         default_theme = crate::highlight::DEFAULT_THEME_SLUG,
         added_band = hex(crate::highlight::DEFAULT_ADDED_BAND_DARK),
         deleted_band = hex(crate::highlight::DEFAULT_DELETED_BAND_DARK),

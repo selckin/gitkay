@@ -559,6 +559,10 @@ pub(super) fn emit_converted(
     // conversion or REWINDS to here: falling back to the raw body without rewinding
     // would print it under a half-written converted patch. See the `printed` error arm.
     let rewind = (lines.mark(), files[fi].additions, files[fi].deletions);
+    // Whether this call is the one that gives the entry its body. Under `OnScreen` the
+    // real `diff --git` header was printed before we were called and `diff_line_idx`
+    // already points at it, so a rewind here must leave it alone.
+    let synthesized = matches!(header, HeaderOf::Missing { .. });
     files[fi].is_converted = true;
     match header {
         HeaderOf::OnScreen { prefixes } if delta.flags().contains(git2::DiffFlags::BINARY) => {
@@ -567,7 +571,17 @@ pub(super) fn emit_converted(
             }
         }
         HeaderOf::OnScreen { .. } => {}
-        HeaderOf::Missing { prefixes } => lines.extend(swept_header_lines(delta, prefixes)),
+        HeaderOf::Missing { prefixes } => {
+            // Set HERE, where the body actually begins, rather than by the sweep before
+            // it calls: `diff_line_idx` answers the same question the rewind below does
+            // — did this write rows — and as a caller's job it meant knowing which of
+            // six early exits wrote none and clearing it again for each. A seventh would
+            // have left a stale `Some` on a bodyless entry, and `file_line_starts` sorts
+            // on it, so every file jump, hunk click and page-step past it would land on
+            // whatever row happened to be there.
+            files[fi].diff_line_idx = Some(lines.len());
+            lines.extend(swept_header_lines(delta, prefixes));
+        }
     }
     // One buffer for this whole converted patch, for the reason `push_patch_line`
     // states: it runs per row, and a converted archive is as long as any other file.
@@ -597,6 +611,9 @@ pub(super) fn emit_converted(
         lines.rewind(rewind.0);
         files[fi].is_converted = false;
         (files[fi].additions, files[fi].deletions) = (rewind.1, rewind.2);
+        if synthesized {
+            files[fi].diff_line_idx = None;
+        }
         return Substitution::Failed;
     }
     Substitution::Done

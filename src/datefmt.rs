@@ -64,6 +64,10 @@ pub const RELATIVE_DATE_SAMPLE: &str = "4 years, 11 months ago";
 /// every rung allocate twice — once for the phrase, once to embed it in
 /// `"… ago"` — for a string built per visible row per frame; same reasoning as
 /// `compact_count_into` in `main.rs`.
+///
+/// `diffstat` has its own copy over `usize`, deliberately: sharing this one means a
+/// generic with three bounds to carry `if n == 1`, which is more to read than the
+/// three lines it removes.
 const fn plural(n: i64) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
