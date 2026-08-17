@@ -1218,7 +1218,12 @@ sorted drivers keep the same rows with the same rewritten parents.
   above was caught the second time.
   **Two coordinate systems now exist and the split is the whole risk of the
   feature**, not the wrapping. `DiffViewport` publishes both (`top_line`/`top_row`,
-  `rows`/`lines`) because the consumers want different ones: everything that indexes
+  `rows`/`lines`) because the consumers want different ones — and `store` takes the
+  render's whole `VisibleDiff` rather than four positional `usize`s, since this is the
+  one place the two systems meet and `rows`/`lines` mean different things on either
+  side of the call. `top_line` is not carried on that observation: it is `lines.start`
+  by construction, and a second field would have to be kept equal to it by hand.
+  Everything that indexes
   `diff_lines` — the anchor, the word-diff window, the highlight window, the sidebar's
   file tracking, `scroll_memory` — wants LINES, and only the half-screen Space step
   wants visual rows. `DiffScrollTo` carries that distinction into the pending target:

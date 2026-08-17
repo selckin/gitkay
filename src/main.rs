@@ -209,11 +209,16 @@ impl DiffViewport {
     }
 
     /// Publish this frame's position.
-    fn store(&self, top_line: usize, top_row: usize, rows: usize, lines: usize) {
-        self.top_line.store(top_line, Ordering::Relaxed);
-        self.top_row.store(top_row, Ordering::Relaxed);
-        self.rows.store(rows, Ordering::Relaxed);
-        self.lines.store(lines, Ordering::Relaxed);
+    ///
+    /// Takes the observation itself rather than four bare `usize`s: this is the one
+    /// place the two coordinate systems meet, and `rows`/`lines` mean different things
+    /// on either side of the call, so a positional list is exactly where they could be
+    /// swapped without a type error.
+    fn store(&self, v: &VisibleDiff) {
+        self.top_line.store(v.lines.start, Ordering::Relaxed);
+        self.top_row.store(v.top_row, Ordering::Relaxed);
+        self.rows.store(v.rows, Ordering::Relaxed);
+        self.lines.store(v.lines.len(), Ordering::Relaxed);
     }
 
     /// Put the pane back at the top — what a freshly installed diff needs, since
@@ -1388,8 +1393,6 @@ struct DiffView<'a> {
 struct VisibleDiff {
     /// The logical lines on screen — for the highlight worker's file window.
     lines: std::ops::Range<usize>,
-    /// The line the top row belongs to (a continuation row still names its line).
-    top_line: usize,
     /// The visual row at the top of the viewport, sub-row included.
     top_row: usize,
     /// The viewport's height in visual rows — the true screenful even where the
@@ -1990,7 +1993,6 @@ fn show_virtualized_diff(
         let real = rows.start.min(n_rows.saturating_sub(1))..rows.end.min(n_rows);
         on_visible(VisibleDiff {
             lines: wrap.map_or_else(|| real.clone(), |w| w.lines_of_rows(real.clone())),
-            top_line: line_of(real.start).0,
             top_row: real.start,
             rows: viewport_rows,
         });
@@ -8445,7 +8447,7 @@ impl eframe::App for GitkApp {
                         &font_id,
                         diff_view,
                         |v| {
-                            viewport.store(v.top_line, v.top_row, v.rows, v.lines.len());
+                            viewport.store(&v);
                             // Tell the background worker which files are on screen so it
                             // tokenizes those first, plus one viewport (in lines)
                             // above/below for read-ahead. No-op with syntax off — there
@@ -9702,7 +9704,7 @@ mod tests {
                         last_top_anchor: None,
                         menu_salt: 0,
                     },
-                    |v| seen = Some((v.top_line, v.top_row, v.lines)),
+                    |v| seen = Some((v.lines.start, v.top_row, v.lines)),
                     |line, sub| {
                         asked.push((line, sub));
                         (egui::text::LayoutJob::default(), None, egui::Color32::WHITE)
