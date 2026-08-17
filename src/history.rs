@@ -1220,12 +1220,14 @@ pub fn load_commits_inner(
         let _notice = arm_slow_walk_notice(repo, scope, SLOW_FILTER_NOTICE);
         let filtered = lazy_filtered_walk(repo, scope, max, &ref_map)
             .or_else(|| sorted_filtered_walk(repo, scope, max, &ref_map));
-        let examined = filtered.as_ref().map_or(0, |f| f.walked);
-        if let Some(filtered) = filtered {
+        let examined = if let Some(filtered) = filtered {
             tip_answer = filtered.tip;
             nearest_map = Some(filtered.nearest);
             real = filtered.kept;
-        }
+            filtered.walked
+        } else {
+            0
+        };
         // Recorded even when neither driver answered (an unborn HEAD under a pathspec),
         // because the branch is what the reader was waiting on either way: leaving it
         // unrecorded there had the early notice blame the path filter and the report
