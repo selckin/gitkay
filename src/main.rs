@@ -2023,8 +2023,15 @@ fn show_virtualized_diff(
             // false NEGATIVE: a menu that fails to attach. Never a menu attached to
             // the wrong row, and so never a wrong write.
             // By LINE: a menu acts on a file and a hunk, neither of which a wrapped
-            // line's second row means anything different for. The widget ID below
-            // still keys on the VISUAL row, so two rows of one line are two widgets.
+            // line's second row means anything different for. The widget ID below is
+            // `(line, sub)` for the same reason — `sub` only so two rows of one line
+            // are two widgets — and NOT the visual row `i`, which names a different
+            // line after every re-wrap. An open menu keyed on `i` would silently
+            // re-point at whatever line landed on that row when the window was
+            // resized; keyed on the line, the row it was opened on either survives
+            // the re-wrap or stops being drawn, and egui closes a popup whose owner
+            // stops calling in. Unwrapped, `line == i` and `sub == 0`, so this is the
+            // id the pane has always used.
             if let Some(file_idx) = row_menu_target(line)
                 && (any_menu_open
                     || (pointer.is_some_and(|p| rect.contains(p))
@@ -2037,7 +2044,7 @@ fn show_virtualized_diff(
                 // the sense exists only so `context_menu` can see a right-click.
                 let resp = ui.interact(
                     rect,
-                    ui.id().with(("diff_row", menu_salt, i)),
+                    ui.id().with(("diff_row", menu_salt, line, sub)),
                     egui::Sense::CLICK,
                 );
                 resp.context_menu(|ui| row_menu(ui, line, file_idx));
