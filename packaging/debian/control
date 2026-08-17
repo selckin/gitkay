@@ -14,8 +14,10 @@ Architecture: any
 # cleanly on a minimal desktop and then aborts at launch on
 # dlopen("libxkbcommon.so.0"). Wayland + EGL + xkbcommon are required; the X11
 # set is the fallback backend, so it is Recommends and a Wayland-only system is
-# not made to pull it in. The release workflow's binary repack computes the same
-# split — keep the two lists in step.
+# not made to pull it in. packaging/build-deb.sh READS these two fields into the
+# binary repack it builds for the release workflow (dropping the substvars,
+# which it computes itself), so this is the only place they are stated; it
+# refuses to build if it reads none.
 Depends: ${shlibs:Depends}, ${misc:Depends},
  libwayland-client0, libwayland-egl1, libxkbcommon0, libegl1
 Recommends: libx11-6, libx11-xcb1, libxcb1, libxcursor1, libxi6,

@@ -1,1 +1,3 @@
 /target
+# packaging/build-{rpm,deb}.sh default here, so a local repack leaves no trace
+/dist

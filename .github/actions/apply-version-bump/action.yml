@@ -1,0 +1,31 @@
+name: Apply the pending version bump
+description: >
+  Reconstruct the release tree on a runner that checked out the PRE-bump sha.
+  Nothing is pushed until every build has passed, so on the dispatch path the
+  bump exists only as the patch the version job computed over that exact sha —
+  every job that compiles or packages has to apply it first. Stated once here
+  rather than once per job: three copies is three chances for a job to be added
+  that builds the version the release is moving off, and that failure ships a
+  package rather than failing.
+
+inputs:
+  sha:
+    description: The sha this workspace was checked out at. Named in the error only.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Fetch the pending version bump
+      uses: actions/download-artifact@v8
+      with:
+        name: version-bump
+
+    - name: Apply the pending version bump
+      shell: bash
+      env:
+        SHA: ${{ inputs.sha }}
+      run: |
+        git apply version-bump.patch \
+          || { echo "::error::the version bump does not apply to $SHA"; exit 1; }
+        rm -f version-bump.patch

@@ -24,8 +24,9 @@ BuildRequires:  pkg-config
 # (libwayland-client on Fedora, libwayland-client0 on openSUSE) while every rpm
 # distro's auto-PROVIDES emits the soname. Wayland + EGL + xkbcommon are required;
 # the X11 set is the fallback backend, so it is Recommends and a Wayland-only
-# system is not made to pull it in. The release workflow's binary repack carries
-# the same split — keep the two lists in step.
+# system is not made to pull it in. packaging/build-rpm.sh READS these lines
+# into the binary repack it builds for the release workflow, so this is the only
+# place they are stated; it refuses to build if it reads none.
 #
 # The `()(64bit)` suffix is part of the provide's NAME on a 64-bit build (a
 # 32-bit one provides the bare soname, a different string), so it cannot be
