@@ -567,7 +567,14 @@ The invariants:
   measured 12.8s) and costs ~300ns on a commit that only modifies files. So the
   dimension is `total_blob_bytes`, not `deltas` — an earlier version of this file
   guessed the opposite from `rename_limit`, which bounds the file count and not the
-  bytes. `scoped_diff` logs the split past `SLOW_DETECT_SIMILAR`.
+  bytes. `scoped_diff` logs the split past `SLOW_DETECT_SIMILAR`. **One type carries
+  that measurement both ways**: `RowCostProbe` is built from the odb headers *before* a
+  build (`probe_deltas`, what the scheduler decides on) and read back off the pass's own
+  `DiffFile::size`s *after* one (`from_built_sizes`, what the slow-build report and its
+  `parallel_ceiling` print), with `charge_delta` the one place the three dimensions are
+  accumulated. `max_delta_bytes` counts a DELTA and not one side, because a delta is
+  what xdiff holds at once and what a parallel patch pass could never split — it is the
+  floor the ceiling is taken against.
 - **A commit oid does NOT determine its diff.** The persistent store's `StoreContext`
   folds in the git dir, an attributes fingerprint, the diff-affecting config and the
   crate version. That list has been wrong three times — extend it, don't trust it.
