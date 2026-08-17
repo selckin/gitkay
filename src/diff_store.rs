@@ -831,14 +831,14 @@ impl DiffStore {
         if over_entry_cap(
             oid,
             min_encoded_bytes(data.lines.len(), data.files.len()),
-            false,
+            "at least",
         ) {
             return false;
         }
         let bytes = encode(data);
         // Then exactly, for what the floor lets through: a few very long lines encode
         // to far more than their count suggests.
-        if over_entry_cap(oid, bytes.len() as u64, true) {
+        if over_entry_cap(oid, bytes.len() as u64, "exactly") {
             return false;
         }
         if let Err(e) = self.write_atomic(key, &bytes) {
@@ -940,16 +940,21 @@ const fn min_encoded_bytes(lines: usize, files: usize) -> u64 {
 }
 
 /// Whether an entry of this size is too large for the store to keep, saying so once
-/// when it is. `measured` distinguishes the floor from the real size in the log: a
-/// reader wondering why one commit rebuilds on every visit needs to know which of the
-/// two checks refused it.
-fn over_entry_cap(oid: git2::Oid, bytes: u64, measured: bool) -> bool {
+/// when it is.
+///
+/// `how` is how `bytes` was arrived at — `"at least"` for the pre-encode floor,
+/// `"exactly"` for the encoded size — and it goes in the log because a reader
+/// wondering why one commit rebuilds on every visit needs to know which of the two
+/// checks refused it. The caller says the word rather than setting a flag this
+/// function turns back into one: both call sites then read as the sentence they
+/// produce.
+fn over_entry_cap(oid: git2::Oid, bytes: u64, how: &str) -> bool {
     if bytes <= MAX_ENTRY_BYTES {
         return false;
     }
     log::debug!(
-        "diff store: not saving {oid} — {}{bytes} bytes, over the {MAX_ENTRY_BYTES}-byte entry cap",
-        if measured { "" } else { "at least " }
+        "diff store: not saving {oid} — {how} {bytes} bytes, over the \
+         {MAX_ENTRY_BYTES}-byte entry cap"
     );
     true
 }
