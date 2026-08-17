@@ -51,7 +51,7 @@ impl StatFile<'_> {
         let Some(old) = self.old_path else {
             return self.new_path.to_owned();
         };
-        let common = common_dirlen(old, self.new_path);
+        let common = crate::diff::common_dir_prefix_len(old, self.new_path);
         if common > 0 {
             format!(
                 "{}{{{}{RENAME_SEPARATOR}{}}}",
@@ -67,22 +67,6 @@ impl StatFile<'_> {
     const fn changes(&self) -> usize {
         self.insertions + self.deletions
     }
-}
-
-/// Length of the directory prefix the two paths share, including its trailing `/`, or
-/// 0 — libgit2's `git_fs_path_common_dirlen`. A `/` byte cannot occur inside a
-/// multi-byte UTF-8 sequence, so the result is always a char boundary.
-fn common_dirlen(one: &str, two: &str) -> usize {
-    let (a, b) = (one.as_bytes(), two.as_bytes());
-    let mut dirsep = None;
-    for i in 0..a.len().min(b.len()) {
-        if a[i] == b'/' && b[i] == b'/' {
-            dirsep = Some(i);
-        } else if a[i] != b[i] {
-            break;
-        }
-    }
-    dirsep.map_or(0, |i| i + 1)
 }
 
 /// Decimal digits in `val` — libgit2's `digits_for_value`, which the count column is
@@ -202,20 +186,6 @@ mod tests {
             deletions,
             binary: None,
         }
-    }
-
-    /// The common-directory rule the rename form rests on, at the boundaries libgit2's
-    /// loop actually turns on: the last `/` shared by both paths, and only within the
-    /// matching prefix.
-    #[test]
-    fn common_dirlen_is_the_last_shared_directory_separator() {
-        assert_eq!(common_dirlen("a/b/one.txt", "a/b/two.txt"), 4); // "a/b/"
-        assert_eq!(common_dirlen("a/one.txt", "b/one.txt"), 0); // nothing shared
-        assert_eq!(common_dirlen("one.txt", "two.txt"), 0); // no directory at all
-        // A shared prefix that is not a directory boundary does not count.
-        assert_eq!(common_dirlen("abc/x", "abd/x"), 0);
-        // The separator has to be at the same index in both.
-        assert_eq!(common_dirlen("a/b/x", "a/bb/x"), 2);
     }
 
     #[test]
