@@ -1545,7 +1545,7 @@ fn append_diff_body(
     diff: &git2::Diff,
     settings: DiffSettings,
     env: BuildEnv<'_>,
-) -> bool {
+) -> PatchPass {
     let tc = env.tc;
     let source = scope.source;
     // Collect file stats. `FileEntry::path_bytes` is the identity key for matching
@@ -1696,7 +1696,10 @@ fn append_diff_body(
         // headed, and this path only runs where nothing is driven. `failed` likewise
         // stays false: the one thing that could set it is a print error, and a worker
         // that hits one abandons the attempt rather than reporting a short diff.
-        return lookup_failed || resolved.is_some_and(|r| r.failed);
+        return PatchPass {
+            failed: lookup_failed || resolved.is_some_and(|r| r.failed),
+            sizes,
+        };
     }
 
     let printed = diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
@@ -1817,10 +1820,7 @@ fn append_diff_body(
         failed = true;
     }
 
-    let sizes: Vec<(u64, u64)> = diff
-        .deltas()
-        .map(|d| (d.old_file().size(), d.new_file().size()))
-        .collect();
+    let sizes = delta_sizes(diff);
     finish_stats_block(lines, files, &sizes, stats_at);
 
     // The sweep. A delta whose hunks are ALL suppressed by `ignore_ws` never flushes
@@ -1884,7 +1884,10 @@ fn append_diff_body(
     // to `~/.cache/gitkay/diffs` under a key that does not move. It is the same
     // transient-failure-served-for-weeks outcome a failed CONVERSION is refused for,
     // arriving one step earlier.
-    failed || lookup_failed || resolved.is_some_and(|r| r.failed)
+    PatchPass {
+        failed: failed || lookup_failed || resolved.is_some_and(|r| r.failed),
+        sizes,
+    }
 }
 
 /// Blob bytes below which the patch pass is not worth splitting across threads.
@@ -2222,6 +2225,29 @@ const fn blank_entry() -> FileEntry {
     }
 }
 
+/// The blob sizes libgit2 filled in as it loaded them, per delta.
+///
+/// Only meaningful on a diff whose patch pass has RUN, and only on that one: a split
+/// pass loads its blobs in the workers' copies, so this reads zeroes off the caller's.
+/// See `PatchPass::sizes`.
+fn delta_sizes(diff: &git2::Diff<'_>) -> Vec<(u64, u64)> {
+    diff.deltas()
+        .map(|d| (d.old_file().size(), d.new_file().size()))
+        .collect()
+}
+
+/// What a patch pass leaves behind besides the rows themselves.
+///
+/// `sizes` is the blob sizes libgit2 filled in as it loaded them, per delta — which the
+/// diffstat block prints for a binary file and the slow-build report measures the diff
+/// by. It travels rather than being read off the caller's `git2::Diff` because a SPLIT
+/// pass loads its blobs in the workers' copies, leaving the caller's deltas at zero.
+/// Both consumers were caught by that, separately.
+struct PatchPass {
+    failed: bool,
+    sizes: Vec<(u64, u64)>,
+}
+
 /// Lay the workers' per-delta patches down in delta order, which is the order the
 /// sequential pass emits them in.
 ///
@@ -2391,11 +2417,13 @@ pub fn build_diff_data<'r>(
     let mut rows = DiffRows::new(header);
     let mut files = Vec::new();
     let t = std::time::Instant::now();
-    let failed = append_diff_body(&mut rows, &mut files, repo, scope, &diff, settings, env);
+    let PatchPass { failed, sizes } =
+        append_diff_body(&mut rows, &mut files, repo, scope, &diff, settings, env);
     let patched = t.elapsed();
     if patched >= SLOW_BUILD_REPORT {
-        // After the pass, which is the only time the sizes are there to read.
-        let bytes = RowCostProbe::from_built_sizes(&diff);
+        // The sizes the PASS read, which is not the same thing as the sizes on this
+        // thread's diff once the pass has been split. See `RowCostProbe::from_built_sizes`.
+        let bytes = RowCostProbe::from_built_sizes(&sizes);
         log::debug!(
             "perf: {what}: patch pass {patched:?} over {} deltas, {} bytes (largest {}) \
              — parallel ceiling {:.1}x",
@@ -2796,22 +2824,25 @@ impl RowCostProbe {
     /// it must be taken AFTER the print — before it every size is zero, and
     /// `built_sizes_are_readable_once_the_patch_pass_has_run` pins that.
     ///
+    /// **It takes the sizes rather than the diff, because "the diff the pass ran over"
+    /// stopped being the caller's once the pass could be split.** A split pass loads
+    /// every blob in the WORKERS' copies, so the caller's own deltas still read zero —
+    /// which shipped, and reported a 1.3GB commit as `0 bytes … ceiling 1.0x` in the one
+    /// log line `performance.md` §1 tells a reader to consult before starting. The
+    /// diffstat's binary sizes had already been caught doing this and fixed; the report
+    /// is the second consumer of the same fact and was missed.
+    ///
     /// It answers the SIZES and nothing else: no driver is resolved here, so the row is
     /// recorded as `driver_unknown` — the reading that routes a row to the heavy lane
     /// rather than spawning a driver on the light one, so a value that escaped this
     /// reporting path into the costly test would err in the safe direction.
-    pub fn from_built_sizes(diff: &git2::Diff<'_>) -> Self {
+    pub fn from_built_sizes(sizes: &[(u64, u64)]) -> Self {
         let mut probe = Self {
             driver_unknown: true,
             ..Self::default()
         };
-        for delta in diff.deltas() {
-            probe.charge_delta(
-                delta
-                    .old_file()
-                    .size()
-                    .saturating_add(delta.new_file().size()),
-            );
+        for (old, new) in sizes {
+            probe.charge_delta(old.saturating_add(*new));
         }
         probe
     }
@@ -3698,13 +3729,13 @@ pub mod tests {
         .expect("the fixture diffs");
 
         assert_eq!(
-            RowCostProbe::from_built_sizes(&diff).total_blob_bytes,
+            RowCostProbe::from_built_sizes(&delta_sizes(&diff)).total_blob_bytes,
             0,
             "control: before the pass every size is zero, which is why it is taken after"
         );
         let mut rows = DiffRows::new(Vec::new());
         let mut files = Vec::new();
-        append_diff_body(
+        let pass = append_diff_body(
             &mut rows,
             &mut files,
             &repo,
@@ -3714,7 +3745,9 @@ pub mod tests {
             BuildEnv::of(None),
         );
 
-        let bytes = RowCostProbe::from_built_sizes(&diff);
+        // What the PASS read — which is what the slow-build report is built from, and
+        // is not the same thing as this thread's diff once the pass can be split.
+        let bytes = RowCostProbe::from_built_sizes(&pass.sizes);
         assert_eq!(bytes.deltas, files.len());
         assert!(bytes.total_blob_bytes > 0 && bytes.max_delta_bytes > 0);
         assert!(bytes.max_delta_bytes <= bytes.total_blob_bytes);
@@ -5267,6 +5300,61 @@ mod parallel_patch_tests {
         assert_eq!(workers_within_memory(u64::MAX, Some(GB)), usize::MAX);
     }
 
+    /// **The split pass has to report the diff's SIZE, and this is the regression that
+    /// escaped into a release build.**
+    ///
+    /// libgit2 fills `DiffFile::size` in as it loads each blob, so a split pass fills in
+    /// the WORKERS' copies and leaves the caller's deltas reading zero. Two things
+    /// consume those sizes: the diffstat block's `Bin <old> -> <new> bytes`, which the
+    /// oracle caught, and `build_diff_data`'s slow-build report, which it did not —
+    /// because that report is a log line and no test read it. It shipped, and said
+    ///
+    /// ```text
+    /// patch pass 17.98s over 53 deltas, 0 bytes (largest 0) — parallel ceiling 1.0x
+    /// ```
+    ///
+    /// for a 1.3GB commit. That line is not decoration: `performance.md` §1 gates this
+    /// whole feature on reading the ceiling for a real commit before starting, so the
+    /// split blinded the instrument that justifies it.
+    #[test]
+    fn the_split_pass_reports_the_same_sizes_as_the_sequential_one() {
+        let (_d, repo, oid) = everything_repo();
+        let s = base_settings();
+        let scope = RowScope::new(DiffSource::Commit(oid));
+
+        let sizes_of = |workers: usize| {
+            let diff = diff_of(&repo, oid, s);
+            let mut rows = DiffRows::new(Vec::new());
+            let mut files = Vec::new();
+            let progress = DiffProgress::default();
+            let pass = super::tests::with_parallel_patch_pass(workers, || {
+                append_diff_body(
+                    &mut rows,
+                    &mut files,
+                    &repo,
+                    &scope,
+                    &diff,
+                    s,
+                    BuildEnv::tracked(None, &progress),
+                )
+            });
+            pass.sizes
+        };
+
+        let sequential = sizes_of(0);
+        let split = sizes_of(4);
+        let reported = RowCostProbe::from_built_sizes(&sequential);
+        assert!(
+            reported.total_blob_bytes > 0,
+            "control: the fixture has blobs to measure"
+        );
+        assert_eq!(
+            split, sequential,
+            "the split pass must report the sizes it read, not the zeroes left on the \
+             caller's own deltas"
+        );
+    }
+
     /// **The oracle `performance.md` §1 asks for: the sequential builder is the
     /// specification, and the split pass has to reproduce it exactly.**
     ///
@@ -5494,7 +5582,7 @@ mod parallel_patch_tests {
             })
             .expect("prints");
             let printed = t.elapsed();
-            let cost = RowCostProbe::from_built_sizes(&diff);
+            let cost = RowCostProbe::from_built_sizes(&delta_sizes(&diff));
             println!(
                 "{rev} ({oid:.8}): {} deltas, {} bytes, largest delta {} — ceiling {:.2}x",
                 cost.deltas,
