@@ -611,6 +611,14 @@ The invariants:
   on the shape with nothing to gain, and stopping after 64 deltas takes it to 1.4ms.
   A worker that cannot reproduce the delta list abandons the attempt and the sequential
   pass runs — the only answer that cannot render the wrong file's rows.
+  **The size gate reads every delta, and a 64-delta cap was tried and removed.** It
+  looked free — the probe is an odb header read per side, and capping took an all-loose
+  1000-file fixture's gate from 26ms to 1.4ms — but it declines any diff whose bytes are
+  spread thinly, and that is not the shape with nothing to gain: the kernel's SPDX sweep
+  is 11,139 files with no delta over 616KB and splits **2.60x**, which the cap gave up
+  to save 58ms of a 3.58s build. Uncapped the cost is self-limiting, the probe and the
+  build both scaling with the delta count — 0.46% of a 2,044-delta build, 1.6% of an
+  11,139-delta one, and two deltas' worth on the blob-heavy commits, which exit early.
   Two things a split pass must carry back that the sequential one reads off the shared
   diff afterwards: the per-file counts, and the **binary sizes** the diffstat block
   prints, which libgit2 fills in as it loads each blob and so exist only in the copy of
