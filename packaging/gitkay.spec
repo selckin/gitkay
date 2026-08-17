@@ -1,5 +1,5 @@
 Name:           gitkay
-Version:        0.0.6
+Version:        0.0.7
 Release:        1%{?dist}
 Summary:        A fast, native Wayland git history viewer
 License:        MIT
@@ -68,6 +68,29 @@ install -Dm755 target/release/gitkay %{buildroot}%{_bindir}/gitkay
 %{_bindir}/gitkay
 
 %changelog
+* Mon Aug 17 2026 Thomas Matthijs <github@selckin.be> - 0.0.7-1
+- cleanup: state each shared rule once, in the code that owns it
+- diff, wrap: say when the split is abandoned and when the arena fills
+- perf docs: the in-app measurement, on the commit the plan is about
+- diff: report the sizes the patch pass read, not the caller's zeroes
+- diff: scale the split's worker count with the memory the machine has
+- bench: run one shape alone, so peak RSS can be attributed to it
+- diff: let the split gate read every delta, not just the first 64
+- diff: workers claim their next delta instead of taking a fixed share
+- diff: split the patch pass across threads for the build being waited on
+- diff pane: slice a tabbed line from its measured row starts
+- diff store: a stats hit reads the file table, not every row
+- diff pane: the tab census belongs to the build, not to the frame loop
+- highlight: one budget type, and a pass that reports what it did
+- constants: a bound lives in the module that enforces it
+- caches: one place says what share of a budget an entry may take
+- history: one taxonomy for which walk ran, not two
+- diff: apply the file order instead of sorting back into it
+- diffstat: borrow the name column where there is no rename to build
+- diff store: the entry-cap log takes the word, not a flag to turn back into one
+- diff: one spelling for "drivers, no progress sink"
+- ...and 126 more commits
+
 * Mon Aug 03 2026 Thomas Matthijs <github@selckin.be> - 0.0.6-1
 - commit-list stats: stop computing a third of the band twice
 - history: add --first-parent, showing the mainline only
