@@ -32,9 +32,40 @@ use crate::history::{
 use crate::prefetch::InflightClaim;
 use crate::textconv::Textconv;
 use crate::{
-    DerivedHistory, DiffCacheKey, DiffDeps, Epoch, PREHIGHLIGHT_CEILING, build_or_load,
-    derive_from_commits, finalize_diff_key, highlight_diff_until, store_of, textconv_for,
+    DerivedHistory, DiffCacheKey, DiffDeps, Epoch, build_or_load, derive_from_commits,
+    finalize_diff_key, highlight_diff_until, store_of, textconv_for,
 };
+
+/// Time backstop for the pre-highlight pass. The pass is bounded by **rows** —
+/// colour the landing screenful — and this only stops a pathological grammar, or
+/// a screenful that needs tokenizing thousands of rows from its file's start,
+/// from stalling the swap without limit.
+///
+/// Sized from measurement rather than taste: syntect costs ~0.3ms/line idle but
+/// 0.7–2.7ms/line on a machine already saturated by superseded highlight workers
+/// and prefetches, so a ~50-row screenful is 35–135ms. A ceiling much below that
+/// would routinely cut a legitimate screenful short, which is the failure this
+/// design has already made twice.
+///
+/// **Two earlier attempts bounded by the clock instead, and both failed.** The
+/// first ended the budget at `DIFF_PLACEHOLDER_DELAY` and so guaranteed arriving
+/// exactly when the pane blanks (measured: a 16.7ms diff whose pre-highlight ran
+/// 115ms, swapping at ~132ms against the 100ms threshold). The second subtracted
+/// a 40ms margin from that, which fixed the overshoot but opened a 40ms **dead
+/// band**: a compute landing between 60ms and 100ms was too late to colour and
+/// too early to blank, so it coloured nothing and flashed plain — measured nine
+/// times in one session at 74–96ms, the normal range for a 1–2k-line diff. Rows
+/// have no band. The cost is that a slow screenful can now push a load past the
+/// threshold into a brief blank, which is the deliberate trade: the blank ends
+/// **styled**, where the dead band ended plain.
+const PREHIGHLIGHT_CEILING: std::time::Duration = std::time::Duration::from_millis(120);
+
+// Asserted at compile time rather than in a test, so a bad edit fails the build instead
+// of one suite nobody may run.
+const _: () = assert!(
+    PREHIGHLIGHT_CEILING.as_millis() > 0,
+    "a zero ceiling silently disables pre-highlighting entirely"
+);
 
 /// A finished async diff load handed back to the UI: the computed data plus the cache
 /// key to store it under (its `content` hash filled in here for a virtual entry) and

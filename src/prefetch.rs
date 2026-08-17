@@ -33,9 +33,101 @@ use crate::highlight::Highlighter;
 use crate::history::CommitInfo;
 use crate::workers::{StatsJob, StatsResult};
 use crate::{
-    DiffCacheKey, DiffDeps, PREFETCH_HIGHLIGHT_BUDGET, PREFETCH_LINE_BUDGET_DIVISOR,
-    PREFETCH_MAX_DIFF_BYTES, PREFETCH_MAX_HIGHLIGHT_LINES, PREFETCH_MAX_WORKERS, build_or_load,
-    highlight_diff_until, mem, spawn_guarded, store_of, textconv_for,
+    DiffCacheKey, DiffDeps, build_or_load, highlight_diff_until, mem, spawn_guarded, store_of,
+    textconv_for,
+};
+
+/// Lines one prefetch dispatch may build before it stops and drops the rest of its
+/// band.
+///
+/// Half the cache, so a dispatch cannot evict its own warms — the band it just filled
+/// is the band the user is about to scroll into — while the other half stays for the
+/// live diff and the previous band. The `diff cache: insert … evicted …` debug line is
+/// where you would see it bind.
+///
+/// It bounds a **dispatch**, not the band, so it is no defence against one enormous
+/// row: `PREFETCH_MAX_ENTRY_LINES` is that. Lines built but dropped for being oversized
+/// still count here — a worker that spent six seconds on a diff it then discarded has
+/// done a dispatch's worth of harm whether or not anything was cached.
+const PREFETCH_LINE_BUDGET_DIVISOR: usize = 2;
+/// Largest diff a prefetch will pre-**highlight**. A bigger one is still cached, just
+/// as `WarmDepth::DiffOnly` however near the view it is.
+///
+/// An absolute line count, not a fraction of the cache, because this bounds syntect
+/// TIME rather than memory — the two scale with completely different things, and tying
+/// it to the cache would mean raising the budget silently signs the pool up for longer
+/// stalls. Measured: `ef5d12e6` (133,460 lines) took **10.65s** highlighted where the
+/// same diff took 761ms as `DiffOnly` — ~9.9s of one worker, a quarter of the pool, on
+/// a row the user had not asked for.
+///
+/// The trade is barely a trade. Pre-highlighting exists so a diff arrives coloured
+/// instead of flashing plain, and `ensure_diff_highlighted` colours the landing
+/// screenful on demand in milliseconds; on a diff this size the full pass is spending
+/// seconds to pre-colour tens of thousands of rows nobody will scroll to. 10,000 lines
+/// keeps the overwhelming majority of real diffs fully warm — in a measured session
+/// only a handful of rows exceeded it.
+///
+/// **It does NOT cap the time, though this comment used to claim it did** ("~1.3s at
+/// the ~0.13ms/line this repo sees under pool contention"). A 5,310-line commit —
+/// comfortably under this cap — measured `build 418ms + colour 29.6s`, i.e. 5.6ms a
+/// line, 43× the assumed rate. The rate is a property of the GRAMMAR, not of the repo,
+/// so no line count can stand in for a clock. `Limits::highlight_budget` is the actual
+/// bound; this one is what keeps the memory and the pointless work down.
+const PREFETCH_MAX_HIGHLIGHT_LINES: usize = 10_000;
+/// How long a speculative colour pass may run. See `Limits::highlight_budget` for the
+/// measurement that forced it and why a line cap could not.
+///
+/// Generous against every legitimate row observed — the slowest real colour in that
+/// session was 424ms for 4,530 lines — and it restores the ~1.3s worst case the line
+/// cap was aiming at, by bounding the thing that actually varies.
+const PREFETCH_HIGHLIGHT_BUDGET: std::time::Duration = std::time::Duration::from_millis(1_500);
+/// Blob bytes a prefetch will read before postponing the row.
+///
+/// libgit2 loads both sides of every changed file and runs xdiff over them, so a diff's
+/// cost tracks BYTES READ and not the number of changed lines. Line-based caps cannot
+/// see it coming — on a repo holding 265MB files, a few-line change in one cost ~11s of
+/// a core while producing a three-line patch.
+///
+/// Thresholds the **total**, not the largest blob, which is the correction the second
+/// measurement forced: a row whose largest blob was comfortably under this still took
+/// **5.6s** to build, where a row of comparable line count took 40ms. Many medium files
+/// have a small maximum and a large total, and a max-only guard waved them straight
+/// through. `RowCostProbe` still reports the maximum and the delta count, because the
+/// three read very differently in a log and the next surprise may be one of the others.
+///
+/// 8 MiB is ~0.4s at the ~55ms/MB those figures imply, in line with what the rest of
+/// the band costs. Being conservative is cheap here precisely because the row is
+/// **deferred rather than dropped**: it still gets warmed, just last.
+const PREFETCH_MAX_DIFF_BYTES: u64 = 8 * 1024 * 1024;
+/// Prefetch: ceiling on the worker pool, however many cores the machine has.
+///
+/// The work does not scale indefinitely: a band is ~54 rows and an ordinary row costs
+/// ~3ms to build, so eight workers already drain a whole band in well under a frame.
+/// The expensive rows are not in this pool at all — the heavy lane builds those, on
+/// threads of its own, admitted against memory rather than counted against this.
+const PREFETCH_MAX_WORKERS: usize = 8;
+
+// Asserted at compile time rather than in a test, so a bad edit fails the build instead
+// of one suite nobody may run. `DIFF_CACHE_LINE_FLOOR` is the cache's own, and is read
+// from the root for that reason: the third assertion is about what this pool's bounds
+// must still hold at the SMALLEST budget the derivation there can produce.
+const _: () = {
+    assert!(
+        PREFETCH_LINE_BUDGET_DIVISOR > 1,
+        "a dispatch that may fill the whole cache evicts its own warms, and the \
+         band the user is about to scroll into is gone before they reach it"
+    );
+    assert!(
+        MAX_ENTRY_DIVISOR > PREFETCH_LINE_BUDGET_DIVISOR,
+        "one speculative row must not be able to spend a whole dispatch's budget, \
+         or the band is one giant diff and nothing else"
+    );
+    assert!(
+        PREFETCH_MAX_HIGHLIGHT_LINES < crate::DIFF_CACHE_LINE_FLOOR / MAX_ENTRY_DIVISOR,
+        "a row too big to pre-highlight must still be cacheable at EVERY budget the \
+         derivation can produce, or on a small machine the size rule collapses into \
+         the entry rule and the DiffOnly downgrade never happens"
+    );
 };
 
 /// How much of a prefetched row's diff gets built.

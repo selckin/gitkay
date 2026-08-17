@@ -193,7 +193,13 @@ cp target/release/gitkay ~/.local/bin/   # install
 One egui/eframe immediate-mode app — all app state lives in the `GitkApp`
 struct. `src/main.rs` holds that state, the frame loop and the rendering; every
 subsystem it drives has been lifted out beside it, so what remains there is the UI
-and the wiring. Those modules: `src/diff.rs` (the diff **data** layer: `DiffLine` /
+and the wiring. **A bound lives in the module that enforces it**, not at the root:
+`diff_highlight` owns the highlight chunk/line/time budgets and the prewarm caps,
+`prefetch` the `PREFETCH_*` bounds, `workers` the pre-highlight ceiling,
+`diff_store` the entry-cap divisor both caches share — each with the compile-time
+consistency block that checks it, so a reader adjusting a number meets its
+constraints in the same file. What the root still holds are the UI's own samples and
+the diff-cache budget derivation the pool's bounds are fractions of. Those modules: `src/diff.rs` (the diff **data** layer: `DiffLine` /
 `DiffData` / `FileEntry` / `DiffSettings`, `PerRow` and its two aliases
 `RowSpans`/`RowEmphasis` — what the DISPLAY derives per row, held BESIDE the rows
 rather than inside them, which is what lets the row array be shared with the highlight
