@@ -720,7 +720,23 @@ struct Coordinator {
     /// with the pane beside it for the session. `cache_diff` refuses exactly that
     /// through `stats_harvestable`; this is the same rule for the route that bypasses
     /// it.
+    ///
+    /// Stamping the BAND is only sound while every queued target belongs to it, which
+    /// `band_settings` is what keeps true — see `finish`'s `TooBig` arm, the one path
+    /// that can put a target back on a queue the band that produced it has left.
     band_stats_epoch: u64,
+    /// The settings the CURRENT band was submitted under, or `None` before the first
+    /// band. Uniform across a band — the UI builds every key in a dispatch from one
+    /// `self.diff_settings` — so the front target speaks for all of them, as the front
+    /// job does for `stats_epoch`.
+    ///
+    /// Held so a target handed out under an earlier band can be recognised when it
+    /// comes back. Settings rather than a band serial, because the two memos this
+    /// guards are both about settings and neither cares that a band was merely
+    /// re-submitted: `measured` is oid-keyed and only `textconv` (a `DiffSettings`
+    /// field) invalidates it, and the counts a warm sends are only wrong when the
+    /// stats-relevant settings moved.
+    band_settings: Option<DiffSettings>,
     /// One mailbox per pool worker, then one per heavy worker. Heavy ids continue
     /// straight on from the pool's, so `id >= mailboxes.len()` names the lane.
     mailboxes: Vec<mpsc::Sender<Job>>,
@@ -832,6 +848,7 @@ impl Coordinator {
         // Stamped here, with the settings the targets carry, and not at claim time —
         // see `band_stats_epoch`.
         self.band_stats_epoch = self.stats_epoch;
+        self.band_settings = targets.front().map(|t| t.key.settings);
         let (mut ready, mut deferred) = (VecDeque::new(), VecDeque::new());
         for mut target in targets {
             if self.oversized.contains(&target.key) || self.unconverted.contains(&target.key) {
@@ -857,12 +874,31 @@ impl Coordinator {
         drop(self.warming.remove(&id));
         match outcome {
             Outcome::TooBig { target, cost } => {
-                // Postponed, not dropped: the cache is sized to hold it and revisiting
-                // it should be instant. It simply must not stand in front of fifty
-                // cheap rows. No dedup needed — the coordinator handed this row out
-                // exactly once, so it can come back exactly once.
-                self.measured.insert(target.key.oid, cost);
-                self.deferred.push_back(target.measured(cost));
+                // The one outcome that puts a target back on a queue, and the probe it
+                // came from started under whatever band was current THEN. Everything
+                // else the band owns was replaced wholesale by `take_band`, so this is
+                // the only way a row from a superseded band can reach the live one — and
+                // it carries that band's `key.settings` while `claim_warm` would stamp
+                // it with the current `band_stats_epoch`, sending counts summed under
+                // the old settings as though they answered the new question. Its cost
+                // is likewise measured under the old `textconv`, so recording it would
+                // re-pin the row to the heavy lane just after `note_settings` cleared
+                // `measured` to stop exactly that.
+                //
+                // So both only happen while the settings still hold. Postponed and not
+                // dropped in that case: the cache is sized to hold it and revisiting it
+                // should be instant. It simply must not stand in front of fifty cheap
+                // rows. No dedup needed — the coordinator handed this row out exactly
+                // once, so it can come back exactly once.
+                if self.band_settings.as_ref() == Some(&target.key.settings) {
+                    self.measured.insert(target.key.oid, cost);
+                    self.deferred.push_back(target.measured(cost));
+                } else {
+                    log::debug!(
+                        "prefetch: dropping a probed row whose band is gone ({})",
+                        target.key.oid
+                    );
+                }
             }
             Outcome::Warmed { lines } => self.warmed += lines,
             Outcome::Oversized { key, lines } => {
@@ -1265,6 +1301,7 @@ pub fn spawn_prefetch_pool(
         hl: None,
         stats_epoch: 0,
         band_stats_epoch: 0,
+        band_settings: None,
         mailboxes,
         heavy,
         inflight,
@@ -1943,6 +1980,7 @@ mod tests {
                 hl: None,
                 stats_epoch: 0,
                 band_stats_epoch: 0,
+                band_settings: None,
                 mailboxes,
                 heavy,
                 inflight: Arc::default(),
@@ -2238,6 +2276,9 @@ mod tests {
     #[test]
     fn a_row_reported_too_big_lands_on_the_heavy_lane_measured() {
         let (mut coord, _rxs) = test_coord(2);
+        // The band that handed the row out — what `finish` checks it against.
+        coord.take_band(std::iter::once(heavy_target(1)).collect());
+        coord.ready.clear(); // it is with the worker now reporting
         coord.finish(
             0,
             Outcome::TooBig {
@@ -2252,6 +2293,43 @@ mod tests {
             "measured exactly once"
         );
         assert_eq!(coord.measured.get(&oid(1)), Some(&cost(999)));
+    }
+
+    /// …but only into the band it came from.
+    ///
+    /// `take_band` replaces both queues wholesale, so this requeue is the ONE way a
+    /// row handed out under earlier settings can reach the live band. Left in, it
+    /// takes `band_stats_epoch` from the band it never belonged to — shipping counts
+    /// summed under the old settings as the answer to the new question, which
+    /// `answered()` then stops anything re-asking — and it re-populates `measured`
+    /// with a cost probed under the old `textconv`, just after `note_settings`
+    /// cleared that map to prevent exactly this.
+    #[test]
+    fn a_too_big_row_whose_band_is_gone_is_dropped_rather_than_requeued() {
+        let (mut coord, _rxs) = test_coord(2);
+        coord.take_band(std::iter::once(heavy_target(1)).collect());
+        coord.ready.clear();
+        // The toolbar toggle: the column is invalidated and a new band submitted
+        // under settings the row in flight was never probed under.
+        let mut toggled = heavy_target(2);
+        toggled.key.settings.ignore_ws = !toggled.key.settings.ignore_ws;
+        coord.take_band(std::iter::once(toggled).collect());
+        coord.finish(
+            0,
+            Outcome::TooBig {
+                target: Box::new(heavy_target(1)),
+                cost: cost(999),
+            },
+        );
+        assert!(
+            coord.deferred.is_empty(),
+            "a row from a superseded band must not take a heavy slot in this one"
+        );
+        assert_eq!(
+            coord.measured.get(&oid(1)),
+            None,
+            "nor re-pin an oid whose cost was measured under settings that are gone"
+        );
     }
 
     /// A measured row is re-offered to the heavy lane rather than re-probed, and one

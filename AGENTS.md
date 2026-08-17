@@ -675,6 +675,17 @@ sorted drivers keep the same rows with the same rewritten parents.
   the next `SubmitStats` raises `stats_epoch`, and stamping at claim time then installs
   pre-toggle counts under the current epoch, where `answered()` stops anything
   re-asking and the column disagrees with the pane for the session.
+  **Stamping the band is only sound while every queued target belongs to it**, and
+  `take_band` replaces both queues wholesale, so there is exactly one hole: `finish`'s
+  `TooBig` arm, which puts a row probed under an earlier band back on the live band's
+  `deferred`. It is guarded by `Coordinator::band_settings` — the settings the current
+  band was submitted under — and a row that does not match is dropped rather than
+  requeued. Settings and not a band serial, because a band is re-submitted constantly
+  while scrolling and neither thing this guards cares about that: the counts are only
+  wrong when the stats-relevant settings moved, and `measured` is oid-keyed with
+  `textconv` (a `DiffSettings` field) its only invalidator — so recording that row's
+  cost would also re-pin it to the heavy lane just after `note_settings` cleared the
+  map to prevent exactly that.
   Harvested only when the diff's `stats_relevant` settings match the CURRENT ones, and
   that guard is load-bearing rather than defensive: `stash_current_diff` reaches
   `cache_diff` with the **outgoing** diff, and the toolbar's rename/whitespace toggles
@@ -1314,8 +1325,9 @@ encoding — and the pruner's eviction + temp sweep), `word_diff` (LCS word
 alignment), `prefetch` (the coordinator's scheduling decisions, driven through its message
 protocol rather than by reaching into its fields: the heavy lane's two admission
 bounds and the stampede a whole dispatch would otherwise commit, the deferral round
-trip, the conversion charge that keeps a driven row from being admitted as free, stats
-claiming, and `warm_disposition`'s precedence),
+trip — and the band boundary it must not cross, the one way a superseded target can
+reach the live band — the conversion charge that keeps a driven row from being admitted
+as free, stats claiming, and `warm_disposition`'s precedence),
 `commitgraph` (the file format, over fixtures this suite writes itself so it depends
 on no `git` binary: both on-disk shapes, a zeroed generation refused as the
 pre-2.19 marker it is, a chunk whose claimed end is past the real end of the file,
