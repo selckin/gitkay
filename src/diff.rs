@@ -2599,11 +2599,18 @@ pub fn measured_row_diff<'r>(
 /// built under settings whose counts match — which is why `stats_relevant` excludes
 /// `context` (surrounding lines are never counted) and includes the rename toggles.
 pub fn stats_from_data(data: &DiffData) -> CommitStats {
+    stats_of_files(&data.files)
+}
+
+/// `stats_from_data` over the file table alone — what the persistent store's
+/// `load_stats` has, having deliberately not decoded the rows. Shared so the column
+/// cannot depend on which of the two answered it.
+pub fn stats_of_files(files: &[FileEntry]) -> CommitStats {
     CommitStats {
-        files: data.files.len(),
+        files: files.len(),
         lines: LineStats::Counted(
-            data.files.iter().map(|f| f.additions).sum(),
-            data.files.iter().map(|f| f.deletions).sum(),
+            files.iter().map(|f| f.additions).sum(),
+            files.iter().map(|f| f.deletions).sum(),
         ),
     }
 }

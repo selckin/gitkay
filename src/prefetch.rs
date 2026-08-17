@@ -1521,15 +1521,16 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
     // diff is in the store is LOADED rather than built, so it does not want the heavy
     // lane; and if the entry is pruned before the warm, `warm_row` probes it itself
     // (`target.probed` being `None`) and defers it there.
+    //
+    // `load_stats`, not `load`: this wants three integers off the entry's file table,
+    // and decoding the rows to reach them meant an `Arc<str>` per line — materialised
+    // and dropped, 400k of them on a 400k-line entry. Same key, same numbers.
     if job.want == StatsWant::FilesAndLines
         && let Some(store) = store_of(&ctx.deps.store)
-        && let Some(data) = store.load(&job.scope, job.settings)
+        && let Some(stats) = store.load_stats(&job.scope, job.settings)
     {
-        log::debug!(
-            "stats: {oid} from the diff store ({} files)",
-            data.files.len()
-        );
-        send_stats(ctx, job, Some(diff::stats_from_data(&data)));
+        log::debug!("stats: {oid} from the diff store ({} files)", stats.files);
+        send_stats(ctx, job, Some(stats));
         return Outcome::Stats { oid, costly: None };
     }
     // `FilesAndLines` calls `diff.stats()`, which loads blob content — the same bytes
