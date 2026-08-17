@@ -32,8 +32,12 @@ use crate::{
 /// What a highlight worker sends back. Both are tagged with the generation they were
 /// computed for, so a superseded pass's messages are dropped rather than applied.
 pub enum HighlightMsg {
-    /// One chunk's worth of finished spans.
-    Batch(HighlightBatch),
+    /// One chunk's worth of finished spans: `(line index, spans)` per code line
+    /// tokenized.
+    Batch {
+        generation: u64,
+        lines: Vec<(usize, Vec<highlight::Span>)>,
+    },
     /// This pass has ENDED — finished, superseded, out of budget or panicking — and
     /// nothing more will arrive under this generation.
     ///
@@ -46,14 +50,6 @@ pub enum HighlightMsg {
     /// O(lines) — and the memo that existed to keep that scan off the frame loop is gone
     /// with it.
     Settled { generation: u64 },
-}
-
-/// One file's worth of finished highlight spans, sent worker → UI. Tagged with
-/// the generation it was computed for so stale results are dropped.
-pub struct HighlightBatch {
-    pub generation: u64,
-    /// `(line index, spans)` for each code line in the file.
-    pub lines: Vec<(usize, Vec<highlight::Span>)>,
 }
 
 /// Reports a pass's end however it ends, including a panic inside syntect — the same
@@ -448,10 +444,10 @@ pub fn highlight_worker(job: HighlightJob) {
                 coloured += updates.len();
                 // Receiver gone (app closing) → stop.
                 if tx
-                    .send(HighlightMsg::Batch(HighlightBatch {
+                    .send(HighlightMsg::Batch {
                         generation,
                         lines: updates,
-                    }))
+                    })
                     .is_err()
                 {
                     return;

@@ -7810,8 +7810,10 @@ impl GitkApp {
         // worker was spawned).
         while let Ok(msg) = self.highlight_rx.try_recv() {
             match msg {
-                HighlightMsg::Batch(batch) if self.diff_generation.is_current(batch.generation) => {
-                    for (i, spans) in batch.lines {
+                HighlightMsg::Batch { generation, lines }
+                    if self.diff_generation.is_current(generation) =>
+                {
+                    for (i, spans) in lines {
                         // `set` drops a row past the end, which is what `get_mut` did
                         // here before: a batch is computed against a snapshot and can
                         // outlive it.
