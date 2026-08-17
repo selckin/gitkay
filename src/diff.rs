@@ -24,6 +24,7 @@ pub use wrap::{RowSlice, WrapIndex};
 use crate::datefmt::format_commit_time;
 use crate::diffstat;
 use crate::highlight;
+use crate::mem;
 use crate::textconv::{self, Textconv};
 use crate::word_diff;
 
@@ -1988,7 +1989,23 @@ fn parallel_patch_workers(
     }
     // LAST, because it is the only clause that costs anything — every cheap answer
     // above gets to say no before a single odb header is read.
-    if !carries_blob_bytes(repo, diff, PARALLEL_PATCH_MIN_BYTES) {
+    //
+    // `probe_deltas` is the app's one answer to "how big is this row", and this asks it
+    // rather than a bespoke variant for the reason §10 of the cleanup plan gives: two
+    // ways to compute a diff's bytes is how they come to disagree. It is asked with no
+    // `Textconv` because a driven diff was already declined above, so there is nothing
+    // for the driver half to find.
+    let cost = probe_deltas(repo, diff, None).ok()?;
+    if cost.total_blob_bytes < PARALLEL_PATCH_MIN_BYTES {
+        return None;
+    }
+    // What the machine will admit to having, now — the same live reading, and the same
+    // meaning for `None`, that the heavy lane's admission uses.
+    let workers = workers.min(workers_within_memory(
+        cost.max_delta_bytes,
+        mem::usable_bytes(),
+    ));
+    if workers <= 1 {
         return None;
     }
     // Only when it says yes: a line per declined build would be one per commit switch,
@@ -2001,48 +2018,61 @@ fn parallel_patch_workers(
     Some(workers)
 }
 
-/// Does this diff carry `min_bytes` of blob?
+/// What one more worker is charged against the memory the machine will admit to having.
 ///
-/// Deliberately NOT `probe_deltas`, which is the app's one answer to "how big is this
-/// row": that computes the total exactly because its callers threshold on it, where
-/// this only has to know whether one threshold is crossed and stops the moment it is.
-/// On the commits this exists for — gigabytes in tens of files — that is two or three
-/// deltas.
+/// The worst case for a worker is that it holds the LARGEST delta — both sides, since
+/// xdiff needs the pair — doubled for xdiff's own line records and the rows built from
+/// them, which is the same charge `Coordinator::heavy_need` makes for the same reason.
+const SPLIT_WORKER_BLOB_MULTIPLE: u64 = 2;
+
+/// How many workers this machine can afford for a diff whose largest delta is
+/// `max_delta_bytes`.
 ///
-/// **It reads every delta, and a delta cap was tried and removed.** The cost is an odb
-/// header read per side, which measured 5.2µs a delta on a packed repository and ~26µs
-/// on an all-loose one; capping it at 64 deltas took a 1000-file build's gate from 26ms
-/// to 1.4ms. But the cap declines any diff whose bytes are spread thinly, and that shape
-/// is not the one with nothing to gain — measured on the kernel's SPDX sweep, 11,139
-/// files and 122MB with no delta over 616KB: **3.55s sequential against 1.35s split,
-/// 2.63×**, which the cap gave up to save 58ms.
+/// **The split doubles peak memory on exactly the commits it is for, and this is what
+/// bounds that.** Measured on a 2.49GB commit: 3.82GB resident sequential against
+/// 7.63GB across eight workers, because the workers hold their deltas' blobs at once
+/// where the sequential pass holds one at a time. The foreground build is deliberately
+/// not admitted against memory — it is the row the reader clicked — which was safe
+/// while it read one delta at a time and is not once it reads eight.
 ///
-/// Unbounded the ratio is self-limiting, because the probe and the build both scale
-/// with the delta count: where the probe is expensive in absolute terms it is 1.6% of
-/// the build in front of it (that sweep), and where it is a large FRACTION the build is
-/// tens of milliseconds and so is the probe.
+/// **Every worker is charged, including the first.** An earlier version made the first
+/// one free, on the reasoning that its memory is what the sequential pass would have
+/// used anyway — which is wrong in the direction that matters: at the moment this
+/// decides, the sequential build has not run either, so its blobs come out of the same
+/// `usable` reading. On the measured commit that mattered — a 3.82GB sequential build
+/// on a machine reporting 6GB spare would have been told it could afford four workers,
+/// and four measured 7.44GB.
 ///
-/// A header that cannot be read contributes 0, as it does in `probe_deltas`: an
-/// unreadable object will fail the build too, and the answer to "should this be split"
-/// is then no, which is the safe direction.
-fn carries_blob_bytes(repo: &Repository, diff: &git2::Diff<'_>, min_bytes: u64) -> bool {
-    let Ok(odb) = repo.odb() else { return false };
-    let mut total: u64 = 0;
-    for delta in diff.deltas() {
-        for file in [delta.old_file(), delta.new_file()] {
-            let id = file.id();
-            if id.is_zero() {
-                continue; // that side has no blob (an add, or a delete)
-            }
-            if let Ok((size, _)) = odb.read_header(id) {
-                total = total.saturating_add(size as u64);
-            }
-        }
-        if total >= min_bytes {
-            return true;
-        }
-    }
-    false
+/// Conservative by design even so, since only one delta is actually the largest: on
+/// that commit this charges 1.74GB a worker where the true marginal cost was ~1.2GB.
+/// Erring the other way costs an OOM on the one build big enough to matter, and the
+/// speed given up is small — four workers already measured 15.7s against eight
+/// workers' 16.1s there, the two heaviest deltas being what the wall clock waits on.
+///
+/// **What this is NOT is a cap on peak memory, and the measurements say so plainly.**
+/// Six workers and eight both peaked at 7.59GB on that commit, because its bytes sit in
+/// three dominant deltas and any worker count at or above three has all three in
+/// flight; only going down to two moved the peak (4.67GB), and that costs 29s against
+/// 16s. What the bound does is scale the number of deltas that can be in flight with
+/// the memory the machine has, so a constrained machine degrades toward the sequential
+/// pass — 2GB spare admits nobody and the build stays as it was — and a commit whose
+/// bytes are spread over MANY large deltas, where worker count really does set the
+/// peak, is held down. Bounding the peak on a few-dominant-blobs commit needs
+/// admission per DELTA rather than per worker, the shape `Coordinator::heavy_fits` has,
+/// and that wants its own measurement rather than being assumed into this one.
+///
+/// `None` from `mem` means the platform will not say, and then the thread count is the
+/// only bound — exactly as `Coordinator::heavy_fits` treats the same answer.
+fn workers_within_memory(max_delta_bytes: u64, usable: Option<u64>) -> usize {
+    let (Some(usable), Some(per_worker)) = (
+        usable,
+        max_delta_bytes
+            .checked_mul(SPLIT_WORKER_BLOB_MULTIPLE)
+            .filter(|b| *b > 0),
+    ) else {
+        return usize::MAX;
+    };
+    usize::try_from(usable / per_worker).unwrap_or(usize::MAX)
 }
 
 /// Generate every delta's patch across `workers` threads, in delta order.
@@ -5202,6 +5232,41 @@ mod parallel_patch_tests {
         }
     }
 
+    /// The split doubles peak memory on the commits it is for — measured 3.82GB
+    /// resident sequential against 7.63GB across eight workers on a 2.49GB commit — and
+    /// the foreground build is deliberately not admitted against memory, being the row
+    /// the reader clicked. So this bound is the only thing standing between a big
+    /// commit and eight copies of its worst delta.
+    ///
+    /// A pure unit, because a memory bound that is silently wrong is worse than none:
+    /// it would look like the feature working right up until the machine it was meant
+    /// to protect ran out.
+    #[test]
+    fn the_worker_count_is_bounded_by_what_the_machine_can_spare() {
+        const GB: u64 = 1024 * 1024 * 1024;
+
+        // Nothing to spare admits nobody, and the caller turns that into no split at
+        // all. EVERY worker is charged, the first included — see the doc.
+        assert_eq!(workers_within_memory(GB, Some(0)), 0);
+        // Four spare against a 1GB largest delta charged double is two workers.
+        assert_eq!(workers_within_memory(GB, Some(4 * GB)), 2);
+        // The measured commit: a 0.87GB largest delta against the ~12.4GB this machine
+        // reported spare admits 7, so `PARALLEL_PATCH_MAX_WORKERS` is what bounds it
+        // there and the bound costs nothing.
+        assert_eq!(workers_within_memory(871_878_346, Some(12_412_251_760)), 7);
+        // The same commit on a laptop with 2GB spare gets no split: one worker is not a
+        // split, and the caller declines it.
+        assert!(workers_within_memory(871_878_346, Some(2 * GB)) < 2);
+
+        // A platform that will not say bounds nothing, as `heavy_fits` also treats it.
+        assert_eq!(workers_within_memory(GB, None), usize::MAX);
+        // Nor does a diff whose deltas measured nothing — an unreadable object reads as
+        // 0, and a zero charge must not become a division by it.
+        assert_eq!(workers_within_memory(0, Some(GB)), usize::MAX);
+        // A delta so large the doubling overflows is not a reason to panic.
+        assert_eq!(workers_within_memory(u64::MAX, Some(GB)), usize::MAX);
+    }
+
     /// **The oracle `performance.md` §1 asks for: the sequential builder is the
     /// specification, and the split pass has to reproduce it exactly.**
     ///
@@ -5392,6 +5457,29 @@ mod parallel_patch_tests {
         let scope = RowScope::new(DiffSource::Commit(oid));
         let s = base_settings();
 
+        let run = |label: &str, forced: usize| {
+            let repo = open();
+            let progress = DiffProgress::default();
+            let t = Instant::now();
+            let data = super::tests::with_parallel_patch_pass(forced, || {
+                get_diff_data(&repo, &scope, s, BuildEnv::tracked(None, &progress))
+            });
+            let took = t.elapsed();
+            println!("  {label}: {took:?} ({} rows)", data.lines.len());
+            (took, data.lines.len())
+        };
+
+        // `BENCH_ONLY=<n>` runs ONE build and nothing else — 0 for the sequential pass,
+        // otherwise that many workers — so an external `/usr/bin/time -v` attributes its
+        // peak RSS to that shape rather than to whichever phase of a mixed run was
+        // largest. Before the warm-up below for the same reason.
+        if let Ok(only) = std::env::var("BENCH_ONLY")
+            && let Ok(w) = only.parse::<usize>()
+        {
+            run(&format!("only, workers={w}"), w);
+            return;
+        }
+
         {
             let repo = open();
             let diff = scoped_diff(&repo, s, &scope.paths, |r, o| {
@@ -5413,6 +5501,12 @@ mod parallel_patch_tests {
                 cost.total_blob_bytes,
                 cost.max_delta_bytes,
                 cost.parallel_ceiling()
+            );
+            let usable = mem::usable_bytes();
+            println!(
+                "  memory: {usable:?} usable — bound {} workers (cap {})",
+                workers_within_memory(cost.max_delta_bytes, usable),
+                PARALLEL_PATCH_MAX_WORKERS
             );
             println!("  warm-up (bare print): {printed:?} ({n} rows)");
 
@@ -5476,33 +5570,6 @@ mod parallel_patch_tests {
                     cost.parallel_ceiling()
                 );
             }
-        }
-
-        let run = |label: &str, forced: usize| {
-            let repo = open();
-            let progress = DiffProgress::default();
-            let t = Instant::now();
-            let data = super::tests::with_parallel_patch_pass(forced, || {
-                get_diff_data(&repo, &scope, s, BuildEnv::tracked(None, &progress))
-            });
-            let took = t.elapsed();
-            println!("  {label}: {took:?} ({} rows)", data.lines.len());
-            (took, data.lines.len())
-        };
-
-        // `BENCH_ONLY=seq` / `BENCH_ONLY=split` runs one shape alone, so an external
-        // `/usr/bin/time -v` attributes its peak RSS to that shape and not to whichever
-        // phase of a mixed run happened to be largest.
-        match std::env::var("BENCH_ONLY").as_deref() {
-            Ok("seq") => {
-                run("sequential only", 0);
-                return;
-            }
-            Ok("split") => {
-                run("split only", workers.first().copied().unwrap_or(8));
-                return;
-            }
-            _ => {}
         }
 
         let (sequential, rows) = run("sequential", 0);
