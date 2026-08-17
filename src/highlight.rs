@@ -11,9 +11,10 @@ use two_face::re_exports::syntect;
 // place a slug string is interpreted.
 pub use two_face::theme::EmbeddedThemeName;
 
-pub use syntect::easy::HighlightLines;
-use syntect::highlighting::{Color as SynColor, Highlighter as SynHighlighter, Theme};
-use syntect::parsing::{Scope, SyntaxReference, SyntaxSet};
+use syntect::highlighting::{
+    Color as SynColor, HighlightIterator, HighlightState, Highlighter as SynHighlighter, Theme,
+};
+use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxReference, SyntaxSet};
 
 /// Default syntax theme when none is configured or the configured slug is unknown.
 pub const DEFAULT_THEME_SLUG: &str = "catppuccin-mocha";
@@ -543,7 +544,7 @@ impl Highlighter {
     /// effect. Visible under `RUST_LOG=gitkay=info` when someone wonders why a file
     /// looks flat. The once-per-extension dedup still applies: a diff holds hundreds
     /// of files and the prefetch band warms dozens of rows across threads.
-    pub fn new_file_state(&self, path: &str) -> HighlightLines<'_> {
+    pub fn new_file_state(&self, path: &str) -> FileState<'_> {
         let Some(syntax) = self.syntax_for(path) else {
             if let Some(ext) = self.note_missing_grammar(path) {
                 log::info!(
@@ -552,9 +553,9 @@ impl Highlighter {
                      to highlight them as something else (e.g. \"xml\")"
                 );
             }
-            return HighlightLines::new(self.syntaxes.find_syntax_plain_text(), &self.theme);
+            return FileState::new(self.syntaxes.find_syntax_plain_text(), &self.theme);
         };
-        HighlightLines::new(syntax, &self.theme)
+        FileState::new(syntax, &self.theme)
     }
 
     /// Record that `path`'s extension has no grammar, returning it the FIRST time only
@@ -599,12 +600,7 @@ impl Highlighter {
     /// the caller's scratch (cleared here): the highlight loops tokenize hundreds
     /// of thousands of lines, so the newline-terminated copy syntect needs is
     /// built in one reused allocation instead of a fresh `String` per line.
-    pub fn tokenize_line(
-        &self,
-        state: &mut HighlightLines,
-        code: &str,
-        buf: &mut String,
-    ) -> Vec<Span> {
+    pub fn tokenize_line(&self, state: &mut FileState, code: &str, buf: &mut String) -> Vec<Span> {
         // Only the head of a very long line is tokenized; the tail gets one flat span
         // (see `MAX_TOKENIZE_CHARS`), which is also what keeps "the spans cover the
         // whole body" true — `append_body`'s span path emits ONLY the spans, so a body
@@ -620,6 +616,21 @@ impl Highlighter {
         buf.push('\n');
         let base = buf.as_ptr() as usize;
         let head_len = head.len();
+        // A truncated line is tokenized on a COPY of the file's state, so the bound
+        // costs only this line's colour and not the rest of the file's. Advancing the
+        // real state over a fragment leaves the parser wherever the cut happened to
+        // land — mid-string, mid-comment — and every later line of the file is then
+        // tokenized from there. That is the same hazard `highlight_diff_until`'s doc
+        // names for its own cut, where the remedy is re-deriving the state from the
+        // file's start; here the state before the line already IS that, so keeping it
+        // is enough.
+        //
+        // What it gives up is a construct the long line legitimately OPENS and does
+        // not close. That is the rarer half by far — a line this long is minified
+        // output or one enormous literal, both of which balance within themselves —
+        // and unlike the alternative it fails toward the file reading as it did
+        // before the line, rather than toward everything after it in one colour.
+        let snapshot = tail.then(|| state.snapshot());
         let mut spans = state.highlight_line(buf, &self.syntaxes).map_or_else(
             // A grammar hiccup must never drop the line: render it plain.
             |_| vec![(self.palette.foreground, 0..head_len)],
@@ -634,10 +645,64 @@ impl Highlighter {
                     .collect()
             },
         );
+        if let Some(before) = snapshot {
+            state.restore(before);
+        }
         if tail {
             spans.push((self.palette.foreground, head_len..code.len()));
         }
         spans
+    }
+}
+
+/// The parser state one file's rows are tokenized through, carried from line to
+/// line so a multi-line construct colours the lines it spans.
+///
+/// This is syntect's own `HighlightLines` with its fields made reachable, and it
+/// exists for two of them: the parse and style states have to be recoverable so an
+/// over-long line can be tokenized without moving them (see
+/// `Highlighter::tokenize_line`). `HighlightLines` keeps them private and hands
+/// them back only by consuming itself, which is no use behind a `&mut`.
+pub struct FileState<'a> {
+    /// Built per file, as `HighlightLines` builds it: `SynHighlighter::new` sorts
+    /// every selector in the theme, so it is far too costly to build per line and
+    /// cannot be shared from `Highlighter` either, which owns the theme it borrows.
+    hl: SynHighlighter<'a>,
+    parse: ParseState,
+    style: HighlightState,
+}
+
+impl<'a> FileState<'a> {
+    fn new(syntax: &SyntaxReference, theme: &'a Theme) -> Self {
+        let hl = SynHighlighter::new(theme);
+        let style = HighlightState::new(&hl, ScopeStack::new());
+        Self {
+            hl,
+            parse: ParseState::new(syntax),
+            style,
+        }
+    }
+
+    /// Where the parser stands, to be put back by `restore`. The highlighter is not
+    /// part of it: it is derived from the theme alone and no line moves it.
+    fn snapshot(&self) -> (ParseState, HighlightState) {
+        (self.parse.clone(), self.style.clone())
+    }
+
+    fn restore(&mut self, (parse, style): (ParseState, HighlightState)) {
+        self.parse = parse;
+        self.style = style;
+    }
+
+    /// One line, styled — syntect's `HighlightLines::highlight_line` verbatim, over
+    /// the fields this type exposes.
+    fn highlight_line<'b>(
+        &mut self,
+        line: &'b str,
+        syntaxes: &SyntaxSet,
+    ) -> Result<Vec<(syntect::highlighting::Style, &'b str)>, syntect::Error> {
+        let ops = self.parse.parse_line(line, syntaxes)?;
+        Ok(HighlightIterator::new(&mut self.style, &ops[..], line, &self.hl).collect())
     }
 }
 
@@ -667,6 +732,11 @@ impl Highlighter {
 /// which is what an untokenized row renders as anyway. What is lost is colour past the
 /// first 20,000 characters of one line, in exchange for a bound that makes every budget
 /// above it mean something.
+///
+/// **Colour past the cut on THAT LINE is the whole of what is lost**, and keeping it
+/// that way is `tokenize_line`'s business: the per-file parser state is snapshotted
+/// across a truncated line, because advancing it over a fragment would leave the parser
+/// wherever the cut landed and recolour every line after it in the file.
 pub const MAX_TOKENIZE_CHARS: usize = 20_000;
 
 /// `code` split into the part syntect sees and whether anything was held back.
@@ -941,6 +1011,35 @@ mod tests {
             .collect();
         assert_eq!(past.len(), 1, "the tail should be one span, got {past:?}");
         assert_eq!(past[0].1, MAX_TOKENIZE_CHARS..code.len());
+    }
+
+    /// …and the bound costs that line's colour ONLY, not the rest of the file's.
+    ///
+    /// `state` is per-FILE and every later row is tokenized from wherever it was
+    /// left. Advancing it over a fragment leaves the parser mid-construct — here
+    /// inside the string literal the cut lands in — and every following line then
+    /// comes back as one span in the string colour, which does not heal: a later
+    /// quote merely closes and reopens it. The line's own colour is not the cost
+    /// worth paying for that, so the truncated line is tokenized on a copy.
+    #[test]
+    fn a_truncated_line_does_not_recolour_the_rest_of_its_file() {
+        let hl = test_highlighter();
+        let follow = "fn main() { let z = 1; }";
+
+        // What the following line looks like when nothing came before it.
+        let mut clean = hl.new_file_state("a.rs");
+        let want = hl.tokenize_line(&mut clean, follow, &mut String::new());
+        assert!(
+            want.len() > 2,
+            "the fixture must really tokenize, got {want:?}"
+        );
+
+        // The same line, after a line long enough to be cut mid-literal.
+        let mut state = hl.new_file_state("a.rs");
+        let long = format!("let x = \"{}\";", "y".repeat(MAX_TOKENIZE_CHARS + 500));
+        hl.tokenize_line(&mut state, &long, &mut String::new());
+        let got = hl.tokenize_line(&mut state, follow, &mut String::new());
+        assert_eq!(got, want, "the cut must not follow the file down");
     }
 
     /// The split's arithmetic, at a cap small enough to assert cheaply.
