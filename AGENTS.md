@@ -1230,7 +1230,11 @@ sorted drivers keep the same rows with the same rewritten parents.
   with, so what runs off the right edge is clipped where nothing can bring it back.
   So a line holding a tab is measured and sliced by a walk over its characters
   (`column_rows`), which charges the tab its real width and lets a character that
-  would straddle the edge start the next row. Finding the tabs is a pass over the
+  would straddle the edge start the next row — **once**, at measure time, whose row
+  starts are then kept (`MAX_ROW_STARTS`, a 32MB ceiling like the one above) for
+  `slice` to index. Restarting that walk per row is quadratic in how far the reader has
+  scrolled INTO the line, every frame; past the cap a line falls back to it, and the
+  slices are identical either way. Finding the tabs is a pass over the
   TEXT where the rest is a pass over the LINES (~400ms/GB of short lines against 20ms
   for their `len()`s), and two things keep it off the paths that matter: a line whose
   worst case already fits (`len() + 3×tabs ≤ width`) takes one row with no walk, and a

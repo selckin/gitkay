@@ -55,9 +55,18 @@
 //! width` — takes one row with no walk, which is every ordinary source line. And a
 //! diff proven to hold no tab anywhere records that (`tabless`), so `rewidth` — the
 //! rebuild a window drag runs on every frame of the drag — skips the pass entirely
-//! and is the same `len()` arithmetic it always was. The 8.3M-character minified
+//! and is the same `len()` arithmetic it always was. That census is the BUILD's
+//! answer where there is one (`DiffData::tabless`), so an install does not re-read the
+//! diff on the frame loop to find out. The 8.3M-character minified
 //! line this module exists for is scanned once, at `memchr` speed (699µs), and not
 //! again while it is on screen.
+//!
+//! What a tabbed line costs is not only finding its tabs but SLICING it, and that used
+//! to be paid per row per frame: `slice` restarted `column_rows` from the line's
+//! beginning, so drawing rows `k..k+50` of one such line cost `Σ (k+i)×width` character
+//! decodes and grew with how far the reader had scrolled into it. `measure` already
+//! walks each tabbed line once to count its rows, so it keeps their starts
+//! (`MAX_ROW_STARTS`) and `slice` indexes them.
 
 use std::ops::Range;
 
@@ -88,6 +97,29 @@ const MIN_BODY_COLS: usize = 16;
 /// draws, rather than to something half-wrapped.
 const MAX_WRAPPED_LINES: usize = 1_000_000;
 
+/// How many tabbed-line row starts one index will remember before letting the rest of
+/// them be re-walked per draw.
+///
+/// A tabbed line cannot be sliced by arithmetic — a tab spends four columns on one byte,
+/// so where row `k` begins is a fact about the text before it — and `measure` already
+/// walks each such line once to count its rows. Keeping those row starts turns `slice`
+/// into an index lookup; without them it restarts the walk from the line's beginning for
+/// every visible row, so drawing rows `k..k+50` of one tab-indented generated file costs
+/// `Σ (k+i)×width` character decodes **per frame**, growing with how far the reader has
+/// scrolled into the line.
+///
+/// It needs a ceiling for the same reason `MAX_WRAPPED_LINES` does, and it is the
+/// module's whole design: 1M tabbed lines wrapping to 100 rows each is 100M offsets.
+/// Eight bytes each, so this is a 32MB ceiling to match. Past it a line simply keeps the
+/// walk — the slices are identical either way, which is what
+/// `the_walk_and_the_recorded_starts_slice_a_line_the_same` pins — so the cap costs
+/// speed and never correctness.
+const MAX_ROW_STARTS: usize = 4_000_000;
+
+/// `Tall::starts_at` for a line with no recorded row starts: a line with no tab (which
+/// needs none) or one the arena had no room for (which falls back to the walk).
+const NO_STARTS: u32 = u32::MAX;
+
 /// One logical line that occupies more than one visual row.
 ///
 /// `first_row` is a running total rather than something derived at query time, so
@@ -104,6 +136,13 @@ struct Tall {
     /// frame — which on the minified line this module exists for is megabytes a
     /// row, to answer a question that cannot change while the index lives.
     tabbed: bool,
+    /// Where this line's row starts begin in `WrapIndex::starts`, or `NO_STARTS`.
+    ///
+    /// Only a `tabbed` line ever has any — the rest are sliced by arithmetic — and a
+    /// tabbed line may still lack them, `MAX_ROW_STARTS` being finite. The two
+    /// questions are separate for exactly that reason: `tabbed` says the arithmetic is
+    /// wrong for this line, this says whether the answer is already in hand.
+    starts_at: u32,
 }
 
 /// Which slice of a logical line one visual row draws, and whether that row is the
@@ -151,6 +190,11 @@ pub struct WrapIndex {
     /// do the honest thing rather than inherit a claim about lines it never read.
     tabless: bool,
     tall: Vec<Tall>,
+    /// Row-start byte offsets for the tabbed lines that fit `MAX_ROW_STARTS`, packed
+    /// end to end and indexed by `Tall::starts_at`. One arena rather than a `Vec` per
+    /// entry: the lines that need it are rare, and a per-entry `Vec` would put a
+    /// 24-byte header on all 1M `Tall`s to serve them.
+    starts: Vec<usize>,
 }
 
 impl WrapIndex {
@@ -200,7 +244,21 @@ impl WrapIndex {
     /// milliseconds, which is why the caller only builds one when wrapping is
     /// actually switched on.
     fn measure(lines: &[DiffLine], cols: usize, gutter: LineNoGutter, known_tabless: bool) -> Self {
+        Self::measure_capped(lines, cols, gutter, known_tabless, MAX_ROW_STARTS)
+    }
+
+    /// `measure` with the row-start arena's ceiling as a parameter, so a test can set it
+    /// to zero and prove what must not regress: that a line the arena could not take is
+    /// sliced exactly as one it could. A `const` cannot be varied to show that.
+    fn measure_capped(
+        lines: &[DiffLine],
+        cols: usize,
+        gutter: LineNoGutter,
+        known_tabless: bool,
+        max_starts: usize,
+    ) -> Self {
         let mut tall: Vec<Tall> = Vec::new();
+        let mut starts: Vec<usize> = Vec::new();
         let mut total_rows: usize = 0;
         let mut tabless = true;
         for (line, l) in lines.iter().enumerate() {
@@ -227,10 +285,31 @@ impl WrapIndex {
                 total_rows += 1;
                 continue;
             }
+            // The walk a tabbed line needs, done ONCE: its row starts are recorded
+            // here so `slice` indexes them instead of re-walking from the line's
+            // beginning for every visible row of every frame. A line the arena has no
+            // room for records none and is re-walked, as every tabbed line used to be.
+            let mut starts_at = NO_STARTS;
             let rows = if tabs == 0 {
                 content.len().div_ceil(width)
             } else {
-                column_rows(content, width).count()
+                let at = starts.len();
+                let mut rows = 0usize;
+                for r in column_rows(content, width) {
+                    rows += 1;
+                    if starts.len() < max_starts {
+                        starts.push(r.start);
+                    }
+                }
+                // All of this line's starts or none of them: a half-recorded line would
+                // have `slice` answer some of its rows from the arena and run off the
+                // end for the rest.
+                if starts.len() == at + rows {
+                    starts_at = u32::try_from(at).unwrap_or(NO_STARTS);
+                } else {
+                    starts.truncate(at);
+                }
+                rows
             };
             if tall.len() >= MAX_WRAPPED_LINES {
                 log::warn!(
@@ -246,6 +325,7 @@ impl WrapIndex {
                 first_row: total_rows,
                 rows,
                 tabbed: tabs > 0,
+                starts_at,
             });
             total_rows += rows;
         }
@@ -257,6 +337,7 @@ impl WrapIndex {
             total_rows,
             tabless,
             tall,
+            starts,
         }
     }
 
@@ -275,6 +356,7 @@ impl WrapIndex {
             total_rows: n_lines,
             tabless: false,
             tall: Vec::new(),
+            starts: Vec::new(),
         }
     }
 
@@ -356,19 +438,47 @@ impl WrapIndex {
         }
         let content = line.rendered();
         let width = body_cols(line.kind, self.cols, self.gutter);
-        let range = if self.tall_of(line_idx).is_some_and(|t| t.tabbed) {
-            column_rows(content, width)
+        let tall = self.tall_of(line_idx);
+        let range = match tall {
+            // Recorded when this line was measured, which is the whole point: the walk
+            // that counted its rows knew where each began, and re-deriving that here
+            // means restarting from the line's start on every row of every frame.
+            Some(t) if t.starts_at != NO_STARTS => self.recorded_row(t, content, sub),
+            // A tabbed line the arena had no room for. Correct, and as slow as every
+            // tabbed line used to be.
+            Some(t) if t.tabbed => column_rows(content, width)
                 .nth(sub)
-                .unwrap_or(content.len()..content.len())
-        } else {
-            let start = floor_boundary(content, sub.saturating_mul(width));
-            let end = floor_boundary(content, sub.saturating_add(1).saturating_mul(width));
-            start..end
+                .unwrap_or(content.len()..content.len()),
+            _ => {
+                let start = floor_boundary(content, sub.saturating_mul(width));
+                let end = floor_boundary(content, sub.saturating_add(1).saturating_mul(width));
+                start..end
+            }
         };
         RowSlice {
             range,
             first: sub == 0,
         }
+    }
+
+    /// Row `sub` of a line whose starts are in the arena.
+    ///
+    /// Its end is the next row's start, and the last row's end is the line's end —
+    /// which is what makes the rows tile the line exactly, the same property
+    /// `column_rows` has and for the same reason: one boundary serves both sides.
+    fn recorded_row(&self, t: &Tall, content: &str, sub: usize) -> Range<usize> {
+        let at = t.starts_at as usize;
+        // Past the last row: the empty tail, which is what the walk's `nth` answers.
+        if sub >= t.rows {
+            return content.len()..content.len();
+        }
+        let start = self.starts[at + sub];
+        let end = if sub + 1 < t.rows {
+            self.starts[at + sub + 1]
+        } else {
+            content.len()
+        };
+        start..end
     }
 
     /// This line's entry, if it is one of the ones that wrap.
@@ -768,6 +878,70 @@ mod tests {
             "the fixture has to wrap, or this asserts nothing"
         );
         check_rows(std::slice::from_ref(&text), &[40]);
+    }
+
+    /// The recorded row starts are an optimisation, and `MAX_ROW_STARTS` means a line
+    /// may not get them — so what must not regress is that the two paths cannot be told
+    /// apart. Driven through `measure_capped` with the arena closed, which is why that
+    /// ceiling is a parameter rather than only a `const`.
+    ///
+    /// Also asserts the fast path against `column_rows` itself, since the arena is only
+    /// trustworthy while it says what the walk that filled it would.
+    #[test]
+    fn the_walk_and_the_recorded_starts_slice_a_line_the_same() {
+        let g = LineNoGutter::default();
+        // Tabs throughout, not merely leading: a row boundary then lands mid-run, where
+        // an offset and a column count are least likely to agree by accident.
+        let text = format!("\t{}", "ab\tcd\tefghij".repeat(30));
+        let lines = vec![line(&text, LineKind::Context)];
+        let width = 40;
+
+        let recorded = WrapIndex::measure_capped(&lines, width, g, false, MAX_ROW_STARTS);
+        let walked = WrapIndex::measure_capped(&lines, width, g, false, 0);
+        assert!(
+            recorded.total_rows() > 3,
+            "the fixture has to wrap several times"
+        );
+        assert_eq!(
+            recorded.total_rows(),
+            walked.total_rows(),
+            "the cap must not change how many rows a line takes"
+        );
+        // Control: the two really did take different routes. Nothing observable
+        // downstream can tell them apart — that IS the property under test — so what is
+        // pinned here is the precondition `slice` branches on.
+        assert_ne!(
+            recorded.tall_of(0).expect("the line wraps").starts_at,
+            NO_STARTS,
+            "the uncapped build must record this line's starts, or the fast path is dead"
+        );
+        assert_eq!(
+            walked.tall_of(0).expect("the line wraps").starts_at,
+            NO_STARTS,
+            "and the capped one must not"
+        );
+
+        let body = lines[0].rendered();
+        // The content width, not the pane's: `slice` subtracts the gutter and the
+        // marker column before it walks anything.
+        let body_width = body_cols(lines[0].kind, width, g);
+        // One past the end too: a `sub` off the end answers the empty tail, and the
+        // arena path has to say what the walk's `nth` says there as well.
+        for sub in 0..=recorded.total_rows() {
+            let from_arena = recorded.slice(0, &lines[0], sub);
+            assert_eq!(
+                from_arena,
+                walked.slice(0, &lines[0], sub),
+                "row {sub} differs between the recorded starts and the walk"
+            );
+            if sub < recorded.total_rows() {
+                assert_eq!(
+                    from_arena.range,
+                    column_rows(body, body_width).nth(sub).expect("row exists"),
+                    "row {sub} differs from the walk that filled the arena"
+                );
+            }
+        }
     }
 
     /// The census `rewidth` carries over is an optimisation, so the only thing that
