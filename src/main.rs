@@ -1233,6 +1233,7 @@ fn resync_wrap_index(
     index: &mut Option<diff::WrapIndex>,
     wrap: bool,
     lines: &[DiffLine],
+    tabless: bool,
     cols: usize,
     gutter: LineNoGutter,
 ) -> bool {
@@ -1250,7 +1251,7 @@ fn resync_wrap_index(
     // exactly the resize case below: the drag changes the width and nothing else, and
     // re-finding the tabs is the one part of the measure that reads the text.
     let built = index.as_ref().map_or_else(
-        || diff::WrapIndex::build(lines, cols, gutter),
+        || diff::WrapIndex::build(lines, cols, gutter, tabless),
         |old| old.rewidth(lines, cols, gutter),
     );
     let took = t.elapsed();
@@ -3111,6 +3112,11 @@ struct GitkApp {
     /// failed? Carried across the display so `stash_current_diff` can hand it back to
     /// `cache_diff`, which is the one caller that reassembles a `DiffData` from parts.
     diff_textconv_failed: bool,
+    /// Was the displayed diff PROVEN tab-free by the build that made it
+    /// (`DiffData::tabless`)? What `WrapIndex::build` is told, so the first frame after
+    /// an install does not re-read the diff's text to find out — and, like
+    /// `diff_textconv_failed`, what `from_parts` needs back on the way to the cache.
+    diff_tabless: bool,
     /// Cached per-row galleys for the (un-virtualized) file-list sidebar.
     sidebar_cache: SidebarCache,
     /// Sorted `(patch start line, file index)` for the current diff — the
@@ -3887,6 +3893,7 @@ impl GitkApp {
             diff_max_chars,
             diff_linenos: None, // no diff yet, and nothing to measure until one draws
             diff_textconv_failed: false,
+            diff_tabless: false,
             sidebar_cache: SidebarCache::default(),
             file_line_starts: Vec::new(),
             clipboard: None,
@@ -4278,6 +4285,7 @@ impl GitkApp {
                 std::mem::take(&mut self.diff_files),
                 self.diff_max_chars,
                 self.diff_textconv_failed,
+                self.diff_tabless,
             );
             // A virtual entry is content-keyed, so each working-tree edit — or, for the
             // range row, each move of its endpoints — produces a fresh hash and the
@@ -4478,7 +4486,7 @@ impl GitkApp {
         // field added to `DiffData` a compile error here rather than a value silently
         // dropped at the display boundary. `max_chars` is precomputed at build time (on
         // the worker), so no per-line rescan happens here.
-        let (lines, spans, files, max_chars, textconv_failed) = data.into_parts();
+        let (lines, spans, files, max_chars, textconv_failed, tabless) = data.into_parts();
         self.diff_max_chars = max_chars;
         // Drop the previous diff's gutter widths; the render re-measures on the
         // first frame that needs them, so a session with line numbers off never
@@ -4495,6 +4503,11 @@ impl GitkApp {
         // free to have the same line count.
         self.diff_wrap = None;
         self.diff_textconv_failed = textconv_failed;
+        // What the BUILD proved about this diff's tabs, so the index the render is
+        // about to make does not re-read every byte to learn it. Carried on `GitkApp`
+        // for the reason `diff_textconv_failed` is: the display outlives the `DiffData`
+        // it was split out of, and `from_parts` needs it back.
+        self.diff_tabless = tabless;
         // Emphasis is not part of a diff and is not carried across one: it is per
         // viewport, and `ensure_visible_word_emphasis` refills the window on the next
         // frame. Sized here against the incoming rows, which is the one place it can be
@@ -8167,6 +8180,7 @@ impl eframe::App for GitkApp {
                         &mut self.diff_wrap,
                         self.wrap,
                         &self.diff_lines,
+                        self.diff_tabless,
                         cols,
                         linenos,
                     );
@@ -9244,7 +9258,7 @@ mod tests {
         // happens at `cols - prefix_len` and not at that floor.
         let cols = 23;
         let prefix_len = g.chars() + 1; // + the marker column
-        let idx = diff::WrapIndex::build(&lines, cols, g);
+        let idx = diff::WrapIndex::build(&lines, cols, g, false);
         let rows = idx.total_rows();
         assert_eq!(rows, body.len().div_ceil(cols - prefix_len));
         let mut drawn = String::new();
@@ -9343,25 +9357,25 @@ mod tests {
         let mut index = None;
 
         // Off, and nothing to drop: no move, on this frame or any after it.
-        assert!(!resync_wrap_index(&mut index, false, &lines, 40, g));
-        assert!(!resync_wrap_index(&mut index, false, &lines, 40, g));
+        assert!(!resync_wrap_index(&mut index, false, &lines, false, 40, g));
+        assert!(!resync_wrap_index(&mut index, false, &lines, false, 40, g));
         assert!(index.is_none());
 
         // Ticked on: built, and a move.
-        assert!(resync_wrap_index(&mut index, true, &lines, 40, g));
+        assert!(resync_wrap_index(&mut index, true, &lines, false, 40, g));
         assert!(index.as_ref().is_some_and(|w| w.total_rows() > lines.len()));
         // Settled: same inputs, no move — or the pane would be pinned every frame
         // and could not be scrolled at all.
-        assert!(!resync_wrap_index(&mut index, true, &lines, 40, g));
+        assert!(!resync_wrap_index(&mut index, true, &lines, false, 40, g));
         // A narrower pane re-wraps: a move.
-        assert!(resync_wrap_index(&mut index, true, &lines, 30, g));
+        assert!(resync_wrap_index(&mut index, true, &lines, false, 30, g));
 
         // Unticked: the index goes, and that IS a move — this is the assertion the
         // bug failed.
-        assert!(resync_wrap_index(&mut index, false, &lines, 30, g));
+        assert!(resync_wrap_index(&mut index, false, &lines, false, 30, g));
         assert!(index.is_none());
         // And exactly once: every frame after the untick is quiet again.
-        assert!(!resync_wrap_index(&mut index, false, &lines, 30, g));
+        assert!(!resync_wrap_index(&mut index, false, &lines, false, 30, g));
     }
 
     /// A diff row's context-menu id follows the LINE it draws, not the visual row.
@@ -9439,7 +9453,7 @@ mod tests {
         // The rows in the order they are drawn, read off by sweeping the pointer down
         // the pane: each row is a contiguous band, so a change of id is the next row.
         let row_ids = |cols: usize| -> Vec<egui::Id> {
-            let wrap = diff::WrapIndex::build(&lines, cols, g);
+            let wrap = diff::WrapIndex::build(&lines, cols, g, false);
             let mut out: Vec<egui::Id> = Vec::new();
             for step in 0..200 {
                 if let Some(id) = row_id_at(&wrap, step as f32 * 2.0)
@@ -9453,8 +9467,8 @@ mod tests {
 
         let (narrow, wide) = (40, 200);
         let (in_, iw) = (
-            diff::WrapIndex::build(&lines, narrow, g),
-            diff::WrapIndex::build(&lines, wide, g),
+            diff::WrapIndex::build(&lines, narrow, g, false),
+            diff::WrapIndex::build(&lines, wide, g, false),
         );
         // Control: the re-wrap has to actually move the last line to another row, and
         // leave a different line on the row it came from.
@@ -9498,7 +9512,7 @@ mod tests {
             DiffLine::new("tail", LineKind::Context),
         ];
         let cols = 40;
-        let idx = diff::WrapIndex::build(&lines, cols, LineNoGutter::default());
+        let idx = diff::WrapIndex::build(&lines, cols, LineNoGutter::default(), false);
         assert!(idx.total_rows() > 3, "the long line has to actually wrap");
         let lay_out = |wrap: Option<&diff::WrapIndex>| {
             let mut asked: Vec<(usize, usize)> = Vec::new();
