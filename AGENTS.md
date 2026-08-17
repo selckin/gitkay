@@ -1234,7 +1234,7 @@ sorted drivers keep the same rows with the same rewritten parents.
   key first; that key is gone.) It is **render-only**, like `file_list`: no diff data
   moves, so it is not a `DiffSettings` field either — nor of `ToolbarDiffSettings`,
   whose whole point is the fields that force a re-diff — and neither cache is keyed
-  on it. A tick needs no branch of its own: `ensure_wrap_index` builds an index on
+  on it. A tick needs no branch of its own: `resync_wrap_index` builds an index on
   the next frame and an untick drops it — and **both report a move**, which is the
   half that was wrong at first. The `ScrollArea`'s offset is in visual rows, so the
   frame after an untick that offset names a completely different line; unticking a
