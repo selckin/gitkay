@@ -70,19 +70,16 @@ impl StatFile<'_> {
 }
 
 /// Decimal digits in `val` — libgit2's `digits_for_value`, which the count column is
-/// padded to. Its `placevalue *= 10` is unbounded in C; here it stops at the last place
-/// a `usize` can hold, which no real count reaches.
+/// padded to. Its `placevalue *= 10` loop is arithmetic with one right answer, so this
+/// is `ilog10` rather than a port of the loop; the port is the FORMATTING around it,
+/// where libgit2's quirks are the point. Zero takes one digit, as it does there —
+/// unlike `LineNoGutter::digits`, whose zero means "no column at all".
 const fn digits_for_value(val: usize) -> usize {
-    let mut count = 1;
-    let mut place: usize = 10;
-    while val >= place {
-        count += 1;
-        match place.checked_mul(10) {
-            Some(next) => place = next,
-            None => break,
-        }
+    // `unwrap_or` is not const yet; the match is the same expression.
+    match val.checked_ilog10() {
+        Some(log) => log as usize + 1,
+        None => 1,
     }
-    count
 }
 
 /// The block: one row per file, then the summary row. Rows carry no trailing newline
