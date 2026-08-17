@@ -921,6 +921,20 @@ fn row_chars(line: &DiffLine) -> usize {
     line.text.chars().count()
 }
 
+/// Fold one row into a running widest-row maximum.
+///
+/// The character walk runs only where the row's BYTE length could beat the maximum,
+/// which retires it for essentially every row: a character is never fewer bytes than
+/// one, so a row no longer in bytes than the maximum cannot be wider in characters —
+/// the same inequality `diff::wrap` builds its whole index on. The widest row turns up
+/// early in a build and every row after it costs one `usize` comparison, where this
+/// used to decode every character of every row pushed.
+fn widen(max: &mut usize, line: &DiffLine) {
+    if line.text.len() > *max {
+        *max = (*max).max(row_chars(line));
+    }
+}
+
 /// The rows a diff build is accumulating, with the widest one measured as they go.
 ///
 /// `DiffData::max_chars` sizes the pane's horizontal scroll range, and `DiffData::new`
@@ -954,7 +968,10 @@ impl DiffRows {
     /// Start from rows the caller assembled itself — a diff's header block — measuring
     /// them: a commit message line is routinely the widest row in a small diff.
     fn new(lines: Vec<DiffLine>) -> Self {
-        let max_chars = lines.iter().map(row_chars).max().unwrap_or(0);
+        let mut max_chars = 0;
+        for line in &lines {
+            widen(&mut max_chars, line);
+        }
         Self { lines, max_chars }
     }
 
@@ -963,7 +980,7 @@ impl DiffRows {
     }
 
     fn push(&mut self, line: DiffLine) {
-        self.max_chars = self.max_chars.max(row_chars(&line));
+        widen(&mut self.max_chars, &line);
         self.lines.push(line);
     }
 
@@ -986,7 +1003,7 @@ impl DiffRows {
     /// mismatch must not panic in the middle of a build.
     fn set(&mut self, i: usize, line: DiffLine) {
         if let Some(slot) = self.lines.get_mut(i) {
-            self.max_chars = self.max_chars.max(row_chars(&line));
+            widen(&mut self.max_chars, &line);
             *slot = line;
         }
     }
