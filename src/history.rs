@@ -842,7 +842,7 @@ fn filtered_walk(
     ref_map: &std::collections::HashMap<git2::Oid, Vec<(String, RefKind)>>,
     label: &str,
     bloom: Option<&PathBloom<'_>>,
-    oids: impl Iterator<Item = Result<git2::Oid, Declined>>,
+    oids: impl Iterator<Item = Result<(git2::Oid, Option<Vec<git2::Oid>>), Declined>>,
 ) -> Option<FilteredWalk> {
     // 1. Walk newest→oldest, recording every commit's parents; keep the ones that
     //    touch the path until we have `max` of them.
@@ -878,20 +878,26 @@ fn filtered_walk(
     let t_walk = std::time::Instant::now();
     for item in oids {
         // A walk that cannot answer takes the whole pass with it; see `Declined`.
-        let oid = item.ok()?;
+        let (oid, walked_parents) = item.ok()?;
         if prepared.is_none() {
             prepared = Some(t_walk.elapsed());
         }
         if !seen.insert(oid) {
             continue;
         }
-        let Ok(commit) = timed(&mut find, || repo.find_commit(oid)) else {
-            continue;
-        };
-        let parents: Vec<git2::Oid> = commit_parents(&commit, scope.first_parent);
-        walked.push((oid, parents.clone()));
-        // The commit still had to be READ, for the parents the rewrite chains through;
-        // what the filter saves is the tree comparison, which is the expensive half.
+        // Asked BEFORE the commit is read, because on a cold pathspec the answer is
+        // usually "no" and a commit ruled out needs nothing the object holds: not the
+        // tree comparison, not a row, not a rename trace. What it still needs is its
+        // PARENTS, which the rewrite below chains through — and the lazy walk read
+        // those when it expanded the commit, so it hands them over rather than
+        // leaving this loop to re-derive them from an object it would otherwise have
+        // no reason to touch. On the kernel clone the filters rule out 190,618 of
+        // 191,485 commits, and that is the whole of the saving: `find_commit` parses
+        // a commit out of the pack and was the lazy walk's dominant per-commit cost.
+        //
+        // The sorted driver has no parents to offer (a `Revwalk` yields oids alone),
+        // and pays nothing for it: libgit2's ordering pass has already parsed every
+        // commit, so its `find_commit` is an odb-cache hit.
         let ruled = timed(&mut touch, || {
             bloom.is_some_and(|b| b.definitely_unchanged(oid))
         });
@@ -905,6 +911,15 @@ fn filtered_walk(
             tested += 1;
             timed(&mut touch, || {
                 follow_path.as_ref().map_or_else(
+        if ruled && let Some(parents) = walked_parents {
+            walked.push((oid, parents));
+            continue;
+        }
+        let Ok(commit) = timed(&mut find, || repo.find_commit(oid)) else {
+            continue;
+        };
+        let parents = walked_parents.unwrap_or_else(|| commit_parents(&commit, scope.first_parent));
+        walked.push((oid, parents.clone()));
                     || commit_touches_paths(repo, &commit, &scope.paths),
                     |p| commit_touches_paths(repo, &commit, std::slice::from_ref(p)),
                 )
@@ -1057,7 +1072,7 @@ fn lazy_filtered_walk_bounded(
             }
             taken += 1;
             match walk.next() {
-                Some(oid) => Some(Ok(oid)),
+                Some((oid, parents)) => Some(Ok((oid, Some(parents)))),
                 None if walk.done() => None,
                 None => Some(Err(Declined)),
             }
@@ -1101,7 +1116,7 @@ fn sorted_filtered_walk(
         ref_map,
         "sorted",
         bloom.as_ref(),
-        revwalk.flatten().map(Ok),
+        revwalk.flatten().map(|oid| Ok((oid, None))),
     )
 }
 
@@ -3754,28 +3769,56 @@ mod tests {
         let (_root, _main_c, _side_c, tip) = merged_history(&repo);
         commit_file(&repo, "g.txt", "later", "g again");
         let tip2 = commit_file(&repo, "f.txt", "later", "f again");
-        write_commit_graph(&repo, &[tip, tip2]);
-        let repo = open_repo(dir.path());
         let scope = cli::Scope {
             paths: vec!["g.txt".to_string()],
             ..Default::default()
         };
-        let ref_map = build_ref_map(&repo);
-
-        let lazy = lazy_filtered_walk(&repo, &scope, 100, &ref_map).expect("the lazy filter");
-        let sorted = sorted_filtered_walk(&repo, &scope, 100, &ref_map).expect("the sorted filter");
+    ///
+    /// **Run against both graph shapes, because they take different code paths through
+    /// the filter loop.** With changed-path filters a ruled-out commit never has its
+    /// object read at all — the loop takes its parents from the walk, which is where
+    /// the rewrite chains through — so a fixture with only a plain graph would assert
+    /// the parents of a path this no longer exercises.
+        // A commit the filter DROPS, sitting between two it keeps. Without one the
+        // parent rewrite has no work to do — every kept row's parent is either kept
+        // or the bottom of history — and the rewritten parents this test compares are
+        // then the same however badly the walk reported them.
+        commit_file(&repo, "f.txt", "middle", "f middle");
         let rows = |w: &FilteredWalk| -> Vec<(String, Vec<git2::Oid>)> {
             w.kept
                 .iter()
                 .map(|c| (c.summary.clone(), c.parents.clone()))
                 .collect()
         };
-        assert_eq!(rows(&lazy), rows(&sorted));
-        assert!(lazy.kept.len() >= 2, "the fixture should keep real rows");
-        assert!(
-            lazy.walked <= sorted.walked,
-            "the lazy walk stops where the filter is satisfied"
-        );
+
+        let mut with_filters = false;
+        for _ in 0..2 {
+            if with_filters {
+                write_commit_graph_with_changed_paths(&repo, &[tip, tip2]);
+            } else {
+                write_commit_graph(&repo, &[tip, tip2]);
+            }
+            // Reopened: libgit2 and `CommitGraph` both read the file at open time.
+            let repo = open_repo(dir.path());
+            let graph = crate::commitgraph::CommitGraph::for_repo(&repo).unwrap();
+            assert_eq!(
+                PathBloom::of(&graph, &scope).is_some(),
+                with_filters,
+                "the second pass has to actually use the filters, or it repeats the first"
+            );
+            let ref_map = build_ref_map(&repo);
+
+            let lazy = lazy_filtered_walk(&repo, &scope, 100, &ref_map).expect("the lazy filter");
+            let sorted =
+                sorted_filtered_walk(&repo, &scope, 100, &ref_map).expect("the sorted filter");
+            assert_eq!(rows(&lazy), rows(&sorted), "with_filters={with_filters}");
+            assert!(lazy.kept.len() >= 2, "the fixture should keep real rows");
+            assert!(
+                lazy.walked <= sorted.walked,
+                "the lazy walk stops where the filter is satisfied"
+            );
+            with_filters = true;
+        }
     }
 
     /// A commit-graph written with `--changed-paths` answers the filter's question from

@@ -105,10 +105,22 @@ const EXPAND_BATCH: usize = 512;
 /// (`u32::MAX` for one the graph does not hold), and its indegree in git's convention
 /// (1 = ready). The generation is kept rather than re-read because a lookup is a binary
 /// search through a file, and the walk asks repeatedly.
-#[derive(Clone, Copy)]
 struct Node {
     generation: u32,
     indegree: u32,
+    /// The parents `expand` read, kept until the commit is emitted and handed to the
+    /// caller with it.
+    ///
+    /// A commit CANNOT be emitted before it is expanded — it sits in the frontier at
+    /// its own generation until then, so the floor is never below it and
+    /// `safe_to_emit` is false — which is what makes this `Some` at emit time rather
+    /// than hopefully-set. Reading the parents again there was a second
+    /// `find_commit` per emitted commit for a value this already had, and the caller
+    /// then read them a THIRD time off its own `find_commit`.
+    ///
+    /// Taken at emit, so what is held is bounded by the discovered-but-not-yet-emitted
+    /// frontier rather than by everything the walk has ever seen.
+    parents: Option<Vec<git2::Oid>>,
 }
 
 /// The state of one lazy topological walk.
@@ -190,6 +202,7 @@ impl<'a> TopoWalk<'a> {
             Node {
                 generation,
                 indegree: 1,
+                parents: None,
             },
         );
         self.frontier.push(ByGeneration(generation, oid));
@@ -212,7 +225,8 @@ impl<'a> TopoWalk<'a> {
     /// step that builds the indegrees Kahn's algorithm consumes.
     fn expand(&mut self, oid: git2::Oid) -> Option<()> {
         let known = self.generation_of(oid) != u32::MAX;
-        for parent in self.parents(oid)? {
+        let parents = self.parents(oid)?;
+        for &parent in &parents {
             self.discover(parent);
             // The ancestry-closure check. A commit the graph knows must have parents
             // it knows; if it does not, the file is not closed under ancestry and the
@@ -223,6 +237,8 @@ impl<'a> TopoWalk<'a> {
             }
             self.nodes.get_mut(&parent)?.indegree += 1;
         }
+        // Kept for the emit, which needs exactly this list and used to read it again.
+        self.nodes.get_mut(&oid)?.parents = Some(parents);
         Some(())
     }
 
@@ -240,9 +256,15 @@ impl<'a> TopoWalk<'a> {
         self.floor().is_none_or(|floor| floor < g)
     }
 
-    /// The next commit in `git log --graph` order, or `None` when the walk is done or
-    /// the commit-graph cannot answer for something it needs.
-    pub fn next(&mut self) -> Option<git2::Oid> {
+    /// The next commit in `git log --graph` order **and its parents**, or `None` when
+    /// the walk is done or the commit-graph cannot answer for something it needs.
+    ///
+    /// The parents come with the commit because the walk has them: it read them to
+    /// build this commit's indegree, and every caller needs them too — the path
+    /// filter chains its parent rewrite through them, and `build_commit_info` draws
+    /// the lanes from them. Handing them over is what lets a caller that wants
+    /// nothing else from the commit object skip reading it.
+    pub fn next(&mut self) -> Option<(git2::Oid, Vec<git2::Oid>)> {
         loop {
             // Emit as soon as the top of the stack is provably final. Checking only
             // the TOP is enough: the stack is the emission order, so nothing below it
@@ -263,10 +285,14 @@ impl<'a> TopoWalk<'a> {
                 if !self.emitted.insert(top) {
                     continue;
                 }
-                let Some(parents) = self.parents(top) else {
+                // Set by `expand`, which every emitted commit has been through — see
+                // `Node::parents`. Absent means that invariant broke, and this walk
+                // refuses rather than re-deriving a list whose absence says the order
+                // it is producing cannot be trusted.
+                let Some(parents) = self.nodes.get_mut(&top).and_then(|n| n.parents.take()) else {
                     return self.decline();
                 };
-                for parent in parents {
+                for &parent in &parents {
                     let Some(node) = self.nodes.get_mut(&parent) else {
                         return self.decline();
                     };
@@ -275,7 +301,7 @@ impl<'a> TopoWalk<'a> {
                         self.ready.push(parent);
                     }
                 }
-                return Some(top);
+                return Some((top, parents));
             }
             // Not safe yet (or nothing ready): lower the floor.
             if self.frontier.is_empty() {
@@ -294,7 +320,7 @@ impl<'a> TopoWalk<'a> {
 
     /// Latch the refusal and answer `None`. Every bail-out goes through here, so
     /// "gave up" cannot be reported as "ran out" by a path that forgot to say so.
-    const fn decline(&mut self) -> Option<git2::Oid> {
+    const fn decline<T>(&mut self) -> Option<T> {
         self.declined = true;
         None
     }
@@ -310,7 +336,7 @@ impl<'a> TopoWalk<'a> {
             // call, which also covers the already-finished case: `next` over an empty
             // stack and an empty frontier changes nothing, so `done` is still true.
             match self.next() {
-                Some(oid) => out.push(oid),
+                Some((oid, _)) => out.push(oid),
                 None if self.done() => break,
                 None => return None,
             }
