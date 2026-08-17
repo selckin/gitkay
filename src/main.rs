@@ -322,30 +322,6 @@ fn diff_cache_line_budget() -> usize {
 /// still count here — a worker that spent six seconds on a diff it then discarded has
 /// done a dispatch's worth of harm whether or not anything was cached.
 const PREFETCH_LINE_BUDGET_DIVISOR: usize = 2;
-/// Largest diff a prefetch will cache.
-///
-/// A speculative warm that alone fills a large share of the cache is **negative
-/// value**: every row in the band is about equally likely to be opened, so holding one
-/// giant row costs a dozen ordinary ones. Worse at the extreme — `DiffCache::insert`
-/// keeps at least one entry, so a diff bigger than the whole budget evicts everything
-/// and then sits alone until the next insert evicts it too. Measured: a 133,460-line
-/// diff evicted all 51 warmed entries (98,507 lines), leaving the cache empty of
-/// anything useful.
-///
-/// An eighth of the budget, so the cache can always hold at least eight prefetched rows
-/// and at a realistic ~1,930 lines a row some hundreds of them. Deliberately a
-/// *fraction*: what makes a row too big is how much of the band it displaces, so the
-/// cap tracks the cache rather than being tuned against it.
-///
-/// At the current budget that is 150,000 lines, chosen so the largest diff seen on a
-/// real repo (133,460 lines — the one that emptied the cache when nothing capped it)
-/// is now **admitted** rather than dropped: the cache is big enough to hold it beside
-/// a full band. Refusing an entry is the fallback for a repo that outgrows even this,
-/// not the normal path.
-///
-/// The **display** path is deliberately unaffected: a diff the user actually opened is
-/// theirs to cache however large, because they are looking at it.
-const PREFETCH_MAX_ENTRY_DIVISOR: usize = 8;
 /// Largest diff a prefetch will pre-**highlight**. A bigger one is still cached, just
 /// as `WarmDepth::DiffOnly` however near the view it is.
 ///
@@ -568,12 +544,12 @@ const _: () = {
          band the user is about to scroll into is gone before they reach it"
     );
     assert!(
-        PREFETCH_MAX_ENTRY_DIVISOR > PREFETCH_LINE_BUDGET_DIVISOR,
+        diff_store::MAX_ENTRY_DIVISOR > PREFETCH_LINE_BUDGET_DIVISOR,
         "one speculative row must not be able to spend a whole dispatch's budget, \
          or the band is one giant diff and nothing else"
     );
     assert!(
-        PREFETCH_MAX_HIGHLIGHT_LINES < DIFF_CACHE_LINE_FLOOR / PREFETCH_MAX_ENTRY_DIVISOR,
+        PREFETCH_MAX_HIGHLIGHT_LINES < DIFF_CACHE_LINE_FLOOR / diff_store::MAX_ENTRY_DIVISOR,
         "a row too big to pre-highlight must still be cacheable at EVERY budget the \
          derivation can produce, or on a small machine the size rule collapses into \
          the entry rule and the DiffOnly downgrade never happens"
