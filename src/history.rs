@@ -774,11 +774,22 @@ struct PathBloom<'a> {
 }
 
 impl<'a> PathBloom<'a> {
+    /// Whether the filters could answer for this scope AT ALL — the two declines that
+    /// are properties of the command line rather than of the file, so they can be
+    /// asked before a graph is opened and by a caller that has no graph to open.
+    ///
+    /// Split out because `commit_graph_advice` has to ask exactly this: it offers
+    /// `--changed-paths` as the fix for a slow filtered walk, and a scope this refuses
+    /// would not read the index it is being told to spend minutes writing. Re-deriving
+    /// the rule there is what made that advice wrong for `--follow` and for a glob —
+    /// the same lesson `WalkCost::of` states for the walk report, arriving through a
+    /// predicate instead of through a scope.
+    fn applicable(scope: &cli::Scope) -> bool {
+        !scope.follow && !scope.paths.is_empty() && scope.paths.iter().all(|p| literal_pathspec(p))
+    }
+
     fn of(graph: &'a crate::commitgraph::CommitGraph, scope: &cli::Scope) -> Option<Self> {
-        if scope.follow
-            || scope.paths.is_empty()
-            || !scope.paths.iter().all(|p| literal_pathspec(p))
-        {
+        if !Self::applicable(scope) {
             return None;
         }
         let t = std::time::Instant::now();
@@ -1723,25 +1734,39 @@ fn slow_walk_message(elapsed: std::time::Duration, rows: usize, cost: WalkCost) 
 /// without one is worth a word too, but only when a pathspec is what was slow. Asking
 /// `has_changed_paths` rather than opening the filters keeps that check free.
 ///
-/// **Only the LAZINESS is gated on `topo_scope`.** It is available solely to a scope
-/// `topo_scope` accepts, so promising it elsewhere is a false promise; the changed-path
-/// index is not — `sorted_filtered_walk` opens the filters for ANY filtered scope, so a
-/// range or a `--follow` walk saves exactly the same tree comparisons and has the same
-/// reason to be told. That is why a filtered scope gets an answer whether or not it
-/// would walk lazily and whether or not a graph exists: only the sentence changes, and
-/// the one it gets promises exactly what its own walk would gain.
+/// **The two halves are gated separately, and neither gate is re-derived here.** The
+/// laziness is `topo_scope`'s — it is available solely to a scope that predicate
+/// accepts, so promising it elsewhere is a false promise. The index is
+/// `PathBloom::applicable`'s, which is a WIDER scope but not every scope:
+/// `sorted_filtered_walk` opens the filters for a range as readily as for the plain
+/// one, so a range gains exactly the same tree comparisons and has the same reason to
+/// be told — but `--follow` moves its path as the walk descends and a glob is not a
+/// path git ever hashed, and `PathBloom::of` builds keys for neither. Both were being
+/// offered `--changed-paths` while this asked the scope itself, which is the mistake
+/// `WalkCost::of` names one screen up: the fact belongs to the code that acts on it.
+/// So a filtered scope gets an answer whether or not it would walk lazily and whether
+/// or not a graph exists — but only where something would actually read the file, and
+/// the sentence it gets promises exactly the halves its own walk would gain.
 pub fn commit_graph_advice(repo: &Repository, scope: &cli::Scope) -> Option<&'static str> {
     let graph = crate::commitgraph::CommitGraph::for_repo(repo);
-    match (&graph, scope.paths.is_empty()) {
-        (None, true) if topo_scope(scope) => Some(ADVICE_NO_GRAPH),
-        (None, false) if topo_scope(scope) => Some(ADVICE_NO_GRAPH_FILTERED),
-        // A filtered scope the lazy walk does not cover — a range, a `--follow` — in a
-        // repository with no graph at all. It gains no laziness, so this promises none;
-        // it gains the tree comparisons the changed-path index skips, exactly as the
-        // arm below does for a graph that is merely missing the index.
-        (None, false) => Some(ADVICE_NO_GRAPH_FILTER_ONLY),
-        (Some(g), false) if !g.has_changed_paths() => Some(ADVICE_NO_CHANGED_PATHS),
-        _ => None,
+    // The two halves, each asked of the code that would do the gaining: `topo_scope`
+    // for the laziness, `PathBloom::applicable` for the index. Asking the SCOPE about
+    // the index instead is what made this promise `--changed-paths` to a `--follow`
+    // walk and to a glob — neither of which `PathBloom::of` will build keys for, so
+    // the file the reader was told to spend minutes writing would go unread.
+    let no_lazy_walk = graph.is_none() && topo_scope(scope);
+    let no_index =
+        PathBloom::applicable(scope) && graph.as_ref().is_none_or(|g| !g.has_changed_paths());
+    match (no_lazy_walk, no_index) {
+        (true, true) => Some(ADVICE_NO_GRAPH_FILTERED),
+        (true, false) => Some(ADVICE_NO_GRAPH),
+        // A filtered scope the lazy walk does not cover — a range, a literal-path
+        // `--follow` is already excluded above — which still gains the tree
+        // comparisons the changed-path index skips. Whether it has a graph at all
+        // decides only which command it is pointed at.
+        (false, true) if graph.is_none() => Some(ADVICE_NO_GRAPH_FILTER_ONLY),
+        (false, true) => Some(ADVICE_NO_CHANGED_PATHS),
+        (false, false) => None,
     }
 }
 
@@ -3179,6 +3204,30 @@ mod tests {
             "the index, and deliberately not the laziness this scope would not get"
         );
 
+        // The two scopes whose walk would never READ a changed-path index: `--follow`
+        // moves its path as it descends, and a glob is not a path git hashed, so
+        // `PathBloom::of` builds keys for neither. Offering `--changed-paths` to them
+        // is a false promise — minutes of writing for a file the walk declines — and
+        // it was made until the advice asked `PathBloom` instead of the scope.
+        let followed = cli::Scope {
+            follow: true,
+            ..filtered.clone()
+        };
+        assert_eq!(
+            commit_graph_advice(&repo, &followed),
+            None,
+            "--follow gains neither half: no lazy walk, and no filters it would read"
+        );
+        let globbed = cli::Scope {
+            paths: vec!["*.txt".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            commit_graph_advice(&repo, &globbed),
+            Some(ADVICE_NO_GRAPH),
+            "a glob still walks lazily, but must not be promised the index"
+        );
+
         write_commit_graph(&repo, &[tip]);
         let repo = open_repo(dir.path());
         assert_eq!(
@@ -3186,6 +3235,9 @@ mod tests {
             None,
             "there is one now, and nothing to advise"
         );
+        // A graph missing only the index has nothing to offer these two either.
+        assert_eq!(commit_graph_advice(&repo, &followed), None);
+        assert_eq!(commit_graph_advice(&repo, &globbed), None);
         // …but it carries no changed-path index, which only a path filter misses.
         assert_eq!(
             commit_graph_advice(&repo, &filtered),
