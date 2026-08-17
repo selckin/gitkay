@@ -1242,9 +1242,13 @@ pub fn load_commits_inner(
             let _ = go.send(());
         }
         // The same knowledge, said to the reader instead of to a thread — and on the
-        // same terms: only if the wait actually materialises. Cancelled by falling out
-        // of this block.
-        let _notice = arm_slow_walk_notice(commit_graph_advice(repo, scope), SLOW_ORDERING_NOTICE);
+        // same terms: only if the wait actually materialises. Which sentence is the
+        // same question the report at the end asks, answered from the same fact.
+        // Cancelled by falling out of this block.
+        let _notice = arm_slow_walk_notice(
+            commit_graph_advice(repo, scope),
+            ordering_notice(provisional.is_some()),
+        );
         let t_setup = std::time::Instant::now();
         let walk = history_revwalk(repo, scope);
         let setup = t_setup.elapsed();
@@ -1305,7 +1309,7 @@ pub fn load_commits_inner(
         scope,
         t.elapsed(),
         real.len(),
-        WalkCost::of(scope, walked_commits, lazy),
+        WalkCost::of(walked_commits, lazy, provisional.is_some()),
     );
 
     // Join the probes now — their half-second ran alongside the walk above — and put
@@ -1612,11 +1616,16 @@ pub enum WalkCost {
 impl WalkCost {
     /// Which of the three a finished walk was, or `None` for one not worth reporting.
     ///
+    /// **Every input is a fact the walk recorded, and the scope is not one of them.**
     /// `walked` is `Some` only from the path-filter branch of `load_commits_inner`,
     /// which is the one that counts what it examined — so the pathspec case cannot be
-    /// constructed without its denominator. `lazy` is likewise recorded by the branch
-    /// that took it, and not re-derived here: a commit-graph existing does not mean the
-    /// walk used it (see `ProvisionalGo` for the same distinction costing 57s).
+    /// constructed without its denominator. `lazy` is recorded by the branch that took
+    /// it: a commit-graph existing does not mean the walk used it (see `ProvisionalGo`
+    /// for the same distinction costing 57s). And `stood_in` is whether a provisional
+    /// list was actually arranged for THIS walk, which `provisional_scope(scope)` only
+    /// approximates — it is equally true of a watcher rebuild, where no stand-in runs
+    /// and the previous list is what stays on screen, so the report claimed a
+    /// best-effort pass that never happened.
     ///
     /// **A lazy walk is reported as nothing at all**, though it can cross the threshold
     /// — 660ms for 200 rows on a 1.47M-commit clone, where what is left after the
@@ -1627,11 +1636,11 @@ impl WalkCost {
     /// with nothing to advise and silences the one that has something. This wrong
     /// sentence was on screen — "the whole history walked and sorted" for a walk that
     /// did neither — which is what the flag exists to stop.
-    const fn of(scope: &cli::Scope, walked: Option<usize>, lazy: bool) -> Option<Self> {
+    const fn of(walked: Option<usize>, lazy: bool, stood_in: bool) -> Option<Self> {
         match walked {
             Some(walked) => Some(Self::PathFilter { walked }),
             None if lazy => None,
-            None if provisional_scope(scope) => Some(Self::OrderingAfterProvisional),
+            None if stood_in => Some(Self::OrderingAfterProvisional),
             None => Some(Self::Ordering),
         }
     }
@@ -1835,8 +1844,35 @@ fn arm_slow_walk_notice(
 
 /// The early notice's why-clause for a walk with no path filter: the ordering pass,
 /// which is every scope's floor and the whole of the wait.
+///
+/// **Neither variant says anything about what is on screen**, and the first one said
+/// "before the first row can be drawn" until a reader pointed out that the row was
+/// already there: this fires at `SLOW_HISTORY_WALK` and a stand-in lands at
+/// `PROVISIONAL_HISTORY_DELAY`, 300ms earlier. A rebuild leaves the PREVIOUS list up
+/// for the whole walk too, and neither the walk nor the thread reporting for it knows
+/// which of those the reader is looking at. So the sentence names the arrangement — a
+/// stand-in was arranged, or none was — which is a fact the walk holds, and the reader
+/// can see their own screen.
 const SLOW_ORDERING_NOTICE: &str = "still building the commit list: the whole history has to be walked and sorted \
-     before the first row can be drawn";
+     before its order is known";
+
+/// `SLOW_ORDERING_NOTICE` where a provisional list was arranged, so the rows the reader
+/// gets in the meantime are the approximate ones and the walk will replace them. Told
+/// apart by whether a stand-in was actually ARMED, never by re-reading the scope — see
+/// `WalkCost::of`.
+const SLOW_ORDERING_STANDIN_NOTICE: &str = "still building the commit list: a best-effort order is standing in while the whole \
+     history is walked and sorted, and will be replaced when it lands";
+
+/// Which of the two an unfiltered walk gets. Split from the arming for the reason
+/// `slow_walk_message` is split from the logging: so both sentences are testable
+/// without capturing output.
+const fn ordering_notice(stood_in: bool) -> &'static str {
+    if stood_in {
+        SLOW_ORDERING_STANDIN_NOTICE
+    } else {
+        SLOW_ORDERING_NOTICE
+    }
+}
 
 /// The early notice's why-clause for a path-filtered walk — a different cost with a
 /// different lever, as `WalkCost` says at more length. No denominator here, unlike the
@@ -2985,6 +3021,37 @@ mod tests {
         );
     }
 
+    /// **No early sentence may describe the window**, because the thread saying it
+    /// cannot see one: a stand-in lands at `PROVISIONAL_HISTORY_DELAY`, 300ms before
+    /// this fires, and a watcher rebuild leaves the previous list up for the whole
+    /// walk. "before the first row can be drawn" was exactly that mistake, said over a
+    /// list that was already on screen. What each may name is the work it is doing, and
+    /// — where one was arranged — the stand-in.
+    #[test]
+    fn the_early_notice_names_the_work_and_never_the_window() {
+        let standin = ordering_notice(true);
+        let plain = ordering_notice(false);
+        for notice in [standin, plain, SLOW_FILTER_NOTICE] {
+            assert!(
+                notice.starts_with("still building the commit list:"),
+                "{notice}"
+            );
+            assert!(
+                !notice.contains("first row") && !notice.contains("on screen"),
+                "an early notice may not claim what is displayed: {notice}"
+            );
+        }
+        for notice in [standin, plain] {
+            assert!(notice.contains("walked and sorted"), "{notice}");
+        }
+        assert!(SLOW_FILTER_NOTICE.contains("path filter"), "the other cost");
+        assert!(standin.contains("best-effort"), "{standin}");
+        assert!(
+            !plain.contains("best-effort"),
+            "nothing was arranged to stand in: {plain}"
+        );
+    }
+
     /// The second line names a fix, so it may only appear where the fix works: this
     /// repository has no commit-graph AND this scope would walk with one. Advising it
     /// for a scope that ignores the file is the false promise the advice was withheld
@@ -3082,40 +3149,32 @@ mod tests {
     /// scope: only the branch that counts what it examined can produce the pathspec
     /// case, and a provisional list is impossible there.
     ///
-    /// The last two are the same rule for the lazy walk, and the reason it is a
-    /// recorded fact rather than a re-derivation: the scope alone said "the whole
-    /// history walked and sorted" about a walk that did neither, and spent the
-    /// once-per-process latch saying it.
+    /// The lazy and stand-in cases are why every input is a recorded fact: read off the
+    /// scope instead, this said "the whole history walked and sorted" about a walk that
+    /// did neither and spent the once-per-process latch saying it, and promised a
+    /// "best-effort pass" to a rebuild that ran none.
     #[test]
     fn walk_cost_picks_the_case_from_what_the_walk_produced() {
-        let filtered = cli::Scope {
-            paths: vec!["src".into()],
-            ..cli::Scope::default()
-        };
         assert!(matches!(
-            WalkCost::of(&filtered, Some(4), false),
+            WalkCost::of(Some(4), false, false),
             Some(WalkCost::PathFilter { walked: 4 })
         ));
         assert!(matches!(
-            WalkCost::of(&cli::Scope::default(), None, false),
+            WalkCost::of(None, false, true),
             Some(WalkCost::OrderingAfterProvisional)
         ));
-        let all = cli::Scope {
-            all: true,
-            ..cli::Scope::default()
-        };
         assert!(matches!(
-            WalkCost::of(&all, None, false),
-            Some(WalkCost::Ordering)
+            WalkCost::of(None, false, false),
+            Some(WalkCost::Ordering),
         ));
         assert!(
-            WalkCost::of(&cli::Scope::default(), None, true).is_none(),
+            WalkCost::of(None, true, true).is_none(),
             "a lazy walk is the fast path: nothing to advise, and the latch is worth \
              more to a walk that has something"
         );
         assert!(
             matches!(
-                WalkCost::of(&filtered, Some(4), true),
+                WalkCost::of(Some(4), true, false),
                 Some(WalkCost::PathFilter { walked: 4 })
             ),
             "a lazy walk under a path filter still pays the per-commit diff, and the \
