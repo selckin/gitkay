@@ -47,20 +47,25 @@ const FULL_MIN_SCALE: usize = 7;
 impl StatFile<'_> {
     /// The name column as libgit2 prints it: a rename whose paths share a directory
     /// collapses to `dir/{old => new}`, and one that shares none to `old => new`.
-    fn printed_name(&self) -> String {
+    ///
+    /// `Cow` because the block only ever measures this and pushes it: every ordinary
+    /// file is its own path already, and a diff is mostly ordinary files, so the owned
+    /// form is the rename's to pay for.
+    fn printed_name(&self) -> std::borrow::Cow<'_, str> {
+        use std::borrow::Cow;
         let Some(old) = self.old_path else {
-            return self.new_path.to_owned();
+            return Cow::Borrowed(self.new_path);
         };
         let common = crate::diff::common_dir_prefix_len(old, self.new_path);
         if common > 0 {
-            format!(
+            Cow::Owned(format!(
                 "{}{{{}{RENAME_SEPARATOR}{}}}",
                 &old[..common],
                 &old[common..],
                 &self.new_path[common..]
-            )
+            ))
         } else {
-            format!("{old}{RENAME_SEPARATOR}{}", self.new_path)
+            Cow::Owned(format!("{old}{RENAME_SEPARATOR}{}", self.new_path))
         }
     }
 
@@ -89,8 +94,8 @@ const fn digits_for_value(val: usize) -> usize {
 pub fn block(files: &[StatFile<'_>], width: usize) -> Vec<String> {
     use std::fmt::Write as _;
 
-    let names: Vec<String> = files.iter().map(StatFile::printed_name).collect();
-    let max_name = names.iter().map(String::len).max().unwrap_or(0);
+    let names: Vec<_> = files.iter().map(StatFile::printed_name).collect();
+    let max_name = names.iter().map(|n| n.len()).max().unwrap_or(0);
     let max_filestat = files.iter().map(StatFile::changes).max().unwrap_or(0);
     let max_digits = digits_for_value(max_filestat + 1);
 
