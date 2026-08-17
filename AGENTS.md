@@ -402,7 +402,8 @@ The big picture, ahead of the detail sections below:
 ### Startup & timing
 Startup work is structured so the window paints as soon as possible; the heavy/IO-bound
 parts run off the window-creation critical path. Threads: `gitkay-history` (+
-`gitkay-history-quick`), `gitkay-probes`, `gitkay-fonts`, `gitkay-prewarm`,
+`gitkay-history-quick`, `gitkay-slow-walk`), `gitkay-probes`, `gitkay-fonts`,
+`gitkay-prewarm`,
 `gitkay-fg-{i}`, `gitkay-prefetch-coord` / `-{i}` / `-heavy-{k}`, `gitkay-cache-prune`.
 
 **> Most of what follows was found by MEASUREMENT, and several plausible
@@ -432,9 +433,9 @@ The invariants:
   must describe its commits truthfully or the walk a test compares against is the wrong
   one (`test_repo::write_graph_of` fills every column from the real commit).
 - **gitkay does not write a commit-graph, and keeps no generation cache of its own** —
-  it says the file is absent and names the command (`commit_graph_advice`, a second
-  `warn` line under `note_slow_history_walk`'s latch). That is a measurement, not a
-  preference: traversing the kernel's history through `git2` to compute generations
+  it says the file is absent and names the command (`commit_graph_advice`, its own
+  `warn` line under its own latch, `GRAPH_ADVICE_REPORTED`). That is a measurement, not
+  a preference: traversing the kernel's history through `git2` to compute generations
   costs **62.8s** against the 45s walk it would replace, because `find_commit` parses
   every commit object out of the pack — the exact cost the format exists to eliminate,
   and what lets `git commit-graph write --reachable` do the same job in 35s. So a cache
@@ -450,6 +451,24 @@ The invariants:
   whether or not a graph exists. A filtered scope therefore always gets an answer; only
   the sentence changes, and the one it gets promises exactly what its own walk would
   gain.
+- **A slow walk says so WHILE it runs, not only once it is over** — the end-of-walk
+  report arrives 57s after the window on a 1.47M-commit clone, by which time the wait it
+  explains is finished. `arm_slow_walk_notice` is a thread the two slow branches arm
+  (`SLOW_ORDERING_NOTICE`, `SLOW_FILTER_NOTICE`) that waits out `SLOW_HISTORY_WALK` and
+  speaks only if the walk is still going; the walk's own stack frame owns the sender, so
+  every exit path — panic included — cancels it, and nothing is ever sent through the
+  channel. It cannot be predicted, only timed: the same branch is 17ms at 13k commits.
+  The advice goes to whichever reporter gets there first, which is why it has a latch of
+  its own, taken only when there is something to print — latching on a scope with no
+  advice would silence the next scope that has some.
+- **The report names the walk that RAN, not the one the scope suggests.** `WalkCost::of`
+  takes `lazy` as a recorded fact, and answers `None` for it: a lazy walk crosses the
+  500ms threshold on a large repository (660ms for 200 rows on that clone, the rest
+  being each row's own commit read out of the pack) and would otherwise be handed the
+  sorted walk's sentence — "the whole history walked and sorted" for a walk that did
+  neither — while SPENDING the once-per-process latch on the one case with no lever to
+  name. Same lesson as the provisional walk below: a commit-graph existing says nothing
+  about which walk ran.
 - **`Sort::NONE` is WRONG — do not retry it.** ~150× faster and emits *parents before
   children* on git.git past row 252, which breaks the graph layout invariant. Test any
   ordering change against git.git at 700+ rows, checking parent-before-child.
