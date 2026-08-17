@@ -12001,7 +12001,7 @@ mod tests {
         };
         let tc = Textconv::new();
 
-        let data = get_diff_data(&repo, &scope, s, BuildEnv::textconv(&tc));
+        let data = get_diff_data(&repo, &scope, s, BuildEnv::of(Some(&tc)));
         assert!(
             !data.lines.is_empty(),
             "control: the pane still shows the raw diff rather than blanking"
@@ -12022,7 +12022,7 @@ mod tests {
             &repo,
             &scope,
             s,
-            BuildEnv::textconv(&tc),
+            BuildEnv::of(Some(&tc)),
             None,
         );
         assert_eq!(

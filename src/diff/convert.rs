@@ -763,7 +763,7 @@ pub(super) mod tests {
             &repo,
             &RowScope::new(DiffSource::Uncommitted),
             conv_settings(),
-            BuildEnv::textconv(&tc),
+            BuildEnv::of(Some(&tc)),
         );
         let named: Vec<&str> = data
             .lines
@@ -1398,7 +1398,7 @@ pub(super) mod tests {
             &repo,
             &scope,
             conv_settings(),
-            BuildEnv::textconv(&Textconv::new()),
+            BuildEnv::of(Some(&Textconv::new())),
         );
         assert!(
             !data.textconv_failed,
@@ -1433,7 +1433,7 @@ pub(super) mod tests {
             &repo,
             &scope,
             conv_settings(),
-            BuildEnv::textconv(&Textconv::new()),
+            BuildEnv::of(Some(&Textconv::new())),
         );
         let rows = texts(&data);
         assert!(
