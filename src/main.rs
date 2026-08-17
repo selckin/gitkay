@@ -8063,7 +8063,7 @@ impl Drop for GitkApp {
     /// line.
     ///
     /// Freeing them is real work and buys nothing: a large diff is millions of
-    /// `DiffLine`s each holding an `Arc<String>`, and the allocator walks every one of
+    /// `DiffLine`s each holding an `Arc<str>`, and the allocator walks every one of
     /// them to hand the memory back to a process that is about to stop existing.
     /// Measured on a 76.5M-line diff: **3.24s of a 3.44s exit**, with the window
     /// already gone — the reader sees gitkay linger after they closed it, and eframe

@@ -2653,7 +2653,7 @@ pub fn order_files(
     let lines = Arc::make_mut(lines);
     let files = Arc::make_mut(files);
 
-    // Rows are MOVED, never cloned: wrapping in `Option` (free — `Arc<String>`'s niche
+    // Rows are MOVED, never cloned: wrapping in `Option` (free — `Arc<str>`'s niche
     // keeps the layout identical, so the collect is done in place) lets each row be
     // `take`n out with a plain memcpy. Leaving a blank `DiffLine` behind instead reads
     // just as well and is what this did first, but the filler has to be CLONED per row,
