@@ -1843,64 +1843,6 @@ fn append_diff_body(
     failed || lookup_failed || resolved.is_some_and(|r| r.failed)
 }
 
-/// Where a build's bytes were: the total across every delta, and the largest single
-/// one.
-///
-/// **The largest delta is the floor under any parallel patch pass.** That pass is
-/// per-delta and libgit2 emits a delta's rows only once it has computed the whole patch
-/// (measured: the first line of a 900k-line single-file diff arrives at 1.000s of a
-/// 1.07s print), so one file cannot be split across threads however many there are —
-/// and `total / max` is the best speedup an unlimited number of them could reach.
-///
-/// It is the number to decide by, and it is not the thread count. On the repo this came
-/// from, commits whose builds take a minute have ceilings of **1.0 to 3.7**: one 435MB
-/// blob against a 1.2GB commit is 1.4, and a single-file 92MB one is exactly 1.0.
-///
-/// Free to compute: `DiffFile::size` is filled in as libgit2 loads each blob, so this
-/// reads back what the pass just did rather than touching the odb again. Which is also
-/// why it must be taken AFTER the print — before it, every size is zero.
-pub struct DeltaBytes {
-    pub total: u64,
-    pub max: u64,
-    pub deltas: usize,
-}
-
-impl DeltaBytes {
-    /// Both sides of each delta, since xdiff needs the pair — that is the unit of work
-    /// a parallel pass would hand to a thread.
-    pub fn of(diff: &git2::Diff<'_>) -> Self {
-        let mut out = Self {
-            total: 0,
-            max: 0,
-            deltas: 0,
-        };
-        for delta in diff.deltas() {
-            let bytes = delta
-                .old_file()
-                .size()
-                .saturating_add(delta.new_file().size());
-            out.total = out.total.saturating_add(bytes);
-            out.max = out.max.max(bytes);
-            out.deltas += 1;
-        }
-        out
-    }
-
-    /// The best speedup a per-delta parallel patch pass could reach here. `1.0` when
-    /// one delta holds everything, which is the case worth knowing before starting.
-    pub fn parallel_ceiling(&self) -> f64 {
-        if self.max == 0 {
-            return 1.0;
-        }
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "a ratio for a log line; the inputs are byte counts"
-        )]
-        let ceiling = self.total as f64 / self.max as f64;
-        ceiling.max(1.0)
-    }
-}
-
 /// A build slower than this reports where its bytes went.
 ///
 /// Well past anything interactive, so an ordinary repo never emits it and the stats
@@ -2010,13 +1952,13 @@ pub fn build_diff_data<'r>(
     let patched = t.elapsed();
     if patched >= SLOW_BUILD_REPORT {
         // After the pass, which is the only time the sizes are there to read.
-        let bytes = DeltaBytes::of(&diff);
+        let bytes = RowCostProbe::from_built_sizes(&diff);
         log::debug!(
             "perf: {what}: patch pass {patched:?} over {} deltas, {} bytes (largest {}) \
              — parallel ceiling {:.1}x",
             bytes.deltas,
-            bytes.total,
-            bytes.max,
+            bytes.total_blob_bytes,
+            bytes.max_delta_bytes,
             bytes.parallel_ceiling()
         );
     }
@@ -2306,7 +2248,7 @@ impl LineStats {
 /// patch text is generated.
 ///
 /// The single place a `DiffSource` becomes a `git2::Diff`, so `commit_stats` and
-/// `max_blob_bytes` cannot drift and a new row kind cannot reach one while missing the
+/// `RowCostProbe` cannot drift and a new row kind cannot reach one while missing the
 /// other. Exhaustive on `CommitKind`'s four shapes for the same reason.
 pub fn source_diff<'r>(
     repo: &'r Repository,
@@ -2349,14 +2291,26 @@ pub fn source_diff<'r>(
 /// A header that cannot be read contributes 0 rather than failing the probe: an
 /// unreadable object will fail the real build too, and refusing to *estimate* is not a
 /// reason to refuse to warm.
+///
+/// **Two constructors, one set of dimensions.** `probe_deltas` reads the sizes out of
+/// the odb headers *before* a build, which is what the scheduler decides on;
+/// `from_built_sizes` reads them back off `DiffFile::size` *after* a build, which is
+/// what the slow-build report says. They were two types until they were not, and the
+/// duplicate carried the derivation the scheduler wanted (`parallel_ceiling`) while the
+/// scheduler's own copy could not express it. `charge_delta` is the one place all three
+/// dimensions are accumulated, so the two can never mean different things by `max`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RowCostProbe {
     /// Every changed blob, both sides, summed. The best single predictor of build cost,
     /// and what the prefetch guard thresholds on.
     pub total_blob_bytes: u64,
-    /// The largest single blob. Kept because it is what a "one enormous file" row looks
-    /// like, and it reads very differently in a log from a wide-but-shallow one.
-    pub max_blob_bytes: u64,
+    /// The largest single delta — both sides of it, since xdiff needs the pair and a
+    /// delta is the unit of work. Kept because it is what a "one enormous file" row
+    /// looks like, and it reads very differently in a log from a wide-but-shallow one.
+    ///
+    /// **It is also the floor under any parallel patch pass**, which is what
+    /// `parallel_ceiling` reads it for.
+    pub max_delta_bytes: u64,
     /// Changed files.
     pub deltas: usize,
     /// Does any changed path have a `diff.<driver>.textconv`?
@@ -2375,8 +2329,9 @@ pub struct RowCostProbe {
     /// natural spelling and the wrong one — see `driver_unknown`. Making the wrong read
     /// a compile error is what keeps that from being a doc comment nobody reaches.
     driven: bool,
-    /// Could not be determined — the config read or an attribute lookup FAILED, so
-    /// whether any path is driven is unknown rather than false.
+    /// Could not be determined, so whether any path is driven is unknown rather than
+    /// false — the config read or an attribute lookup FAILED, or nobody asked
+    /// (`from_built_sizes`).
     ///
     /// Separate from `driven`, and the separation is not cosmetic: the two are read by
     /// callers whose cost of being wrong differs by orders of magnitude. Routing to the
@@ -2390,6 +2345,69 @@ pub struct RowCostProbe {
 }
 
 impl RowCostProbe {
+    /// Measure a diff from the sizes its patch pass has already read.
+    ///
+    /// Free: `DiffFile::size` is filled in as libgit2 loads each blob, so this reads
+    /// back what the pass just did rather than touching the odb again. Which is also why
+    /// it must be taken AFTER the print — before it every size is zero, and
+    /// `built_sizes_are_readable_once_the_patch_pass_has_run` pins that.
+    ///
+    /// It answers the SIZES and nothing else: no driver is resolved here, so the row is
+    /// recorded as `driver_unknown` — the reading that routes a row to the heavy lane
+    /// rather than spawning a driver on the light one, so a value that escaped this
+    /// reporting path into the costly test would err in the safe direction.
+    pub fn from_built_sizes(diff: &git2::Diff<'_>) -> Self {
+        let mut probe = Self {
+            driver_unknown: true,
+            ..Self::default()
+        };
+        for delta in diff.deltas() {
+            probe.charge_delta(
+                delta
+                    .old_file()
+                    .size()
+                    .saturating_add(delta.new_file().size()),
+            );
+        }
+        probe
+    }
+
+    /// Charge one delta, both its sides already summed — the unit of work, since xdiff
+    /// needs the pair.
+    ///
+    /// The one place the three size dimensions are accumulated, so the odb-header route
+    /// and the built-sizes one cannot disagree about what `max_delta_bytes` counts.
+    fn charge_delta(&mut self, bytes: u64) {
+        self.deltas += 1;
+        self.total_blob_bytes = self.total_blob_bytes.saturating_add(bytes);
+        self.max_delta_bytes = self.max_delta_bytes.max(bytes);
+    }
+
+    /// The best speedup a per-delta parallel patch pass could reach on this row. `1.0`
+    /// when one delta holds everything, which is the case worth knowing before starting.
+    ///
+    /// **The largest delta is the floor.** That pass is per-delta and libgit2 emits a
+    /// delta's rows only once it has computed the whole patch (measured: the first line
+    /// of a 900k-line single-file diff arrives at 1.000s of a 1.07s print), so one file
+    /// cannot be split across threads however many there are — and `total / max` is the
+    /// best an unlimited number of them could reach.
+    ///
+    /// It is the number to decide by, and it is not the thread count. On the repo this
+    /// came from, commits whose builds take a minute have ceilings of **1.0 to 3.7**:
+    /// one 435MB blob against a 1.2GB commit is 1.4, and a single-file 92MB one is
+    /// exactly 1.0.
+    pub fn parallel_ceiling(&self) -> f64 {
+        if self.max_delta_bytes == 0 {
+            return 1.0;
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a ratio for a log line; the inputs are byte counts"
+        )]
+        let ceiling = self.total_blob_bytes as f64 / self.max_delta_bytes as f64;
+        ceiling.max(1.0)
+    }
+
     /// Did a driver certainly match a changed path?
     ///
     /// The strict reading, for the caller whose answer is permanent.
@@ -2427,6 +2445,8 @@ impl RowCostProbe {
 /// Shared by both ways a row gets measured — before its diff exists (`probe_row_cost`,
 /// where the point is to decide *without* building) and while it is being built
 /// (`measured_row_diff`) — so the two can never threshold on differently-computed bytes.
+/// The third reader of those sizes, the finished build's own report, takes them off the
+/// pass it just ran (`RowCostProbe::from_built_sizes`) and thresholds on nothing.
 fn probe_deltas(
     repo: &Repository,
     diff: &git2::Diff<'_>,
@@ -2446,7 +2466,6 @@ fn probe_deltas(
     probe.driver_unknown = resolved.as_ref().is_some_and(|r| r.failed);
     let resolved = resolved.filter(|r| !r.is_empty());
     for delta in diff.deltas() {
-        probe.deltas += 1;
         if !probe.driven
             && let Some(resolved) = resolved.as_ref()
         {
@@ -2460,17 +2479,17 @@ fn probe_deltas(
                 }
             }
         }
+        let mut bytes: u64 = 0;
         for file in [delta.old_file(), delta.new_file()] {
             let id = file.id();
             if id.is_zero() {
                 continue; // that side has no blob (an add, or a delete)
             }
             if let Ok((size, _)) = odb.read_header(id) {
-                let size = size as u64;
-                probe.total_blob_bytes = probe.total_blob_bytes.saturating_add(size);
-                probe.max_blob_bytes = probe.max_blob_bytes.max(size);
+                bytes = bytes.saturating_add(size as u64);
             }
         }
+        probe.charge_delta(bytes);
     }
     Ok(probe)
 }
@@ -3157,11 +3176,11 @@ pub mod tests {
     /// the LARGEST delta, not by the thread count.
     #[test]
     fn the_parallel_ceiling_is_set_by_the_largest_delta() {
-        let of = |total, max| {
-            DeltaBytes {
-                total,
-                max,
-                deltas: 0,
+        let of = |total_blob_bytes, max_delta_bytes| {
+            RowCostProbe {
+                total_blob_bytes,
+                max_delta_bytes,
+                ..RowCostProbe::default()
             }
             .parallel_ceiling()
         };
@@ -3180,8 +3199,13 @@ pub mod tests {
     /// `DiffFile::size` is only filled in as libgit2 loads each blob, so the summary is
     /// meaningless before the patch pass and correct after it — which is why
     /// `build_diff_data` takes it where it does.
+    ///
+    /// And it must report what the odb-header route reports for the same diff. The two
+    /// were separate types measuring the same three quantities, and `max` meant a
+    /// different thing in each; they are one type so that cannot recur, and this is what
+    /// says so.
     #[test]
-    fn delta_bytes_are_readable_once_the_patch_pass_has_run() {
+    fn built_sizes_are_readable_once_the_patch_pass_has_run() {
         let (_d, repo, oid) = everything_repo();
         let scope = RowScope::new(DiffSource::Commit(oid));
         let s = base_settings();
@@ -3191,7 +3215,7 @@ pub mod tests {
         .expect("the fixture diffs");
 
         assert_eq!(
-            DeltaBytes::of(&diff).total,
+            RowCostProbe::from_built_sizes(&diff).total_blob_bytes,
             0,
             "control: before the pass every size is zero, which is why it is taken after"
         );
@@ -3207,11 +3231,22 @@ pub mod tests {
             BuildEnv::of(None),
         );
 
-        let bytes = DeltaBytes::of(&diff);
+        let bytes = RowCostProbe::from_built_sizes(&diff);
         assert_eq!(bytes.deltas, files.len());
-        assert!(bytes.total > 0 && bytes.max > 0);
-        assert!(bytes.max <= bytes.total);
+        assert!(bytes.total_blob_bytes > 0 && bytes.max_delta_bytes > 0);
+        assert!(bytes.max_delta_bytes <= bytes.total_blob_bytes);
         assert!(bytes.parallel_ceiling() >= 1.0);
+
+        let probed = probe_deltas(&repo, &diff, None).expect("the fixture's headers read");
+        assert_eq!(
+            (
+                probed.total_blob_bytes,
+                probed.max_delta_bytes,
+                probed.deltas
+            ),
+            (bytes.total_blob_bytes, bytes.max_delta_bytes, bytes.deltas),
+            "the odb headers and the pass's own sizes measure the same diff"
+        );
     }
 
     /// `max_chars` sizes the pane's horizontal scroll range, and the build accumulates
@@ -3431,13 +3466,16 @@ pub mod tests {
         )
         .unwrap();
         assert!(
-            got.max_blob_bytes > 200_000,
-            "a 1-line patch over a 200KB blob must report the blob: {got:?}"
+            got.max_delta_bytes > 400_000,
+            "a 1-line patch over a 200KB blob must report the blob, both sides of it \
+             — the delta is the unit: {got:?}"
         );
-        assert!(
-            got.total_blob_bytes > got.max_blob_bytes,
-            "a modify reads BOTH sides, so the total must exceed the largest: {got:?}"
+        assert_eq!(
+            got.total_blob_bytes, got.max_delta_bytes,
+            "one delta holds everything, so there is nothing a parallel pass could \
+             split: {got:?}"
         );
+        assert!((got.parallel_ceiling() - 1.0).abs() < 1e-9, "{got:?}");
         assert_eq!(got.deltas, 1);
     }
 
@@ -3464,8 +3502,12 @@ pub mod tests {
         .unwrap();
         assert_eq!(got.deltas, 5);
         assert!(
-            got.total_blob_bytes >= 5 * got.max_blob_bytes,
+            got.total_blob_bytes >= 5 * got.max_delta_bytes,
             "five equal files must total ~5x the largest: {got:?}"
+        );
+        assert!(
+            (got.parallel_ceiling() - 5.0).abs() < 1e-9,
+            "and five equal deltas are exactly what five threads could split: {got:?}"
         );
     }
 
@@ -3487,7 +3529,7 @@ pub mod tests {
         .unwrap();
         assert_eq!(got.total_blob_bytes, "one\ntwo\n".len() as u64);
         assert_eq!(
-            got.max_blob_bytes, got.total_blob_bytes,
+            got.max_delta_bytes, got.total_blob_bytes,
             "only one side exists"
         );
     }

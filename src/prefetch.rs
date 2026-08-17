@@ -408,10 +408,10 @@ impl Limits {
     /// in two five-argument format strings that can disagree.
     pub fn defer_reason(&self, cost: &diff::RowCostProbe) -> String {
         format!(
-            "{} blob bytes over {} (largest {}, {} files{})",
+            "{} blob bytes over {} (largest delta {}, {} files{})",
             cost.total_blob_bytes,
             self.max_blob_bytes,
-            cost.max_blob_bytes,
+            cost.max_delta_bytes,
             cost.deltas,
             cost.textconv_note()
         )
