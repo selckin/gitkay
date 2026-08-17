@@ -451,13 +451,22 @@ The invariants:
   paid, faster, and to every other tool's benefit. There are **four cases**, because a
   path filter also wants the changed-path index, which only `--changed-paths` writes, so
   a repository whose graph lacks one is worth a word — but only when a pathspec is what
-  was slow. **What `topo_scope` gates is the LAZINESS, not the advice**: naming a fix
+  was slow. **Each half is gated by the code that would do the gaining, and neither
+  gate is re-derived from the scope.** `topo_scope` gates the LAZINESS — naming a fix
   for a scope that would ignore the file is a false promise, which is why the line did
-  not exist before the lazy walk did — but `sorted_filtered_walk` opens the filters for
-  ANY filtered scope, so a range or a `--follow` walk saves the same tree comparisons
-  whether or not a graph exists. A filtered scope therefore always gets an answer; only
-  the sentence changes, and the one it gets promises exactly what its own walk would
-  gain.
+  not exist before the lazy walk did. `PathBloom::applicable` gates the INDEX, and it
+  is a wider scope but not every scope: `sorted_filtered_walk` opens the filters for a
+  range as readily as for the plain one, so a range saves the same tree comparisons
+  whether or not a graph exists — but `--follow` moves its path as the walk descends
+  and a glob is not a path git ever hashed, and `PathBloom::of` builds keys for
+  neither. Both were being offered `--changed-paths` — minutes of writing for a file
+  their walk declines — while `commit_graph_advice` asked the *scope* about the index
+  instead of asking `PathBloom`; that predicate is `applicable` precisely so the two
+  cannot drift, and a fourth decline reason added to `PathBloom` reaches the advice by
+  construction. So a filtered scope gets an answer whether or not it would walk lazily
+  and whether or not a graph exists, but only where something would read the file, and
+  the sentence it gets promises exactly the halves its own walk would gain. Same lesson
+  as `WalkCost::of` below: the fact belongs to the code that acts on it.
 - **A slow walk says so WHILE it runs, not only once it is over** — the end-of-walk
   report arrives 57s after the window on a 1.47M-commit clone, by which time the wait it
   explains is finished. `arm_slow_walk_notice` is a thread the two slow branches arm
