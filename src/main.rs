@@ -309,78 +309,6 @@ fn diff_cache_line_budget() -> usize {
     );
     budget
 }
-/// Lines one prefetch dispatch may build before it stops and drops the rest of its
-/// band.
-///
-/// Half the cache, so a dispatch cannot evict its own warms — the band it just filled
-/// is the band the user is about to scroll into — while the other half stays for the
-/// live diff and the previous band. The `diff cache: insert … evicted …` debug line is
-/// where you would see it bind.
-///
-/// It bounds a **dispatch**, not the band, so it is no defence against one enormous
-/// row: `PREFETCH_MAX_ENTRY_LINES` is that. Lines built but dropped for being oversized
-/// still count here — a worker that spent six seconds on a diff it then discarded has
-/// done a dispatch's worth of harm whether or not anything was cached.
-const PREFETCH_LINE_BUDGET_DIVISOR: usize = 2;
-/// Largest diff a prefetch will pre-**highlight**. A bigger one is still cached, just
-/// as `WarmDepth::DiffOnly` however near the view it is.
-///
-/// An absolute line count, not a fraction of the cache, because this bounds syntect
-/// TIME rather than memory — the two scale with completely different things, and tying
-/// it to the cache would mean raising the budget silently signs the pool up for longer
-/// stalls. Measured: `ef5d12e6` (133,460 lines) took **10.65s** highlighted where the
-/// same diff took 761ms as `DiffOnly` — ~9.9s of one worker, a quarter of the pool, on
-/// a row the user had not asked for.
-///
-/// The trade is barely a trade. Pre-highlighting exists so a diff arrives coloured
-/// instead of flashing plain, and `ensure_diff_highlighted` colours the landing
-/// screenful on demand in milliseconds; on a diff this size the full pass is spending
-/// seconds to pre-colour tens of thousands of rows nobody will scroll to. 10,000 lines
-/// keeps the overwhelming majority of real diffs fully warm — in a measured session
-/// only a handful of rows exceeded it.
-///
-/// **It does NOT cap the time, though this comment used to claim it did** ("~1.3s at
-/// the ~0.13ms/line this repo sees under pool contention"). A 5,310-line commit —
-/// comfortably under this cap — measured `build 418ms + colour 29.6s`, i.e. 5.6ms a
-/// line, 43× the assumed rate. The rate is a property of the GRAMMAR, not of the repo,
-/// so no line count can stand in for a clock. `Limits::highlight_budget` is the actual
-/// bound; this one is what keeps the memory and the pointless work down.
-const PREFETCH_MAX_HIGHLIGHT_LINES: usize = 10_000;
-/// How long a speculative colour pass may run. See `Limits::highlight_budget` for the
-/// measurement that forced it and why a line cap could not.
-///
-/// Generous against every legitimate row observed — the slowest real colour in that
-/// session was 424ms for 4,530 lines — and it restores the ~1.3s worst case the line
-/// cap was aiming at, by bounding the thing that actually varies.
-const PREFETCH_HIGHLIGHT_BUDGET: std::time::Duration = std::time::Duration::from_millis(1_500);
-/// Blob bytes a prefetch will read before postponing the row.
-///
-/// libgit2 loads both sides of every changed file and runs xdiff over them, so a diff's
-/// cost tracks BYTES READ and not the number of changed lines. Line-based caps cannot
-/// see it coming — on a repo holding 265MB files, a few-line change in one cost ~11s of
-/// a core while producing a three-line patch.
-///
-/// Thresholds the **total**, not the largest blob, which is the correction the second
-/// measurement forced: a row whose largest blob was comfortably under this still took
-/// **5.6s** to build, where a row of comparable line count took 40ms. Many medium files
-/// have a small maximum and a large total, and a max-only guard waved them straight
-/// through. `RowCostProbe` still reports the maximum and the delta count, because the
-/// three read very differently in a log and the next surprise may be one of the others.
-///
-/// 8 MiB is ~0.4s at the ~55ms/MB those figures imply, in line with what the rest of
-/// the band costs. Being conservative is cheap here precisely because the row is
-/// **deferred rather than dropped**: it still gets warmed, just last.
-const PREFETCH_MAX_DIFF_BYTES: u64 = 8 * 1024 * 1024;
-/// Prewarm: most files scanned in the HEAD tree to rank languages by frequency.
-/// Frequencies converge long before this, so the top languages are the same on a
-/// 5k- or 500k-file tree.
-const MAX_TREE_ENTRIES: usize = 5_000;
-/// Prewarm: most languages whose regexes we compile ahead of time.
-const MAX_WARM_LANGS: usize = 12;
-/// Prewarm: max HEAD-tree recursion depth, bounding the prewarm thread's stack on
-/// pathologically deep trees (real repos nest far shallower). Deeper subtrees are
-/// skipped — the entry cap already bounds total work.
-const MAX_TREE_DEPTH: usize = 64;
 /// Prefetch: how far past a visible edge a row is still worth **fully colouring**.
 ///
 /// Not the width of the warmed band — `warm_band` is that, and it reaches a full
@@ -389,13 +317,6 @@ const MAX_TREE_DEPTH: usize = 64;
 /// Beyond it a row is cached un-highlighted, which is what makes the wide band
 /// affordable.
 const PREFETCH_MARGIN: usize = 8;
-/// Prefetch: ceiling on the worker pool, however many cores the machine has.
-///
-/// The work does not scale indefinitely: a band is ~54 rows and an ordinary row costs
-/// ~3ms to build, so eight workers already drain a whole band in well under a frame.
-/// The expensive rows are not in this pool at all — the heavy lane builds those, on
-/// threads of its own, admitted against memory rather than counted against this.
-const PREFETCH_MAX_WORKERS: usize = 8;
 
 /// Real commits loaded by the startup walk. The `all_loaded` derivation compares
 /// the loaded count against this same constant (and the watcher-reload floor
@@ -437,86 +358,6 @@ const DIFF_PLACEHOLDER_DELAY: std::time::Duration = std::time::Duration::from_mi
 /// this it is a normal frame and the line would be noise; above it, the reader felt it.
 const DIFF_INSTALL_SLOW: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// The longest one highlight pass will spend colouring.
-///
-/// The line budget below bounds the MEMORY a pass can commit to; this bounds its
-/// appetite for a core, and the two are not interchangeable because the cost of a line
-/// varies by more than twenty times. Measured on the 76.5M-line repo: 2M lines of
-/// `.oml`/xml/csv data took **140s** at ~70µs a line, where plain text runs at ~3µs and
-/// would have spent under seven seconds on the same 2M. A pass that long is also
-/// felt elsewhere — `band_warmable` holds the prefetch band back for as long as the
-/// foreground diff is colouring, deliberately, so the band sat idle for those 140s.
-///
-/// Twenty seconds is longer than any diff a person reads end to end needs (a
-/// 300k-line one is under a second of plain text, and a few seconds of real grammar)
-/// and short enough that neither the core nor the band is held for minutes.
-const HIGHLIGHT_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// The most rows one highlight pass will colour.
-///
-/// A bound on the WORK, not on the diff — which is the whole of the difference. This
-/// was `MAX_HIGHLIGHT_LINES`, a cap on the diff's *size* past which the pane simply
-/// stayed plain, and it stood on two costs. The hand-off's copy of the whole diff was
-/// the one that fixed the number here rather than anywhere else (12.0s on the frame
-/// loop at 76.5M lines, ~0.3s at this bound), and it is gone: the worker shares the
-/// rows now. What remains is the tokenizing itself, at ~3µs/line for plain text and
-/// ~60µs for a real grammar — so an unbounded pass over that same diff is four minutes
-/// of CPU at best and over an hour at worst, and it accumulates a `Vec` of spans per
-/// code line the whole way, for rows nobody will ever scroll to.
-///
-/// That is a bound on appetite, and it belongs on the pass. The worker colours in
-/// `pick_file` order — the visible file first, then a page each way — so every diff,
-/// at any size, is coloured where the reader is looking; only the rows past the budget
-/// go without, and a diff that large is past reading rather than past colouring.
-/// Nothing else changes for it: the pane, the sidebar, word diff, search and the write
-/// actions all work exactly as they do on a coloured diff.
-///
-/// The number is deliberately the old cap's. At ~3-60µs a row it is 6s-120s of
-/// background CPU and a few hundred MB of spans — the ceiling a 2M-line diff was
-/// already allowed to reach, now applied to work instead of to size.
-///
-/// The speculative path has its own, far smaller bound for the same reason
-/// (`PREFETCH_MAX_HIGHLIGHT_LINES`); this is the displayed diff's.
-const HIGHLIGHT_LINE_BUDGET: usize = 2_000_000;
-
-/// Lines per chunk between priority / cancellation re-checks in the streaming
-/// `highlight_worker`. Small enough to switch quickly, large enough that the
-/// per-chunk overhead is negligible. Those re-checks are hints — being a chunk
-/// late costs a slightly worse ordering — so this can afford to be coarse.
-const HIGHLIGHT_CHUNK: usize = 256;
-
-/// Lines per chunk for the deadline-bounded pre-highlight pass, which is much
-/// finer because a deadline is only honoured to within one chunk. Measured on a
-/// real 3.7k-line diff, syntect costs ~0.3ms/line here, which makes a 256-line
-/// chunk ~85ms of potential overrun — on its own more than enough to blow past
-/// the very threshold the budget exists to stay under. 16 lines keeps that to a
-/// few milliseconds.
-const PREHIGHLIGHT_CHUNK: usize = 16;
-
-/// Time backstop for the pre-highlight pass. The pass is bounded by **rows** —
-/// colour the landing screenful — and this only stops a pathological grammar, or
-/// a screenful that needs tokenizing thousands of rows from its file's start,
-/// from stalling the swap without limit.
-///
-/// Sized from measurement rather than taste: syntect costs ~0.3ms/line idle but
-/// 0.7–2.7ms/line on a machine already saturated by superseded highlight workers
-/// and prefetches, so a ~50-row screenful is 35–135ms. A ceiling much below that
-/// would routinely cut a legitimate screenful short, which is the failure this
-/// design has already made twice.
-///
-/// **Two earlier attempts bounded by the clock instead, and both failed.** The
-/// first ended the budget at `DIFF_PLACEHOLDER_DELAY` and so guaranteed arriving
-/// exactly when the pane blanks (measured: a 16.7ms diff whose pre-highlight ran
-/// 115ms, swapping at ~132ms against the 100ms threshold). The second subtracted
-/// a 40ms margin from that, which fixed the overshoot but opened a 40ms **dead
-/// band**: a compute landing between 60ms and 100ms was too late to colour and
-/// too early to blank, so it coloured nothing and flashed plain — measured nine
-/// times in one session at 74–96ms, the normal range for a 1–2k-line diff. Rows
-/// have no band. The cost is that a slow screenful can now push a load past the
-/// threshold into a brief blank, which is the deliberate trade: the blank ends
-/// **styled**, where the dead band ended plain.
-const PREHIGHLIGHT_CEILING: std::time::Duration = std::time::Duration::from_millis(120);
-
 // Asserted at compile time rather than in a test, so a bad edit fails the build
 // instead of one suite nobody may run.
 const _: () = {
@@ -530,30 +371,10 @@ const _: () = {
         "the context cell is measured from this sample, so a sample narrower than the \
          widest width it must hold lets the number shove the `+` button as it grows"
     );
-    assert!(
-        PREHIGHLIGHT_CHUNK < HIGHLIGHT_CHUNK,
-        "a ceiling is honoured only to within one chunk, so the bounded pass must step finer"
-    );
-    assert!(
-        PREHIGHLIGHT_CEILING.as_millis() > 0,
-        "a zero ceiling silently disables pre-highlighting entirely"
-    );
-    assert!(
-        PREFETCH_LINE_BUDGET_DIVISOR > 1,
-        "a dispatch that may fill the whole cache evicts its own warms, and the \
-         band the user is about to scroll into is gone before they reach it"
-    );
-    assert!(
-        diff_store::MAX_ENTRY_DIVISOR > PREFETCH_LINE_BUDGET_DIVISOR,
-        "one speculative row must not be able to spend a whole dispatch's budget, \
-         or the band is one giant diff and nothing else"
-    );
-    assert!(
-        PREFETCH_MAX_HIGHLIGHT_LINES < DIFF_CACHE_LINE_FLOOR / diff_store::MAX_ENTRY_DIVISOR,
-        "a row too big to pre-highlight must still be cacheable at EVERY budget the \
-         derivation can produce, or on a small machine the size rule collapses into \
-         the entry rule and the DiffOnly downgrade never happens"
-    );
+    // The rest of these live beside the constants they check — `diff_highlight`,
+    // `workers`, `prefetch` — which is where the constants themselves now are. What is
+    // left here is the pair that compares a UI sample against something else's width,
+    // because the samples are the UI's own.
 };
 
 /// Everything a cached diff's content + spans depend on. `diff_bg` is excluded

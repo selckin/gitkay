@@ -24,10 +24,79 @@ use std::sync::{Arc, mpsc};
 
 use crate::diff::{DiffLine, FileEntry, RowSpans, file_line_ranges};
 use crate::highlight::{self, DiffBg, FileState, Highlighter};
-use crate::{
-    Epoch, HIGHLIGHT_CHUNK, HIGHLIGHT_LINE_BUDGET, HIGHLIGHT_TIME_BUDGET, MAX_TREE_DEPTH,
-    MAX_TREE_ENTRIES, MAX_WARM_LANGS, PREHIGHLIGHT_CHUNK, VisibleRange, config, spawn_guarded,
-};
+use crate::{Epoch, VisibleRange, config, spawn_guarded};
+
+/// Prewarm: most files scanned in the HEAD tree to rank languages by frequency.
+/// Frequencies converge long before this, so the top languages are the same on a
+/// 5k- or 500k-file tree.
+const MAX_TREE_ENTRIES: usize = 5_000;
+/// Prewarm: most languages whose regexes we compile ahead of time.
+const MAX_WARM_LANGS: usize = 12;
+/// Prewarm: max HEAD-tree recursion depth, bounding the prewarm thread's stack on
+/// pathologically deep trees (real repos nest far shallower). Deeper subtrees are
+/// skipped — the entry cap already bounds total work.
+const MAX_TREE_DEPTH: usize = 64;
+
+/// Lines per chunk between priority / cancellation re-checks in the streaming
+/// `highlight_worker`. Small enough to switch quickly, large enough that the
+/// per-chunk overhead is negligible. Those re-checks are hints — being a chunk
+/// late costs a slightly worse ordering — so this can afford to be coarse.
+const HIGHLIGHT_CHUNK: usize = 256;
+/// Lines per chunk for the deadline-bounded pre-highlight pass, which is much
+/// finer because a deadline is only honoured to within one chunk. Measured on a
+/// real 3.7k-line diff, syntect costs ~0.3ms/line here, which makes a 256-line
+/// chunk ~85ms of potential overrun — on its own more than enough to blow past
+/// the very threshold the budget exists to stay under. 16 lines keeps that to a
+/// few milliseconds.
+const PREHIGHLIGHT_CHUNK: usize = 16;
+/// The most rows one highlight pass will colour.
+///
+/// A bound on the WORK, not on the diff — which is the whole of the difference. This
+/// was `MAX_HIGHLIGHT_LINES`, a cap on the diff's *size* past which the pane simply
+/// stayed plain, and it stood on two costs. The hand-off's copy of the whole diff was
+/// the one that fixed the number here rather than anywhere else (12.0s on the frame
+/// loop at 76.5M lines, ~0.3s at this bound), and it is gone: the worker shares the
+/// rows now. What remains is the tokenizing itself, at ~3µs/line for plain text and
+/// ~60µs for a real grammar — so an unbounded pass over that same diff is four minutes
+/// of CPU at best and over an hour at worst, and it accumulates a `Vec` of spans per
+/// code line the whole way, for rows nobody will ever scroll to.
+///
+/// That is a bound on appetite, and it belongs on the pass. The worker colours in
+/// `pick_file` order — the visible file first, then a page each way — so every diff,
+/// at any size, is coloured where the reader is looking; only the rows past the budget
+/// go without, and a diff that large is past reading rather than past colouring.
+/// Nothing else changes for it: the pane, the sidebar, word diff, search and the write
+/// actions all work exactly as they do on a coloured diff.
+///
+/// The number is deliberately the old cap's. At ~3-60µs a row it is 6s-120s of
+/// background CPU and a few hundred MB of spans — the ceiling a 2M-line diff was
+/// already allowed to reach, now applied to work instead of to size.
+///
+/// The speculative path has its own, far smaller bound for the same reason
+/// (`PREFETCH_MAX_HIGHLIGHT_LINES`); this is the displayed diff's.
+const HIGHLIGHT_LINE_BUDGET: usize = 2_000_000;
+/// The longest one highlight pass will spend colouring.
+///
+/// The line budget below bounds the MEMORY a pass can commit to; this bounds its
+/// appetite for a core, and the two are not interchangeable because the cost of a line
+/// varies by more than twenty times. Measured on the 76.5M-line repo: 2M lines of
+/// `.oml`/xml/csv data took **140s** at ~70µs a line, where plain text runs at ~3µs and
+/// would have spent under seven seconds on the same 2M. A pass that long is also
+/// felt elsewhere — `band_warmable` holds the prefetch band back for as long as the
+/// foreground diff is colouring, deliberately, so the band sat idle for those 140s.
+///
+/// Twenty seconds is longer than any diff a person reads end to end needs (a
+/// 300k-line one is under a second of plain text, and a few seconds of real grammar)
+/// and short enough that neither the core nor the band is held for minutes.
+const HIGHLIGHT_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+// Asserted at compile time rather than in a test, so a bad edit fails the build instead
+// of one suite nobody may run. Beside the constants it checks, which is the only place
+// a reader adjusting one of them is certain to look.
+const _: () = assert!(
+    PREHIGHLIGHT_CHUNK < HIGHLIGHT_CHUNK,
+    "a ceiling is honoured only to within one chunk, so the bounded pass must step finer"
+);
 
 /// What a highlight worker sends back. Both are tagged with the generation they were
 /// computed for, so a superseded pass's messages are dropped rather than applied.
