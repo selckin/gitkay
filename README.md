@@ -92,7 +92,7 @@
 - **Live view** — `.git` (refs, HEAD, index) is watched, so the graph reloads itself after a commit, fetch, or rebase
 - **Combined range row** — `gitkay v1.0..main` adds a row for the range as a whole, diffed end to end
 - **Warm across launches** — built diffs are cached on disk, so a commit with huge blobs but a small patch is not rebuilt every time you open it
-- **Persistent layout** — window size/position, the panel splitters and the diff toolbar's settings survive restarts
+- **Persistent layout** — window size/position, the zoom level, the panel splitters and the diff toolbar's settings survive restarts
 - **Auto-select** first commit on startup with diff shown
 - **Lazy loading** — starts with 200 commits, loads more as you scroll
 - **Unique author colors** — each contributor gets a distinct color
@@ -158,6 +158,7 @@ unexplained.
 | **Click** commit | Select, show diff, copy SHA to clipboard *and* primary selection |
 | **↑ / ↓** | Select previous / next commit (view follows) |
 | **Scroll** | Browse history (lazy loads more commits) |
+| **Ctrl+Scroll**, **Ctrl+`+`** / **Ctrl+`-`** / **Ctrl+`0`** | Zoom the whole window in / out, or back to 100% (kept across restarts; `[text]` in the config sets the per-role sizes it scales) |
 | **Start typing** (anywhere) | Focus the search bar; filters by SHA / author / message / branch / tag |
 | **Enter** / **↑** / **↓** in search | Cycle matches with an `n/total` counter; the graph scrolls to each |
 | **Esc** | Dismiss a write error (when no menu is open) |
@@ -307,6 +308,11 @@ refs = { font = "proportional" }                  # keep the default size
 
 All roles default to monospace. Sizes are clamped to **4–64**, so a stray `0`
 or `500` cannot make the window unusable.
+
+**Ctrl+Scroll** (and **Ctrl+`+`** / **Ctrl+`-`** / **Ctrl+`0`**) scales the whole
+window on top of these — the rows and the spacing with the text, not just the
+glyphs — and the level survives restarts. These sizes are still where a
+per-role change belongs; the zoom multiplies all of them at once.
 
 ### `[diff]` — the diff pane
 
