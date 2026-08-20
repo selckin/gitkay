@@ -2899,7 +2899,7 @@ fn compute_branch_highlight(
 /// two palettes stay one table.
 const GRAPH_COLORS: &[(u8, u8, u8)] = REF_COLORS.split_at(8).0;
 
-fn graph_color(col: usize) -> egui::Color32 {
+const fn graph_color(col: usize) -> egui::Color32 {
     let (r, g, b) = GRAPH_COLORS[col % GRAPH_COLORS.len()];
     egui::Color32::from_rgb(r, g, b)
 }
