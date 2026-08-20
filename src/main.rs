@@ -653,13 +653,15 @@ type StatGalleys = (Arc<egui::Galley>, Arc<egui::Galley>);
 /// laid out into galleys once, not re-allocated and re-measured per frame. Scoped
 /// to the current `file_rows`: `resync_file_layout` resets it (a font change must
 /// too), and `ensure` drops the elided labels whenever the row width changes
-/// (sidebar drag / window resize).
+/// (sidebar drag / window resize) and everything whenever the text scale does.
 #[derive(Default)]
 struct SidebarCache {
     /// Per file index: the stat galleys, `None` until first drawn.
     stats: Vec<Option<StatGalleys>>,
     /// The row width the elided labels below were computed for.
     elide_width: f32,
+    /// The `pixels_per_point` every galley below was laid out at.
+    scale: f32,
     /// Per file index: the label elided for `elide_width`, laid out in
     /// `Color32::PLACEHOLDER` so the normal/hover color applies at paint time
     /// (one galley serves both states).
@@ -670,7 +672,20 @@ impl SidebarCache {
     /// Size both caches for `files` entries and key the elided labels to `width`:
     /// a width change drops only the elided labels (the stat galleys are
     /// width-independent), a size mismatch (fresh diff) drops both.
-    fn ensure(&mut self, files: usize, width: f32) {
+    ///
+    /// `scale` drops both as well, and is a KEY rather than something the zoom
+    /// handler remembers to reset: a galley holds glyph UVs into the font atlas
+    /// built for one `pixels_per_point`, and that value moves for two unrelated
+    /// reasons — the UI zoom, and the window meeting a monitor of a different DPI,
+    /// which nothing in this app is otherwise told about. Keyed here, neither can
+    /// be forgotten, and the value asked for is exactly the one the galleys will
+    /// be built at this frame.
+    fn ensure(&mut self, files: usize, width: f32, scale: f32) {
+        if self.scale != scale {
+            self.scale = scale;
+            self.stats.clear();
+            self.elided.clear();
+        }
         if self.stats.len() != files {
             self.stats = vec![None; files];
         }
@@ -1412,7 +1427,8 @@ const MAX_DIFF_CONTEXT: u32 = 99;
 /// assert below ties its width to the ceiling.
 const CONTEXT_SAMPLE: &str = "99";
 
-/// How far a trackpad must travel, in points, to move the context width by one.
+/// How far a trackpad must travel, in points, to move the context width — or the
+/// zoom — by one step.
 ///
 /// It paces **only** devices reporting `MouseWheelUnit::Point`. A wheel reports
 /// `Line`, one per notch, and a notch is one step by construction — nothing is
@@ -1420,17 +1436,45 @@ const CONTEXT_SAMPLE: &str = "99";
 /// `InputOptions::line_scroll_speed` moving underneath us.
 const TRACKPAD_POINTS_PER_STEP: f32 = 40.0;
 
-/// Wheel input this frame as whole steps — positive when scrolled up, i.e. when the
-/// content would move down.
+/// Which half of the wheel input a reader is asking for. The line between them is
+/// egui's zoom modifier, **read off `InputOptions::zoom_modifier`** and asked
+/// through its own `matches_any` rather than named here — the same predicate
+/// `InputState` itself partitions on, so our two halves cannot come apart from
+/// egui's when that option is changed or its default moves under an upgrade (the
+/// `SCROLL_SOURCE` lesson). And it is a partition: a notch belongs to exactly one
+/// half, so no two readers can act on the same event.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wheel {
+    /// Scrolling with no zoom modifier held.
+    Plain,
+    /// Ctrl/cmd-scroll, which is a zoom gesture.
+    Zoom,
+}
+
+/// The `want`ed wheel input this frame as whole steps — positive when scrolled up,
+/// i.e. when the content would move down.
 ///
 /// Read from the raw `MouseWheel` events rather than `InputState::smooth_scroll_delta`
 /// because that field is smoothed over several frames: one notch arrives as a decaying
 /// tail, which a threshold either splits into several steps or swallows whole. The raw
 /// events are discrete, so a notch is a step and only `Point` devices need pacing.
+/// `InputState::zoom_delta` is that same smoothing over the zoom half, exponentiated
+/// (`scroll_zoom_speed`) after `line_scroll_speed` has turned a notch into 40 points
+/// — a 22% jump per notch, and a different one per device — so the zoom reads these
+/// events too rather than taking it.
 ///
 /// `accum` carries the sub-step remainder between frames so a slow drag still steps
-/// eventually.
-fn wheel_steps(events: &[egui::Event], accum: &mut f32) -> i32 {
+/// eventually. Each reader owns one, or a part-spent zoom would step the other.
+///
+/// `zoom_modifier` is egui's own (`Options::input_options`), passed in rather than
+/// spelled out — see `Wheel`.
+fn wheel_steps(
+    events: &[egui::Event],
+    accum: &mut f32,
+    zoom_modifier: egui::Modifiers,
+    want: Wheel,
+) -> i32 {
+    let want_zoom = want == Wheel::Zoom;
     for event in events {
         if let egui::Event::MouseWheel {
             unit,
@@ -1438,10 +1482,7 @@ fn wheel_steps(events: &[egui::Event], accum: &mut f32) -> i32 {
             modifiers,
             ..
         } = event
-            // egui's own zoom predicate, rather than a hand-spelled one: with the
-            // default `zoom_modifier` this is ctrl/cmd-scroll, which is a zoom
-            // gesture and not a widget's to reinterpret.
-            && !modifiers.matches_any(egui::Modifiers::COMMAND)
+            && modifiers.matches_any(zoom_modifier) == want_zoom
         {
             *accum += match unit {
                 egui::MouseWheelUnit::Point => delta.y / TRACKPAD_POINTS_PER_STEP,
@@ -1453,6 +1494,31 @@ fn wheel_steps(events: &[egui::Event], accum: &mut f32) -> i32 {
     let steps = accum.trunc();
     *accum -= steps;
     steps as i32
+}
+
+/// What one wheel notch moves the UI zoom by, and the range it moves in. The step
+/// is egui's own keyboard-zoom increment and the bounds are what its Ctrl+±/Ctrl+0
+/// clamps to — both private to `egui::gui_zoom`, so they are restated here to keep
+/// a notch and a keypress the same size and inside the same range.
+const ZOOM_STEP: f32 = 0.1;
+const ZOOM_MIN: f32 = 0.2;
+const ZOOM_MAX: f32 = 5.0;
+
+/// The factor `steps` notches from `current`, clamped and then snapped to the step
+/// grid — **in that order and with that expression, because both are egui's**
+/// (`gui_zoom::zoom_in`/`zoom_out`). `(z / ZOOM_STEP).round() * ZOOM_STEP` looks
+/// equivalent and is not: it disagrees with egui in the last ulp at 1.3, 1.8, 2.1,
+/// …, so a level reached by the wheel would be a different `f32` from the same
+/// level reached by Ctrl+±. That is not cosmetic — `pixels_per_point` is derived
+/// from this value and `SidebarCache` keys its galleys on it by exact equality, so
+/// the two spellings would drop the sidebar's cache for nothing every time the
+/// reader switched input.
+///
+/// Pure, so the three things worth pinning — the snap, both clamps, and that a
+/// multi-notch flick moves by every notch rather than one — need no `Context`.
+fn zoom_target(current: f32, steps: i32) -> f32 {
+    let z = (current + ZOOM_STEP * steps as f32).clamp(ZOOM_MIN, ZOOM_MAX);
+    (z * 10.0).round() / 10.0
 }
 
 /// Minimum height of one file-list row, in points — the floor `GitkApp::file_row_h`
@@ -3156,6 +3222,9 @@ struct GitkApp {
     /// Unspent trackpad scrolling over the toolbar's context-width group, in steps —
     /// see `wheel_steps`. Dropped when the toolbar stops being shown.
     diff_context_scroll: f32,
+    /// Unspent trackpad zooming, in steps — the ctrl/cmd-scroll half of the same
+    /// wheel input, read window-wide rather than over one widget.
+    zoom_scroll: f32,
     fonts: Fonts, // resolved, clamped font settings; call .font_id(role) for a FontId
     // Deferred FontDefinitions from the off-thread build: Some until applied. Set when a
     // cold fontdb scan outlives window-init, so the window paints in default fonts and
@@ -3692,6 +3761,13 @@ impl GitkApp {
         prewarm_rx: Option<mpsc::Receiver<Arc<Highlighter>>>,
     ) -> Result<Self, String> {
         let startup_t0 = std::time::Instant::now();
+        // eframe has already restored egui's memory blob — before the window was
+        // built, which is the whole reason it is saved (see `persist_egui_memory`).
+        // Its `options` half is what was wanted; its `data` half is last session's
+        // widget state, and a `ScrollArea` offset restored under a different diff
+        // opens the pane part-way down a file nobody was reading. Dropped here
+        // rather than declined at load, since the two halves arrive together.
+        cc.egui_ctx.memory_mut(|m| m.data.clear());
         let mut style = (*cc.egui_ctx.global_style()).clone();
         style.visuals = egui::Visuals::dark();
         style.visuals.panel_fill = BG;
@@ -3982,6 +4058,7 @@ impl GitkApp {
             line_numbers,
             diff_toolbar_rect: None,
             diff_context_scroll: 0.0,
+            zoom_scroll: 0.0,
             fonts,
             pending_fonts,
             pending_history,
@@ -6948,8 +7025,17 @@ impl GitkApp {
                             // wheel events this reads (see AGENTS.md's tooltip pitfall).
                             let mut steps = group.inner;
                             if ui.rect_contains_pointer(group.response.rect) {
+                                // Outside the `input` closure — nesting two
+                                // `Context` reads is egui's documented deadlock.
+                                let zoom_modifier =
+                                    ui.ctx().options(|o| o.input_options.zoom_modifier);
                                 let wheel = ui.input(|i| {
-                                    wheel_steps(&i.events, &mut self.diff_context_scroll)
+                                    wheel_steps(
+                                        &i.events,
+                                        &mut self.diff_context_scroll,
+                                        zoom_modifier,
+                                        Wheel::Plain,
+                                    )
                                 });
                                 wheeled |= wheel != 0;
                                 steps += wheel;
@@ -7076,7 +7162,11 @@ impl GitkApp {
                     // `&self` row draws can fill it while the
                     // row list is borrowed.
                     let mut cache = std::mem::take(&mut self.sidebar_cache);
-                    cache.ensure(self.diff_files.len(), ui.available_width());
+                    cache.ensure(
+                        self.diff_files.len(),
+                        ui.available_width(),
+                        ui.ctx().pixels_per_point(),
+                    );
                     let mut frame = SidebarFrame {
                         row_h,
                         current_file,
@@ -7377,6 +7467,44 @@ impl GitkApp {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => self.pending_fonts = None, // builder died; keep defaults
             }
+        }
+    }
+
+    /// Ctrl/cmd-scroll zooms the whole UI, a notch per `ZOOM_STEP` — the same
+    /// scale egui's built-in Ctrl+±/Ctrl+0 moves, so the wheel and the keyboard
+    /// are one setting and not two. Nothing here has to notice the keyboard's
+    /// half: the factor is read from the `Context` and every cache the scale
+    /// invalidates is keyed on it (`SidebarCache::ensure`).
+    ///
+    /// It scales rather than resizing text: every length here is in points, so
+    /// `zoom_factor` takes the rows, the gutters and the sidebar with the glyphs,
+    /// where a font-size change would leave the layout around them at the old size.
+    ///
+    /// Read window-wide (`Context`, not a hovered widget) because a zoom is not
+    /// aimed at anything, and unlike the toolbar's context wheel it is not
+    /// occlusion-tested: egui hands ctrl-scroll to nobody else — `InputState`
+    /// routes it to `zoom_factor_delta` instead of `smooth_scroll_delta`, so the
+    /// `ScrollArea` under the pointer does not also move.
+    ///
+    /// **Persisted, and not as a convenience**: eframe's window geometry is stored
+    /// divided by the live zoom and rebuilt multiplied by whatever the `Context`
+    /// holds at startup, so the factor has to survive a restart for those two to
+    /// agree — see `persist_egui_memory`. It rides in egui's own memory blob
+    /// rather than a key of this app's, because only that is loaded before the
+    /// window exists; nothing here saves or restores it. The `[text]` sizes remain
+    /// the permanent per-role knob, which this scales on top of.
+    fn apply_zoom(&mut self, ctx: &egui::Context) {
+        // Read before `input`, not inside it: both take a `Context` read lock, and
+        // nesting them is the deadlock egui warns about.
+        let zoom_modifier = ctx.options(|o| o.input_options.zoom_modifier);
+        let steps = ctx
+            .input(|i| wheel_steps(&i.events, &mut self.zoom_scroll, zoom_modifier, Wheel::Zoom));
+        if steps != 0 {
+            // From the LIVE factor, which `set_zoom_factor` does not write until
+            // the next pass begins: counting from a value written this frame would
+            // land on it again and swallow the notch. The snap and the clamps are
+            // `zoom_target`'s, which is egui's keyboard zoom to the ulp.
+            ctx.set_zoom_factor(zoom_target(ctx.zoom_factor(), steps));
         }
     }
 
@@ -8010,10 +8138,25 @@ impl Drop for GitkApp {
 }
 
 impl eframe::App for GitkApp {
-    // Persist only the diff-panel splitter height (below), not the whole egui
-    // memory blob — persisting the blob would also restore scroll positions.
+    /// Save egui's own memory blob, which is eframe's default and is stated here
+    /// because the obvious reading of this app says otherwise. What the blob is
+    /// wanted for is ONE field — `Options::zoom_factor` — and not for restoring
+    /// the zoom as a convenience: eframe records the window size divided by the
+    /// live zoom (`WindowSettings::from_window`) and rebuilds the window
+    /// multiplied by whatever the `Context` holds before this app exists, so with
+    /// nothing restored that factor is 1.0 and a session spent zoomed comes back
+    /// in a window scaled by 1/zoom — compounding every launch, and on the 30s
+    /// autosave rather than only on a clean exit. This blob is the only thing
+    /// loaded early enough to make those two agree (`create_egui_context`, before
+    /// the window is built).
+    ///
+    /// The blob's widget state — scroll offsets above all — is emphatically NOT
+    /// wanted and is dropped in `GitkApp::new`; see the `Memory::data` clear there.
+    /// (`Memory::areas` rides along too and is left: every `Area` this app shows is
+    /// positioned by the code that shows it, so a restored one is overwritten on
+    /// the frame it appears.)
     fn persist_egui_memory(&self) -> bool {
-        false
+        true
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -8095,6 +8238,7 @@ impl eframe::App for GitkApp {
         let t_drains = std::time::Instant::now();
 
         let search_id = egui::Id::new("search_field");
+        self.apply_zoom(&ctx);
         self.handle_keys(&ctx, search_id);
         // After the drains and key handling: any diff installed or scroll target
         // queued above gets its visible rows emphasized before this frame renders.
@@ -11258,20 +11402,29 @@ mod tests {
                 )
             };
             let mut c = SidebarCache::default();
-            c.ensure(2, 100.0);
+            c.ensure(2, 100.0, 1.0);
             assert_eq!((c.stats.len(), c.elided.len()), (2, 2));
             c.stats[0] = Some((galley(), galley()));
             c.elided[0] = Some(galley());
             // Same shape ⇒ everything kept.
-            c.ensure(2, 100.0);
+            c.ensure(2, 100.0, 1.0);
             assert!(c.stats[0].is_some() && c.elided[0].is_some());
             // Width change ⇒ elided labels dropped, stat galleys kept.
-            c.ensure(2, 90.0);
+            c.ensure(2, 90.0, 1.0);
             assert!(c.stats[0].is_some());
             assert!(c.elided.iter().all(Option::is_none));
-            // File-count change (fresh diff) ⇒ both dropped.
+            // Scale change (a zoom step, or a move to a monitor of another DPI)
+            // ⇒ both dropped, the width being untouched: every galley here was
+            // laid out against the atlas for the old `pixels_per_point`, and the
+            // stat galleys are the ones no other key would have caught.
             c.elided[0] = Some(galley());
-            c.ensure(3, 90.0);
+            c.ensure(2, 90.0, 1.5);
+            assert!(c.stats.iter().all(Option::is_none));
+            assert!(c.elided.iter().all(Option::is_none));
+            // File-count change (fresh diff) ⇒ both dropped.
+            c.stats[0] = Some((galley(), galley()));
+            c.elided[0] = Some(galley());
+            c.ensure(3, 90.0, 1.5);
             assert!(c.stats.iter().all(Option::is_none));
             assert!(c.elided.iter().all(Option::is_none));
         });
@@ -11756,6 +11909,11 @@ mod tests {
         assert!(shown.ends_with("αβγδε.rs"), "{out}");
     }
 
+    /// egui's default `InputOptions::zoom_modifier`, which is what the app reads
+    /// off the live `Context`. Stated here rather than constructed, so a test says
+    /// which modifier it is splitting on.
+    const ZM: egui::Modifiers = egui::Modifiers::COMMAND;
+
     /// One `MouseWheel` event, as a backend reports it.
     fn wheel(unit: egui::MouseWheelUnit, dy: f32, modifiers: egui::Modifiers) -> egui::Event {
         egui::Event::MouseWheel {
@@ -11778,7 +11936,7 @@ mod tests {
             1.0,
             egui::Modifiers::NONE,
         )];
-        assert_eq!(wheel_steps(&up, &mut accum), 1);
+        assert_eq!(wheel_steps(&up, &mut accum, ZM, Wheel::Plain), 1);
         assert_eq!(accum, 0.0, "a notch leaves no remainder to drift on");
 
         let down = [wheel(
@@ -11786,7 +11944,7 @@ mod tests {
             -1.0,
             egui::Modifiers::NONE,
         )];
-        assert_eq!(wheel_steps(&down, &mut accum), -1);
+        assert_eq!(wheel_steps(&down, &mut accum, ZM, Wheel::Plain), -1);
         assert_eq!(accum, 0.0);
     }
 
@@ -11802,10 +11960,26 @@ mod tests {
             TRACKPAD_POINTS_PER_STEP * 0.3,
             egui::Modifiers::NONE,
         )];
-        assert_eq!(wheel_steps(&nudge, &mut accum), 0, "0.3 of a step");
-        assert_eq!(wheel_steps(&nudge, &mut accum), 0, "0.6 of a step");
-        assert_eq!(wheel_steps(&nudge, &mut accum), 0, "0.9 of a step");
-        assert_eq!(wheel_steps(&nudge, &mut accum), 1, "1.2 crosses it");
+        assert_eq!(
+            wheel_steps(&nudge, &mut accum, ZM, Wheel::Plain),
+            0,
+            "0.3 of a step"
+        );
+        assert_eq!(
+            wheel_steps(&nudge, &mut accum, ZM, Wheel::Plain),
+            0,
+            "0.6 of a step"
+        );
+        assert_eq!(
+            wheel_steps(&nudge, &mut accum, ZM, Wheel::Plain),
+            0,
+            "0.9 of a step"
+        );
+        assert_eq!(
+            wheel_steps(&nudge, &mut accum, ZM, Wheel::Plain),
+            1,
+            "1.2 crosses it"
+        );
         assert!(
             (accum - 0.2).abs() < 0.001,
             "the remainder carries: {accum}"
@@ -11821,10 +11995,10 @@ mod tests {
             wheel(egui::MouseWheelUnit::Line, 2.0, egui::Modifiers::NONE),
             wheel(egui::MouseWheelUnit::Line, 1.0, egui::Modifiers::NONE),
         ];
-        assert_eq!(wheel_steps(&flick, &mut accum), 3);
+        assert_eq!(wheel_steps(&flick, &mut accum, ZM, Wheel::Plain), 3);
     }
 
-    /// Ctrl-scroll is egui's zoom gesture. A widget that happens to be under the
+    /// Ctrl-scroll is the zoom gesture. A widget that happens to be under the
     /// pointer must not also read it — the user asked to zoom, and the re-diff
     /// this would trigger is not free. All three spellings of that modifier, since
     /// the veto asks egui's `matches_any` rather than naming the fields itself.
@@ -11836,8 +12010,103 @@ mod tests {
             wheel(egui::MouseWheelUnit::Line, 1.0, egui::Modifiers::COMMAND),
             wheel(egui::MouseWheelUnit::Line, 1.0, egui::Modifiers::MAC_CMD),
         ];
-        assert_eq!(wheel_steps(&zoom, &mut accum), 0);
+        assert_eq!(wheel_steps(&zoom, &mut accum, ZM, Wheel::Plain), 0);
         assert_eq!(accum, 0.0, "and it leaves nothing behind to step later");
+    }
+
+    /// …and the other half of that partition: the zoom reads exactly the notches
+    /// the context width refuses, and none of the ones it takes. Both directions
+    /// of the split are pinned, or a modifier the two disagree about would either
+    /// act twice or be dropped on the floor.
+    #[test]
+    fn the_zoom_reads_ctrl_scroll_and_only_that() {
+        // One accumulator each, as the two real readers have: sharing one is the
+        // aliasing the helper's own doc rules out.
+        let (mut zoom_accum, mut plain_accum) = (0.0, 0.0);
+        let mixed = [
+            wheel(egui::MouseWheelUnit::Line, 1.0, egui::Modifiers::CTRL),
+            wheel(egui::MouseWheelUnit::Line, 1.0, egui::Modifiers::COMMAND),
+            wheel(egui::MouseWheelUnit::Line, 1.0, egui::Modifiers::MAC_CMD),
+            wheel(egui::MouseWheelUnit::Line, 1.0, egui::Modifiers::NONE),
+            wheel(egui::MouseWheelUnit::Line, 1.0, egui::Modifiers::SHIFT),
+        ];
+        assert_eq!(
+            wheel_steps(&mixed, &mut zoom_accum, ZM, Wheel::Zoom),
+            3,
+            "the three modified notches, and neither unmodified one"
+        );
+        assert_eq!(
+            wheel_steps(&mixed, &mut plain_accum, ZM, Wheel::Plain),
+            2,
+            "and the two the zoom left"
+        );
+    }
+
+    /// The zoom arithmetic, which is the whole of `apply_zoom` once the notches
+    /// are counted: every notch of a flick moves (a three-notch flick that moved
+    /// one step would make a trackpad useless), the result lands on the step grid
+    /// so repeated `+ 0.1` cannot drift off it, and both ends clamp rather than
+    /// running away.
+    #[test]
+    fn zoom_target_steps_snaps_and_clamps() {
+        assert_eq!(zoom_target(1.0, 1), 1.1);
+        assert_eq!(zoom_target(1.0, -1), 0.9);
+        assert_eq!(zoom_target(1.0, 3), 1.3, "every notch of a flick, not one");
+        assert_eq!(zoom_target(1.0, 0), 1.0);
+        assert_eq!(zoom_target(ZOOM_MAX, 1), ZOOM_MAX);
+        assert_eq!(zoom_target(ZOOM_MIN, -1), ZOOM_MIN);
+        assert_eq!(
+            zoom_target(1.0, 100),
+            ZOOM_MAX,
+            "a long flick stops at the end"
+        );
+        assert_eq!(zoom_target(1.0, -100), ZOOM_MIN);
+        // Walking up a notch at a time must land on the same values as naming the
+        // level outright — the drift a snap exists to prevent.
+        let mut z = 1.0;
+        for _ in 0..10 {
+            z = zoom_target(z, 1);
+        }
+        assert_eq!(z, 2.0);
+    }
+
+    /// `ZOOM_STEP` / `ZOOM_MIN` / `ZOOM_MAX` are copies of constants private to
+    /// `egui::gui_zoom`, so nothing but this pins them: egui's own public
+    /// `zoom_in`/`zoom_out` are the oracle, exactly as libgit2 is the oracle for
+    /// the diffstat block it no longer implements. Without it an egui upgrade that
+    /// moved either bound would leave Ctrl+± reaching a level Ctrl+scroll cannot,
+    /// with nothing to say so.
+    #[test]
+    fn the_zoom_constants_are_egui_s_own() {
+        let ctx = egui::Context::default();
+        // `set_zoom_factor` only takes effect at the start of the next pass.
+        let pass = || {
+            ctx.run_ui(egui::RawInput::default(), |_| {})
+                .drop_without_applying_deltas();
+        };
+        let settle = |z: f32| {
+            ctx.set_zoom_factor(z);
+            pass();
+        };
+
+        settle(1.0);
+        egui::gui_zoom::zoom_in(&ctx);
+        pass();
+        assert_eq!(
+            ctx.zoom_factor(),
+            zoom_target(1.0, 1),
+            "one keypress is one notch"
+        );
+
+        settle(ZOOM_MAX);
+        egui::gui_zoom::zoom_in(&ctx);
+        pass();
+        assert_eq!(ctx.zoom_factor(), ZOOM_MAX, "egui's ceiling is ours");
+
+        settle(ZOOM_MIN);
+        egui::gui_zoom::zoom_out(&ctx);
+        pass();
+        assert_eq!(ctx.zoom_factor(), ZOOM_MIN, "and its floor");
     }
 
     /// A pending anchor may only ever be captured on `Anchor`, and `Restore`

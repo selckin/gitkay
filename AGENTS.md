@@ -1136,11 +1136,19 @@ sorted drivers keep the same rows with the same rewritten parents.
   hand-written key pairs, and the convention had already slipped: `wrap` was added
   third and every doc comment enumerating the group still named only the first two.
   **The context width also takes the wheel**, over the whole `Context: - N +` group
-  (`wheel_steps`). Four things there are load-bearing. It reads the raw `MouseWheel`
+  (`wheel_steps`). Five things there are load-bearing. It reads the raw `MouseWheel`
   events and **never `InputState::smooth_scroll_delta`**, which is smoothed across
   frames — one notch arrives as a decaying tail that any threshold either splits into
   several steps or swallows whole; raw `Line` events make a notch one step by
-  construction, so only `Point` devices are paced. The group is **deliberately
+  construction, so only `Point` devices are paced. It asks for the **plain** half of
+  that input (`Wheel::Plain`), the zoom below taking the modified half, so a notch
+  reaches exactly one of the two — and the line between them is
+  `Options::input_options.zoom_modifier`, **read off the live `Context` rather than
+  named here**, because it is the same value `InputState` partitions on: hardcode
+  `Modifiers::COMMAND` and a changed option (or a moved default) leaves a notch either
+  zooming *and* scrolling a `ScrollArea` or doing neither, which is the
+  `SCROLL_SOURCE` pitfall again. Read it OUTSIDE the `input` closure — two nested
+  `Context` reads are egui's documented deadlock. The group is **deliberately
   unlabelled** — an `on_hover_text` parks an interactable tooltip layer under the
   pointer, which wins the hit-test and swallows the very wheel events this reads (see
   the tooltip pitfall below). All three adjusters clamp at **one** site, so the width
@@ -1148,6 +1156,65 @@ sorted drivers keep the same rows with the same rewritten parents.
   And a wheel step **defers** its re-diff (`defer_diff_load`) where a click loads at
   once — see the top panel's `DIFF_LOAD_DEBOUNCE` for why supersession does not cover
   a burst.
+- **UI zoom**: ctrl/cmd-scroll scales the whole window, `ZOOM_STEP` (0.1) per notch,
+  between `ZOOM_MIN` and `ZOOM_MAX` — the step and the range egui's own Ctrl+±/Ctrl+0
+  keyboard zoom moves in, restated here only because `gui_zoom`'s constants are private.
+  The two are **one setting** and `apply_zoom` holds none of it: it counts notches and
+  writes `Context::set_zoom_factor`, and every step is counted from the LIVE factor —
+  which that call does not write until the next pass begins, so a step counted off a
+  value written this frame would land on it again and swallow the notch.
+  **"One setting" is compiled and tested rather than asserted, in two places.** The
+  arithmetic is `zoom_target` (pure), which clamps and *then* snaps, with egui's own
+  expression: `(z / ZOOM_STEP).round() * ZOOM_STEP` looks equivalent and disagrees in
+  the last ulp at 1.3, 1.8, 2.1, … — `pixels_per_point` is derived from this value and
+  `SidebarCache` keys its galleys on it by exact equality, so the two spellings would
+  drop the sidebar's cache every time the reader switched between the wheel and the
+  keyboard. And the three copied constants are pinned against
+  `egui::gui_zoom::zoom_in`/`zoom_out` through a headless `Context`
+  (`the_zoom_constants_are_egui_s_own`) — egui's public half is the oracle for its own
+  private constants, the way libgit2 is the oracle for the diffstat block it no longer
+  implements. Without that test an egui bump moving either bound leaves Ctrl+±
+  reaching a level Ctrl+scroll cannot, silently.
+  It **scales rather than resizing text**: every length here is in points, so
+  `zoom_factor` takes the rows, the gutters, the column samples and the sidebar along
+  with the glyphs, where scaling `Fonts`' role sizes would leave the layout around them
+  at their old size and invalidate every width measured from a font (the wrap index,
+  `MetaCols`, `LineNoGutter`) rather than nothing.
+  What a scale change *does* invalidate is the **sidebar's cached galleys** — the only
+  galleys held across frames — which bake glyph UVs into the atlas for one
+  `pixels_per_point`. That is a **key on `SidebarCache::ensure`, not something the zoom
+  remembers to reset**: the same value moves when the window meets a monitor of another
+  DPI, which no handler here is told about at all, and keyed at the one gate every row
+  draw passes through, neither trigger can be forgotten. A font swap is genuinely the
+  other rule and stays an explicit reset (`apply_pending_fonts`, the config reload):
+  `set_fonts` changes the glyphs without moving any value a cache could poll.
+  It reads the wheel **window-wide** and, unlike the toolbar's context group, is not
+  occlusion-tested — egui hands ctrl-scroll to nobody else: `InputState` routes a wheel
+  event carrying the `zoom_modifier` into `zoom_factor_delta` and leaves
+  `smooth_scroll_delta` at zero, so the `ScrollArea` under the pointer does not move
+  with it. Raw events rather than that `zoom_delta`, for the same reason the context
+  width refuses `smooth_scroll_delta` — and it is worse here, being exponentiated
+  (`scroll_zoom_speed`) after `line_scroll_speed` has made a notch 40 points:
+  `exp(40/200)`, a 22% jump, twice the keyboard's step and a different size on every
+  device.
+  **Persisted, and the WINDOW is why** — not the convenience of reopening zoomed.
+  eframe stores the window size divided by the live zoom factor
+  (`WindowSettings::from_window`) and rebuilds the window multiplied by whatever the
+  `Context` holds before this app exists, so the two only agree if the factor survives
+  the restart: leave it at 1.0 and a session spent at zoom 2 reopens in a half-size
+  window, again on the next launch, and again — the same compounding shape as the
+  Wayland window-growth bug the `persist_window` comment records, and reached through
+  the 30s autosave rather than only a clean exit. Ctrl+± could always do this; the
+  wheel made it easy. **An earlier version of this file concluded the opposite — "not
+  persisted, deliberately" — off the same arithmetic. The asymmetry is on the SAVE
+  side, so declining to persist does not avoid it, it is what causes it.**
+  It rides in **egui's own memory blob** (`persist_egui_memory`, back on) rather than a
+  key of this app's, because that blob is the only thing loaded early enough
+  (`create_egui_context`, ahead of the window); `apply_zoom` neither saves nor restores
+  anything. What that blob also carries — last session's `ScrollArea` offsets, which
+  would open the pane part-way down a file nobody was reading — is dropped in
+  `GitkApp::new` (`Memory::data`, cleared; `options`, which holds the factor, is kept).
+  The `[text]` sizes remain the permanent per-role knob, which this scales on top of.
 - **Diff-load progress**: past `DIFF_PLACEHOLDER_DELAY` a commit switch blanks the
   pane, and what it blanks to says what the build is doing rather than only that it is
   doing something — `loading_diff_text` (pure), fed by a `diff::DiffProgress` the
@@ -1860,7 +1927,7 @@ ones that actually fail when the write is removed.
 - `collect_refs` per commit is O(commits × refs) → precompute ref map once
 - Working-tree edits do not touch `.git`; refresh commits/diff on selection changes to keep virtual staged/uncommitted entries current without a recursive worktree watcher
 - Branch highlighting walks first-parent children upward, but all parents downward, so merge commits keep merged history highlighted
-- File-list sidebar is not row-virtualized — every row draws each frame, so per-row file text goes through `SidebarCache`: elided labels (laid out in `Color32::PLACEHOLDER` so normal/hover color applies at paint time) and `+n`/`-n` stat galleys are built once per (diff, width, font) — `resync_file_layout` and a font reload reset the cache, `ensure` re-keys it on width change. Both stat galleys always exist, a zero count included (`+0`/`-0`, as in the commit list), so `StatGalleys` holds no `Option` and the row's stats block is a fixed distance from its right edge instead of sliding when one side is empty. `build_file_rows` (pure) turns `(new_path, Option<old_path>)` pairs into header/file rows per `[diff] file_list` (`grouped` = one header per directory, files sorted by label, root-level files last; renames/copies group under their `rename_brace` common directory) — and it is the single decision of what order files are read in, the **diff pane** included (see **Bottom panel**); `left_elide` left-truncates labels, measuring the full string once and binary-searching only when it overflows (directory headers still elide per frame — they're the minority of rows). `grouped` directory headers are drawn breadcrumb-style (`draw_dir_header` + `diff::common_dir_prefix_len` — shared with the diffstat block's `dir/{old => new}` factoring, which is libgit2's own rule and was a second copy of it): the ancestor path a header shares with the header drawn just above it is dimmed (`SUBTEXT_DIM`) and the distinguishing tail is `SUBTEXT`, so deep trees don't repeat the same long prefix on every header
+- File-list sidebar is not row-virtualized — every row draws each frame, so per-row file text goes through `SidebarCache`: elided labels (laid out in `Color32::PLACEHOLDER` so normal/hover color applies at paint time) and `+n`/`-n` stat galleys are built once per (diff, width, scale, font) — `resync_file_layout` and a font reload reset the cache, `ensure` re-keys it on the row width and on `pixels_per_point`, which is what covers a zoom step and a monitor-DPI change (see **UI zoom**). Both stat galleys always exist, a zero count included (`+0`/`-0`, as in the commit list), so `StatGalleys` holds no `Option` and the row's stats block is a fixed distance from its right edge instead of sliding when one side is empty. `build_file_rows` (pure) turns `(new_path, Option<old_path>)` pairs into header/file rows per `[diff] file_list` (`grouped` = one header per directory, files sorted by label, root-level files last; renames/copies group under their `rename_brace` common directory) — and it is the single decision of what order files are read in, the **diff pane** included (see **Bottom panel**); `left_elide` left-truncates labels, measuring the full string once and binary-searching only when it overflows (directory headers still elide per frame — they're the minority of rows). `grouped` directory headers are drawn breadcrumb-style (`draw_dir_header` + `diff::common_dir_prefix_len` — shared with the diffstat block's `dir/{old => new}` factoring, which is libgit2's own rule and was a second copy of it): the ancestor path a header shares with the header drawn just above it is dimmed (`SUBTEXT_DIM`) and the distinguishing tail is `SUBTEXT`, so deep trees don't repeat the same long prefix on every header
 - Any new diff-*data*-affecting setting goes in `DiffSettings` only. `GitkApp` holds one `DiffSettings` field (the diff-shaping state — `context`/`ignore_ws`/`detect_renames`/`detect_copies` are toolbar-owned + persisted, grouped as `ToolbarDiffSettings`; `show_stats`/`textconv` come from `[diff]` config), and `DiffCacheKey` *embeds* a `DiffSettings`. (It also carries a `drivers` fingerprint, which is NOT a setting — it is the repo's own `diff.<name>.textconv` config, and it is in the key for the same reason: an edited driver changes a driven file's whole body without moving the oid. See **Textconv**.) So a field added to `DiffSettings` is automatically (a) part of the cache key — cached diffs invalidate when it changes, no second edit site — and (b) covered by the config-reload's whole-struct comparison (`new_settings != self.diff_settings`), which triggers the re-diff. The prefetch mapping reads it back as `key.settings`. Settings that only change *spans* (theme, syntax on/off, `diff_bg`, `[diff.languages]`) or *render* (`file_list`) are handled by their own branches in the config-reload block, not `DiffSettings`. The three render-only settings the TOOLBAR owns — `word_diff`, `line_numbers` and `wrap` — have no reload branch at all, because they have no config key to reload from; a render-only setting added later has to choose which of those two shapes it is. `file_list` decides the order the pane's patch bodies are laid out in as well as the sidebar's rows, which is a re-lay of built data and not a re-diff — it stays out here because `diff::order_files` is idempotent, so a cached or stored diff is re-laid on install rather than rebuilt (see **Bottom panel**). `wrap` is the third shape and not a config setting at all: it is toolbar-owned like `word_diff` and `line_numbers`, so it has no reload branch to forget, and it needs no re-lay either — the wrap index is measured by the render on the first frame that wants one and `resync_wrap_index`'s own `!wrap` arm drops it, reporting that drop as a move so the reader's line is pinned (see **Soft wrapping**).
   The span half is **one struct too** (`SpanSettings`, held as `GitkApp::span_settings`), compared and assigned whole for the same reason `DiffSettings` is: as four loose fields the reload's test was a four-term `||` chain that a fifth setting could silently miss, and missing it is not a lost frame — every cached diff keeps yesterday's colours, sticky via `diff_cache.contains`, for the session with nothing logged. Which of the four are in `DiffCacheKey` is unchanged and is the next paragraph's subject.
   **Three of those four span settings are in `DiffCacheKey`, and the fourth shapes no span** — so a stale entry simply misses, and the reload neither clears the cache nor carries an epoch. `theme` and `enabled` are their own key fields; `[diff.languages]` is a `u64` from `highlight::languages_fingerprint`, cached on `GitkApp` because `diff_cache_key` runs ~54 times per dispatch and the map is a `BTreeMap`. `diff_bg` is **not** in the key and must not be: it decides `DiffPalette::added_bg`/`deleted_bg`, which `diff_row_job` reads live from `self.diff_palette` at render time, and the one palette-derived span (`tokenize`'s grammar-hiccup fallback) takes `foreground`, which is theme-derived. Nothing bakes it into a `Span`. `set_span_settings` is the sole later writer of the map and the fingerprint both, so the cached value cannot describe a map that is gone — which would be silent and permanent, every key hitting entries tokenized with the wrong grammar while `diff_cache.contains` kept any dispatch from rebuilding them.
