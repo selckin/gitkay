@@ -1389,9 +1389,7 @@ pub fn run_local_probes(repo: &Repository, paths: &[String]) -> (bool, bool) {
     ) -> Result<git2::Diff<'r>, git2::Error>| {
         let t = std::time::Instant::now();
         let mut opts = pathspec_opts(paths);
-        let hit = build(repo, &mut opts)
-            .ok()
-            .is_some_and(|diff| diff.deltas().len() > 0);
+        let hit = build(repo, &mut opts).is_ok_and(|diff| diff.deltas().len() > 0);
         log::debug!(
             "perf: load_commits: {label} probe -> {hit} {:?}",
             t.elapsed()

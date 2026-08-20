@@ -974,7 +974,7 @@ impl DiffData {
 /// lives here because that is the layer both of the others already depend on — as two
 /// copies, the port and the sidebar's could have disagreed about a rename displayed one
 /// above the other in the same window.
-pub fn common_dir_prefix_len(a: &str, b: &str) -> usize {
+pub const fn common_dir_prefix_len(a: &str, b: &str) -> usize {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     let mut pfx = 0;
     let mut i = 0;

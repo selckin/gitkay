@@ -251,8 +251,8 @@ impl Layer {
         let mut raw = [0u8; 256 * 4];
         file.read_exact_at(&mut raw, fanout_at).ok()?;
         let mut fanout = [0u32; 256];
-        for (slot, chunk) in fanout.iter_mut().zip(raw.chunks_exact(4)) {
-            *slot = u32::from_be_bytes(chunk.try_into().unwrap_or_default());
+        for (slot, chunk) in fanout.iter_mut().zip(raw.as_chunks::<4>().0) {
+            *slot = u32::from_be_bytes(*chunk);
         }
         // Monotonic by construction; a file that is not says nothing trustworthy
         // about where an oid lives, and the binary search below would read outside
@@ -503,14 +503,13 @@ fn murmur3(seed: u32, data: &[u8], signed: bool) -> u32 {
         }
     };
     let mut h = seed;
-    let mut chunks = data.chunks_exact(4);
-    for c in &mut chunks {
+    let (chunks, tail) = data.as_chunks::<4>();
+    for c in chunks {
         let mut k = byte(c[0]) | (byte(c[1]) << 8) | (byte(c[2]) << 16) | (byte(c[3]) << 24);
         k = k.wrapping_mul(C1).rotate_left(15).wrapping_mul(C2);
         h ^= k;
         h = h.rotate_left(13).wrapping_mul(5).wrapping_add(0xe654_6b64);
     }
-    let tail = chunks.remainder();
     if !tail.is_empty() {
         let mut k = 0u32;
         for (i, &b) in tail.iter().enumerate() {
@@ -880,8 +879,11 @@ impl<'a> ChangedPaths<'a> {
                 fanout: layer.fanout,
                 oids,
                 index: raw
-                    .chunks_exact(4)
-                    .map(|c| u32::from_be_bytes(c.try_into().unwrap_or_default()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .copied()
+                    .map(u32::from_be_bytes)
                     .collect(),
                 data: bloom.data,
                 data_end: bloom.data_end,
