@@ -2,7 +2,8 @@
 //! is about to be rebuilt, and finding that place again in the result.
 //!
 //! Every toolbar setting reshapes the pane under a fixed row offset — widening the
-//! context inserts lines above every hunk, `ignore_ws` merges hunks and can leave a
+//! context inserts lines above every hunk, an option that hides changes
+//! (`DiffSettings::showing_all_content`) merges hunks and can leave a
 //! file with no patch body at all, rename detection collapses two entries into one —
 //! so a remembered row number names a different line afterwards. `capture_anchor`
 //! takes a bearing that survives all of it (byte path, side, git line number) and

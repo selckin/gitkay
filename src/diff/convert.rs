@@ -10,9 +10,12 @@
 //! - a BINARY delta's header carries no `---`/`+++` pair, so one is synthesized —
 //!   under the prefixes read back off the header libgit2 printed, since
 //!   `diff.noprefix` moves them per repo (`header_prefixes`, `filename_lines`);
-//! - `ignore_ws` can suppress every raw hunk, so the delta gets no header and there
-//!   is nothing to hook — the sweep re-emits those at the end under a header that
-//!   claims only what is true (`swept_header_lines`, `move_to_end`);
+//! - an option that HIDES changes (`ignore_ws`, `ignore_blank_lines`) can suppress
+//!   every raw hunk, so the delta gets no header and there is nothing to hook — the
+//!   sweep re-emits those at the end under a header that claims only what is true
+//!   (`swept_header_lines`, `move_to_end`). The sweep triggers on the ABSENCE of a
+//!   header rather than on which option caused it, so it covers both; the fixtures
+//!   below drive it through `ignore_ws`;
 //! - which sides may be converted comes from the delta's MODES, never from
 //!   `DiffFile::mode()`, which panics outside git2's canonical seven — and the two
 //!   mode sources exist because the `--raw` one is a second full patch generation
@@ -864,7 +867,8 @@ pub(super) mod tests {
         );
     }
 
-    /// A driven delta whose raw hunks are ALL suppressed by `ignore_ws` never
+    /// A driven delta whose raw hunks are ALL suppressed — `ignore_ws` here, but
+    /// `ignore_blank_lines` reaches the same state — never
     /// flushes a file header, so the `'F'` callback never fires and there is
     /// nothing to substitute on — while git, converting first, would still show the
     /// converted patch. The post-print sweep is what emits it.

@@ -406,21 +406,102 @@ commit LIST's concern, and the relative form is a port of git's `show_date_relat
 whose rounding is the whole of it),
 `src/cli.rs` (pure argv parser, rev-vs-path classification, pathspec
 resolution, window-title suffix, help/version text), and
-`src/word_diff.rs` (pure intra-line word diff: tokenizer + LCS alignment; the
-`DiffLine`-aware driver `emphasize_rows` lives in `src/diff.rs`, and is
+`src/word_diff.rs` (pure word diff: tokenizer + LCS alignment. A change block is
+aligned **whole** — both sides' rows concatenated, and every whitespace run collapsed
+to one separator token, the LINE BREAK between two rows included — so where the breaks
+fall never reaches the alignment. Rewrapped prose then emphasizes the words that
+changed rather than every row the rewrap touched, and a block whose `-` and `+` runs
+differ in length gets emphasis at all, which 1:1 pairing cannot give it. What that
+costs is only the whitespace a rewrap touches: a run INSIDE a row keeps its own text, so
+`a  b` against `a b` still marks the run that grew, but a run that merges with a break
+beside it (trailing spaces, the next row's indent) goes canonical, the two sides of a
+rewrap having to see the same separator there. **Emphasis has to be a minority of the
+block to mean anything** — where less than half the larger side aligned, it is dropped
+whole, because a `-` side of one blank line or a lone `}` against an insertion of hundreds
+of rows would otherwise draw every one of them as changed, which is the solid highlight a
+pure deletion is refused for. That guard is about AREA, so **a single row a side is
+exempt**: painting one row solid is what the pane draws for it without word diff anyway,
+and applied to a pair the rule silently stops emphasizing ordinary rewrites.
+**A refused block comes back as `None`, not as empty ranges**, because the whole-block
+path is an UPGRADE on pairing the block's rows 1:1 and must never draw LESS than pairing
+would: `emphasize_rows` falls back to the pair path on a `None`, where each row is judged
+on its own and the guard does not reach it. Collapsed into one value the refusal was
+written in as the block's decision, the pair fallback below became unreachable, and an
+ordinary two-row rewrite (`let a = 1;` / `let b = 2;` → `let x = compute(p, q);` /
+`let y = compute(r, s);`) drew nothing at all — emphasis the code had before there was a
+block path. The fallback then decides pair 0 whether or not the window reaches it, or the
+block stays undecided and every later frame re-tokenizes and re-aligns the whole of it to
+be told the same thing.
+**What word diff costs is bounded by ONE question, `word_diff::alignment_fits`, asked
+over a `SideWeight` per side** — and a `SideWeight` is gathered from the rows' LENGTHS in
+one short-circuiting pass, never from tokens, which is what lets a block of millions of
+rows be disqualified by its first few thousand without tokenizing any of it. Three
+numbers make up that answer because they bound three different costs, none implying
+another: `MAX_CELLS`, the table, a bound on TIME before it is one on memory (the fill is a
+dependent scan, so a 1M-cell table measures ~13ms, a whole frame); `MAX_SIDE_WEIGHT`, one
+side, since tokenizing it and writing its rows are O(that side) where the table is O(the
+product) — a blank line deleted above a huge insertion weighs 1 against a million and
+would clear a product budget alone; and `MAX_ROW_BYTES`, a READABILITY rule, the one thing
+that looks at a row on its own, since a side's weight says nothing about its widest row.
+**A PAIR — one row a side — takes a larger cell budget than a block** (`MAX_PAIR_CELLS`,
+sized from `MAX_ROW_BYTES` so the two cannot drift): a pair's two dimensions are each
+bounded by `MAX_ROW_BYTES` already, so its worst case is fixed and lands on the one row
+the reader is looking at, where a block's sides can each reach `MAX_SIDE_WEIGHT` and one
+window can hold several blocks. Under the block budget alone the widest symmetric pair
+that aligned was **1023** bytes a side, half what the pre-block code covered
+(`MAX_WORD_DIFF_LINE`, 2048) and a silent loss of emphasis on every long JSON row and
+wide SQL statement — and it left `MAX_ROW_BYTES` naming no limit a symmetric pair could
+reach, so raising it to widen coverage changed nothing. Which budget applies is decided
+inside `alignment_fits`, from the row counts `SideWeight` carries, so neither caller has
+to know there are two.
+They live together in `word_diff` with the `const _: () = assert!` block that keeps them
+consistent, and `emphasize_rows` asks all three through one `alignable` predicate — ONE
+call, the O(1) floor over the row counts included, so the block path and the pair path
+cannot answer differently about the same rows and a later caller cannot get the expensive
+form by forgetting the cheap one. It returns the COST rather than a bool, because
+affording ONE alignment and affording every alignment a window asks for are different
+questions: `word_diff`'s budgets bound one table, and a block only has to OVERLAP the
+window to be decided, so a rewritten region holding three or four near-maximal blocks paid
+three or four full tables on a single frame loop. `diff::MAX_PASS_CELLS` bounds one
+`emphasize_rows` pass at about one maximal table; the first alignment of a pass is always
+allowed, so a block larger than the budget still makes progress. Nothing is refused for
+good — a block over the budget is left **entirely** undecided, its pairs included, and a
+later frame aligns it whole. Letting it fall through to the pair path instead would put a
+per-frame budget in charge of how a block is RENDERED, so the same diff would look
+different depending on how the reader scrolled into it.
+The question is asked about a BLOCK rather than a row because aligning a block whole is
+quadratic in the block where pairing its lines is linear in it (a 57-row block: ~1M cells
+whole, ~70k paired), so a block that cannot afford one table falls back to pairing its
+runs 1:1, which costs the sum of the pairs' tables. Pairing needs equal-length runs — an
+oversized UNEVEN block gets nothing, and is marked decided so it is not re-weighed every
+frame — and is computed only for the pairs the window reaches (derived arithmetically, not
+by testing every pair of the block; the whole-block path is window-gated too, since it
+writes a block at a time and a large rewritten region holds many blocks). Because the
+weight bounds the table exactly, an alignment never refuses a block for SIZE — a
+`debug_assert` in `block_emphasis` holds the caller to weighing it, rather than a `None`
+nobody could tell from "nothing changed". Within the table, the common prefix and suffix
+are matched off before it is built: they are what a rewrap leaves behind, so the quadratic
+fill runs over the part that actually differs. A pure deletion — a `-` run with no `+` run
+after it — is left alone on both paths; with nothing to align against every token comes
+out changed, which is a solid highlight rather than information. That is
+`alignment_fits`'s own answer, not the driver's: a side of NO ROWS weighs 0, and refusing
+it there is what makes the predicate's "the whole question" claim true — carried in
+`emphasize_rows` instead, only the one caller that remembered it was covered, and the
+block was never marked decided, so it was re-weighed on every frame it stayed on screen.
+The `DiffLine`-aware driver `emphasize_rows` lives in `src/diff.rs`, and is
 **lazy per viewport**: each row's emphasis is a `RowEmphasis` slot (unset = not
 computed, as an unset `RowSpans` slot is), and `ensure_visible_word_emphasis` fills only the
 rows around the visible window — plus any pending scroll target — every frame.
 So the toggle-off path never pays the LCS, and no whole-diff LCS pass ever runs
 anywhere, no matter the diff size; installs and the toggle just nudge a repaint.
-**The LCS is what that bounds, and the block SCAN is a separate bound this file used
-to claim it covered.** A change block is `Del* Add*`, so an added file is ONE block
-spanning the whole file, and `emphasize_rows` must know both runs' true lengths to
-pair them — so a viewport parked inside such a block walks its full length in kind
-checks every frame. A window holding no `Del`/`Add` at all returns before the walk,
-which is the case that never needed it; bounding the rest means recording each
-block's boundaries once per diff, in the sparse shape `wrap::WrapIndex` uses, and
-that index does not exist).
+**The LCS is what that bounds — with the block cap — and the block SCAN is a separate
+bound this file used to claim it covered.** A change block is `Del* Add*`, so an added
+file is ONE block spanning the whole file, and `emphasize_rows` must know both runs'
+true lengths to align or pair them — so a viewport parked inside such a block walks its
+full length in kind checks every frame. A window holding no `Del`/`Add` at all returns
+before the walk, which is the case that never needed it; bounding the rest means
+recording each block's boundaries once per diff, in the sparse shape `wrap::WrapIndex`
+uses, and that index does not exist).
 
 The big picture, ahead of the detail sections below:
 
@@ -980,8 +1061,8 @@ sorted drivers keep the same rows with the same rewritten parents.
   across an invalidation has its results discarded, so nothing else would release
   those claims and dispatch (gated on the set being empty) would stop for the
   session. Invalidation is keyed on `stats_relevant` — `ignore_ws` /
-  `detect_renames` / `detect_copies` — not the whole `DiffSettings`, so bumping
-  the toolbar's context doesn't blank the column. The oid key is wrong for the two
+  `ignore_blank_lines` / `detect_renames` / `detect_copies` / `textconv` — not the
+  whole `DiffSettings`, so bumping the toolbar's context doesn't blank the column. The oid key is wrong for the two
   **virtual rows**, which keep one sentinel oid forever: a worktree-only edit
   never touches `.git`, so the watcher's reload (which does evict them) never
   fires, and they would show pre-edit numbers beside a pane that recomputed. Their
@@ -1108,11 +1189,21 @@ sorted drivers keep the same rows with the same rewritten parents.
   Relative mode also asks for a repaint every `RELATIVE_DATE_TICK` (30s), since it is
   the one thing on screen that goes stale with no input to prompt one; without it an
   idle window showed ages frozen at its last paint.
-- **Diff toolbar**: the hover toolbar's `±` context buttons and its
-  rename/copy/whitespace checkboxes mutate `self.diff_settings` directly, and whether
-  anything moved is decided by comparing the **whole struct** against a snapshot taken
-  before the widgets ran — not by a flag each widget sets. A fifth control that forgot
-  such a flag would mutate the settings and skip both `invalidate_stats_if_counts_changed`
+- **Diff toolbar**: the row **wraps** (`horizontal_wrapped` under a stated
+  `set_max_width`) rather than running off the window. It is an `Area`, which does not
+  scroll and whose `constrain` — on by default — CLIPS what does not fit and slides the
+  rest left over the graph, so on a narrow window the right-hand controls were simply
+  unreachable, with no scrollbar and no overflow menu to reach them; eight controls
+  already wanted ~1000pt and every toggle added has made it worse. The width has to be
+  STATED because a bare `Area` reports a tiny `available_width` (see the `Area` pitfall
+  below), so a wrapped layout left to itself breaks after every widget. A taller toolbar
+  stays revealed because `show_toolbar` also tests the toolbar's own last rect, not just
+  the fixed-height hover strip.
+  The `±` context buttons and the rename/copy and
+  ignore-whitespace/ignore-blank-lines checkboxes mutate `self.diff_settings` directly,
+  and whether anything moved is decided by comparing the **whole struct** against a
+  snapshot taken before the widgets ran — not by a flag each widget sets. A control
+  added there that forgot such a flag would mutate the settings and skip both `invalidate_stats_if_counts_changed`
   and `load_selected_diff`, leaving the pane on the old shape and the column on counts
   from settings that no longer apply; and the omission would read as deliberate, since
   `word_diff` beside them legitimately triggers no reload. The comparison is also more
@@ -1124,9 +1215,9 @@ sorted drivers keep the same rows with the same rewritten parents.
   overrode for a session, which meant a save to an unrelated config key silently
   reverted a tick. `wrap` came the other way — a `[diff]` key with no control at all,
   so the one decision you would want to take while looking at a wide line was the one
-  you had to leave the app to make. For the four that are `DiffSettings` fields that is *compiled*
+  you had to leave the app to make. For the five that are `DiffSettings` fields that is *compiled*
   rather than promised — `ToolbarDiffSettings::load` is an exhaustive struct literal
-  and `save` an exhaustive destructure, so a fifth field fails to build in both
+  and `save` an exhaustive destructure, so another field fails to build in both
   directions instead of silently resetting every launch. `word_diff`,
   `line_numbers` and `wrap` sit outside that struct (they change no diff data) and
   have **`ToolbarViewSettings`, the same mechanism for the same reason** — two structs
@@ -1352,7 +1443,7 @@ sorted drivers keep the same rows with the same rewritten parents.
   commit switch — an unvisited commit opens at the top). A **same-oid rebuild
   anchors instead of restoring**: every toolbar setting reshapes the content
   under a fixed row offset (context width inserts lines above every hunk,
-  `ignore_ws` merges hunks and can leave a file with no patch body at all,
+  an option that hides changes merges hunks and can leave a file with no patch body,
   rename detection collapses two entries into one), so `load_selected_diff`
   captures a `DiffAnchor` — byte path, side, git line number, and rows below
   the viewport's top — from the content still on screen, and
@@ -1637,9 +1728,36 @@ The invariants:
 - **Paths are carried as raw bytes**, never the lossy display `String` — a non-UTF-8
   filename used as a pathspec matches nothing and the write reports success having done
   nothing. That is what makes the crate **unix-only** (`compile_error!` in `main.rs`).
+- **A patch is never generated through an option that HIDES content.**
+  `DiffSettings::showing_all_content` — ignore-whitespace and ignore-blank-lines — is
+  cleared for every action diff, because a diff that hides real changes does not
+  describe the file and cannot be written to it. That is also the whole of `hunk_fit`'s
+  correctness argument: those are the ONLY options that diverge from the display, and
+  hiding a change can only ever make the generated hunk WIDER (a hidden change reads as
+  context, which splits the display into narrower hunks and can never merge it), so an
+  overlapping-but-wider hunk is never "more of what the reader clicked". Such a click is
+  refused as `HiddenByOption`, carrying the toggle's own name from `hiding_options` —
+  diagnosed by regenerating the diff **as shown** and asking whether the clicked hunk
+  fits there, since `Exceeds` alone cannot tell "the toggle hid this" from "the file
+  moved on". One list in one place: an option added to `diff_opts` but not to those two
+  methods silently makes both the write and the refusal wrong.
+  **WHICH option is named is asked, not guessed.** With both toggles on, "the first that
+  is on" blamed whitespace for a hunk that blank-line hiding had merged, and the reader
+  unticked it, retried and was refused again naming the other. `hiding_options` pairs each
+  option that is ON with `self` carrying *just that one* cleared, and the refusal path
+  clears each in turn: the one whose absence stops the clicked hunk fitting is the one
+  holding the wider hunk together, and the only one whose name makes "turn it off" true.
+  Every probe is an `as_shown_diff`, so this costs nothing outside a refusal.
+  **The clearing is `action_diff`'s own, not a flag it takes**, and the diagnosis diff is
+  a second entry point (`as_shown_diff`) that hands back the diff ALONE — no
+  `ActionTarget`, which is what a diff is applied THROUGH, so the one shape forbidden
+  above is unapplyable rather than merely commented as unused. As a fourth parameter it
+  was a bare `bool` beside `reversed`: a later write route passing `true`, or swapping
+  the two, compiled and wrote a patch the reader never saw.
 - **Refusals name an action that works, and exist because the alternative is a
   permanently false reason**: `RenameNeedsWholeFile`, `CopyNeedsWholeFile`,
-  `TextconvNotApplicable`, and symlinks/gitlinks on the worktree routes. Modes are read
+  `TextconvNotApplicable`, `HiddenByOption`, and symlinks/gitlinks on the worktree
+  routes. Modes are read
   from the **trees** via `TreeEntry::filemode` — `DiffFile::mode()` `panic!`s outside
   git2's canonical seven and a tree-to-tree diff carries the tree's mode verbatim.
 - **The context menu takes its oid from `current_diff_key`, never `selected_oid()`**, and
@@ -1928,7 +2046,7 @@ ones that actually fail when the write is removed.
 - Working-tree edits do not touch `.git`; refresh commits/diff on selection changes to keep virtual staged/uncommitted entries current without a recursive worktree watcher
 - Branch highlighting walks first-parent children upward, but all parents downward, so merge commits keep merged history highlighted
 - File-list sidebar is not row-virtualized — every row draws each frame, so per-row file text goes through `SidebarCache`: elided labels (laid out in `Color32::PLACEHOLDER` so normal/hover color applies at paint time) and `+n`/`-n` stat galleys are built once per (diff, width, scale, font) — `resync_file_layout` and a font reload reset the cache, `ensure` re-keys it on the row width and on `pixels_per_point`, which is what covers a zoom step and a monitor-DPI change (see **UI zoom**). Both stat galleys always exist, a zero count included (`+0`/`-0`, as in the commit list), so `StatGalleys` holds no `Option` and the row's stats block is a fixed distance from its right edge instead of sliding when one side is empty. `build_file_rows` (pure) turns `(new_path, Option<old_path>)` pairs into header/file rows per `[diff] file_list` (`grouped` = one header per directory, files sorted by label, root-level files last; renames/copies group under their `rename_brace` common directory) — and it is the single decision of what order files are read in, the **diff pane** included (see **Bottom panel**); `left_elide` left-truncates labels, measuring the full string once and binary-searching only when it overflows (directory headers still elide per frame — they're the minority of rows). `grouped` directory headers are drawn breadcrumb-style (`draw_dir_header` + `diff::common_dir_prefix_len` — shared with the diffstat block's `dir/{old => new}` factoring, which is libgit2's own rule and was a second copy of it): the ancestor path a header shares with the header drawn just above it is dimmed (`SUBTEXT_DIM`) and the distinguishing tail is `SUBTEXT`, so deep trees don't repeat the same long prefix on every header
-- Any new diff-*data*-affecting setting goes in `DiffSettings` only. `GitkApp` holds one `DiffSettings` field (the diff-shaping state — `context`/`ignore_ws`/`detect_renames`/`detect_copies` are toolbar-owned + persisted, grouped as `ToolbarDiffSettings`; `show_stats`/`textconv` come from `[diff]` config), and `DiffCacheKey` *embeds* a `DiffSettings`. (It also carries a `drivers` fingerprint, which is NOT a setting — it is the repo's own `diff.<name>.textconv` config, and it is in the key for the same reason: an edited driver changes a driven file's whole body without moving the oid. See **Textconv**.) So a field added to `DiffSettings` is automatically (a) part of the cache key — cached diffs invalidate when it changes, no second edit site — and (b) covered by the config-reload's whole-struct comparison (`new_settings != self.diff_settings`), which triggers the re-diff. The prefetch mapping reads it back as `key.settings`. Settings that only change *spans* (theme, syntax on/off, `diff_bg`, `[diff.languages]`) or *render* (`file_list`) are handled by their own branches in the config-reload block, not `DiffSettings`. The three render-only settings the TOOLBAR owns — `word_diff`, `line_numbers` and `wrap` — have no reload branch at all, because they have no config key to reload from; a render-only setting added later has to choose which of those two shapes it is. `file_list` decides the order the pane's patch bodies are laid out in as well as the sidebar's rows, which is a re-lay of built data and not a re-diff — it stays out here because `diff::order_files` is idempotent, so a cached or stored diff is re-laid on install rather than rebuilt (see **Bottom panel**). `wrap` is the third shape and not a config setting at all: it is toolbar-owned like `word_diff` and `line_numbers`, so it has no reload branch to forget, and it needs no re-lay either — the wrap index is measured by the render on the first frame that wants one and `resync_wrap_index`'s own `!wrap` arm drops it, reporting that drop as a move so the reader's line is pinned (see **Soft wrapping**).
+- Any new diff-*data*-affecting setting goes in `DiffSettings` only. `GitkApp` holds one `DiffSettings` field (the diff-shaping state — `context`/`ignore_ws`/`ignore_blank_lines`/`detect_renames`/`detect_copies` are toolbar-owned + persisted, grouped as `ToolbarDiffSettings`; `show_stats`/`textconv` come from `[diff]` config), and `DiffCacheKey` *embeds* a `DiffSettings`. (It also carries a `drivers` fingerprint, which is NOT a setting — it is the repo's own `diff.<name>.textconv` config, and it is in the key for the same reason: an edited driver changes a driven file's whole body without moving the oid. See **Textconv**.) So a field added to `DiffSettings` is automatically (a) part of the cache key — cached diffs invalidate when it changes, no second edit site — and (b) covered by the config-reload's whole-struct comparison (`new_settings != self.diff_settings`), which triggers the re-diff. The prefetch mapping reads it back as `key.settings`. Settings that only change *spans* (theme, syntax on/off, `diff_bg`, `[diff.languages]`) or *render* (`file_list`) are handled by their own branches in the config-reload block, not `DiffSettings`. The three render-only settings the TOOLBAR owns — `word_diff`, `line_numbers` and `wrap` — have no reload branch at all, because they have no config key to reload from; a render-only setting added later has to choose which of those two shapes it is. `file_list` decides the order the pane's patch bodies are laid out in as well as the sidebar's rows, which is a re-lay of built data and not a re-diff — it stays out here because `diff::order_files` is idempotent, so a cached or stored diff is re-laid on install rather than rebuilt (see **Bottom panel**). `wrap` is the third shape and not a config setting at all: it is toolbar-owned like `word_diff` and `line_numbers`, so it has no reload branch to forget, and it needs no re-lay either — the wrap index is measured by the render on the first frame that wants one and `resync_wrap_index`'s own `!wrap` arm drops it, reporting that drop as a move so the reader's line is pinned (see **Soft wrapping**).
   The span half is **one struct too** (`SpanSettings`, held as `GitkApp::span_settings`), compared and assigned whole for the same reason `DiffSettings` is: as four loose fields the reload's test was a four-term `||` chain that a fifth setting could silently miss, and missing it is not a lost frame — every cached diff keeps yesterday's colours, sticky via `diff_cache.contains`, for the session with nothing logged. Which of the four are in `DiffCacheKey` is unchanged and is the next paragraph's subject.
   **Three of those four span settings are in `DiffCacheKey`, and the fourth shapes no span** — so a stale entry simply misses, and the reload neither clears the cache nor carries an epoch. `theme` and `enabled` are their own key fields; `[diff.languages]` is a `u64` from `highlight::languages_fingerprint`, cached on `GitkApp` because `diff_cache_key` runs ~54 times per dispatch and the map is a `BTreeMap`. `diff_bg` is **not** in the key and must not be: it decides `DiffPalette::added_bg`/`deleted_bg`, which `diff_row_job` reads live from `self.diff_palette` at render time, and the one palette-derived span (`tokenize`'s grammar-hiccup fallback) takes `foreground`, which is theme-derived. Nothing bakes it into a `Span`. `set_span_settings` is the sole later writer of the map and the fingerprint both, so the cached value cannot describe a map that is gone — which would be silent and permanent, every key hitting entries tokenized with the wrong grammar while `diff_cache.contains` kept any dispatch from rebuilding them.
   **This replaced a cache clear plus a `span_gen` epoch, and the epoch is the part worth understanding.** The clear could not reach warms already queued or running: they were dispatched under the OLD span settings, and with `diff_bg`/`languages` absent from the key `key_is_current` waved their results through, so they landed back in the just-cleared cache carrying the old colours — after which every dispatch skipped them via `contains` and those rows stayed flat for the session. The fix at the time was to stamp a generation on every warm job (on the job, like `hl`, so a reload could not race a worker mid-row) and check it on return, which cost a `u64` threaded through seven layers: `GitkApp` → `PoolHandle::submit` → `CoordMsg::Submit` → `Coordinator` → `Job::Warm` → `warm_row` → `WarmResult` → `WarmFacts::spans_current` → `WarmDisposition::DropStaleSpans`. Putting `languages` in the key retires all of it: such a warm now fails `key_is_current` and is dropped as **stale-KEYED**, by the mechanism that already existed for every other setting. It is also strictly better than the clear, which threw away the whole warm band for a `diff_bg` tweak that invalidated nothing. `DiffCacheKey.drivers` had already solved the identical problem — a config-shaped input that changes a diff without moving the oid — the same way; this is that lesson applied to the last input that had not learned it. **A span setting added later joins the KEY**, unless it can be shown to reach no span.

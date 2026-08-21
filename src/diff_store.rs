@@ -692,6 +692,7 @@ fn entry_key(
     let DiffSettings {
         context,
         ignore_ws,
+        ignore_blank_lines,
         show_stats,
         detect_renames,
         detect_copies,
@@ -700,6 +701,7 @@ fn entry_key(
     put_u32(&mut b, context);
     for flag in [
         ignore_ws,
+        ignore_blank_lines,
         show_stats,
         detect_renames,
         detect_copies,
@@ -1507,6 +1509,13 @@ mod tests {
                 "ignore_ws",
                 DiffSettings {
                     ignore_ws: true,
+                    ..settings()
+                },
+            ),
+            (
+                "ignore_blank_lines",
+                DiffSettings {
+                    ignore_blank_lines: true,
                     ..settings()
                 },
             ),

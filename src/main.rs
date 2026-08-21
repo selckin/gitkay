@@ -883,21 +883,28 @@ fn build_file_rows(files: &[(&str, Option<&str>)], layout: FileListLayout) -> Ve
 ///
 /// Destructured rather than field-picked, which is load-bearing rather than
 /// stylistic — the same discipline as `diff_store::entry_key` and
-/// `diff_menu_salt`. Naming the four fields compiles unchanged when a fifth is
+/// `diff_menu_salt`. Naming the fields it wants compiles unchanged when another is
 /// added, so a count-affecting setting would silently stay out:
 /// `invalidate_stats_if_counts_changed` would never fire and `stats_harvestable`
 /// would wave the pre-toggle numbers through, leaving the column permanently
 /// disagreeing with the sidebar beside it.
-const fn stats_relevant(s: DiffSettings) -> (bool, bool, bool, bool) {
+const fn stats_relevant(s: DiffSettings) -> (bool, bool, bool, bool, bool) {
     let DiffSettings {
         ignore_ws,
+        ignore_blank_lines,
         detect_renames,
         detect_copies,
         textconv,
         context: _,
         show_stats: _,
     } = s;
-    (ignore_ws, detect_renames, detect_copies, textconv)
+    (
+        ignore_ws,
+        ignore_blank_lines,
+        detect_renames,
+        detect_copies,
+        textconv,
+    )
 }
 
 /// Which visible rows still need their stats computed, for the `want` the
@@ -2277,6 +2284,7 @@ fn resolve_config_visuals(cfg: &config::Config) -> (highlight::EmbeddedThemeName
 struct ToolbarDiffSettings {
     context: u32,
     ignore_ws: bool,
+    ignore_blank_lines: bool,
     detect_renames: bool,
     detect_copies: bool,
 }
@@ -2288,6 +2296,7 @@ impl ToolbarDiffSettings {
         Self {
             context: s.context,
             ignore_ws: s.ignore_ws,
+            ignore_blank_lines: s.ignore_blank_lines,
             detect_renames: s.detect_renames,
             detect_copies: s.detect_copies,
         }
@@ -2307,6 +2316,7 @@ impl ToolbarDiffSettings {
             // toolbar's own buttons are bounded by.
             context: stored(storage, "diff_context", 3u32).min(MAX_DIFF_CONTEXT),
             ignore_ws: stored(storage, "diff_ignore_ws", false),
+            ignore_blank_lines: stored(storage, "diff_ignore_blank_lines", false),
             detect_renames: stored(storage, "diff_detect_renames", true),
             detect_copies: stored(storage, "diff_detect_copies", false),
         }
@@ -2318,11 +2328,13 @@ impl ToolbarDiffSettings {
         let Self {
             context,
             ignore_ws,
+            ignore_blank_lines,
             detect_renames,
             detect_copies,
         } = self;
         eframe::set_value(storage, "diff_context", &context);
         eframe::set_value(storage, "diff_ignore_ws", &ignore_ws);
+        eframe::set_value(storage, "diff_ignore_blank_lines", &ignore_blank_lines);
         eframe::set_value(storage, "diff_detect_renames", &detect_renames);
         eframe::set_value(storage, "diff_detect_copies", &detect_copies);
     }
@@ -2391,6 +2403,7 @@ const fn config_diff_settings(
         // them with.
         context: toolbar.context,
         ignore_ws: toolbar.ignore_ws,
+        ignore_blank_lines: toolbar.ignore_blank_lines,
         detect_renames: toolbar.detect_renames,
         detect_copies: toolbar.detect_copies,
         // Config-owned: no toolbar control, so config is the only source.
@@ -3208,7 +3221,7 @@ struct GitkApp {
     // The diff-shaping settings, grouped into their one type. This IS what keys the diff
     // cache (see diff_cache_key), so a new data-affecting setting added to DiffSettings is
     // automatically part of the cache key AND the config-reload comparison — no separate
-    // bucket to keep in sync. context/ignore_ws/detect_* are toolbar-owned +
+    // bucket to keep in sync. context/ignore_ws/ignore_blank_lines/detect_* are toolbar-owned +
     // persisted (ToolbarDiffSettings); show_stats/textconv come from config.
     diff_settings: DiffSettings,
     word_diff: bool,           // highlight changed words within +/- lines (persisted)
@@ -4495,8 +4508,9 @@ impl GitkApp {
     /// Lazily fill word-diff emphasis for the rows around the viewport, plus any
     /// pending jump target so a scroll restore / sidebar click / page-step is
     /// emphasized the same frame it lands. Called every frame after the drains and
-    /// key handling, before the panels render; the per-line `Option` memo in
-    /// `emphasize_rows` makes a settled viewport cost only kind checks. This is
+    /// key handling, before the panels render; the per-row `Option` memo in
+    /// `emphasize_rows` — one slot per row, and the block's first row standing for a
+    /// whole-block alignment — makes a settled viewport cost only kind checks. This is
     /// the ONLY place the LCS pass runs — bounded by the window, it replaces the
     /// old whole-diff passes (worker-side and the install backstop, which stalled
     /// a frame on huge diffs).
@@ -6986,7 +7000,24 @@ impl GitkApp {
                 .fixed_pos(toolbar_pos)
                 .show(ctx, |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.horizontal(|ui| {
+                        // Wrap onto a second line rather than run off the window. This is
+                        // an `Area`, which does not scroll and whose `constrain` (on by
+                        // default) CLIPS what does not fit and slides the rest left over
+                        // the graph — so on a narrow window the right-hand controls were
+                        // simply unreachable, with no scrollbar and no overflow menu to
+                        // get at them. The row already needed ~1000pt for eight controls
+                        // and every toggle added since has made it worse.
+                        //
+                        // The width has to be STATED: a bare `Area` reports a tiny
+                        // `available_width` (see AGENTS.md's `Area` pitfall), so
+                        // `horizontal_wrapped` left to itself would break after every
+                        // widget. Given the panel's width it wraps only when it must, so
+                        // a wide window is laid out exactly as before. The taller toolbar
+                        // stays revealed because `show_toolbar` also tests the toolbar's
+                        // own last rect, not just the fixed-height hover strip.
+                        let margin = egui::Frame::popup(ui.style()).total_margin().sum().x;
+                        ui.set_max_width((panel_rect.width() - margin).max(0.0));
+                        ui.horizontal_wrapped(|ui| {
                             // The context controls in their own group, so the wheel
                             // target below is egui's own rect for them — the spacing
                             // between them included — rather than a union of their
@@ -7050,7 +7081,14 @@ impl GitkApp {
                                     .min(MAX_DIFF_CONTEXT);
                             }
                             ui.add_space(12.0);
-                            ui.checkbox(&mut self.diff_settings.ignore_ws, "Ignore whitespace");
+                            // Labels from `diff.rs`, which is also where a refusal reads
+                            // them (`DiffSettings::hiding_label`) to name the control the
+                            // reader has to come back here and untick.
+                            ui.checkbox(&mut self.diff_settings.ignore_ws, diff::IGNORE_WS_LABEL);
+                            ui.checkbox(
+                                &mut self.diff_settings.ignore_blank_lines,
+                                diff::IGNORE_BLANK_LINES_LABEL,
+                            );
                             ui.checkbox(&mut self.diff_settings.detect_renames, "Detect renames");
                             ui.checkbox(&mut self.diff_settings.detect_copies, "Detect copies");
                             // Word-diff only changes the render, so no diff
@@ -10475,6 +10513,13 @@ mod tests {
         assert_ne!(
             stats_relevant(base),
             stats_relevant(DiffSettings {
+                ignore_blank_lines: true,
+                ..base
+            })
+        );
+        assert_ne!(
+            stats_relevant(base),
+            stats_relevant(DiffSettings {
                 detect_renames: true,
                 ..base
             })
@@ -10940,6 +10985,13 @@ mod tests {
                 "ignore_ws",
                 DiffSettings {
                     ignore_ws: !now.ignore_ws,
+                    ..now
+                },
+            ),
+            (
+                "ignore_blank_lines",
+                DiffSettings {
+                    ignore_blank_lines: !now.ignore_blank_lines,
                     ..now
                 },
             ),
@@ -12143,6 +12195,7 @@ mod tests {
         DiffSettings {
             context: 3,
             ignore_ws: false,
+            ignore_blank_lines: false,
             show_stats: true,
             detect_renames: true,
             detect_copies: false,
@@ -12460,14 +12513,7 @@ mod tests {
             None,
             &repo,
             &RowScope::new(DiffSource::Commit(oid)),
-            DiffSettings {
-                context: 3,
-                ignore_ws: false,
-                show_stats: true,
-                detect_renames: true,
-                detect_copies: false,
-                textconv: false,
-            },
+            probe_settings(),
             BuildEnv::NONE,
             None,
         );
