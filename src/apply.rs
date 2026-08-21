@@ -199,11 +199,13 @@ pub enum ApplyError {
     /// trusting `FileEntry::is_binary` (false for a converted file, which is on
     /// disk still binary).
     TextconvNotApplicable,
-    /// The clicked hunk cannot be written on its own: with whitespace ignored the
-    /// pane split it out of a wider real hunk, and a hunk is indivisible, so
-    /// applying it would carry along edits the display never showed as changes.
-    /// Actionable rather than fatal — the same click works with the toggle off.
-    HiddenByWhitespace,
+    /// The clicked hunk cannot be written on its own: a display option that hides
+    /// changes — ignore-whitespace or ignore-blank-lines — split it out of a wider real
+    /// hunk, and a hunk is indivisible, so applying it would carry along edits the
+    /// display never showed as changes. Actionable rather than fatal — the same click
+    /// works with the toggle off, which is why it carries the toggle's name
+    /// (`DiffSettings::hiding_label`) rather than making the reader guess which one.
+    HiddenByOption(&'static str),
     Git(git2::Error),
 }
 
@@ -243,10 +245,10 @@ impl ApplyError {
                 "{verb} failed — {path} is shown through a textconv driver, so its hunks are converted text rather than the file's own; {} the file instead of a hunk",
                 verb.to_lowercase()
             ),
-            // Says what to do about it: the click is fine, the whitespace toggle
-            // is what makes this hunk unwritable on its own.
-            Self::HiddenByWhitespace => format!(
-                "{verb} failed — {path}: this hunk also holds changes that \"ignore whitespace\" is hiding; turn it off to {} it",
+            // Says what to do about it: the click is fine, the named toggle is what
+            // makes this hunk unwritable on its own.
+            Self::HiddenByOption(option) => format!(
+                "{verb} failed — {path}: this hunk also holds changes that \"{option}\" is hiding; turn it off to {} it",
                 verb.to_lowercase()
             ),
             Self::Git(e) => format!("{verb} failed — {path}: {}", e.message()),
@@ -307,17 +309,18 @@ pub enum HunkFit {
 /// Containment, not overlap. The clicked range is always a whole displayed hunk
 /// header (`hunk_at_line` parses the `@@` line), and the action diff is built
 /// with the display's own `context`, so in the ordinary case the two ranges are
-/// identical. Exactly one option diverges — `ignore_whitespace`, forced off for
-/// the action (a whitespace-ignored diff does not describe the real content and
-/// is unsafe to apply) — and it only ever makes the generated hunk WIDER:
-/// ignoring whitespace turns changed lines into context, which splits the
-/// display into narrower hunks and can never merge it. Verified: a file edited at
-/// lines 10 and 22 with a whitespace-only change at 16 displays as
-/// `@@ -7,7 @@` + `@@ -19,7 @@` but generates one `@@ -7,19 @@`.
+/// identical. The only options that diverge are the content-HIDING ones
+/// (`DiffSettings::showing_all_content` — ignore-whitespace and ignore-blank-lines,
+/// forced off for the action, since a diff that hides real content does not describe
+/// the file and is unsafe to apply), and they only ever make the generated hunk WIDER:
+/// hiding a change turns changed lines into context, which splits the display into
+/// narrower hunks and can never merge it. Verified: a file edited at lines 10 and 22
+/// with a whitespace-only change at 16 displays as `@@ -7,7 @@` + `@@ -19,7 @@` but
+/// generates one `@@ -7,19 @@`.
 ///
 /// So an overlapping-but-wider hunk is never "more of what the user pointed at";
-/// it is a different hunk's changes fused onto the clicked one by the whitespace
-/// the display was hiding. Taking it would stage an edit the user never clicked.
+/// it is a different hunk's changes fused onto the clicked one by what the display
+/// was hiding. Taking it would stage an edit the user never clicked.
 pub const fn hunk_fit(clicked: &HunkRange, generated: &HunkRange, reversed: bool) -> HunkFit {
     let (gen_start, gen_lines) = generated_side(generated, reversed);
     let gen_end = range_end(gen_start, gen_lines);
@@ -337,17 +340,18 @@ use crate::diff::{
 use git2::{ApplyLocation, ApplyOptions, DiffOptions, Repository};
 use std::cell::Cell;
 
-/// Diff options for an action — the display's options, with `ignore_whitespace`
-/// overridden and the action's own pathspec.
+/// Diff options for an action — the given settings, plus the action's own pathspec.
 ///
 /// It starts from `diff::diff_opts`, the very builder the pane's diff went
 /// through, rather than re-spelling its calls. `hunk_fit`'s whole correctness
-/// argument is that **exactly one** option diverges (`ignore_whitespace`, forced
-/// off here: a whitespace-ignored diff does not describe the real content and is
-/// unsafe to apply) — written twice, a future shaping flag added to `diff_opts`
-/// would quietly make that false and turn every hunk click on an affected file
-/// into a plausible-but-wrong refusal. Built this way the divergence list IS the
-/// code: whatever `diff_opts` shapes, both sides get.
+/// argument is that **only the content-hiding options** diverge, and which those are is
+/// `DiffSettings::showing_all_content`, not a list repeated here: a diff that hides real
+/// content does not describe the file and is unsafe to apply. Written out twice, a
+/// future shaping flag added to `diff_opts` would quietly make that argument false and
+/// turn every hunk click on an affected file into a plausible-but-wrong refusal. Built
+/// this way the divergence list IS the code: whatever `diff_opts` shapes, both sides
+/// get, bar what one named method takes away — and taking it away is `action_diff`'s
+/// job, so that every diff which can be WRITTEN has had it taken away.
 ///
 /// `context` therefore follows the display, so hunk boundaries line up
 /// one-for-one in the common case. The pathspec carries BOTH sides of a rename —
@@ -360,16 +364,8 @@ use std::cell::Cell;
 /// pull that bystander file's OWN delta into the diff, and every route here
 /// applies the diff whole — so a revert would undo an unrelated file's changes
 /// and a hunk click would have two files' hunks to choose between.
-fn action_diff_opts(
-    req: &ApplyRequest,
-    settings: DiffSettings,
-    reversed: bool,
-    ignore_ws: bool,
-) -> DiffOptions {
-    let mut opts = diff_opts(DiffSettings {
-        ignore_ws,
-        ..settings
-    });
+fn action_diff_opts(req: &ApplyRequest, settings: DiffSettings, reversed: bool) -> DiffOptions {
+    let mut opts = diff_opts(settings);
     opts.reverse(reversed);
     // req.path/rename_source are literal paths lifted straight from the diff's own
     // file list (FileEntry::path), never a user-typed glob — disable fnmatch so
@@ -387,6 +383,9 @@ fn action_diff_opts(
 }
 
 /// The diff to apply, where to apply it, and whether it came out reversed.
+///
+/// **The one entry point to an applyable diff, and it clears the content-hiding options
+/// itself** rather than taking a flag for them — see `as_shown_diff` for the other half.
 ///
 /// Each action reuses the `diff.rs` builder that defines what its pane *means*, so
 /// what gets written cannot drift from what was displayed:
@@ -407,11 +406,39 @@ fn action_diff<'r>(
     repo: &'r Repository,
     req: &ApplyRequest,
     settings: DiffSettings,
-    ignore_ws: bool,
+) -> Result<(git2::Diff<'r>, ActionTarget<'r>, bool), ApplyError> {
+    build_action_diff(repo, req, settings.showing_all_content())
+}
+
+/// The action's diff built exactly as the PANE built it — the display's own settings,
+/// content-hiding options and all. The diagnosis diff `apply_hunk` compares against to
+/// tell "the toggle hid this" from "the file moved on".
+///
+/// It hands back the diff ALONE. `ActionTarget` is what a diff is applied through, so
+/// without one there is nothing to apply this to — the one shape AGENTS.md forbids
+/// generating is therefore not merely commented as unused, it is unapplyable. This used
+/// to be `action_diff`'s fourth parameter, a bare `bool` next to `reversed`: a fourth
+/// write route passing `true`, or swapping the two, compiled and wrote a patch the
+/// reader never saw.
+fn as_shown_diff<'r>(
+    repo: &'r Repository,
+    req: &ApplyRequest,
+    settings: DiffSettings,
+) -> Result<git2::Diff<'r>, ApplyError> {
+    Ok(build_action_diff(repo, req, settings)?.0)
+}
+
+/// The shared body of the two above. Private, and the settings it is handed are the
+/// shape it builds in — `action_diff` is the only way to a diff that may be WRITTEN,
+/// and it is what clears the content-hiding options.
+fn build_action_diff<'r>(
+    repo: &'r Repository,
+    req: &ApplyRequest,
+    settings: DiffSettings,
 ) -> Result<(git2::Diff<'r>, ActionTarget<'r>, bool), ApplyError> {
     let action = ApplyAction::of(req.source.oid());
     let reversed = !matches!(action, ApplyAction::Stage);
-    let mut opts = action_diff_opts(req, settings, reversed, ignore_ws);
+    let mut opts = action_diff_opts(req, settings, reversed);
     let (mut diff, target) = match action {
         ApplyAction::Stage => (worktree_git_diff(repo, &mut opts)?, ActionTarget::Index),
         ApplyAction::Unstage => (
@@ -1125,7 +1152,7 @@ fn revert_file(
     req: &ApplyRequest,
     settings: DiffSettings,
 ) -> Result<(), ApplyError> {
-    let (diff, target, _) = action_diff(repo, req, settings, false)?;
+    let (diff, target, _) = action_diff(repo, req, settings)?;
     if diff.deltas().len() == 0 {
         // The regenerated, pathspec-filtered action diff has nothing for this
         // request at all. Mirrors the hunk path's `best_hunk_fit` pre-check:
@@ -1311,7 +1338,7 @@ pub fn apply_request(
     if req.converted {
         return Err(ApplyError::TextconvNotApplicable);
     }
-    let (diff, target, reversed) = action_diff(repo, req, settings, false)?;
+    let (diff, target, reversed) = action_diff(repo, req, settings)?;
 
     // Decide BEFORE mutating. The hunk callback cannot be the gate: libgit2 skips
     // `git_apply__patch` — and with it the callback — whenever
@@ -1363,27 +1390,41 @@ pub fn apply_request(
     match best_hunk_fit(&diff, &clicked, reversed, &req.path)? {
         HunkFit::Within => {}
         // Overlapped, but every candidate reaches past the click — see `hunk_fit`.
-        // Two different causes produce that, and they need opposite advice: the
-        // display split the hunk (whitespace), or the file moved on (stale).
-        // `Exceeds` alone cannot tell them apart, so ASK: regenerate the diff the
-        // way the pane built it — whitespace included — and see whether the
-        // clicked hunk still fits there. If it does, the display is current and
-        // whitespace is the only thing that widened the action diff. If it does
-        // not, the diff has moved on and whitespace is irrelevant; blaming it
-        // would send the user to flip a toggle, retry, and fail again for the
-        // real reason. Only on the refusal path, so the extra diff costs nothing
-        // in the common case.
-        HunkFit::Exceeds if settings.ignore_ws => {
+        // Two different causes produce that, and they need opposite advice: a display
+        // option split the hunk, or the file moved on (stale). `Exceeds` alone cannot
+        // tell them apart, so ASK: regenerate the diff the way the pane built it — what
+        // it hides included — and see whether the clicked hunk still fits there. If it
+        // does, the display is current and the toggle is the only thing that widened the
+        // action diff. If it does not, the diff has moved on and the toggle is
+        // irrelevant; blaming it would send the user to flip it, retry, and fail again
+        // for the real reason. Only on the refusal path, so the extra diff costs nothing
+        // in the common case. The guard is the option list itself, so a toggle added to
+        // `showing_all_content` starts being diagnosed here rather than reported stale.
+        HunkFit::Exceeds if let Some(first_on) = settings.hiding_label() => {
             // `reversed` again, not a second copy of it: `action_diff` derives it from
             // `req` alone, and this is the same `req`.
-            let (as_shown, _, _) = action_diff(repo, req, settings, true)?;
-            return Err(
-                if best_hunk_fit(&as_shown, &clicked, reversed, &req.path)? == HunkFit::Within {
-                    ApplyError::HiddenByWhitespace
-                } else {
-                    ApplyError::Stale
-                },
-            );
+            let as_shown = as_shown_diff(repo, req, settings)?;
+            if best_hunk_fit(&as_shown, &clicked, reversed, &req.path)? != HunkFit::Within {
+                return Err(ApplyError::Stale);
+            }
+            // The display is current, so a hiding option is what widened the action diff.
+            // WHICH one is a second question, and the answer is not "the first that is
+            // ticked": with both on, that names whitespace for a hunk blank-line hiding
+            // merged, and the reader unticks it, retries, and is refused again naming the
+            // other. Clear each in turn, leaving the rest as displayed, and the one whose
+            // absence stops the clicked hunk fitting is the one holding the wider hunk
+            // together — the only one whose name makes "turn it off" true.
+            for (label, without) in settings.hiding_options() {
+                let probe = as_shown_diff(repo, req, without)?;
+                if best_hunk_fit(&probe, &clicked, reversed, &req.path)? != HunkFit::Within {
+                    return Err(ApplyError::HiddenByOption(label));
+                }
+            }
+            // No single option accounts for it, so no single name makes that sentence
+            // true. Each hidden change is revealed by clearing the option that hides it,
+            // so this needs their combination and should not be reachable; name the first
+            // rather than invent a phrasing for a state nothing is known to produce.
+            return Err(ApplyError::HiddenByOption(first_on));
         }
         HunkFit::Exceeds | HunkFit::Disjoint => return Err(ApplyError::Stale),
     }
@@ -1539,7 +1580,7 @@ mod tests {
             ApplyError::Stale,
             ApplyError::ChangedSinceCommit,
             ApplyError::Unsupported,
-            ApplyError::HiddenByWhitespace,
+            ApplyError::HiddenByOption(crate::diff::IGNORE_WS_LABEL),
             ApplyError::RenameNeedsWholeFile,
             ApplyError::CopyNeedsWholeFile,
         ] {
@@ -1554,8 +1595,9 @@ mod tests {
         );
         // This one has to be actionable, not just descriptive: it names the
         // setting to change and the verb to retry.
-        let ws = ApplyError::HiddenByWhitespace.user_message(ApplyAction::Stage, "f.rs");
-        assert!(ws.contains("ignore whitespace"), "{ws}");
+        let ws = ApplyError::HiddenByOption(crate::diff::IGNORE_WS_LABEL)
+            .user_message(ApplyAction::Stage, "f.rs");
+        assert!(ws.contains(crate::diff::IGNORE_WS_LABEL), "{ws}");
         assert!(ws.contains("turn it off to stage it"), "{ws}");
     }
 
@@ -1570,14 +1612,12 @@ mod tests {
         assert!(e.detail().is_some());
     }
 
+    /// The write layer's baseline: `diff::tests::base_settings` with rename detection
+    /// on, which is what the pane ships with and what the rename refusals are about.
     fn settings() -> DiffSettings {
         DiffSettings {
-            context: 3,
-            ignore_ws: false,
-            show_stats: false,
             detect_renames: true,
-            detect_copies: false,
-            textconv: false,
+            ..crate::diff::tests::base_settings()
         }
     }
 
@@ -3838,29 +3878,24 @@ mod tests {
         assert_eq!(entry.id, head_blob);
     }
 
-    /// Ignoring whitespace SPLITS the displayed diff relative to the action
-    /// diff, it never merges it: a whitespace-only line reads as context, so two
-    /// real edits that ignore-ws shows as separate hunks are one wide hunk once
-    /// whitespace counts again. Verified for this fixture — displayed
-    /// `@@ -7,7 @@` + `@@ -19,7 @@`, generated `@@ -7,19 @@`. Clicking the first
-    /// must never drag in the second's edit.
-    #[test]
-    fn a_hunk_click_cannot_apply_changes_ignore_whitespace_hid() {
+    /// A hiding option SPLITS the displayed diff relative to the action diff, it never
+    /// merges it: a change it hides reads as context, so two real edits the display
+    /// shows as separate hunks are one wide hunk once that change counts again. Verified
+    /// for this fixture — displayed `@@ -7,7 @@` + `@@ -19,7 @@`, generated
+    /// `@@ -7,19 @@`. Clicking the first must never drag in the second's edit, and the
+    /// refusal must name the toggle that is on, since that click works with it off.
+    ///
+    /// Driven per option rather than written out per option: the guard is
+    /// `showing_all_content`'s whole list, so an option added to it owes this test with
+    /// its own fixture, not a copy of the twenty lines below.
+    fn a_hidden_change_refuses_the_hunk_click(edited: &str, settings: DiffSettings, toggle: &str) {
         let (_d, repo) = temp_repo();
-        let base = copy_body(0, "");
-        commit_file(&repo, "f.txt", &base, "base");
-        // Line 16 keeps its text and gains an indent, so it is a whitespace-only
-        // change — invisible under ignore-whitespace.
-        let edited = numbered(40, &[(10, "EDITED"), (16, "    line"), (22, "EDITED")]);
-        write_file(&repo, "f.txt", &edited);
+        commit_file(&repo, "f.txt", &numbered(40, &[]), "base");
+        write_file(&repo, "f.txt", edited);
 
-        let ws = DiffSettings {
-            ignore_ws: true,
-            ..settings()
-        };
         let data = crate::diff::get_working_tree_diff(
             &repo,
-            ws,
+            settings,
             &RowScope::new(DiffSource::Uncommitted),
             BuildEnv::NONE,
         );
@@ -3878,17 +3913,82 @@ mod tests {
         );
 
         let req = req(DiffSource::Uncommitted, "f.txt", Some(first));
-        let err = apply_request(&repo, &req, ws)
+        let err = apply_request(&repo, &req, settings)
             .expect_err("an indivisible hunk that exceeds the click must be refused");
-
         assert!(
-            matches!(err, ApplyError::HiddenByWhitespace),
+            matches!(err, ApplyError::HiddenByOption(o) if o == toggle),
             "and must say why, since the same click works with the toggle off: {err:?}"
         );
         assert!(
             !index_blob(&repo, "f.txt").contains("EDITED 22"),
             "clicking the first hunk must not stage the second hunk's edit"
         );
+    }
+
+    #[test]
+    fn a_hunk_click_cannot_apply_changes_ignore_whitespace_hid() {
+        // Line 16 keeps its text and gains an indent, so it is a whitespace-only
+        // change — invisible under ignore-whitespace, and the only thing keeping the
+        // two real edits in one raw hunk.
+        a_hidden_change_refuses_the_hunk_click(
+            &numbered(40, &[(10, "EDITED"), (16, "    line"), (22, "EDITED")]),
+            DiffSettings {
+                ignore_ws: true,
+                ..settings()
+            },
+            crate::diff::IGNORE_WS_LABEL,
+        );
+    }
+
+    #[test]
+    fn a_hunk_click_cannot_apply_changes_ignore_blank_lines_hid() {
+        // A blank line inserted before line 16 does the same job, which is the reason
+        // `action_diff_opts` clears the whole `showing_all_content` list rather than
+        // `ignore_ws` alone. `numbered`'s marker carries the newline, so the fixture is
+        // still one call.
+        a_hidden_change_refuses_the_hunk_click(
+            &numbered(40, &[(10, "EDITED"), (16, "\nline"), (22, "EDITED")]),
+            DiffSettings {
+                ignore_blank_lines: true,
+                ..settings()
+            },
+            crate::diff::IGNORE_BLANK_LINES_LABEL,
+        );
+    }
+
+    /// With BOTH hiding options on, the refusal has to name the one actually holding the
+    /// wider hunk together — not whichever is ticked first.
+    ///
+    /// This is the shape `hiding_label` alone got wrong: it answered "the first that is
+    /// on", so a hunk merged by a hidden BLANK LINE was blamed on whitespace. The reader
+    /// unticks whitespace, clicks again, and is refused a second time naming the other
+    /// option. Both directions are driven, because a rule that always named the second
+    /// would pass a test that only checked the first.
+    #[test]
+    fn the_refusal_names_the_option_that_actually_hid_the_change() {
+        for (hidden, expected) in [
+            // A whitespace-only change at 16, invisible under ignore-whitespace.
+            (
+                numbered(40, &[(10, "EDITED"), (16, "    line"), (22, "EDITED")]),
+                crate::diff::IGNORE_WS_LABEL,
+            ),
+            // A blank line before 16, invisible under ignore-blank-lines and NOT under
+            // ignore-whitespace — which is on here and is not the culprit.
+            (
+                numbered(40, &[(10, "EDITED"), (16, "\nline"), (22, "EDITED")]),
+                crate::diff::IGNORE_BLANK_LINES_LABEL,
+            ),
+        ] {
+            a_hidden_change_refuses_the_hunk_click(
+                &hidden,
+                DiffSettings {
+                    ignore_ws: true,
+                    ignore_blank_lines: true,
+                    ..settings()
+                },
+                expected,
+            );
+        }
     }
 
     /// A rename click whose two pathspec paths no longer resolve to ONE delta.

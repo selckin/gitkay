@@ -789,7 +789,7 @@ struct Coordinator {
     ///
     /// A separate store from `measured`, and `DiffCacheKey`-keyed rather than by oid,
     /// because it answers a different question with a different validity domain: a line
-    /// count depends on the context width and `ignore_ws`, which the key carries and an
+    /// count depends on the context width and on what the diff hides, which the key carries and an
     /// oid does not. It also cannot be probed — the count is unknown until the diff is
     /// built, which is exactly why the verdict has to be kept afterwards. Without it an
     /// over-cap row was rebuilt in full on every dispatch purely to be discarded again

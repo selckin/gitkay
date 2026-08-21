@@ -300,9 +300,12 @@ const PER_ROW_CHUNK: usize = 4096;
 pub type RowSpans = PerRow<Vec<highlight::Span>>;
 
 /// Per-row word-diff emphasis: changed byte ranges within `DiffLine::body()`. Unset ⇒
-/// the lazy per-viewport pass has not reached this row. Owned by the UI alone and
-/// dropped with the displayed diff — it is filled one window at a time and refills
-/// within the frame it is next needed.
+/// the lazy per-viewport pass has not reached this row — and, for the first row of a
+/// change block, that its block has not been decided either: `emphasize_rows` writes a
+/// whole-block alignment into every row of the block at once, so that one slot is what
+/// tells the next frame the work is done. Owned by the UI alone and dropped with the
+/// displayed diff — it is filled one window at a time and refills within the frame it is
+/// next needed.
 pub type RowEmphasis = PerRow<Vec<std::ops::Range<usize>>>;
 
 impl<T> PerRow<T> {
@@ -612,31 +615,47 @@ impl LineNoGutter {
 /// window resized would reflow rows the reader is looking at.
 const STAT_WIDTH: usize = 80;
 
-/// Max body length (bytes) for which word-diff is computed; above this the LCS
-/// table grows too large and the highlight isn't readable anyway.
-pub const MAX_WORD_DIFF_LINE: usize = 2048;
-
-/// Fill in word-diff emphasis for every change-block pair with a line in `rows`,
-/// skipping pairs already computed (`Some`). A change block (a run of `-` lines
-/// followed by a run of `+` lines) is intra-line diffed only when the two runs have
-/// equal length, pairing them 1:1 — the common "edited in place" case.
+/// Fill in word-diff emphasis for every change block with a line in `rows`, skipping
+/// what is already computed (`Some`). A change block is a run of `-` lines followed by
+/// a run of `+` lines.
 ///
-/// Lazy per window: the UI calls this each frame with the rows around the viewport,
-/// so the LCS cost is bounded by the window no matter how large the diff is, and a
-/// pass over an already-emphasized window is just kind checks. `rows` is clamped to
+/// A block is aligned WHOLE where its weight affords it (`word_diff::alignment_fits`):
+/// both sides' rows are tokenized concatenated, with the line breaks as ordinary
+/// separators, so where the breaks fall does not reach the alignment. Rewrapped prose
+/// then emphasizes the words that changed rather than every row the rewrap touched, and
+/// a block whose two runs differ in length gets emphasis at all — neither of which 1:1
+/// pairing can do.
+///
+/// **Whichever path runs, one alignment costs at most one budget** — and that is the
+/// whole reason the fallback exists. Aligning a block whole is quadratic in the BLOCK
+/// where pairing its lines is linear in it, so past the budget the same rows cost the
+/// sum of the pairs' tables rather than the product of the block's: a 57-row block is
+/// ~1M cells aligned whole against ~70k paired, and the whole-block form of it measures
+/// a frame. So a block too heavy falls back to pairing the runs 1:1 when they are of
+/// equal length — the common "edited in place" case.
+///
+/// A pure deletion — a Del run with no Add run after it — is left alone on both paths:
+/// with nothing to align against, every token comes out changed, which is a solid
+/// highlight over the block rather than information. (A pure addition never forms a
+/// block at all; the walk enters one only at a `-` line.)
+///
+/// Lazy per window: the UI calls this each frame with the rows around the viewport, so
+/// the LCS cost is bounded by the window and the budget no matter how large the diff is,
+/// and a pass over an already-emphasized window is just kind checks. `rows` is clamped to
 /// the slice; the walk extends it to the enclosing run of changed lines (kind checks
-/// only), because a pair straddling the window edge needs the true run lengths to
-/// pair correctly.
+/// only), because a block straddling the window edge needs its true run lengths to be
+/// aligned or paired correctly — and the pair loop then derives the pairs the window can
+/// reach ARITHMETICALLY rather than testing every pair of the block.
 ///
-/// **The LCS is bounded by the window; the block SCAN is bounded by the block.** Those
-/// are different bounds and only the first is O(window). A change block is `Del* Add*`,
-/// so an added file is one block covering the whole file, and a viewport parked inside
-/// it walks that block's full length in kind checks every frame — the run lengths on
-/// both sides of the window are exactly what decides whether the pairs align, so
-/// nothing local can answer it. Bounding that too means recording each block's
-/// boundaries once per diff (the sparse shape `wrap::WrapIndex` uses) and binary
-/// searching them; it is a per-diff index and an invalidation site, not a tweak here.
-/// The guard below removes the case that does not need the walk at all.
+/// **The LCS is bounded by the window and the budget; the block SCAN is bounded by the
+/// block.** Those are different bounds and only the first is O(window). A change block is
+/// `Del* Add*`, so an added file is one block covering the whole file, and a viewport
+/// parked inside it walks that block's full length in kind checks every frame — the run
+/// lengths on both sides of the window are exactly what decides how it is emphasized, so
+/// nothing local can answer it. Bounding that too means recording each block's boundaries
+/// once per diff (the sparse shape `wrap::WrapIndex` uses) and binary searching them; it
+/// is a per-diff index and an invalidation site, not a tweak here. The guard below
+/// removes the case that does not need the walk at all.
 ///
 /// `lines` is read, never written: emphasis lands in `emph`, indexed by row.
 pub fn emphasize_rows(lines: &[DiffLine], emph: &mut RowEmphasis, rows: std::ops::Range<usize>) {
@@ -644,13 +663,17 @@ pub fn emphasize_rows(lines: &[DiffLine], emph: &mut RowEmphasis, rows: std::ops
     if lo >= hi {
         return;
     }
-    let in_window = |idx: usize| lo <= idx && idx < hi;
     // Nothing changed on screen ⇒ nothing to emphasize, and the block walk below can be
-    // skipped whole. A pair is only ever written when one of its two rows is IN the
-    // window, and both of those rows are `Del`/`Add` by construction — so if the window
-    // holds neither kind, every pair the extension could reach would be discarded after
-    // being found. Without this, a viewport sitting in ordinary context next to a large
-    // change block still walked that entire block, every frame.
+    // skipped whole. A block is `Del* Add*` and nothing else, so a window holding neither
+    // kind cannot overlap one — and BOTH paths below write only for a block the window
+    // overlaps, so every block the extension could reach would be discarded after being
+    // found. Without this, a viewport sitting in ordinary context next to a large change
+    // block still walked that entire block, every frame.
+    //
+    // Stated over blocks rather than over pairs, which is what it used to say: the
+    // whole-block path writes emphasis into EVERY row of a block it decides, including
+    // rows far outside the window, so "a pair is only written when one of its two rows is
+    // in the window" stopped being the reason this is safe.
     if !lines[lo..hi]
         .iter()
         .any(|l| matches!(l.kind, LineKind::Del | LineKind::Add))
@@ -665,6 +688,8 @@ pub fn emphasize_rows(lines: &[DiffLine], emph: &mut RowEmphasis, rows: std::ops
     while end < lines.len() && matches!(lines[end].kind, LineKind::Del | LineKind::Add) {
         end += 1;
     }
+    // Cells this pass has already committed to. See `MAX_PASS_CELLS`.
+    let mut spent = 0usize;
     while i < end {
         if lines[i].kind != LineKind::Del {
             i += 1;
@@ -678,32 +703,167 @@ pub fn emphasize_rows(lines: &[DiffLine], emph: &mut RowEmphasis, rows: std::ops
         while i < end && lines[i].kind == LineKind::Add {
             i += 1;
         }
-        let dn = add_start - del_start;
-        let an = i - add_start;
-        if dn == an {
-            for k in 0..dn {
-                let (d, a) = (del_start + k, add_start + k);
-                if (!in_window(d) && !in_window(a)) || emph.is_set(d) {
+        // A block always opens with a Del run (the walk above skips anything else), so
+        // only the Add run can be empty. A pure deletion has nothing to align against, so
+        // `align_cells` turns it away with every other unaffordable block — in O(1), on
+        // its empty side's weight, before a body is read.
+        let (add_end, dn, an) = (i, add_start - del_start, i - add_start);
+        // The block is undecided while its FIRST row is unset — this path writes every
+        // row of a block together, so that one slot answers for all of them — and while
+        // it REACHES the window, which the walk does not guarantee: it extends past the
+        // window to the ends of the contiguous changed run, and that run can hold many
+        // blocks. Without the second half, the first frame to enter a large rewritten
+        // region would decide every block in it at once.
+        let undecided = !emph.is_set(del_start) && del_start < hi && add_end > lo;
+        // Whether the whole-block path ran and came back with nothing worth drawing, as
+        // opposed to not having run: the difference decides whether the pair path below
+        // is this block's fallback or a second attempt at what already succeeded.
+        let mut block_refused = false;
+        if undecided
+            && let Some(cells) = align_cells(lines, del_start..add_start, add_start..add_end)
+        {
+            if !spend(&mut spent, cells) {
+                // Affordable in itself, just not on this pass beside what it has already
+                // run. Leave the block ENTIRELY undecided — its pairs included — so a
+                // later frame aligns it whole. Falling through to the pair path would let
+                // a per-frame budget decide how a block is rendered, and the same diff
+                // would then look different depending on how the reader scrolled into it.
+                continue;
+            }
+            match word_diff::block_emphasis(
+                &bodies(lines, del_start..add_start),
+                &bodies(lines, add_start..add_end),
+            ) {
+                Some((de, ae)) => {
+                    for (row, e) in (del_start..).zip(de).chain((add_start..).zip(ae)) {
+                        emph.set(row, e);
+                    }
                     continue;
                 }
-                // The LCS table is O(tokens²) and there are at most body.len()
-                // tokens (each is ≥1 byte), so the byte length bounds it — skip very
-                // long lines (minified JS, one-line JSON) that would blow up memory
-                // for a word-diff nobody can read anyway. Marked computed-empty so
-                // the window doesn't re-consider them every frame.
-                if lines[d].body().len() > MAX_WORD_DIFF_LINE
-                    || lines[a].body().len() > MAX_WORD_DIFF_LINE
-                {
-                    emph.set(d, Vec::new());
-                    emph.set(a, Vec::new());
-                    continue;
-                }
-                let (de, ae) = word_diff::line_emphasis(lines[d].body(), lines[a].body());
-                emph.set(d, de);
-                emph.set(a, ae);
+                // Aligned, and the alignment said nothing worth drawing. The whole-block
+                // path is an UPGRADE on pairing the block's rows 1:1, so it must never
+                // draw LESS than pairing would — fall through and let the pairs, each
+                // judged on its own, have their go.
+                None => block_refused = true,
             }
         }
+        if dn != an {
+            // Refused above and with no pairing to fall back to — an uneven block, a pure
+            // deletion — so nothing can ever write this block: decide it here rather than
+            // re-weighing it on every frame it stays on screen. An empty slice draws
+            // exactly as an unset one.
+            if undecided {
+                emph.set(del_start, Vec::new());
+            }
+            continue;
+        }
+        // Which pairs the window can reach is ARITHMETIC, not a scan: pair `k` is rows
+        // `del_start + k` and `add_start + k`, so the window maps to a `k` interval on
+        // each side. Walking `0..dn` and testing each would re-check every pair of a
+        // whole-file rewrite on every frame, for the life of the diff — including long
+        // after the block above decided it, since the `continue` there only fires on the
+        // frame that computes it.
+        //
+        // Each side is clamped by ITS OWN run length. They are equal here, so `an` and
+        // `dn` are interchangeable today and only the `dn != an` return above makes that
+        // so — narrow or move that guard (to let an uneven block pair its common prefix,
+        // say) and a shared clamp walks the Add side past its run and writes emphasis
+        // onto whatever follows it.
+        let ks = |side_start: usize, run: usize| {
+            lo.saturating_sub(side_start)..hi.saturating_sub(side_start).min(run)
+        };
+        // A refused block is decided by pair 0 whether or not the window reaches it.
+        // Without that the block stays undecided, and every later frame re-tokenizes and
+        // re-aligns the whole of it to be told the same thing.
+        let seed = usize::from(block_refused);
+        for k in (0..seed).chain(ks(del_start, dn)).chain(ks(add_start, an)) {
+            let (d, a) = (del_start + k, add_start + k);
+            // The two intervals overlap where the window holds a pair's both halves.
+            if emph.is_set(d) {
+                continue;
+            }
+            // The same question the block asked, over one row a side. A pair that cannot
+            // afford it — or is too long to read — is marked computed-empty rather than
+            // left unset, so the window does not re-consider it every frame.
+            let (de, ae) = match align_cells(lines, d..d + 1, a..a + 1) {
+                Some(cells) if spend(&mut spent, cells) => {
+                    word_diff::line_emphasis(lines[d].body(), lines[a].body())
+                }
+                // Over the pass budget rather than unaffordable in itself: leave it
+                // unset so a later frame computes it, instead of deciding it empty.
+                Some(_) => continue,
+                None => (Vec::new(), Vec::new()),
+            };
+            emph.set(d, de);
+            emph.set(a, ae);
+        }
     }
+}
+
+/// Cells one `emphasize_rows` pass will align before it leaves the rest for a later
+/// frame — the bound that makes the per-alignment budgets add up to a frame.
+///
+/// `word_diff`'s budgets bound ONE alignment. A window is not one alignment: a block only
+/// has to OVERLAP it to be decided, so a rewritten region holding three or four
+/// near-maximal blocks paid three or four full tables on one frame loop, and the pair path
+/// charges its own table per pair the window reaches. Sized at one maximal block, so a
+/// pass costs about what the module's own measurement says one table does.
+///
+/// Nothing is refused for good here — a block or pair over the budget is simply left
+/// unset, and the next frame (which starts with a full budget) computes it. Emphasis
+/// fills in over a few frames instead of stalling one.
+const MAX_PASS_CELLS: usize = word_diff::MAX_CELLS;
+
+/// Charge `cells` against a pass's remaining budget, answering whether to go ahead.
+///
+/// The FIRST alignment of a pass is always allowed, whatever it costs: the budget is
+/// there to stop several from landing on one frame, and a pass that could refuse its only
+/// candidate would never make progress on a block bigger than the budget.
+const fn spend(spent: &mut usize, cells: usize) -> bool {
+    if *spent > 0 && spent.saturating_add(cells) > MAX_PASS_CELLS {
+        return false;
+    }
+    *spent = spent.saturating_add(cells);
+    true
+}
+
+/// The table `word_diff` would fill for these two runs, or `None` where it refuses them —
+/// `word_diff`'s whole question, asked over `DiffLine`s. One predicate and one call, so
+/// the block path and the 1:1 pair path cannot come to different answers about the same
+/// rows, and so the ORDER stays right: weighing short-circuits on the first row that
+/// busts the budget, where a per-row scan would walk a million-row block to the end
+/// before finding nothing wrong with any single row.
+///
+/// It returns the COST rather than a bool because affording one alignment and affording
+/// every alignment a window asks for are different questions — see `MAX_PASS_CELLS` —
+/// and the cost is already computed here, where the weights are.
+///
+/// The floor is asked FIRST and lives here rather than at the call site. Rows alone bound
+/// a side's weight — every row weighs at least one — so a block the floor already refuses
+/// is refused whatever its bodies hold, in O(1), before a body is read at all; asked
+/// outside, a later caller gets the expensive form and silently loses it.
+fn align_cells(
+    lines: &[DiffLine],
+    del: std::ops::Range<usize>,
+    add: std::ops::Range<usize>,
+) -> Option<usize> {
+    if !word_diff::alignment_fits(
+        word_diff::SideWeight::at_least(del.len()),
+        word_diff::SideWeight::at_least(add.len()),
+    ) {
+        return None;
+    }
+    let weigh = |rows: std::ops::Range<usize>| {
+        word_diff::SideWeight::of(lines[rows].iter().map(|l| l.body().len()))
+    };
+    let (d, a) = (weigh(del), weigh(add));
+    word_diff::alignment_fits(d, a).then(|| word_diff::alignment_cells(d, a))
+}
+
+/// The bodies of `rows`, for handing a block to `word_diff` — which knows `&str` and
+/// deliberately nothing about `DiffLine`.
+fn bodies(lines: &[DiffLine], rows: std::ops::Range<usize>) -> Vec<&str> {
+    lines[rows].iter().map(DiffLine::body).collect()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1138,13 +1298,17 @@ impl DiffRows {
     }
 }
 
-/// Diff rendering options. `context`/`ignore_ws` shape the git diff itself (via
-/// `diff_opts`); `show_stats` is a config-driven presentation flag (whether the
-/// diffstat block is emitted) and is NOT read by `diff_opts`.
+/// Diff rendering options. `context`/`ignore_ws`/`ignore_blank_lines` shape the git diff
+/// itself (via `diff_opts`); `show_stats` is a config-driven presentation flag (whether
+/// the diffstat block is emitted) and is NOT read by `diff_opts`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DiffSettings {
     pub context: u32,
     pub ignore_ws: bool,
+    /// git's `--ignore-blank-lines`: a line that is blank on one side and absent on the
+    /// other is not a change. Separate from `ignore_ws`, which only collapses whitespace
+    /// WITHIN a line and so leaves an added or removed blank line a change of its own.
+    pub ignore_blank_lines: bool,
     pub show_stats: bool,
     pub detect_renames: bool,
     pub detect_copies: bool,
@@ -1163,8 +1327,112 @@ pub struct DiffSettings {
 pub fn diff_opts(settings: DiffSettings) -> DiffOptions {
     let mut opts = DiffOptions::new();
     opts.context_lines(settings.context)
-        .ignore_whitespace(settings.ignore_ws);
+        .ignore_whitespace(settings.ignore_ws)
+        .ignore_blank_lines(settings.ignore_blank_lines);
     opts
+}
+
+/// The toolbar's label for `DiffSettings::ignore_ws`. Named here rather than at the
+/// checkbox because a refusal has to send the reader to a control they can find, so
+/// `hiding_label` and `main`'s toolbar have to say the same word.
+pub const IGNORE_WS_LABEL: &str = "Ignore whitespace";
+
+/// The toolbar's label for `DiffSettings::ignore_blank_lines`. See `IGNORE_WS_LABEL`.
+pub const IGNORE_BLANK_LINES_LABEL: &str = "Ignore blank lines";
+
+impl DiffSettings {
+    /// `self` with every option that HIDES real changed lines turned off — today
+    /// `ignore_ws` and `ignore_blank_lines`, both of which turn changed lines into
+    /// context. The shape a patch has to be generated in to be applied: a diff that
+    /// does not describe the file's real content cannot be written to it.
+    ///
+    /// One list rather than a field spelled out per site, because both places that ask
+    /// are the write layer's — `apply` generates through this, and its refusal path asks
+    /// `hiding_label` which of them hid the changes the reader clicked on.
+    ///
+    /// **Destructured exhaustively, and so is `hiding_label`** — load-bearing rather
+    /// than stylistic, the same discipline `diff_store::entry_key` and `stats_relevant`
+    /// keep. A field added to `DiffSettings` fails to build in both until someone has
+    /// decided whether it hides content; named field by field, an option that hides some
+    /// and is forgotten here writes a patch the reader never saw, which is the one
+    /// failure in this file that costs uncommitted work rather than a stale cache row.
+    pub const fn showing_all_content(self) -> Self {
+        let Self {
+            context,
+            ignore_ws: _,
+            ignore_blank_lines: _,
+            show_stats,
+            detect_renames,
+            detect_copies,
+            textconv,
+        } = self;
+        Self {
+            context,
+            ignore_ws: false,
+            ignore_blank_lines: false,
+            show_stats,
+            detect_renames,
+            detect_copies,
+            textconv,
+        }
+    }
+
+    /// Every option `showing_all_content` would turn off that is currently ON: the name
+    /// the toolbar gives it, so a refusal can point at a control the reader can find,
+    /// paired with `self` carrying **just that one** cleared and the rest left as the
+    /// display has them.
+    ///
+    /// That pairing is what lets the write layer name the option actually responsible
+    /// rather than the first one ticked. `hiding_label` alone answered "which control do
+    /// I blame?" with "the first that is on", so a reader with both ticked was sent to
+    /// untick whitespace for a hunk that blank-line hiding had merged — they untick,
+    /// retry, and are refused again naming the other. Clearing each in turn and asking
+    /// whether the clicked hunk survives distinguishes them; see `apply::apply_hunk`.
+    ///
+    /// Empty when the display is already showing every change, which is what makes it
+    /// the guard on the refusal path.
+    ///
+    /// **Destructured exhaustively, like `showing_all_content`, and for the same
+    /// reason** — the two must agree on the list, and a new option has to be looked at
+    /// in both before it compiles.
+    pub fn hiding_options(self) -> Vec<(&'static str, Self)> {
+        let Self {
+            ignore_ws,
+            ignore_blank_lines,
+            context: _,
+            show_stats: _,
+            detect_renames: _,
+            detect_copies: _,
+            textconv: _,
+        } = self;
+        let mut out = Vec::new();
+        if ignore_ws {
+            out.push((
+                IGNORE_WS_LABEL,
+                Self {
+                    ignore_ws: false,
+                    ..self
+                },
+            ));
+        }
+        if ignore_blank_lines {
+            out.push((
+                IGNORE_BLANK_LINES_LABEL,
+                Self {
+                    ignore_blank_lines: false,
+                    ..self
+                },
+            ));
+        }
+        out
+    }
+
+    /// The option to name when nothing has singled one out — the first that is on.
+    /// Derived from `hiding_options` rather than repeating its list, so "which options
+    /// hide content" is stated once.
+    pub fn hiding_label(self) -> Option<&'static str> {
+        self.hiding_options().first().map(|&(label, _)| label)
+    }
 }
 
 /// `diff_opts` scoped to `paths` — the settings + pathspec pair that every diff
@@ -1869,7 +2137,8 @@ fn append_diff_body(
     let sizes = delta_sizes(diff);
     finish_stats_block(lines, files, &sizes, stats_at);
 
-    // The sweep. A delta whose hunks are ALL suppressed by `ignore_ws` never flushes
+    // The sweep. A delta whose hunks are ALL suppressed — by `ignore_ws`, or equally by
+    // `ignore_blank_lines` — never flushes
     // its header (`should_force_header` is false), so the 'F' callback never fires and
     // there is nothing to hook — while git, converting first, would still show the
     // converted patch. Anything driven that the pass above never headed is emitted
@@ -2298,7 +2567,7 @@ struct PatchPass {
 /// concatenation and two assignments — the whole reason the pass can be split at all.
 fn merge_delta_patches(lines: &mut DiffRows, files: &mut [FileEntry], patches: Vec<DeltaPatch>) {
     for (fi, patch) in patches.into_iter().enumerate() {
-        // A delta that printed nothing — `ignore_ws` suppressing every hunk, an
+        // A delta that printed nothing — an option that hides changes suppressing every hunk, an
         // unchanged file — keeps `diff_line_idx: None`, exactly as the sequential pass
         // leaves it when the 'F' callback never fires.
         if patch.rows.is_empty() {
@@ -3732,6 +4001,7 @@ pub mod tests {
         DiffSettings {
             context: 3,
             ignore_ws: false,
+            ignore_blank_lines: false,
             show_stats: false,
             detect_renames: false,
             detect_copies: false,
@@ -3885,6 +4155,101 @@ pub mod tests {
             "control: the header really carries the tab"
         );
         assert!(!data.tabless, "and the build must not claim otherwise");
+    }
+
+    /// `ignore_blank_lines` is git's `--ignore-blank-lines`, and it is not a stronger
+    /// `ignore_ws`: one is about a line's EXISTENCE, the other about whitespace within a
+    /// line, so neither covers the other.
+    #[test]
+    fn ignore_blank_lines_hides_an_added_blank_line() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", "one\ntwo\n", "base");
+        let oid = commit_file(&repo, "f.txt", "one\n\ntwo\n", "blank line added");
+        let added = |s| {
+            diff_of(&repo, oid, s, None)
+                .lines
+                .iter()
+                .filter(|l| l.kind == LineKind::Add)
+                .count()
+        };
+        assert_eq!(added(base_settings()), 1, "a change by default");
+        assert_eq!(
+            added(DiffSettings {
+                ignore_ws: true,
+                ..base_settings()
+            }),
+            1,
+            "ignore_ws collapses whitespace WITHIN a line; the line is still added"
+        );
+        assert_eq!(
+            added(DiffSettings {
+                ignore_blank_lines: true,
+                ..base_settings()
+            }),
+            0
+        );
+    }
+
+    /// The write layer generates through `showing_all_content` and diagnoses a refusal
+    /// through `hiding_label`, so the two have to agree on the list.
+    #[test]
+    fn content_hiding_options_are_cleared_and_named_together() {
+        let both = DiffSettings {
+            ignore_ws: true,
+            ignore_blank_lines: true,
+            context: 9,
+            detect_renames: true,
+            ..base_settings()
+        };
+        let shown = both.showing_all_content();
+        assert!(!shown.ignore_ws && !shown.ignore_blank_lines);
+        assert_eq!(
+            (shown.context, shown.detect_renames),
+            (9, true),
+            "the rest of the display's shape is what makes the hunks line up"
+        );
+        assert_eq!(both.hiding_label(), Some(IGNORE_WS_LABEL));
+        assert_eq!(
+            DiffSettings {
+                ignore_blank_lines: true,
+                ..base_settings()
+            }
+            .hiding_label(),
+            Some(IGNORE_BLANK_LINES_LABEL)
+        );
+        assert_eq!(
+            shown.hiding_label(),
+            None,
+            "nothing hidden, nothing to name"
+        );
+    }
+
+    #[test]
+    fn every_option_showing_all_content_clears_is_one_hiding_label_names() {
+        // What the exhaustive destructures buy is that a new field must be LOOKED at in
+        // both methods — not that the two agree about it. Clearing a field in
+        // `showing_all_content` and writing `_` for it in `hiding_label` compiles, and
+        // the write layer then refuses that hunk as `Stale`: a permanently false reason,
+        // which is the failure both methods exist to prevent. So the biconditional is
+        // pinned over every combination rather than sampled at two points.
+        for bits in 0..1u8 << 6 {
+            let bit = |n: u8| bits & (1 << n) != 0;
+            let s = DiffSettings {
+                context: u32::from(bits),
+                ignore_ws: bit(0),
+                ignore_blank_lines: bit(1),
+                show_stats: bit(2),
+                detect_renames: bit(3),
+                detect_copies: bit(4),
+                textconv: bit(5),
+            };
+            assert_eq!(
+                s.hiding_label().is_none(),
+                s.showing_all_content() == s,
+                "an option is cleared but not named, or named but not cleared ({bits:#b})"
+            );
+        }
     }
 
     /// The header block is the caller's, assembled before `append_diff_body` runs, and
@@ -4999,23 +5364,191 @@ pub mod tests {
     }
 
     #[test]
-    fn word_emphasis_pairs_equal_blocks_only() {
-        // Unequal block (1 del, 2 add): no 1:1 pairing, nothing computes.
+    fn word_emphasis_aligns_an_uneven_block_whole() {
+        // 1 del, 2 add: there is no 1:1 pairing to be had, and aligning the block whole
+        // is what gives it emphasis at all — landing on the row the changed word is on,
+        // wherever the rewrap put it.
         let lines = vec![
-            DiffLine::new("-x", LineKind::Del),
-            DiffLine::new("+y", LineKind::Add),
-            DiffLine::new("+z", LineKind::Add),
+            DiffLine::new("-one two three", LineKind::Del),
+            DiffLine::new("+one two", LineKind::Add),
+            DiffLine::new("+four", LineKind::Add),
         ];
         let mut emph = blank_emphasis(&lines);
         emphasize_rows(&lines, &mut emph, 0..3);
-        assert!((0..lines.len()).all(|i| !emph.is_set(i)));
+        let shown = |row: usize| -> Vec<&str> {
+            assert!(emph.is_set(row), "row {row} must be computed");
+            emph.slice(row)
+                .iter()
+                .map(|r| &lines[row].body()[r.clone()])
+                .collect()
+        };
+        assert_eq!(shown(0), ["three"]);
+        assert!(shown(1).is_empty(), "the row that did not change is plain");
+        assert_eq!(shown(2), ["four"]);
+    }
+
+    #[test]
+    fn word_emphasis_leaves_a_block_the_window_does_not_reach() {
+        // ONE contiguous changed region holding two blocks — the walk extends through
+        // all of it, so the whole-block path needs a window test of its own: it writes a
+        // block at a time, and a large rewritten region holds many blocks.
+        let lines = vec![
+            DiffLine::new("-one two", LineKind::Del),
+            DiffLine::new("+one three", LineKind::Add),
+            DiffLine::new("-four five", LineKind::Del),
+            DiffLine::new("+four six", LineKind::Add),
+        ];
+        let mut emph = blank_emphasis(&lines);
+        emphasize_rows(&lines, &mut emph, 2..4);
+        assert!(
+            !emph.is_set(0) && !emph.is_set(1),
+            "the block above the window must still be waiting"
+        );
+        assert!(emphasized(&emph, 2) && emphasized(&emph, 3));
+    }
+
+    #[test]
+    fn word_emphasis_leaves_a_pure_deletion_alone() {
+        // Nothing to align against: every token would come out changed, so the block is
+        // refused by `alignment_fits` on its empty side and NOTHING is emphasized.
+        let lines = vec![
+            DiffLine::new("-one two", LineKind::Del),
+            DiffLine::new("-three", LineKind::Del),
+            DiffLine::new(" ctx", LineKind::Context),
+        ];
+        let mut emph = blank_emphasis(&lines);
+        emphasize_rows(&lines, &mut emph, 0..3);
+        assert!(
+            (0..lines.len()).all(|i| !emphasized(&emph, i)),
+            "a pure deletion draws plain"
+        );
+        // Refused for good — decided once, on the block's first row, rather than weighed
+        // again on every frame it stays on screen. An empty slice draws as an unset one,
+        // which is why the assertion above is about emphasis and not about `is_set`.
+        assert!(emph.is_set(0), "and is not re-weighed every frame");
+    }
+
+    #[test]
+    fn word_emphasis_falls_back_to_pairs_when_the_block_alignment_says_nothing() {
+        // An ordinary two-row rewrite. Aligned whole, less than half of the larger side
+        // survives, so the minority guard refuses it — and the 1:1 pair path, which
+        // judges each row on its own and is exempt from that guard, is what must then
+        // draw it. While a refusal was indistinguishable from "aligned, nothing
+        // changed", `emphasize_rows` wrote the empty ranges in as the block's decision,
+        // the pair path below was unreachable, and this drew NOTHING: emphasis the code
+        // had before there was a block path at all.
+        let lines = vec![
+            DiffLine::new("-    let a = 1;", LineKind::Del),
+            DiffLine::new("-    let b = 2;", LineKind::Del),
+            DiffLine::new("+    let x = compute(p, q);", LineKind::Add),
+            DiffLine::new("+    let y = compute(r, s);", LineKind::Add),
+        ];
+        assert!(
+            word_diff::block_emphasis(&bodies(&lines, 0..2), &bodies(&lines, 2..4)).is_none(),
+            "control: the whole-block alignment must be what refuses here, or this test \
+             passes without exercising the fallback"
+        );
+        let mut emph = blank_emphasis(&lines);
+        emphasize_rows(&lines, &mut emph, 0..lines.len());
+        for i in 0..lines.len() {
+            assert!(emphasized(&emph, i), "row {i} drew nothing");
+        }
+    }
+
+    #[test]
+    fn a_refused_block_is_decided_even_when_the_window_misses_its_first_pair() {
+        // Same shape, but the window sits on the block's SECOND pair. The refusal has to
+        // be recorded on the block's first row all the same — that slot is what says the
+        // block is decided — or every later frame re-tokenizes and re-aligns the whole
+        // block to be told the same thing.
+        let lines = vec![
+            DiffLine::new("-    let a = 1;", LineKind::Del),
+            DiffLine::new("-    let b = 2;", LineKind::Del),
+            DiffLine::new("+    let x = compute(p, q);", LineKind::Add),
+            DiffLine::new("+    let y = compute(r, s);", LineKind::Add),
+        ];
+        let mut emph = blank_emphasis(&lines);
+        emphasize_rows(&lines, &mut emph, 1..2);
+        assert!(
+            emph.is_set(0),
+            "the block must be decided, not left to be re-aligned"
+        );
+    }
+
+    #[test]
+    fn one_pass_aligns_one_heavy_block_and_leaves_the_next_for_a_later_frame() {
+        // `word_diff`'s budgets bound ONE alignment; a window is not one alignment. Two
+        // near-maximal blocks both overlapping the window used to pay two full tables on
+        // the same frame loop — and a rewritten region can hold three or four.
+        let filler = "s".repeat(400);
+        let row = |sign: char, tag: &str, i: usize| format!("{sign}{filler} {tag}{i}");
+        let mut texts = Vec::new();
+        for block in 0..2 {
+            for i in 0..2 {
+                texts.push((row('-', "A", block * 2 + i), LineKind::Del));
+            }
+            for i in 0..2 {
+                texts.push((row('+', "B", block * 2 + i), LineKind::Add));
+            }
+        }
+        let lines: Vec<DiffLine> = texts
+            .iter()
+            .map(|(t, k)| DiffLine::new(t.as_str(), *k))
+            .collect();
+        // Control: each block is affordable on its own, and two do not fit one pass.
+        let cells = align_cells(&lines, 0..2, 2..4).expect("a block must be alignable alone");
+        assert!(
+            cells <= MAX_PASS_CELLS && cells * 2 > MAX_PASS_CELLS,
+            "fixture must be sized so one block fits a pass and two do not ({cells} cells)"
+        );
+
+        let mut emph = blank_emphasis(&lines);
+        emphasize_rows(&lines, &mut emph, 0..lines.len());
+        assert!(emph.is_set(0), "the first block is decided");
+        assert!(
+            !emph.is_set(4),
+            "the second must be left for a later frame, not aligned on this one"
+        );
+        // Left UNSET rather than decided empty, so the next pass — which starts with a
+        // full budget — computes it. Emphasis fills in over frames instead of stalling
+        // one.
+        emphasize_rows(&lines, &mut emph, 0..lines.len());
+        assert!(emph.is_set(4), "and the next pass picks it up");
+    }
+
+    #[test]
+    fn word_emphasis_falls_back_to_pairs_on_an_oversized_block() {
+        // Too heavy to align whole, so equal runs pair 1:1 instead — the path whose cost
+        // is bounded by the WINDOW, which is what the untouched rows below show: aligning
+        // whole would have written every one of them.
+        let rows = 64;
+        let filler = "x".repeat(26); // 64 rows of 32-33 bytes: a side weighs 2166
+        let texts: Vec<(String, LineKind)> = (0..rows)
+            .map(|i| (format!("-old {filler} {i}"), LineKind::Del))
+            .chain((0..rows).map(|i| (format!("+new {filler} {i}"), LineKind::Add)))
+            .collect();
+        let lines: Vec<DiffLine> = texts
+            .iter()
+            .map(|(t, kind)| DiffLine::new(t.as_str(), *kind))
+            .collect();
+        // Asked through the gate itself, so the fixture cannot drift away from it.
+        assert!(
+            align_cells(&lines, 0..rows, rows..lines.len()).is_none(),
+            "fixture must be too heavy to align whole"
+        );
+        let mut emph = blank_emphasis(&lines);
+        emphasize_rows(&lines, &mut emph, 0..1);
+        assert!(emphasized(&emph, 0)); // the window's row, and its 1:1 partner
+        assert!(emphasized(&emph, rows));
+        assert!(!emph.is_set(1)); // outside the window: still waiting
+        assert!(!emph.is_set(rows + 1));
     }
 
     #[test]
     fn word_emphasis_marks_overlong_pairs_computed() {
-        // A pair over MAX_WORD_DIFF_LINE is skipped, but marked computed-empty so
+        // A pair over word_diff::MAX_ROW_BYTES is skipped, but marked computed-empty so
         // the per-frame window doesn't re-consider it forever.
-        let long = format!("-{}", "x".repeat(MAX_WORD_DIFF_LINE + 1));
+        let long = format!("-{}", "x".repeat(word_diff::MAX_ROW_BYTES + 1));
         let lines = vec![
             DiffLine::new(long.as_str(), LineKind::Del),
             DiffLine::new("+short", LineKind::Add),

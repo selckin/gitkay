@@ -58,10 +58,10 @@
 - Selectable color theme via `[diff] theme` in the config (any of 29 bundled themes — a curated allowlist; default Catppuccin Mocha), applied live on save; or turn highlighting off for the original flat per-line coloring
 - File list sidebar with per-file `+/-` stats, grouped under directory headers by default (`[diff] file_list` = `grouped`/`full`/`name`)
 - Renamed/copied files shown git-style — one `dir/{old ⇒ new}` entry instead of a delete + add pair
-- **Word diff** toggle — highlights the exact words that changed within a modified line
+- **Word diff** toggle — highlights the exact words that changed, aligning a change block whole so a rewrapped paragraph shows the words that moved rather than every line the rewrap touched
 - Optional line numbers beside every patch line — old and new, in columns sized once per diff so they line up across every file in it
 - Optional soft wrapping — long lines fold to the pane's width, indented under their own line numbers and `+`/`-` marker, with only the visible part of a line ever laid out (an 8-million-character minified line scrolls like any other file)
-- Hover toolbar on the diff: context-line count (click `±`, or scroll over it), ignore whitespace, rename/copy detection, word diff, line numbers, soft wrap — all remembered across runs
+- Hover toolbar on the diff: context-line count (click `±`, or scroll over it), ignore whitespace, ignore blank lines, rename/copy detection, word diff, line numbers, soft wrap — all remembered across runs
 - Highlighting runs in the background, on-screen files first — large diffs never block the UI; diffs are cached and the neighbouring commits prefetched, so stepping through history is instant
 - Click a file to jump to its diff section; the sidebar tracks your position, highlighting the file under the diff view as you scroll
 - Commit header with author, date, full message
@@ -76,8 +76,8 @@
 - Whole-file stage/unstage go straight to the index, so binaries, mode changes,
   CRLF and missing trailing newlines are exact rather than patched
 - What it won't do, it says plainly: a rename or copy names the whole-file
-  action that works instead, and a hunk hidden by "ignore whitespace" names
-  the toggle to turn off
+  action that works instead, and a hunk hidden by "ignore whitespace" or
+  "ignore blank lines" names the toggle to turn off
 
 ### Search
 - Full-width search bar — filter by SHA, author, commit message, branch name, tag name
@@ -167,7 +167,7 @@ unexplained.
 | **Right-click** hunk or file | Stage / Unstage / Revert it — see above |
 | **PageUp / PageDown** | Jump to the previous / next file in the diff |
 | **Space / Shift+Space** | Scroll the diff down / up by half a page |
-| **Hover** the diff | Toolbar: context lines, ignore whitespace, rename/copy detection, word diff |
+| **Hover** the diff | Toolbar: context lines, ignore whitespace, ignore blank lines, rename/copy detection, word diff |
 
 Selecting a commit dims everything outside its ancestry, so a branch stands out
 against the rest of the graph; merged-in history stays bright.
@@ -196,7 +196,7 @@ rest is split by concern:
 | `config.rs` | TOML config, font resolution, the commented template |
 | `cli.rs` | Argument parsing and rev-vs-path classification |
 | `datefmt.rs` | A commit's timestamp, absolute or as an age |
-| `word_diff.rs` | Intra-line word diffing (tokenizer + LCS alignment) |
+| `word_diff.rs` | Word diffing over a whole change block (tokenizer + LCS alignment) |
 | `mem.rs` | What the system will say about available memory |
 
 Built on:
@@ -325,8 +325,8 @@ per-role change belongs; the zoom multiplies all of them at once.
 | `textconv` | `true` | Run `diff.<driver>.textconv` when `.gitattributes` names a driver for a path, as git does — what turns an archive or a PDF into a readable diff instead of "Binary files … differ" |
 
 **Everything on the diff's hover toolbar is set there, not here** — context width,
-ignore whitespace, rename detection, copy detection, word diff, line numbers and
-soft wrap.
+ignore whitespace, ignore blank lines, rename detection, copy detection, word diff,
+line numbers and soft wrap.
 Each is remembered across runs, so the pane reopens the way you left it, and none
 has a config key that could contradict it. There is no third state to reason
 about: what you ticked is what you get.
@@ -334,10 +334,11 @@ about: what you ticked is what you get.
 | Toolbar control | Default | Meaning |
 |---|---|---|
 | Context | `3` | Context lines around each hunk. Click `±` or scroll over the group |
-| Ignore whitespace | off | Ignore whitespace-only changes (git `-w`) |
+| Ignore whitespace | off | Ignore whitespace-only changes (git `-w`). Whitespace *within* a line — an added or removed blank line is still a change |
+| Ignore blank lines | off | Ignore lines that are blank on one side and absent on the other (git `--ignore-blank-lines`) |
 | Detect renames | on | Show a rename as one `old → new` entry instead of a delete + add (git `-M`) |
 | Detect copies | off | Show a file copied from another *modified* file as `source → copy` (git `-C`). More expensive than renames |
-| Word diff | off | Highlight the exact words that changed within a modified line |
+| Word diff | off | Highlight the exact words that changed. A change block is aligned whole, with line breaks counting as ordinary whitespace, so rewrapped prose highlights the words rather than the rewrap (a block too large to align whole falls back to line-by-line, where the two sides have equal line counts) |
 | Line numbers | off | Old and new line numbers in a gutter left of the `+`/`-` marker. One column width per diff, so they line up across files; the commit message and diffstat above the first file keep their own margin |
 | Soft wrap | off | Fold long lines to the pane's width instead of scrolling horizontally. A wrapped line is indented under its own line numbers and `+`/`-` marker, and the horizontal scrollbar goes away. Worth a tick in a repo whose sources have lines wider than a window — minified bundles, generated code, long prose |
 
@@ -473,7 +474,7 @@ outlive the thing that produced it. Deleting the directory is always safe.
 | `~/.config/gitkay/config.toml` | Your config; the commented template is written here on first run |
 | `~/.cache/gitkay/diffs/` | The persistent diff store (see `[cache]`) |
 | `~/.cache/gitkay/fonts.toml` | Resolved font-name → path cache |
-| `~/.local/share/gitkay/` | Window geometry, splitter positions, and the diff toolbar's context / ignore-whitespace / word-diff settings |
+| `~/.local/share/gitkay/` | Window geometry, splitter positions, and every setting on the diff toolbar |
 
 Nothing outside these is touched, and every one of them is safe to delete.
 
