@@ -64,7 +64,7 @@
 - **Old / New** — read one side of a change as continuous code. A unified diff interleaves `-` and `+` lines, so neither version reads as code; `Old` hides the additions and leaves the pre-image, `New` hides the deletions and leaves the post-image, both with the hunk headers still in place. Alt+O / Alt+N / Alt+B, or the toolbar. Hiding rows only — a right-click stages the same hunk in any of the three
 - Hover toolbar on the diff: context-line count (click `±`, or scroll over it), ignore whitespace, ignore blank lines, rename/copy detection, word diff, line numbers, soft wrap, side — all remembered across runs
 - Highlighting runs in the background, on-screen files first — large diffs never block the UI; diffs are cached and the neighbouring commits prefetched, so stepping through history is instant
-- Click a file to jump to its diff section; the sidebar tracks your position, highlighting the file under the diff view as you scroll
+- Click a file to jump to its diff section; the sidebar tracks your position as you scroll, highlighting the file under the diff view and scrolling it into view when it falls off the list
 - Commit header with author, date, full message
 
 ### Staging, Unstaging and Reverting
