@@ -304,6 +304,8 @@ the scroll anchor (its own child module,
 `src/diff/anchor.rs`: `DiffAnchor` / `capture_anchor` / `resolve_anchor` — pure,
 so all five resolution rungs are unit-testable), soft wrapping (likewise its own
 child module, `src/diff/wrap.rs`: `WrapIndex` / `RowSlice` — see **Soft wrapping**),
+the side filter and the ROW MAP the two of them meet in (`src/diff/side.rs`:
+`DiffSide` / `SideIndex` / `RowMap` — see **Reading one side**),
 and the pure line/file lookups — git2-facing and egui-free; cache keying
 and rendering stay in `main.rs`, highlight orchestration in
 `src/diff_highlight.rs`), `src/apply.rs` (the
@@ -1219,13 +1221,15 @@ sorted drivers keep the same rows with the same rewritten parents.
   rather than promised — `ToolbarDiffSettings::load` is an exhaustive struct literal
   and `save` an exhaustive destructure, so another field fails to build in both
   directions instead of silently resetting every launch. `word_diff`,
-  `line_numbers` and `wrap` sit outside that struct (they change no diff data) and
-  have **`ToolbarViewSettings`, the same mechanism for the same reason** — two structs
-  rather than one because the split between diff-shaping and render-only is real, but
-  both `load`/`save` pairs are exhaustive, so a fourth toggle fails to build rather
-  than resetting the tick every launch with nothing to say so. They were three
+  `line_numbers`, `wrap` and `side` sit outside that struct (they change no diff data)
+  and have **`ToolbarViewSettings`, the same mechanism for the same reason** — two
+  structs rather than one because the split between diff-shaping and render-only is
+  real, but both `load`/`save` pairs are exhaustive, so a fifth control fails to build
+  rather than resetting the tick every launch with nothing to say so. They were three
   hand-written key pairs, and the convention had already slipped: `wrap` was added
   third and every doc comment enumerating the group still named only the first two.
+  `side` is the first non-boolean of the group, which changes nothing there and does
+  add one thing exhaustiveness cannot check — see **Reading one side**.
   **The context width also takes the wheel**, over the whole `Context: - N +` group
   (`wheel_steps`). Five things there are load-bearing. It reads the raw `MouseWheel`
   events and **never `InputState::smooth_scroll_delta`**, which is smoothed across
@@ -1494,6 +1498,86 @@ sorted drivers keep the same rows with the same rewritten parents.
   git2's **origin char** and not from `LineKind`: git2 reports a line number
   on its EOF markers too, and those origins have already been folded into
   `LineKind::Context` by the time only the kind is left.
+- **Reading one side** (the toolbar's "Side", `Both` until changed — `src/diff/side.rs`):
+  `Old` hides the `+` lines, leaving `Context + Del`, which is exactly the pre-image
+  within the hunks; `New` hides the `-` lines, leaving the post-image. Hunk and file
+  headers stay in both, being what makes the remainder readable. Also on **Alt+B /
+  Alt+O / Alt+N**.
+  **Render-only, and that is a CORRECTNESS property rather than a cost one.** It hides
+  rows: it never touches `diff_lines`, keys neither cache, and rebuilds nothing.
+  Everything above the renderer — `hunk_at_line`, `file_line_starts`, the highlight and
+  word-diff windows, and every write in `apply.rs` — addresses the diff by LINE index,
+  so a filter that reached the line array would have to be re-argued at each of those
+  sites, one of which stages patches. Confined to the row map it cannot reach one, and
+  `a_filtered_pane_lays_out_fewer_rows_and_still_reports_lines` pins that the menu
+  target is asked about the same line the row builder drew.
+  **THREE coordinate systems now exist**, where soft wrapping introduced the second:
+  a **line** (an index into `diff_lines`), a **wrap row** (`WrapIndex`'s output, in line
+  order), and a **view row** (what the `ScrollArea` scrolls over — wrap rows less the
+  hidden lines' rows). `diff::RowMap` is the ONE place the two transforms compose, and
+  the pane addresses rows through nothing else: `DiffView` carries a `RowMap` rather
+  than a `WrapIndex`, `DiffScrollTo::line`/`row` take one, and `GitkApp::row_map`
+  builds it for the callers outside the render (the Space page-step, the word-diff and
+  highlight windows). It also carries the LINE COUNT, which `DiffView` therefore does
+  not — two copies could only disagree. A third transform added later has one place to
+  compose into rather than eleven call sites to find; `WrapIndex::lines_of_rows` was
+  deleted when `RowMap`'s became its only implementation.
+  The index is **sparse in the shape `WrapIndex` is**: one entry per maximal RUN of
+  hidden lines — i.e. per change block, git emitting a `-` block then a `+` block — so
+  an ordinary diff has a few thousand entries where a per-line prefix sum would be the
+  306MB that module refuses. Each run carries its line range, the view row it collapses
+  at and the running total of rows removed through it, so both directions are one
+  binary search with no array beside it that could disagree. The build is one O(lines)
+  pass reading `DiffLine::kind` and no text at all — unlike `WrapIndex::build`'s tab
+  census — and consults the wrap index once per run BOUNDARY (`row_of_line`, itself a
+  binary search), not once per hidden line. **Runs are strictly increasing in view
+  row**, two maximal runs being separated by at least one visible line: that is what
+  makes both searches unambiguous, and it is asserted rather than left to be inferred.
+  A **hidden** line maps to its run's collapse point — where its first visible successor
+  now sits — which is what a scroll anchor pointing at a line the reader just hid
+  should resolve to. `lines_of_rows` stays CONTIGUOUS and so returns a superset under a
+  filter, spanning the hidden lines between the first and last visible ones; every
+  consumer widens what it is given, so that is the useful answer and not a rounding
+  error to fix.
+  `resync_side_index` mirrors `resync_wrap_index` exactly — same four transitions, and
+  **dropping an index is as much a move as building one**, for the same reason (the
+  offset is in view rows, so the frame after `Both` is reselected it names a different
+  line), reported exactly once via `take()`. It additionally takes the wrap resync's
+  own `rewrapped`, because a re-wrap moves every view row recorded here and two
+  wrappings can agree on the total row count `covers` compares. That row count has one
+  derivation, `SideIndex::wrap_rows_of` — the build records it and the resync compares
+  against it, and derived separately in the two they could never match, which is an
+  O(lines) rebuild every frame with nothing to say so. The render combines the
+  two with a bitwise `|` — both must RUN — into the `moved` that `diff_scroll_target`
+  turns into a `DiffScrollTo::Line(top_line)`, which is what holds the reader's place
+  across a mode change. The index is dropped where `diff_wrap` is (`set_diff_content`,
+  `resync_file_layout`'s moved branch) and for the same two reasons: `covers` cannot see
+  a different diff of the same line count, and a permutation moves a hidden run to where
+  a visible line was.
+  Past `MAX_HIDDEN_RUNS` the build goes **inactive** — every mapping the identity, i.e.
+  the `Both` rendering — so the refusal needs no second code path above the module.
+  Unlike the wrap refusal it is **not silent**: falling back to `Both` is the pane
+  ignoring the mode that was asked for, so the toolbar reads `SideIndex::active()` and
+  says `(too many change blocks)` beside the control. `active()` means exactly that,
+  because the resync drops the index outright in `Both` — an index that exists at all
+  was asked to hide something.
+  It is a toolbar control with **no config key**, persisted in `ToolbarViewSettings`
+  beside `word_diff`/`line_numbers`/`wrap` — the shape the **Diff toolbar** section
+  argues for. It is the first non-boolean there, which changes nothing about the group
+  (what they share is being flipped while reading) but does add a failure mode the
+  exhaustive `load`/`save` pair cannot catch: a wrong serde derive. Hence
+  `the_toolbar_view_settings_round_trip_through_storage`.
+  **The key is `Alt`+letter and has to be.** Any printable keypress focuses the search
+  bar, so `o`/`n`/`b` are not available to bind. Consuming the key is not enough on its
+  own either: `Event::Text` is a separate event from `Event::Key` and carries no
+  modifiers, so the focus test also refuses `i.modifiers.alt` — Alt+letter should never
+  start a search regardless.
+  `diff_row_job` is untouched: the surviving side keeps its `-`/`+` marker and its row
+  tint, which is what says which side is being read. So are `LineNoGutter::measure`
+  (taken over all lines, so the gutter width does not jump between modes), the word-diff
+  emphasis and the syntax spans (both per line), and `wrapping` — the filter drops whole
+  lines and never narrows one, so it has no say in whether the horizontal scroll is
+  offered.
 - **Soft wrapping** (the toolbar's "Soft wrap", off until ticked — `src/diff/wrap.rs`): a long patch
   line folds to the pane's width instead of scrolling off it. **The pane slices lines
   itself and does NOT ask egui to wrap them.** egui lays a whole `LayoutJob` out
@@ -1798,7 +1882,13 @@ things TAB costs: no row of a tab-indented line drawing past the pane's columns
 (measured against an independent column count, and demonstrated to fail under a byte
 measure), and `rewidth` — which carries the tab census across a width change —
 agreeing with a full build over a tabbed diff, a tab-free one, and a line count that
-moved under it),
+moved under it; and `side`, whose subject is a MAPPING rather than a filter — `Both`
+being the identity, each mode keeping exactly the other side's lines, a hidden line
+resolving to its run's collapse point, the runs strictly increasing in view row (the
+invariant both binary searches rest on), a run at the very start and a diff hidden
+entirely, `lines_of_rows` spanning the hidden lines it covers, an over-cap build
+falling back to the identity, and the composition with a real `WrapIndex` where the
+hidden run wraps too, so what it removes is its ROWS and not its lines),
 `diff_cache` (LRU eviction), `diff_store`
 (codec round trips including a non-UTF-8 path and every tag, key derivation, load/save
 over real temp repos, the entry cap from both sides — the measured 76.5M-line shape
@@ -2046,7 +2136,7 @@ ones that actually fail when the write is removed.
 - Working-tree edits do not touch `.git`; refresh commits/diff on selection changes to keep virtual staged/uncommitted entries current without a recursive worktree watcher
 - Branch highlighting walks first-parent children upward, but all parents downward, so merge commits keep merged history highlighted
 - File-list sidebar is not row-virtualized — every row draws each frame, so per-row file text goes through `SidebarCache`: elided labels (laid out in `Color32::PLACEHOLDER` so normal/hover color applies at paint time) and `+n`/`-n` stat galleys are built once per (diff, width, scale, font) — `resync_file_layout` and a font reload reset the cache, `ensure` re-keys it on the row width and on `pixels_per_point`, which is what covers a zoom step and a monitor-DPI change (see **UI zoom**). Both stat galleys always exist, a zero count included (`+0`/`-0`, as in the commit list), so `StatGalleys` holds no `Option` and the row's stats block is a fixed distance from its right edge instead of sliding when one side is empty. `build_file_rows` (pure) turns `(new_path, Option<old_path>)` pairs into header/file rows per `[diff] file_list` (`grouped` = one header per directory, files sorted by label, root-level files last; renames/copies group under their `rename_brace` common directory) — and it is the single decision of what order files are read in, the **diff pane** included (see **Bottom panel**); `left_elide` left-truncates labels, measuring the full string once and binary-searching only when it overflows (directory headers still elide per frame — they're the minority of rows). `grouped` directory headers are drawn breadcrumb-style (`draw_dir_header` + `diff::common_dir_prefix_len` — shared with the diffstat block's `dir/{old => new}` factoring, which is libgit2's own rule and was a second copy of it): the ancestor path a header shares with the header drawn just above it is dimmed (`SUBTEXT_DIM`) and the distinguishing tail is `SUBTEXT`, so deep trees don't repeat the same long prefix on every header
-- Any new diff-*data*-affecting setting goes in `DiffSettings` only. `GitkApp` holds one `DiffSettings` field (the diff-shaping state — `context`/`ignore_ws`/`ignore_blank_lines`/`detect_renames`/`detect_copies` are toolbar-owned + persisted, grouped as `ToolbarDiffSettings`; `show_stats`/`textconv` come from `[diff]` config), and `DiffCacheKey` *embeds* a `DiffSettings`. (It also carries a `drivers` fingerprint, which is NOT a setting — it is the repo's own `diff.<name>.textconv` config, and it is in the key for the same reason: an edited driver changes a driven file's whole body without moving the oid. See **Textconv**.) So a field added to `DiffSettings` is automatically (a) part of the cache key — cached diffs invalidate when it changes, no second edit site — and (b) covered by the config-reload's whole-struct comparison (`new_settings != self.diff_settings`), which triggers the re-diff. The prefetch mapping reads it back as `key.settings`. Settings that only change *spans* (theme, syntax on/off, `diff_bg`, `[diff.languages]`) or *render* (`file_list`) are handled by their own branches in the config-reload block, not `DiffSettings`. The three render-only settings the TOOLBAR owns — `word_diff`, `line_numbers` and `wrap` — have no reload branch at all, because they have no config key to reload from; a render-only setting added later has to choose which of those two shapes it is. `file_list` decides the order the pane's patch bodies are laid out in as well as the sidebar's rows, which is a re-lay of built data and not a re-diff — it stays out here because `diff::order_files` is idempotent, so a cached or stored diff is re-laid on install rather than rebuilt (see **Bottom panel**). `wrap` is the third shape and not a config setting at all: it is toolbar-owned like `word_diff` and `line_numbers`, so it has no reload branch to forget, and it needs no re-lay either — the wrap index is measured by the render on the first frame that wants one and `resync_wrap_index`'s own `!wrap` arm drops it, reporting that drop as a move so the reader's line is pinned (see **Soft wrapping**).
+- Any new diff-*data*-affecting setting goes in `DiffSettings` only. `GitkApp` holds one `DiffSettings` field (the diff-shaping state — `context`/`ignore_ws`/`ignore_blank_lines`/`detect_renames`/`detect_copies` are toolbar-owned + persisted, grouped as `ToolbarDiffSettings`; `show_stats`/`textconv` come from `[diff]` config), and `DiffCacheKey` *embeds* a `DiffSettings`. (It also carries a `drivers` fingerprint, which is NOT a setting — it is the repo's own `diff.<name>.textconv` config, and it is in the key for the same reason: an edited driver changes a driven file's whole body without moving the oid. See **Textconv**.) So a field added to `DiffSettings` is automatically (a) part of the cache key — cached diffs invalidate when it changes, no second edit site — and (b) covered by the config-reload's whole-struct comparison (`new_settings != self.diff_settings`), which triggers the re-diff. The prefetch mapping reads it back as `key.settings`. Settings that only change *spans* (theme, syntax on/off, `diff_bg`, `[diff.languages]`) or *render* (`file_list`) are handled by their own branches in the config-reload block, not `DiffSettings`. The four render-only settings the TOOLBAR owns — `word_diff`, `line_numbers`, `wrap` and `side` — have no reload branch at all, because they have no config key to reload from; a render-only setting added later has to choose which of those two shapes it is. `file_list` decides the order the pane's patch bodies are laid out in as well as the sidebar's rows, which is a re-lay of built data and not a re-diff — it stays out here because `diff::order_files` is idempotent, so a cached or stored diff is re-laid on install rather than rebuilt (see **Bottom panel**). `wrap` is the third shape and not a config setting at all: it is toolbar-owned like `word_diff` and `line_numbers`, so it has no reload branch to forget, and it needs no re-lay either — the wrap index is measured by the render on the first frame that wants one and `resync_wrap_index`'s own `!wrap` arm drops it, reporting that drop as a move so the reader's line is pinned (see **Soft wrapping**). `side` is that same third shape, and its index composes with `wrap`'s rather than replacing it — the composition living in `diff::RowMap`, which is what the pane addresses rows through (see **Reading one side**).
   The span half is **one struct too** (`SpanSettings`, held as `GitkApp::span_settings`), compared and assigned whole for the same reason `DiffSettings` is: as four loose fields the reload's test was a four-term `||` chain that a fifth setting could silently miss, and missing it is not a lost frame — every cached diff keeps yesterday's colours, sticky via `diff_cache.contains`, for the session with nothing logged. Which of the four are in `DiffCacheKey` is unchanged and is the next paragraph's subject.
   **Three of those four span settings are in `DiffCacheKey`, and the fourth shapes no span** — so a stale entry simply misses, and the reload neither clears the cache nor carries an epoch. `theme` and `enabled` are their own key fields; `[diff.languages]` is a `u64` from `highlight::languages_fingerprint`, cached on `GitkApp` because `diff_cache_key` runs ~54 times per dispatch and the map is a `BTreeMap`. `diff_bg` is **not** in the key and must not be: it decides `DiffPalette::added_bg`/`deleted_bg`, which `diff_row_job` reads live from `self.diff_palette` at render time, and the one palette-derived span (`tokenize`'s grammar-hiccup fallback) takes `foreground`, which is theme-derived. Nothing bakes it into a `Span`. `set_span_settings` is the sole later writer of the map and the fingerprint both, so the cached value cannot describe a map that is gone — which would be silent and permanent, every key hitting entries tokenized with the wrong grammar while `diff_cache.contains` kept any dispatch from rebuilding them.
   **This replaced a cache clear plus a `span_gen` epoch, and the epoch is the part worth understanding.** The clear could not reach warms already queued or running: they were dispatched under the OLD span settings, and with `diff_bg`/`languages` absent from the key `key_is_current` waved their results through, so they landed back in the just-cleared cache carrying the old colours — after which every dispatch skipped them via `contains` and those rows stayed flat for the session. The fix at the time was to stamp a generation on every warm job (on the job, like `hl`, so a reload could not race a worker mid-row) and check it on return, which cost a `u64` threaded through seven layers: `GitkApp` → `PoolHandle::submit` → `CoordMsg::Submit` → `Coordinator` → `Job::Warm` → `warm_row` → `WarmResult` → `WarmFacts::spans_current` → `WarmDisposition::DropStaleSpans`. Putting `languages` in the key retires all of it: such a warm now fails `key_is_current` and is dropped as **stale-KEYED**, by the mechanism that already existed for every other setting. It is also strictly better than the clear, which threw away the whole warm band for a `diff_bg` tweak that invalidated nothing. `DiffCacheKey.drivers` had already solved the identical problem — a config-shaped input that changes a diff without moving the oid — the same way; this is that lesson applied to the last input that had not learned it. **A span setting added later joins the KEY**, unless it can be shown to reach no span.

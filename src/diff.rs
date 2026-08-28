@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 mod anchor;
 mod convert;
+mod side;
 mod wrap;
 
 pub use anchor::{AnchorSide, DiffAnchor, anchor_hint, capture_anchor, resolve_anchor};
@@ -19,6 +20,7 @@ use convert::{
     ConvertCtx, DEFAULT_PREFIXES, DeltaDrivers, DeltaModes, HeaderOf, Substitution, delta_modes,
     delta_path, emit_converted, header_prefixes, modes_from_header, move_to_end, side_path_bytes,
 };
+pub use side::{DiffSide, RowMap, SideIndex};
 pub use wrap::{RowSlice, WrapIndex};
 
 use crate::datefmt::format_commit_time;
