@@ -418,17 +418,6 @@ impl WrapIndex {
         }
     }
 
-    /// The logical lines a range of visual rows covers, as a half-open range.
-    /// Empty in, empty out.
-    pub fn lines_of_rows(&self, rows: Range<usize>) -> Range<usize> {
-        if rows.start >= rows.end {
-            return 0..0;
-        }
-        let lo = self.line_of_row(rows.start).0.min(self.n_lines);
-        let hi = (self.line_of_row(rows.end - 1).0 + 1).min(self.n_lines);
-        lo..hi.max(lo)
-    }
-
     /// Which slice of logical line `line_idx` the `sub`-th of its visual rows
     /// draws.
     ///
@@ -988,18 +977,5 @@ mod tests {
             grew.total_rows(),
             WrapIndex::build(&plain, 40, g, false).total_rows()
         );
-    }
-
-    #[test]
-    fn lines_of_rows_covers_the_window() {
-        let lines = ctx_lines(&[10, 300, 10, 10]);
-        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default(), false);
-        // Line 1 wraps to rows 1..=8 (300 bytes over 39 columns).
-        let n = 300_usize.div_ceil(39);
-        assert_eq!(idx.row_of_line(2), 1 + n);
-        assert_eq!(idx.lines_of_rows(0..2), 0..2);
-        assert_eq!(idx.lines_of_rows(2..4), 1..2);
-        assert_eq!(idx.lines_of_rows(0..idx.total_rows()), 0..4);
-        assert_eq!(idx.lines_of_rows(3..3), 0..0);
     }
 }
