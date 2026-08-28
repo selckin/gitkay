@@ -42,7 +42,7 @@
 
 use std::ops::Range;
 
-use super::{DiffLine, LineKind, RowSlice, WrapIndex};
+use super::{DiffLine, LineKind, RowSlice, WrapIndex, WrapKey};
 
 /// Hidden runs one index will hold before it gives up.
 ///
@@ -73,7 +73,7 @@ pub enum DiffSide {
 impl DiffSide {
     /// The `LineKind` this mode hides, or `None` for `Both`. The one place that
     /// mapping lives — `Old` reads the pre-image, so it is the ADDED lines that go.
-    pub const fn hides(self) -> Option<LineKind> {
+    const fn hides(self) -> Option<LineKind> {
         match self {
             Self::Both => None,
             Self::Old => Some(LineKind::Add),
@@ -123,10 +123,25 @@ pub struct SideIndex {
     active: bool,
     side: DiffSide,
     n_lines: usize,
-    /// Rows the wrap index this was built against reported — `n_lines` where there was
-    /// none. Part of `covers`, because a re-wrap moves every `vrow` here.
+    /// What the wrap index this was built against was measured for, or `None` where
+    /// there was none. Every `vrow` below is positioned against that wrapping, so
+    /// this is what `covers` compares.
+    ///
+    /// **The identity, not the row count** — and the reason is not that a count would
+    /// be unsound. A count would in fact be sufficient: a line's row count is
+    /// non-increasing in the pane width, so two wrappings sharing a total share every
+    /// per-line count and hence this whole mapping. But that is an argument about
+    /// `wrap::body_cols` being monotone, held nowhere, checked by nothing, and
+    /// quietly invalidated by any later width rule that is not. What the key buys
+    /// concretely is that `covers` becomes the WHOLE invalidation test: comparing a
+    /// derived value, the caller ALSO had to observe the re-wrap and pass it down,
+    /// which is a second channel and three ordering obligations no signature could
+    /// enforce.
+    wrap_key: Option<WrapKey>,
+    /// Rows the wrapping under this one has, which is what `total_rows` counts down
+    /// from — an arithmetic input, where `wrap_key` above is the identity. `n_lines`
+    /// when there is no wrap index, a line being its own row.
     wrap_rows: usize,
-    total_rows: usize,
     runs: Vec<Run>,
 }
 
@@ -142,16 +157,6 @@ impl SideIndex {
         Self::build_capped(lines, side, wrap, MAX_HIDDEN_RUNS)
     }
 
-    /// The row count a wrap index reports, or `n_lines` where there is none.
-    ///
-    /// Stated once because two places need it and they must agree: `build` records it
-    /// and `resync_side_index` compares against it through `covers`. Derived
-    /// differently in the two, the comparison could never match and the index would be
-    /// rebuilt — an O(lines) pass and a fresh run vector — on every frame, silently.
-    pub fn wrap_rows_of(wrap: Option<&WrapIndex>, n_lines: usize) -> usize {
-        wrap.map_or(n_lines, WrapIndex::total_rows)
-    }
-
     /// `build` with the run ceiling as a parameter, so a test can set it to zero and
     /// prove that a refused index maps exactly as `Both` does. A `const` cannot be
     /// varied to show that.
@@ -161,10 +166,10 @@ impl SideIndex {
         wrap: Option<&WrapIndex>,
         max_runs: usize,
     ) -> Self {
-        let wrap_rows = Self::wrap_rows_of(wrap, lines.len());
+        let wrap_rows = wrap.map_or(lines.len(), WrapIndex::total_rows);
         let row_of = |line: usize| wrap.map_or(line, |w| w.row_of_line(line));
         let Some(hidden) = side.hides() else {
-            return Self::inactive(lines.len(), side, wrap_rows);
+            return Self::inactive(lines.len(), side, wrap);
         };
         let mut runs: Vec<Run> = Vec::new();
         let mut removed = 0usize;
@@ -181,14 +186,15 @@ impl SideIndex {
             // The run's own rows, taken from its two boundaries rather than summed over
             // its lines: `row_of_line` past the end maps past the end, which is exactly
             // what a run reaching the last line wants.
-            let rows = row_of(i) - row_of(start);
+            let first_row = row_of(start);
+            let rows = row_of(i) - first_row;
             if runs.len() >= max_runs {
                 log::warn!(
                     "side: the hidden lines of this {}-line diff fall in more than \
                      {max_runs} runs — over the index cap, so it renders with both sides",
                     lines.len(),
                 );
-                return Self::inactive(lines.len(), side, wrap_rows);
+                return Self::inactive(lines.len(), side, wrap);
             }
             removed += rows;
             runs.push(Run {
@@ -196,7 +202,7 @@ impl SideIndex {
                 lines: i - start,
                 // The run collapses onto the row its first visible successor now takes:
                 // its own start, less everything removed BEFORE it.
-                vrow: row_of(start) - (removed - rows),
+                vrow: first_row - (removed - rows),
                 removed_after: removed,
             });
         }
@@ -204,21 +210,21 @@ impl SideIndex {
             active: true,
             side,
             n_lines: lines.len(),
+            wrap_key: wrap.map(WrapIndex::key),
             wrap_rows,
-            total_rows: wrap_rows - removed,
             runs,
         }
     }
 
     /// An index that maps every row to itself — what `Both` is, and what a refused
     /// build falls back to.
-    const fn inactive(n_lines: usize, side: DiffSide, wrap_rows: usize) -> Self {
+    fn inactive(n_lines: usize, side: DiffSide, wrap: Option<&WrapIndex>) -> Self {
         Self {
             active: false,
             side,
             n_lines,
-            wrap_rows,
-            total_rows: wrap_rows,
+            wrap_key: wrap.map(WrapIndex::key),
+            wrap_rows: wrap.map_or(n_lines, WrapIndex::total_rows),
             runs: Vec::new(),
         }
     }
@@ -233,24 +239,28 @@ impl SideIndex {
     }
 
     /// Whether this index still describes the diff, mode and wrapping it is asked
-    /// about. The three inputs a rebuild depends on, compared in one place so a caller
-    /// cannot check two of them: the line count (a new diff), the mode, and the wrap
-    /// index's row count (a resize, a font change, the line-number toggle, or soft
-    /// wrap itself going on or off — each of which moves every `vrow` here).
+    /// about — the whole of what a rebuild depends on, compared in one place so a
+    /// caller cannot check some of it: the line count (a new diff), the mode, and the
+    /// wrapping's own identity (a resize, a font change, the line-number toggle, or
+    /// soft wrap going on or off — each of which moves every `vrow` here).
+    ///
+    /// **`WrapKey`, not the row count** — see the field for why, and note the reason
+    /// is not that a count would be unsound. It is that this is then the WHOLE test,
+    /// where a count left the caller having to observe the re-wrap and pass it down.
     ///
     /// A different diff with the same line count is NOT caught here, exactly as in
     /// `WrapIndex::covers`: the caller drops the index where content is installed.
-    ///
-    /// Nor is a re-wrap that leaves the total row count unchanged. That is safe only
-    /// because the caller does not rely on this alone — `resync_side_index` rebuilds
-    /// on the wrap resync's own report as well.
-    pub fn covers(&self, n_lines: usize, side: DiffSide, wrap_rows: usize) -> bool {
-        self.n_lines == n_lines && self.side == side && self.wrap_rows == wrap_rows
+    pub fn covers(&self, n_lines: usize, side: DiffSide, wrap: Option<&WrapIndex>) -> bool {
+        self.n_lines == n_lines && self.side == side && self.wrap_key == wrap.map(WrapIndex::key)
     }
 
     /// Total view rows — what the virtualized pane scrolls over.
-    pub const fn total_rows(&self) -> usize {
-        self.total_rows
+    ///
+    /// Derived rather than stored: the last run's running total IS everything this
+    /// index removes, so a field would be a sixth thing the two constructors have to
+    /// keep in step with `runs` and nothing would check that they had.
+    pub fn total_rows(&self) -> usize {
+        self.wrap_rows - self.runs.last().map_or(0, |r| r.removed_after)
     }
 
     /// The wrap row a view row came from.
@@ -367,10 +377,9 @@ impl<'a> RowMap<'a> {
 mod tests {
     use super::*;
     use crate::diff::LineNoGutter;
-
-    fn line(text: &str, kind: LineKind) -> DiffLine {
-        DiffLine::new(text, kind)
-    }
+    // The same two list-builders `wrap`'s suite measures with — shared rather than
+    // re-rolled, these being fixtures for the very mapping this module composes with.
+    use crate::diff::wrap::tests::{ctx_lines, line};
 
     /// A small diff with two change blocks, one of them at the very end:
     ///
@@ -503,10 +512,7 @@ mod tests {
     fn lines_of_rows_covers_the_window() {
         // Wrapping alone, no filter: what `WrapIndex::lines_of_rows` used to assert
         // before `RowMap` became the only place the mapping is composed.
-        let lines: Vec<DiffLine> = [10, 300, 10, 10]
-            .iter()
-            .map(|&w| line(&"x".repeat(w), LineKind::Context))
-            .collect();
+        let lines = ctx_lines(&[10, 300, 10, 10]);
         let w = WrapIndex::build(&lines, 40, LineNoGutter::default(), false);
         let m = map(&lines, Some(&w), None);
         // Line 1 wraps to rows 1..=8 (300 bytes over 39 columns).
@@ -614,12 +620,13 @@ mod tests {
     fn covers_asks_about_the_diff_the_mode_and_the_wrapping() {
         let lines = sample();
         let idx = SideIndex::build(&lines, DiffSide::Old, None);
-        assert!(idx.covers(lines.len(), DiffSide::Old, lines.len()));
-        assert!(!idx.covers(lines.len() - 1, DiffSide::Old, lines.len()));
-        assert!(!idx.covers(lines.len(), DiffSide::New, lines.len()));
+        assert!(idx.covers(lines.len(), DiffSide::Old, None));
+        assert!(!idx.covers(lines.len() - 1, DiffSide::Old, None));
+        assert!(!idx.covers(lines.len(), DiffSide::New, None));
+        let w = WrapIndex::build(&lines, 100, LineNoGutter::default(), false);
         assert!(
-            !idx.covers(lines.len(), DiffSide::Old, lines.len() + 3),
-            "a re-wrap moves every view row here"
+            !idx.covers(lines.len(), DiffSide::Old, Some(&w)),
+            "a different wrapping re-positions every view row here"
         );
     }
 }

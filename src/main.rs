@@ -222,14 +222,27 @@ struct DiffViewport {
     /// Visual rows the viewport holds — the true screenful, even where the padding
     /// rows clamp the real range short.
     rows: AtomicUsize,
-    /// Logical lines those rows cover. Never more than `rows`, and far fewer when
-    /// one wrapped line fills the screen.
+    /// Logical lines those rows DRAW. Never more than `rows`, and far fewer when one
+    /// wrapped line fills the screen.
     ///
     /// Unlike `rows` this is the REAL count, not the screenful: at the end of a
     /// diff, where the padding rows clamp the visible range short, it reports the
     /// lines that are actually there. Every consumer indexes `diff_lines` with it,
     /// so the honest count is the useful one — a screenful's worth of lines that do
     /// not exist would only widen a read-ahead window past the end.
+    ///
+    /// **Which is why it is the drawn count and not the SPAN.** `VisibleDiff::lines`
+    /// is contiguous, so under a side filter it covers the hidden lines between the
+    /// first visible row and the last — and a hidden run is unbounded: in `Old`, a
+    /// commit that adds a large file draws that file as two header rows while the
+    /// span reaches over its whole body. Every reader here is asking "how much is on
+    /// screen" as a read-ahead magnitude, and each multiplies it: the word-diff
+    /// window is `3 ×` this, so an unclamped value put a per-frame walk over the
+    /// whole diff on the frame loop. Clamping to `rows` restores the bound the
+    /// paragraph above states, and is a no-op without a filter, where the span IS the
+    /// drawn count. The SPAN is what the render reports and what
+    /// `lines_of_rows` must return — the sidebar's file tracking reads `top_line`
+    /// off its start — so the two answers are separated here rather than there.
     lines: AtomicUsize,
 }
 
@@ -265,7 +278,10 @@ impl DiffViewport {
         self.top_line.store(v.lines.start, Ordering::Relaxed);
         self.top_row.store(v.top_row, Ordering::Relaxed);
         self.rows.store(v.rows, Ordering::Relaxed);
-        self.lines.store(v.lines.len(), Ordering::Relaxed);
+        // Clamped, and the field's own doc says why: the reported range is a
+        // contiguous SPAN, which a side filter makes unbounded.
+        self.lines
+            .store(v.lines.len().min(v.rows.max(1)), Ordering::Relaxed);
     }
 
     /// Put the pane back at the top — what a freshly installed diff needs, since
@@ -1384,10 +1400,12 @@ fn resync_wrap_index(
 /// different line), and `take()` makes the drop report exactly ONCE, or the pin would
 /// fire every frame and the pane could not be scrolled at all.
 ///
-/// `rewrapped` is the wrap resync's own report, and it is an input rather than
-/// something `SideIndex::covers` could be trusted to catch on its own: a re-wrap
-/// moves every view row recorded here, and two different wrappings can agree on the
-/// total row count they are compared by.
+/// **The wrap index is passed, not its report**, which keeps invalidation to one
+/// channel: `SideIndex::covers` compares the index's own `WrapKey`, so a re-wrap
+/// fails it here without anyone having to say so. Taking the wrap resync's `bool`
+/// instead left three obligations on the caller that no signature could enforce —
+/// resync the wrap index first, thread its answer in, and combine the two reports
+/// with `|` rather than `||` — of which only the last is visible at a call site.
 ///
 /// Called from the render and nowhere else, so a reader who leaves the mode on `Both`
 /// never pays the pass — "off" and "not measured yet" are one `None`, exactly as for
@@ -1397,16 +1415,13 @@ fn resync_side_index(
     side: diff::DiffSide,
     lines: &[DiffLine],
     wrap: Option<&diff::WrapIndex>,
-    rewrapped: bool,
 ) -> bool {
     if side == diff::DiffSide::Both {
         return index.take().is_some();
     }
-    let wrap_rows = diff::SideIndex::wrap_rows_of(wrap, lines.len());
-    if !rewrapped
-        && index
-            .as_ref()
-            .is_some_and(|s| s.covers(lines.len(), side, wrap_rows))
+    if index
+        .as_ref()
+        .is_some_and(|s| s.covers(lines.len(), side, wrap))
     {
         return false;
     }
@@ -1958,11 +1973,6 @@ fn show_virtualized_diff(
         last_top_anchor,
         menu_salt,
     } = view;
-    // The two conversions, stated once. With neither index they are the identity,
-    // which is what makes `Both` at `wrap = false` provably the pre-existing
-    // behaviour.
-    let row_of = |line: usize| map.row_of_line(line);
-    let line_of = |row: usize| map.line_of_row(row);
     let n_rows = map.total_rows();
     let row_h = ui.fonts_mut(|f| f.row_height(font_id));
     let any_menu_open = egui::Popup::is_any_open(ui.ctx());
@@ -1982,8 +1992,12 @@ fn show_virtualized_diff(
     // already fills the viewport (diff_pad_rows would be 0). In VISUAL rows on every
     // term: the anchor is the deepest file's start LINE, and what has to reach the
     // top of the viewport is the row it starts on.
-    let pad =
-        diff_pad_rows(n_rows, last_top_anchor.map(&row_of), viewport_rows).max(BOTTOM_PAD_ROWS);
+    let pad = diff_pad_rows(
+        n_rows,
+        last_top_anchor.map(|l| map.row_of_line(l)),
+        viewport_rows,
+    )
+    .max(BOTTOM_PAD_ROWS);
     let total_rows = n_rows + pad;
     // Wrapping cuts every row to the window, so there is nothing to scroll to
     // horizontally and offering the dimension would only let the reader lose the
@@ -2043,7 +2057,7 @@ fn show_virtualized_diff(
                 ui.allocate_space(egui::vec2(content_w, row_h));
                 continue;
             }
-            let (line, sub) = line_of(i);
+            let (line, sub) = map.line_of_row(i);
             let (job, row_bg, fallback) = build_row(line, sub);
             let galley = ui.fonts_mut(|f| f.layout_job(job));
             let width = ui.available_width().max(galley.size().x);
@@ -4677,6 +4691,31 @@ impl GitkApp {
         )
     }
 
+    /// The diff pane's top LINE as of the end of this frame: a pending
+    /// `diff_scroll_to` where one is due, else the live viewport.
+    ///
+    /// The viewport is a frame behind by construction — the render writes it — and
+    /// `set_diff_content` resets it to the top, so on the frame a restore or an anchor
+    /// is queued the live value names line 0 rather than where the pane is about to
+    /// be. Both readers want the latter: the highlight worker seeds its file window
+    /// with it (a zeroed window colours the wrong end of the diff for a whole chunk),
+    /// and the sidebar's follow records it (reading the stale value there undid the
+    /// restore a frame later).
+    ///
+    /// `honour_pending` is the caller's answer to "is that pending target mine?".
+    /// While a diff load is in flight it names the INCOMING diff, so a caller still
+    /// drawing the outgoing one — the sidebar — passes `false` and takes the live
+    /// value, which is the only one that matches what is on screen.
+    ///
+    /// One method rather than the expression twice: the resolution has to go through
+    /// `row_map`, not the wrap index alone, now that a side filter exists — and that
+    /// is exactly the kind of thing one of two copies forgets.
+    fn pane_top_line(&self, honour_pending: bool) -> usize {
+        self.diff_scroll_to
+            .filter(|_| honour_pending)
+            .map_or_else(|| self.diff_viewport.top_line(), |t| t.line(self.row_map()))
+    }
+
     /// Insert a finished diff into the cache under `key` — the single place the cache's
     /// weight unit (line count) is decided — and take the commit-list numbers off it
     /// while it is in hand.
@@ -5427,9 +5466,7 @@ impl GitkApp {
         // about to land) over the live top row.
         // Both in LINES — `VisibleRange::window` resolves them through
         // `file_line_starts`, which is indexed by line.
-        let top = self
-            .diff_scroll_to
-            .map_or_else(|| self.diff_viewport.top_line(), |t| t.line(self.row_map()));
+        let top = self.pane_top_line(true);
         let rows = top..top + self.diff_viewport.lines().max(1);
         let priority = Arc::new(VisibleRange {
             lo: AtomicUsize::new(0),
@@ -7360,31 +7397,11 @@ impl GitkApp {
                     // with the same accent the commit list uses for the
                     // selected row, so the list tracks the diff view.
                     //
-                    // A pending `diff_scroll_to` wins over the live top line, which
-                    // is a frame behind — the same preference `dispatch_prefetch`
-                    // makes, and here it is what keeps the follow below from undoing
-                    // a restore. `set_diff_content` resets the viewport to the top, so
-                    // on the frame a per-commit restore (or a rebuild's anchor) lands,
-                    // the stale value names line 0 — usually no file at all — and the
-                    // tracked file would advance to that. The restore frame is
-                    // suppressed, so nothing scrolls; but the NEXT frame sees the real
-                    // position as a change and scrolls to it, overriding the sidebar
-                    // offset the restore had just put back. Reading the position the
-                    // pane is about to take makes the suppressed frame record the right
-                    // file, and the frame after it quiet.
-                    //
-                    // Not while a load is in flight, though: there the pending target
-                    // names the INCOMING diff while these rows are still the outgoing
-                    // one's, so the live viewport is the only value that matches what
-                    // is drawn.
-                    let top = if self.diff_load.is_none() {
-                        self.diff_scroll_to.map_or_else(
-                            || self.diff_viewport.top_line(),
-                            |t| t.line(self.row_map()),
-                        )
-                    } else {
-                        self.diff_viewport.top_line()
-                    };
+                    // Where the pane is ABOUT to be, not where it was — see
+                    // `pane_top_line` for why the live viewport is the wrong value on
+                    // the frame a restore lands, and why a load in flight is the one
+                    // case that wants it anyway.
+                    let top = self.pane_top_line(self.diff_load.is_none());
                     let current_file = file_index_at_line_opt(&self.file_line_starts, top);
                     // Shared by every row this frame — the metric
                     // lookup takes the font lock, so don't repeat
@@ -8734,27 +8751,42 @@ impl eframe::App for GitkApp {
                         cols,
                         linenos,
                     );
-                    // The side filter sits on top of that mapping, so it is resynced
-                    // after it and told what it did. `moved` is the two reports
-                    // together — a bitwise `|`, since both resyncs must RUN: the side
-                    // index has to see `rewrapped` whether or not the wrap moved, and
-                    // a `||` would skip it exactly when it matters most.
+                    // The side filter sits on top of that mapping, and notices a
+                    // re-wrap itself: it is handed the wrap index, whose `WrapKey` its
+                    // own `covers` compares. `moved` is the two reports together — a
+                    // bitwise `|`, since both resyncs must RUN, the second having to
+                    // rebuild on a re-wrap the first has already reported.
                     let moved = rewrapped
                         | resync_side_index(
                             &mut self.diff_sides,
                             self.side,
                             &self.diff_lines,
                             self.diff_wrap.as_ref(),
-                            rewrapped,
                         );
-                    // Read before the `&mut` borrow the scroll target takes below.
+                    // Read before the `&mut` borrow the scroll target takes below —
+                    // and the target is resolved before the literal for the same
+                    // reason, so the `&mut self.diff_scroll_to` it needs does not
+                    // conflict with the `&self` of `row_map()` beside it. Spelling
+                    // the map out here instead would be a second copy of `row_map`'s
+                    // body, which is the one thing that function exists to prevent.
                     let top_line = self.diff_viewport.top_line();
+                    // A pending target wins; failing that, a mapping that moved holds
+                    // the reader's place. Re-wrapping moves every visual row below the
+                    // first line that broke differently, and a side change moves every
+                    // row below the first hidden run, so without this dragging the
+                    // window edge — or picking a side — scrolls the pane out from under
+                    // whoever did it. `top_line` is a frame behind, which is exactly
+                    // right: it is the pre-change position, and a line the new mode
+                    // HIDES resolves to where it used to sit. Why a load suppresses
+                    // only half of that is stated there.
+                    let scroll_target = diff_scroll_target(
+                        &mut self.diff_scroll_to,
+                        diff_load_elapsed.is_some(),
+                        moved,
+                        top_line,
+                    );
                     let diff_view = DiffView {
-                        map: diff::RowMap::new(
-                            self.diff_lines.len(),
-                            self.diff_wrap.as_ref(),
-                            self.diff_sides.as_ref(),
-                        ),
+                        map: self.row_map(),
                         // Capped where the rendering is: past `MAX_ROW_RENDER_CHARS`
                         // no row draws anything, so a scroll range sized to an 8M-char
                         // line would be tens of millions of pixels of blank to get
@@ -8762,22 +8794,7 @@ impl eframe::App for GitkApp {
                         // which is what covers the clip marker's own few characters.
                         content_chars: self.diff_max_chars.min(MAX_ROW_RENDER_CHARS)
                             + linenos.chars(),
-                        // A pending target wins; failing that, a mapping that moved
-                        // holds the reader's place. Re-wrapping moves every visual row
-                        // below the first line that broke differently, and a side
-                        // change moves every row below the first hidden run, so
-                        // without this dragging the window edge — or picking a side —
-                        // scrolls the pane out from under whoever did it. `top_line`
-                        // is a frame behind, which is exactly right: it is the
-                        // pre-change position, and a line the new mode HIDES resolves
-                        // to where it used to sit. Why a load suppresses only half of
-                        // that is stated there.
-                        scroll_target: diff_scroll_target(
-                            &mut self.diff_scroll_to,
-                            diff_load_elapsed.is_some(),
-                            moved,
-                            top_line,
-                        ),
+                        scroll_target,
                         // Deepest file-start line (None ⇒ no files). `file_line_starts`
                         // is sorted by start, so the last entry is the largest — an
                         // O(1) read, derived here rather than mirrored in a field
@@ -10072,6 +10089,64 @@ mod tests {
         );
     }
 
+    /// What one headless pass of the diff pane did: which `(line, sub)` pairs the row
+    /// builder was asked for, which LINES the menu was asked about, and the viewport
+    /// the render reported.
+    struct LaidOutPane {
+        asked: Vec<(usize, usize)>,
+        menus: Vec<usize>,
+        top_row: usize,
+        lines: std::ops::Range<usize>,
+    }
+
+    /// Lay the diff pane out once, headless, over `map`.
+    ///
+    /// Shared by the two tests of the renderer seam rather than copied into each: the
+    /// `DiffView` literal is the part that drifts, and a field added to it should
+    /// break one call site rather than silently leave a second test measuring a
+    /// different pane. The third headless site
+    /// (`a_diff_rows_menu_id_follows_its_line_across_a_re_wrap`) deliberately stays
+    /// its own — it drives `ctx.run_ui` twice and reads an interaction snapshot,
+    /// which is a different harness rather than this one plus options.
+    fn lay_out_pane(map: diff::RowMap<'_>) -> LaidOutPane {
+        let mut asked: Vec<(usize, usize)> = Vec::new();
+        // `RefCell` because `row_menu_target` is an `impl Fn` — it answers one
+        // question per row and is deliberately not allowed to mutate anything.
+        let menus: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::default();
+        let mut seen: Option<(usize, std::ops::Range<usize>)> = None;
+        run_headless_input(headless_screen(600.0, 400.0), |ui| {
+            let fid = egui::FontId::monospace(13.0);
+            show_virtualized_diff(
+                ui,
+                &fid,
+                DiffView {
+                    map,
+                    content_chars: 0,
+                    scroll_target: None,
+                    last_top_anchor: None,
+                    menu_salt: 0,
+                },
+                |v| seen = Some((v.top_row, v.lines)),
+                |line, sub| {
+                    asked.push((line, sub));
+                    (egui::text::LayoutJob::default(), None, egui::Color32::WHITE)
+                },
+                |line| {
+                    menus.borrow_mut().push(line);
+                    None
+                },
+                |_, _, _| {},
+            );
+        });
+        let (top_row, lines) = seen.expect("the render reports its viewport");
+        LaidOutPane {
+            asked,
+            menus: menus.into_inner(),
+            top_row,
+            lines,
+        }
+    }
+
     /// The pane's virtualization under soft wrapping, end to end: `show_rows`
     /// scrolls over VISUAL rows, and every callback above the renderer is handed the
     /// LINE that row belongs to.
@@ -10090,30 +10165,8 @@ mod tests {
         let idx = diff::WrapIndex::build(&lines, cols, LineNoGutter::default(), false);
         assert!(idx.total_rows() > 3, "the long line has to actually wrap");
         let lay_out = |wrap: Option<&diff::WrapIndex>| {
-            let mut asked: Vec<(usize, usize)> = Vec::new();
-            let mut seen: Option<(usize, usize, std::ops::Range<usize>)> = None;
-            run_headless_input(headless_screen(600.0, 400.0), |ui| {
-                let fid = egui::FontId::monospace(13.0);
-                show_virtualized_diff(
-                    ui,
-                    &fid,
-                    DiffView {
-                        map: diff::RowMap::new(lines.len(), wrap, None),
-                        content_chars: 0,
-                        scroll_target: None,
-                        last_top_anchor: None,
-                        menu_salt: 0,
-                    },
-                    |v| seen = Some((v.lines.start, v.top_row, v.lines)),
-                    |line, sub| {
-                        asked.push((line, sub));
-                        (egui::text::LayoutJob::default(), None, egui::Color32::WHITE)
-                    },
-                    |_| None,
-                    |_, _, _| {},
-                );
-            });
-            (asked, seen.expect("the render reports its viewport"))
+            let laid = lay_out_pane(diff::RowMap::new(lines.len(), wrap, None));
+            (laid.asked, (laid.lines.start, laid.top_row, laid.lines))
         };
 
         let (asked, (top_line, top_row, visible)) = lay_out(Some(&idx));
@@ -10184,10 +10237,12 @@ mod tests {
     /// specifically that **dropping one reports a move**.
     ///
     /// Same argument, same failure: the `ScrollArea`'s offset is in view rows, so the
-    /// frame after `Both` is reselected that offset names a different line. The extra
-    /// input here is `rewrapped`, which must rebuild even when `covers` is satisfied:
-    /// two wrappings can agree on their total row count while putting every run
-    /// somewhere else.
+    /// frame after `Both` is reselected that offset names a different line.
+    ///
+    /// A re-wrap is in here too, and it is not a separate input: the index is handed
+    /// the wrap index itself, so `SideIndex::covers` sees the new `WrapKey` and
+    /// rebuilds on its own. Passing the wrap resync's `bool` down instead put the
+    /// invalidation on two levels and three unwritten obligations on this caller.
     #[test]
     fn dropping_the_side_index_reports_a_move_exactly_as_building_one_does() {
         use diff::DiffSide;
@@ -10197,77 +10252,36 @@ mod tests {
             DiffLine::new("+A", LineKind::Add),
             DiffLine::new(" ctx", LineKind::Context),
         ];
+        let g = LineNoGutter::default();
         let mut index = None;
+        let resync = |index: &mut Option<diff::SideIndex>, side, wrap| {
+            resync_side_index(index, side, &lines, wrap)
+        };
 
         // Both, and nothing to drop: no move, on this frame or any after it.
-        assert!(!resync_side_index(
-            &mut index,
-            DiffSide::Both,
-            &lines,
-            None,
-            false
-        ));
-        assert!(!resync_side_index(
-            &mut index,
-            DiffSide::Both,
-            &lines,
-            None,
-            false
-        ));
+        assert!(!resync(&mut index, DiffSide::Both, None));
+        assert!(!resync(&mut index, DiffSide::Both, None));
         assert!(index.is_none());
 
         // A side picked: built, and a move.
-        assert!(resync_side_index(
-            &mut index,
-            DiffSide::Old,
-            &lines,
-            None,
-            false
-        ));
+        assert!(resync(&mut index, DiffSide::Old, None));
         assert!(index.as_ref().is_some_and(|s| s.total_rows() == 3));
         // Settled: same inputs, no move — or the pane would be pinned every frame.
-        assert!(!resync_side_index(
-            &mut index,
-            DiffSide::Old,
-            &lines,
-            None,
-            false
-        ));
+        assert!(!resync(&mut index, DiffSide::Old, None));
         // The other side: a move.
-        assert!(resync_side_index(
-            &mut index,
-            DiffSide::New,
-            &lines,
-            None,
-            false
-        ));
-        // A re-wrap under an unchanged mode rebuilds too, on the caller's report
-        // alone — `covers` sees the same line count and the same total here.
-        assert!(resync_side_index(
-            &mut index,
-            DiffSide::New,
-            &lines,
-            None,
-            true
-        ));
+        assert!(resync(&mut index, DiffSide::New, None));
+
+        // Soft wrap coming on re-positions every view row, which the index notices
+        // itself — no report threaded in from the wrap resync.
+        let w = diff::WrapIndex::build(&lines, 100, g, false);
+        assert!(resync(&mut index, DiffSide::New, Some(&w)));
+        assert!(!resync(&mut index, DiffSide::New, Some(&w)));
 
         // Back to Both: the index goes, and that IS a move.
-        assert!(resync_side_index(
-            &mut index,
-            DiffSide::Both,
-            &lines,
-            None,
-            false
-        ));
+        assert!(resync(&mut index, DiffSide::Both, Some(&w)));
         assert!(index.is_none());
         // And exactly once.
-        assert!(!resync_side_index(
-            &mut index,
-            DiffSide::Both,
-            &lines,
-            None,
-            false
-        ));
+        assert!(!resync(&mut index, DiffSide::Both, Some(&w)));
     }
 
     /// The side filter through the renderer itself: `show_rows` scrolls over the rows
@@ -10300,38 +10314,10 @@ mod tests {
         for side in DiffSide::ALL {
             let sides =
                 (side != DiffSide::Both).then(|| diff::SideIndex::build(&lines, side, None));
-            let mut asked: Vec<(usize, usize)> = Vec::new();
-            // `RefCell` because `row_menu_target` is an `impl Fn` — it answers one
-            // question per row and is deliberately not allowed to mutate anything.
-            let menus: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::default();
-            let mut seen = None;
-            run_headless_input(headless_screen(600.0, 400.0), |ui| {
-                let fid = egui::FontId::monospace(13.0);
-                show_virtualized_diff(
-                    ui,
-                    &fid,
-                    DiffView {
-                        map: diff::RowMap::new(lines.len(), None, sides.as_ref()),
-                        content_chars: 0,
-                        scroll_target: None,
-                        last_top_anchor: None,
-                        menu_salt: 0,
-                    },
-                    |v| seen = Some(v.lines),
-                    |line, sub| {
-                        asked.push((line, sub));
-                        (egui::text::LayoutJob::default(), None, egui::Color32::WHITE)
-                    },
-                    |line| {
-                        menus.borrow_mut().push(line);
-                        None
-                    },
-                    |_, _, _| {},
-                );
-            });
+            let laid = lay_out_pane(diff::RowMap::new(lines.len(), None, sides.as_ref()));
             let want = expect(side);
             assert_eq!(
-                asked,
+                laid.asked,
                 want.iter().map(|&l| (l, 0)).collect::<Vec<_>>(),
                 "{side:?} draws the wrong lines"
             );
@@ -10339,13 +10325,12 @@ mod tests {
             // never the view row — so a right-click in Old or New resolves to the
             // hunk it does in Both.
             assert_eq!(
-                menus.into_inner(),
-                want,
+                laid.menus, want,
                 "{side:?} asks the menu about the wrong line"
             );
             // The reported window is contiguous in line space, so under a filter it
             // covers the hidden lines it spans. Every consumer widens it anyway.
-            assert_eq!(seen, Some(0..lines.len()), "{side:?}");
+            assert_eq!(laid.lines, 0..lines.len(), "{side:?}");
         }
     }
 
