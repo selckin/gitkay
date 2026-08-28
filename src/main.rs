@@ -702,6 +702,12 @@ impl SidebarCache {
 struct SidebarFrame<'c> {
     row_h: f32,
     current_file: Option<usize>,
+    /// Where `current_file`'s row was drawn, filled by `draw_file_row` — the one
+    /// place that knows it, the list not being virtualized and so having no
+    /// arithmetic a caller could use instead (directory headers and file rows are
+    /// different heights, and `indented` varies). Read by the caller to keep that row
+    /// scrolled into view as the diff moves under it.
+    current_rect: Option<egui::Rect>,
     cache: &'c mut SidebarCache,
     /// The write request chosen from a row's context menu, if any — filled by
     /// `draw_file_row` (an `&self` method) and drained by the caller once the
@@ -1288,6 +1294,19 @@ struct VisibleDiff {
 /// the last line/file never sits flush against the bottom edge.
 const BOTTOM_PAD_ROWS: usize = 2;
 
+/// Rows of context the file sidebar keeps around the file it is following, as it
+/// scrolls to bring that file into view.
+///
+/// A MINIMAL scroll (the margin at 0) leaves the tracked row flush against whichever
+/// edge it entered from, which is the worst of both: no sight of what is coming, and
+/// the list moves again at every single file boundary, since the next one is always
+/// one row off screen. Scrolling far enough to clear this margin instead means the
+/// crossings after it cost nothing, so the sidebar settles rather than creeping — the
+/// number therefore buys calm, and pays for it in how far one move travels. Bounded
+/// by the viewport at the call site, so a short sidebar cannot ask to scroll further
+/// than it can show.
+const FILE_LIST_FOLLOW_MARGIN_ROWS: f32 = 6.0;
+
 /// How long a wrap-index build may take before it is worth a log line. It runs on
 /// the frame loop, so this is a frame budget rather than a work budget.
 const WRAP_INDEX_SLOW: std::time::Duration = std::time::Duration::from_millis(5);
@@ -1393,6 +1412,43 @@ fn resync_side_index(
     }
     *index = Some(diff::SideIndex::build(lines, side, wrap));
     true
+}
+
+/// Whether the file sidebar should scroll to keep the tracked file in view this
+/// frame, advancing `tracked` to the file the diff is now in.
+///
+/// The sidebar highlights the file under the diff's top line, and highlighting it is
+/// no use once the list is longer than a screenful — the accent lands on a row nobody
+/// can see. What decides the scroll is the tracked file CHANGING, which is what makes
+/// this follow the diff without fighting the reader: scrolling the sidebar on its own
+/// moves no diff and so changes nothing here, and only the diff crossing a file
+/// boundary does.
+///
+/// `suppressed` covers the frames where the position is not this function's to
+/// choose — a diff still loading (the rows on screen belong to the OUTGOING diff) and
+/// a remembered per-commit offset being restored (which is the position that should
+/// win). **`tracked` advances on those frames all the same**, and that is the half
+/// worth stating: left stale, the first ordinary frame after a commit switch would
+/// scroll to a file the reader never moved to, undoing the restore one frame later.
+///
+/// Advancing is only half of that, though, and the other half is the caller's: what
+/// it advances to has to be where the pane will BE, not where the stale viewport says
+/// it was. `set_diff_content` resets the viewport to the top, so on the restore frame
+/// the live value names line 0 — see the `top` the sidebar computes.
+///
+/// A free function over the `Option` rather than a method, for the reason
+/// `resync_wrap_index` and `diff_scroll_target` are: the transitions are then
+/// testable without a `GitkApp`, and this one is entirely transitions.
+fn follow_tracked_file(
+    tracked: &mut Option<usize>,
+    current: Option<usize>,
+    suppressed: bool,
+) -> bool {
+    if *tracked == current {
+        return false;
+    }
+    *tracked = current;
+    !suppressed
 }
 
 /// Where the diff pane scrolls this frame: a pending target if one is due, else the
@@ -3226,6 +3282,11 @@ struct GitkApp {
     /// The sidebar's live scroll offset, recorded each frame it renders — what
     /// `stash_current_diff` saves into `scroll_memory` for the outgoing commit.
     file_list_scroll: f32,
+    /// The file the sidebar has already followed the diff to — so the follow fires on
+    /// the frame the diff crosses a file boundary and on no other. Compared against
+    /// the live `current_file` in `show_file_sidebar`; see the follow there for why it
+    /// is written even on the frames that do not scroll.
+    file_list_tracked: Option<usize>,
     /// Where the diff pane is, in both coordinate systems — written by the render
     /// each frame, read by the frame loop on the next one. See `DiffViewport`.
     diff_viewport: Arc<DiffViewport>,
@@ -4101,6 +4162,7 @@ impl GitkApp {
             file_list_scroll_to: None,
             pending_anchor: None,
             file_list_scroll: 0.0,
+            file_list_tracked: None,
             diff_viewport: Arc::new(DiffViewport::default()),
             wrap,
             diff_wrap: None,
@@ -6152,6 +6214,7 @@ impl GitkApp {
 
         if frame.current_file == Some(idx) {
             ui.painter().rect_filled(rect, 2.0, select_accent());
+            frame.current_rect = Some(rect);
         } else if resp.hovered() {
             ui.painter().rect_filled(rect, 2.0, mauve(20));
         }
@@ -7283,9 +7346,12 @@ impl GitkApp {
                 // load_selected_diff) only once the sidebar shows the
                 // diff it was queued for — never mid-load, when the
                 // rows on screen still belong to the outgoing diff.
-                if self.diff_load.is_none()
-                    && let Some(y) = self.file_list_scroll_to.take()
-                {
+                let restore = self
+                    .diff_load
+                    .is_none()
+                    .then(|| self.file_list_scroll_to.take())
+                    .flatten();
+                if let Some(y) = restore {
                     file_scroll = file_scroll.vertical_scroll_offset(y);
                 }
                 let file_scroll_out = file_scroll.show(ui, |ui| {
@@ -7293,7 +7359,32 @@ impl GitkApp {
                     // still in the commit header) — highlighted below
                     // with the same accent the commit list uses for the
                     // selected row, so the list tracks the diff view.
-                    let top = self.diff_viewport.top_line();
+                    //
+                    // A pending `diff_scroll_to` wins over the live top line, which
+                    // is a frame behind — the same preference `dispatch_prefetch`
+                    // makes, and here it is what keeps the follow below from undoing
+                    // a restore. `set_diff_content` resets the viewport to the top, so
+                    // on the frame a per-commit restore (or a rebuild's anchor) lands,
+                    // the stale value names line 0 — usually no file at all — and the
+                    // tracked file would advance to that. The restore frame is
+                    // suppressed, so nothing scrolls; but the NEXT frame sees the real
+                    // position as a change and scrolls to it, overriding the sidebar
+                    // offset the restore had just put back. Reading the position the
+                    // pane is about to take makes the suppressed frame record the right
+                    // file, and the frame after it quiet.
+                    //
+                    // Not while a load is in flight, though: there the pending target
+                    // names the INCOMING diff while these rows are still the outgoing
+                    // one's, so the live viewport is the only value that matches what
+                    // is drawn.
+                    let top = if self.diff_load.is_none() {
+                        self.diff_scroll_to.map_or_else(
+                            || self.diff_viewport.top_line(),
+                            |t| t.line(self.row_map()),
+                        )
+                    } else {
+                        self.diff_viewport.top_line()
+                    };
                     let current_file = file_index_at_line_opt(&self.file_line_starts, top);
                     // Shared by every row this frame — the metric
                     // lookup takes the font lock, so don't repeat
@@ -7311,6 +7402,7 @@ impl GitkApp {
                     let mut frame = SidebarFrame {
                         row_h,
                         current_file,
+                        current_rect: None,
                         cache: &mut cache,
                         pending_apply: None,
                         menu_salt: diff_menu_salt(self.current_diff_key.as_ref()),
@@ -7341,7 +7433,36 @@ impl GitkApp {
                     // borrow of `cache` (and the loop's borrow of `self.file_rows`)
                     // end — the dispatch below needs `&mut self`.
                     let pending_apply = frame.pending_apply.take();
+                    let current_rect = frame.current_rect;
                     self.sidebar_cache = cache;
+
+                    // Keep the tracked file in view, not merely accented — see
+                    // `follow_tracked_file` for when, and `current_rect` for where.
+                    //
+                    // `Align::None` is a MINIMAL scroll, and the margin is what turns
+                    // that from "flush against the edge" into "comfortably inside":
+                    // the rect asked for is the row plus `FILE_LIST_FOLLOW_MARGIN_ROWS`
+                    // of context each side, so the scroll travels far enough that the
+                    // next several boundaries need none. Minimal is still the right
+                    // mode underneath — a row already sitting inside the margin does
+                    // not move at all, so clicking a file, which jumps the diff to a
+                    // row the reader can already see, stays a no-op rather than a jolt.
+                    //
+                    // Capped at the viewport's own half-height: past that the expanded
+                    // rect is taller than the visible area, which egui resolves by
+                    // aligning one of its edges — so the row the margin exists to
+                    // centre would end up pinned to an edge again, in a sidebar too
+                    // short to show the context that was asked for.
+                    if follow_tracked_file(
+                        &mut self.file_list_tracked,
+                        current_file,
+                        restore.is_some() || self.diff_load.is_some(),
+                    ) && let Some(rect) = current_rect
+                    {
+                        let margin = (FILE_LIST_FOLLOW_MARGIN_ROWS * row_h)
+                            .min((ui.clip_rect().height() - rect.height()).max(0.0) / 2.0);
+                        ui.scroll_to_rect(rect.expand2(egui::vec2(0.0, margin)), None);
+                    }
                     // Ignore a click while a diff load is in flight:
                     // the sidebar still shows the OUTGOING diff, so
                     // the clicked line index is in its coordinates —
@@ -10019,6 +10140,44 @@ mod tests {
         assert_eq!(asked, vec![(0, 0), (1, 0), (2, 0)]);
         assert_eq!((top_line, top_row), (0, 0));
         assert_eq!(visible, 0..lines.len());
+    }
+
+    /// Every transition of the sidebar's follow, and specifically that a SUPPRESSED
+    /// change still advances the tracked file.
+    ///
+    /// That is the half a caller-side `if` gets wrong. Left stale across a commit
+    /// switch — the frames where the restore owns the position — the first ordinary
+    /// frame afterwards sees a change that is not one and scrolls to a file the reader
+    /// never moved to, undoing the restore a frame later.
+    #[test]
+    fn a_suppressed_follow_still_advances_the_tracked_file() {
+        let mut tracked = None;
+
+        // Settled on nothing: no change, no scroll, however many frames pass.
+        assert!(!follow_tracked_file(&mut tracked, None, false));
+        assert!(!follow_tracked_file(&mut tracked, None, false));
+
+        // The diff crosses into a file: follow it.
+        assert!(follow_tracked_file(&mut tracked, Some(0), false));
+        assert_eq!(tracked, Some(0));
+        // Settled again — or the sidebar would be pinned every frame and the reader
+        // could not scroll it at all, which is the failure `Align::None` alone would
+        // not prevent.
+        assert!(!follow_tracked_file(&mut tracked, Some(0), false));
+        // And on across a boundary.
+        assert!(follow_tracked_file(&mut tracked, Some(3), false));
+
+        // Suppressed (a load in flight, or a remembered offset being restored): no
+        // scroll — but the tracked file moves anyway…
+        assert!(!follow_tracked_file(&mut tracked, Some(7), true));
+        assert_eq!(tracked, Some(7));
+        // …so the first unsuppressed frame afterwards is quiet, rather than firing
+        // on a change that was already accounted for.
+        assert!(!follow_tracked_file(&mut tracked, Some(7), false));
+
+        // Scrolling back into the commit header is a change like any other.
+        assert!(follow_tracked_file(&mut tracked, None, false));
+        assert_eq!(tracked, None);
     }
 
     /// Every transition of the side index, and — as for the wrap index above —

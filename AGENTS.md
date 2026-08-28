@@ -1493,7 +1493,42 @@ sorted drivers keep the same rows with the same rewritten parents.
   `stash_current_diff` had just saved in the pre-rebuild coordinate system.
   The **sidebar keeps its pixel offset** (`file_list_y`) and can still drift
   under `ignore_ws` — a second mechanism for a much smaller annoyance,
-  deliberately not built. What makes the anchor possible is
+  deliberately not built.
+  The sidebar also **follows the diff**, not merely accenting the file under its top
+  line: the list is as long as the commit is wide, so past a screenful the highlight
+  landed on a row nobody could see and the sidebar read as not tracking at all.
+  `follow_tracked_file` (free, pure, for the reason `resync_wrap_index` beside it is —
+  it is entirely transitions) fires on the tracked file CHANGING, which is what makes
+  it follow without fighting the reader: scrolling the sidebar on its own moves no
+  diff and so changes nothing, and only the diff crossing a file boundary does. The
+  scroll is `Align::None`, i.e. MINIMAL, over the row **expanded by
+  `FILE_LIST_FOLLOW_MARGIN_ROWS`** — minimal alone left the row flush against
+  whichever edge it entered from, which is the worst of both: no sight of what is
+  coming, and the list moved again at every single boundary, the next one always being
+  one row off screen. Scrolling clear of that margin means the crossings after it cost
+  nothing, so the sidebar settles rather than creeping; the constant buys calm and pays
+  in how far one move travels. Minimal is still the right mode underneath — a row
+  already inside the margin does not move, so clicking a file, which jumps the diff to
+  a row the reader can already see, stays a no-op rather than a jolt. The margin is
+  **capped at the viewport's half-height**, or the expanded rect is taller than the
+  visible area, egui aligns one of its edges, and the row is pinned to an edge again in
+  exactly the sidebar too short to show the context asked for. **A suppressed frame advances the tracked file all the
+  same**, and that is the half a caller-side `if` gets wrong: suppression covers a
+  diff still loading (the rows on screen belong to the outgoing diff) and a remembered
+  offset being restored (which is the position that should win), and leaving the value
+  stale across those makes the first ordinary frame afterwards scroll to a file the
+  reader never moved to, undoing the restore one frame later. **What it advances TO is
+  the other half, and it is not the live viewport**: `set_diff_content` resets that to
+  the top, so on the restore frame it names line 0 and usually no file at all — the
+  suppressed frame would then record nothing and the next frame would scroll after
+  all, which is the same undo arriving one step later. So the tracked file is read off
+  a pending `diff_scroll_to` where there is one, the preference `dispatch_prefetch`
+  makes for the same reason, and off the live top line only while a load is in flight,
+  where the pending target names the incoming diff and these rows are the outgoing
+  one's.
+  Where the row IS comes from `SidebarFrame::current_rect`, filled by `draw_file_row`:
+  the list is not virtualized and its rows are not uniform (directory headers and
+  indented file rows), so there is no arithmetic the caller could use instead. What makes the anchor possible is
   `DiffLine::old_lineno`/`new_lineno`, recorded in `append_diff_body` from
   git2's **origin char** and not from `LineKind`: git2 reports a line number
   on its EOF markers too, and those origins have already been folded into
