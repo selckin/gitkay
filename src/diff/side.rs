@@ -216,6 +216,51 @@ impl SideIndex {
         }
     }
 
+    /// Re-measure the SAME diff under the SAME mode against a new wrapping, keeping
+    /// the run partition this index already found.
+    ///
+    /// **Which lines are hidden cannot move under a re-wrap** — a run is a maximal
+    /// span of one `LineKind`, and wrapping changes no line's kind — so only the row
+    /// halves of each `Run` do. Walking the runs is therefore O(runs) with no
+    /// allocation, where `build` is O(lines) plus a fresh `Vec<Run>` grown from empty.
+    ///
+    /// This is `WrapIndex::rewidth`'s counterpart and exists for the same reason: a
+    /// window-resize drag re-measures on every frame of the drag, and without it the
+    /// side filter charged a second full pass over `diff_lines` beside the wrap
+    /// index's. Measured on a rewrite-heavy synthetic diff at 100 columns, against
+    /// `rewidth` on the same frame:
+    ///
+    /// | lines | runs | `rewidth` | `build` | `rewrap` |
+    /// |------:|-----:|----------:|--------:|---------:|
+    /// |  100k | 12.5k|    851µs  |  450µs  |    42µs  |
+    /// |    1M | 125k |   13.7ms  | 5.21ms  |   502µs  |
+    /// |    5M | 625k |   61.9ms  | 39.7ms  |  2.67ms  |
+    ///
+    /// So it takes what the filter added to a resize frame from ~40-60% of the wrap
+    /// index's own cost down to ~4%. An inactive index has no runs and needs only its
+    /// new row count; it stays inactive, the refusal being about the run COUNT, which
+    /// a re-wrap cannot change.
+    pub fn rewrap(&mut self, wrap: Option<&WrapIndex>) {
+        let row_of = |line: usize| wrap.map_or(line, |w| w.row_of_line(line));
+        let mut removed = 0usize;
+        for r in &mut self.runs {
+            let first_row = row_of(r.line);
+            let rows = row_of(r.line + r.lines) - first_row;
+            removed += rows;
+            r.vrow = first_row - (removed - rows);
+            r.removed_after = removed;
+        }
+        self.wrap_rows = wrap.map_or(self.n_lines, WrapIndex::total_rows);
+        self.wrap_key = wrap.map(WrapIndex::key);
+    }
+
+    /// Whether this index is over the same diff and mode as it is asked about, and so
+    /// whether `rewrap` may keep its runs. Weaker than `covers`, which additionally
+    /// requires the wrapping to be unchanged.
+    pub fn describes(&self, n_lines: usize, side: DiffSide) -> bool {
+        self.n_lines == n_lines && self.side == side
+    }
+
     /// An index that maps every row to itself — what `Both` is, and what a refused
     /// build falls back to.
     fn inactive(n_lines: usize, side: DiffSide, wrap: Option<&WrapIndex>) -> Self {
@@ -614,6 +659,72 @@ mod tests {
 
         let flat = map(&lines, None, Some(&idx));
         assert_eq!(flat.slice(2, &lines[2], 0), RowSlice::whole(&lines[2]));
+    }
+
+    /// `rewrap` keeps the runs a re-wrap cannot move and re-measures only their rows,
+    /// so it must land where a full `build` at that width would.
+    ///
+    /// The parity is the whole safety argument for skipping the O(lines) pass —
+    /// `wrap.rs` pins `rewidth` against `build` for exactly the same reason. Checked
+    /// over both modes and several widths, including one where nothing wraps.
+    #[test]
+    fn rewrap_agrees_with_a_full_build_at_the_new_width() {
+        let lines = wide();
+        let g = LineNoGutter::default();
+        for side in [DiffSide::Old, DiffSide::New] {
+            let first = WrapIndex::build(&lines, 100, g, false);
+            let mut idx = SideIndex::build(&lines, side, Some(&first));
+            for cols in [40, 60, 100, 500] {
+                let w = WrapIndex::build(&lines, cols, g, false);
+                idx.rewrap(Some(&w));
+                let fresh = SideIndex::build(&lines, side, Some(&w));
+                let m = map(&lines, Some(&w), Some(&idx));
+                let f = map(&lines, Some(&w), Some(&fresh));
+                assert_eq!(m.total_rows(), f.total_rows(), "{side:?} at {cols}");
+                for l in 0..lines.len() {
+                    assert_eq!(
+                        m.row_of_line(l),
+                        f.row_of_line(l),
+                        "{side:?} at {cols} line {l}"
+                    );
+                }
+                for r in 0..m.total_rows() {
+                    assert_eq!(
+                        m.line_of_row(r),
+                        f.line_of_row(r),
+                        "{side:?} at {cols} row {r}"
+                    );
+                }
+                assert!(
+                    idx.covers(lines.len(), side, Some(&w)),
+                    "{side:?} at {cols}"
+                );
+            }
+            // And back to no wrapping at all.
+            idx.rewrap(None);
+            let fresh = SideIndex::build(&lines, side, None);
+            assert_eq!(idx.total_rows(), fresh.total_rows(), "{side:?} unwrapped");
+            assert!(idx.covers(lines.len(), side, None), "{side:?} unwrapped");
+        }
+    }
+
+    /// A refused index has no runs to re-measure and must stay refused: the cap is on
+    /// the run COUNT, which a re-wrap cannot change.
+    #[test]
+    fn rewrapping_a_refused_index_keeps_it_refused_and_the_identity() {
+        let lines = wide();
+        let g = LineNoGutter::default();
+        let w = WrapIndex::build(&lines, 100, g, false);
+        let mut idx = SideIndex::build_capped(&lines, DiffSide::New, Some(&w), 0);
+        assert!(!idx.active());
+        let narrow = WrapIndex::build(&lines, 40, g, false);
+        idx.rewrap(Some(&narrow));
+        assert!(!idx.active());
+        assert_eq!(idx.total_rows(), narrow.total_rows(), "still the identity");
+        let m = map(&lines, Some(&narrow), Some(&idx));
+        for l in 0..lines.len() {
+            assert_eq!(m.row_of_line(l), narrow.row_of_line(l));
+        }
     }
 
     #[test]
