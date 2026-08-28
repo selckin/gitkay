@@ -21,7 +21,7 @@ use convert::{
     delta_path, emit_converted, header_prefixes, modes_from_header, move_to_end, side_path_bytes,
 };
 pub use side::{DiffSide, RowMap, SideIndex};
-pub use wrap::{RowSlice, WrapIndex};
+pub use wrap::{RowSlice, WrapIndex, WrapKey};
 
 use crate::datefmt::format_commit_time;
 use crate::diffstat;

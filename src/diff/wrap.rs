@@ -166,6 +166,17 @@ impl RowSlice {
     }
 }
 
+/// What a `WrapIndex` was measured for: the whole of what makes one index describe
+/// the same mapping as another. Its own type rather than a tuple so a fourth input
+/// added to `WrapIndex` is a compile error at `key`, not a comparison that silently
+/// stops distinguishing something.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct WrapKey {
+    n_lines: usize,
+    cols: usize,
+    gutter: LineNoGutter,
+}
+
 /// Where every logical line of one diff sits in visual-row space, for one pane
 /// width and one gutter width.
 ///
@@ -376,16 +387,36 @@ impl WrapIndex {
         self.active
     }
 
-    /// Whether this index still describes the diff and pane it is asked about. The
-    /// three inputs a rebuild depends on, compared in one place so a caller cannot
-    /// check two of them: the line count (a new diff), the width (a resize or a
-    /// font change), and the gutter (the line-number toggle).
+    /// What this index was measured for — the three inputs a rebuild depends on: the
+    /// line count (a new diff), the width (a resize or a font change), and the gutter
+    /// (the line-number toggle).
     ///
-    /// A different diff with the same line count is NOT caught here — the caller
-    /// drops the index where content is installed, for the same reason it drops
-    /// the gutter measurement there.
+    /// Public because an index built ON TOP of this one has to know when the mapping
+    /// under it moved, and asking that of a derived value (the row count) works only
+    /// by an argument about `body_cols` that nothing here checks. Handing out the
+    /// identity lets such an index answer for itself, rather than having the render
+    /// observe a re-wrap and pass it down. See `diff::SideIndex::covers`.
+    ///
+    /// A different diff with the same key is NOT distinguished — the caller drops the
+    /// index where content is installed, for the same reason it drops the gutter
+    /// measurement there.
+    pub const fn key(&self) -> WrapKey {
+        WrapKey {
+            n_lines: self.n_lines,
+            cols: self.cols,
+            gutter: self.gutter,
+        }
+    }
+
+    /// Whether this index still describes the diff and pane it is asked about —
+    /// `key` compared in one place, so a caller cannot check two of its three parts.
     pub fn covers(&self, n_lines: usize, cols: usize, gutter: LineNoGutter) -> bool {
-        self.n_lines == n_lines && self.cols == cols && self.gutter == gutter
+        self.key()
+            == WrapKey {
+                n_lines,
+                cols,
+                gutter,
+            }
     }
 
     /// Total visual rows in the diff — what the virtualized pane scrolls over.
@@ -563,16 +594,20 @@ const fn floor_boundary(s: &str, i: usize) -> usize {
     i
 }
 
+/// Shared with `super::side`'s suite, which measures the same `DiffLine` lists
+/// through the mapping this module feeds. `pub(super)` rather than copied, for the
+/// reason AGENTS.md gives for the `DiffSettings` baselines: a fixture spelled out
+/// twice is one that can drift while looking identical.
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
-    fn line(text: &str, kind: LineKind) -> DiffLine {
+    pub(in crate::diff) fn line(text: &str, kind: LineKind) -> DiffLine {
         DiffLine::new(text, kind)
     }
 
     /// A diff of context rows, `n` bytes each as given.
-    fn ctx_lines(widths: &[usize]) -> Vec<DiffLine> {
+    pub(in crate::diff) fn ctx_lines(widths: &[usize]) -> Vec<DiffLine> {
         widths
             .iter()
             .map(|&w| line(&"x".repeat(w), LineKind::Context))

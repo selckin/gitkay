@@ -1571,9 +1571,18 @@ sorted drivers keep the same rows with the same rewritten parents.
   A **hidden** line maps to its run's collapse point — where its first visible successor
   now sits — which is what a scroll anchor pointing at a line the reader just hid
   should resolve to. `lines_of_rows` stays CONTIGUOUS and so returns a superset under a
-  filter, spanning the hidden lines between the first and last visible ones; every
-  consumer widens what it is given, so that is the useful answer and not a rounding
-  error to fix.
+  filter, spanning the hidden lines between the first and last visible ones; the
+  sidebar's file tracking reads `top_line` off its start, so the span is what the
+  render must report.
+  **What the span must not become is a read-ahead magnitude**, and
+  `DiffViewport::store` is where the two are separated: a hidden run is unbounded (in
+  `Old`, a commit adding a large file draws it as two header rows while the span
+  reaches over its whole body), and `lines` is multiplied by every reader —
+  `ensure_visible_word_emphasis` takes `3 ×` it — so an unclamped value put a
+  per-frame `emphasize_rows` walk over the whole diff on the frame loop, plus a
+  highlight read-ahead band over files the mode never draws. It is stored clamped to
+  `rows`, which restores the bound its own doc states ("never more than `rows`") and
+  is a no-op without a filter, where the span IS the drawn count.
   `resync_side_index` mirrors `resync_wrap_index` exactly — same four transitions, and
   **dropping an index is as much a move as building one**, for the same reason (the
   offset is in view rows, so the frame after `Both` is reselected it names a different
