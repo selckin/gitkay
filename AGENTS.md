@@ -1586,12 +1586,30 @@ sorted drivers keep the same rows with the same rewritten parents.
   `resync_side_index` mirrors `resync_wrap_index` exactly — same four transitions, and
   **dropping an index is as much a move as building one**, for the same reason (the
   offset is in view rows, so the frame after `Both` is reselected it names a different
-  line), reported exactly once via `take()`. It additionally takes the wrap resync's
-  own `rewrapped`, because a re-wrap moves every view row recorded here and two
-  wrappings can agree on the total row count `covers` compares. That row count has one
-  derivation, `SideIndex::wrap_rows_of` — the build records it and the resync compares
-  against it, and derived separately in the two they could never match, which is an
-  O(lines) rebuild every frame with nothing to say so. The render combines the
+  line), reported exactly once via `take()`.
+  It is handed the wrap INDEX rather than the wrap resync's report, which keeps
+  invalidation to ONE channel: `SideIndex::covers` compares `WrapIndex::key` (a
+  `WrapKey` — the line count, the columns and the gutter), so a re-wrap fails it here
+  without anyone having to say so. **The reason for comparing the key is not that a
+  row count would be unsound** — a line's row count is non-increasing in the pane
+  width, so two wrappings sharing a total share every per-line count and hence the
+  whole mapping. It is that a count rests on an argument about `body_cols` being
+  monotone that nothing checks, and that it left the caller having to observe the
+  re-wrap and thread it down: three ordering obligations (resync wrap first, pass its
+  answer in, combine with `|` not `||`) of which only the last is visible at a call
+  site.
+  A re-wrap under an unchanged diff and mode does NOT rebuild: `SideIndex::rewrap`
+  re-measures the runs' row halves in place, since which lines are hidden cannot move
+  under a re-wrap — a run is a maximal span of one `LineKind`. That is
+  `WrapIndex::rewidth`'s counterpart and exists for the same reason, a resize drag
+  re-measuring on every frame of the drag. Measured on a rewrite-heavy diff at 100
+  columns, `build` costs 450µs / 5.21ms / 39.7ms at 100k / 1M / 5M lines beside
+  `rewidth`'s own 851µs / 13.7ms / 61.9ms on the same frame, where `rewrap` costs
+  42µs / 502µs / 2.67ms — so the filter's share of a resize frame drops from ~40-60%
+  of the wrap index's cost to ~4%.
+  `rewrap_agrees_with_a_full_build_at_the_new_width` pins the parity, which is the
+  whole safety argument for skipping the pass; a refused index has no runs and stays
+  refused, the cap being on the run COUNT, which a re-wrap cannot change. The render combines the
   two with a bitwise `|` — both must RUN — into the `moved` that `diff_scroll_target`
   turns into a `DiffScrollTo::Line(top_line)`, which is what holds the reader's place
   across a mode change. The index is dropped where `diff_wrap` is (`set_diff_content`,

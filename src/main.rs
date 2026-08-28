@@ -1419,14 +1419,22 @@ fn resync_side_index(
     if side == diff::DiffSide::Both {
         return index.take().is_some();
     }
-    if index
-        .as_ref()
-        .is_some_and(|s| s.covers(lines.len(), side, wrap))
-    {
-        return false;
+    match index.as_mut() {
+        Some(s) if s.covers(lines.len(), side, wrap) => false,
+        // Same diff, same mode, different wrapping — which is every frame of a resize
+        // drag. Which lines are hidden cannot have moved (a run is a span of one
+        // `LineKind`), so only the runs' row halves are re-measured: O(runs) and no
+        // allocation, against `build`'s O(lines) and a fresh vector. See
+        // `SideIndex::rewrap` for what that is worth.
+        Some(s) if s.describes(lines.len(), side) => {
+            s.rewrap(wrap);
+            true
+        }
+        _ => {
+            *index = Some(diff::SideIndex::build(lines, side, wrap));
+            true
+        }
     }
-    *index = Some(diff::SideIndex::build(lines, side, wrap));
-    true
 }
 
 /// Whether the file sidebar should scroll to keep the tracked file in view this
