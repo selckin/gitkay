@@ -9181,7 +9181,7 @@ fn main() -> eframe::Result {
     // Existence is checked relative to the run dir, so `gitkay foo.rs` in a subdir
     // resolves against that subdir — the path the user actually typed.
     let is_path = |tok: &str| run_dir.join(tok).exists();
-    let (revs, raw_paths) = match cli::classify(&raw.pre, &raw.post, is_rev, is_path) {
+    let (revs, raw_paths) = match cli::classify(&raw.pre, raw.post.as_deref(), is_rev, is_path) {
         Ok(rp) => rp,
         Err(e) => {
             eprintln!("gitkay: {e}");
