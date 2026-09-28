@@ -1028,11 +1028,16 @@ const fn stats_relevant(s: DiffSettings) -> (bool, bool, bool, bool, bool) {
 /// list is also what `dispatch_commit_stats` compares against `stats_submitted` to
 /// decide whether anything changed — a list that varies with row *positions* rather
 /// than with content would resubmit on every scroll.
+///
+/// `supplied_by_pane` is a virtual row whose own diff the pane is loading right now:
+/// installing it hands the column its numbers (`sync_virtual_stats`), so a stats job for
+/// it would be a second full worktree diff built to say the same thing.
 fn stats_targets(
     commits: &[CommitInfo],
     view: std::ops::Range<usize>,
     known: &HashMap<git2::Oid, Option<CommitStats>>,
     want: StatsWant,
+    supplied_by_pane: Option<git2::Oid>,
 ) -> Vec<git2::Oid> {
     let satisfied = |oid: &git2::Oid| match known.get(oid) {
         // Never computed — it needs computing.
@@ -1049,7 +1054,7 @@ fn stats_targets(
         .unwrap_or_default()
         .iter()
         .map(|c| c.oid)
-        .filter(|oid| !satisfied(oid))
+        .filter(|oid| !satisfied(oid) && Some(*oid) != supplied_by_pane)
         .filter(|oid| seen.insert(*oid))
         .collect()
 }
@@ -1096,11 +1101,16 @@ fn install_stats_result(
         // later submission, while `stats_targets` reads `NotAsked` under a
         // `FilesAndLines` want as "still owed" and re-lists it every frame — a cell
         // blank for the session, and a band never warmed while the row is on screen.
+        //
+        // Nor may a `Withheld` overwrite real counts: `run_stats_job` withholds a driven
+        // virtual row's `+`/`-`, and the pane's own install of that row supplies them
+        // (`sync_virtual_stats`) — a job already running when the pane's diff landed
+        // would otherwise blank what the sidebar beside it shows. So: a fresh answer
+        // never replaces a more informative one (`LineStats::rank`).
         Some(fresh) => {
-            let downgrade = !fresh.lines.answered()
-                && known
-                    .get(&oid)
-                    .is_some_and(|had| had.is_some_and(|had| had.lines.answered()));
+            let downgrade = known
+                .get(&oid)
+                .is_some_and(|had| had.is_some_and(|had| fresh.lines.rank() < had.lines.rank()));
             if !downgrade {
                 known.insert(oid, Some(fresh));
             }
@@ -1111,11 +1121,12 @@ fn install_stats_result(
     }
 }
 
-/// Whether a diff about to be cached may hand its numbers to the commit-list column.
+/// Whether a diff may hand its numbers to the commit-list column.
 ///
-/// Two conditions, and the second is the load-bearing one. Real commits only, because
-/// the virtual rows are content-keyed and their stats are evicted by
-/// `sync_virtual_stats` on a content change, which this would race. And only a diff
+/// Two conditions, and the second is the load-bearing one. Real commits only: the
+/// virtual rows are content-keyed, and their numbers are taken where their content is
+/// recorded (`sync_virtual_stats`), never off a diff that may predate an edit — this
+/// runs for the diff being REPLACED too. And only a diff
 /// built under settings whose COUNTS match the current ones: `stash_current_diff`
 /// reaches `cache_diff` with the **outgoing** diff, and the toolbar's rename/whitespace
 /// toggles run `invalidate_stats_if_counts_changed` and *then* `load_selected_diff` —
@@ -1135,9 +1146,14 @@ fn install_stats_result(
 /// decision rather than a model of it (`GitkApp` needs a real
 /// `eframe::CreationContext`).
 fn stats_harvestable(key: &DiffCacheKey, current: DiffSettings, drivers: u64) -> bool {
-    is_real_commit(key.oid)
-        && key.drivers == drivers
-        && stats_relevant(key.settings) == stats_relevant(current)
+    is_real_commit(key.oid) && counts_match(key, current, drivers)
+}
+
+/// Was `key`'s diff built under the settings and drivers the column counts under now?
+/// `stats_harvestable`'s second condition, and the whole condition for a virtual row
+/// installing (`sync_virtual_stats`).
+fn counts_match(key: &DiffCacheKey, current: DiffSettings, drivers: u64) -> bool {
+    key.drivers == drivers && stats_relevant(key.settings) == stats_relevant(current)
 }
 
 /// Drop every failed stats entry, keeping successes untouched, so a reload
@@ -1184,6 +1200,13 @@ fn retry_failed_stats(known: &mut HashMap<git2::Oid, Option<CommitStats>>) {
 /// it is left alone; the cheap fix if it ever bites is to record the evicted oid
 /// and have `drain_commit_stats` drop the next result for it.
 ///
+/// **And it installs the row's numbers, `counts`, off the very diff whose content it
+/// just recorded** — `None` when that diff was built under settings the column does not
+/// count under (`counts_match`). One step, so the numbers can only ever be the recorded
+/// content's: that is what spares the uncommitted row a stats job of its own, a second
+/// full worktree diff built only to count what the pane just counted. It runs for an
+/// unchanged key too, so a reload that found the same content still answers the row.
+///
 /// Free rather than a method, and taking the two maps rather than `&mut self`,
 /// so the regression is pinned against the real function instead of a model of
 /// it — no repo, no worker, no `egui::Context`.
@@ -1191,6 +1214,7 @@ fn sync_virtual_stats(
     seen: &mut HashMap<git2::Oid, u64>,
     known: &mut HashMap<git2::Oid, Option<CommitStats>>,
     key: &DiffCacheKey,
+    counts: Option<CommitStats>,
 ) {
     if !CommitKind::of(key.oid).is_virtual() {
         return;
@@ -1200,6 +1224,9 @@ fn sync_virtual_stats(
         .is_some_and(|prev| prev != key.content)
     {
         known.remove(&key.oid);
+    }
+    if let Some(counts) = counts {
+        install_stats_result(known, key.oid, Some(counts));
     }
 }
 
@@ -3243,6 +3270,10 @@ struct DiffLoadState {
     /// load is running, and beside the `Option` as a bare `bool` it was a third thing
     /// to reset in lockstep with them.
     is_rebuild: bool,
+    /// The row this load is building — what `dispatch_commit_stats` leaves to the pane
+    /// (`supplied_by_pane`). Carried rather than read off the selection, which is a
+    /// different fact that merely coincides with it.
+    oid: git2::Oid,
 }
 
 /// Drives the one-time deferral of the startup diff. `GitkApp::new` runs during
@@ -5109,7 +5140,15 @@ impl GitkApp {
         // edit becomes visible to the stats column. Before the early return: an
         // unchanged key is exactly the "content did not move" case, and it must
         // still be recorded as seen.
-        sync_virtual_stats(&mut self.virtual_diff_content, &mut self.commit_stats, &key);
+        let counts = (CommitKind::of(key.oid).is_virtual()
+            && counts_match(&key, self.diff_settings, self.drivers_fingerprint()))
+        .then(|| diff::stats_from_data(&data));
+        sync_virtual_stats(
+            &mut self.virtual_diff_content,
+            &mut self.commit_stats,
+            &key,
+            counts,
+        );
         // Same key ⇒ same content (real commits are oid+settings-keyed; the range row
         // carries an endpoint hash, the working-tree rows a diff hash), so keep the
         // on-screen copy — spans and
@@ -5140,17 +5179,19 @@ impl GitkApp {
     /// `is_rebuild` is likewise rewritten on every dispatch and not just the first of a
     /// burst, so a load that changes character mid-flight is classified by its latest
     /// dispatch.
-    fn arm_diff_load(&mut self, progress: Arc<DiffProgress>, is_rebuild: bool) {
+    fn arm_diff_load(&mut self, oid: git2::Oid, progress: Arc<DiffProgress>, is_rebuild: bool) {
         match &mut self.diff_load {
             Some(state) => {
                 state.progress = progress;
                 state.is_rebuild = is_rebuild;
+                state.oid = oid;
             }
             None => {
                 self.diff_load = Some(DiffLoadState {
                     started: std::time::Instant::now(),
                     progress,
                     is_rebuild,
+                    oid,
                 });
             }
         }
@@ -5180,7 +5221,7 @@ impl GitkApp {
             && let Some(running) = self.inflight_loads.get(&key).map(Arc::clone)
         {
             log::debug!("diff-load: adopt in-flight worker for {}", key.oid);
-            self.arm_diff_load(running, same_oid_rebuild);
+            self.arm_diff_load(key.oid, running, same_oid_rebuild);
             return;
         }
         let progress = Arc::new(DiffProgress::default());
@@ -5188,7 +5229,7 @@ impl GitkApp {
         // The render path only blanks to the "Loading diff…" placeholder once the load
         // outlives DIFF_PLACEHOLDER_DELAY, so a fast uncached load swaps straight to the
         // new diff without a blank / sidebar-collapse strobe.
-        self.arm_diff_load(Arc::clone(&progress), same_oid_rebuild);
+        self.arm_diff_load(key.oid, Arc::clone(&progress), same_oid_rebuild);
 
         let oid = key.oid;
         // The job owns its inputs: paths and key are moved in (not cloned) — on the
@@ -5698,6 +5739,12 @@ impl GitkApp {
         } else {
             StatsWant::FilesOnly
         };
+        // A virtual row whose own diff is loading gets its numbers from that diff.
+        let supplied_by_pane = self
+            .diff_load
+            .as_ref()
+            .map(|load| load.oid)
+            .filter(|oid| CommitKind::of(*oid).is_virtual());
         // Visible rows first, the band only once those are all known — the column fills
         // where the user is looking before it warms where they might scroll.
         let targets = {
@@ -5706,6 +5753,7 @@ impl GitkApp {
                 self.commit_view_range.clone(),
                 &self.commit_stats,
                 want,
+                supplied_by_pane,
             );
             if visible.is_empty() {
                 stats_targets(
@@ -5713,6 +5761,7 @@ impl GitkApp {
                     warm_band(&self.commit_view_range),
                     &self.commit_stats,
                     want,
+                    supplied_by_pane,
                 )
             } else {
                 visible
@@ -11254,11 +11303,11 @@ mod tests {
         );
         known.insert(oid(3), None); // tried, failed
 
-        let got = stats_targets(&commits, 0..4, &known, StatsWant::FilesAndLines);
+        let got = stats_targets(&commits, 0..4, &known, StatsWant::FilesAndLines, None);
         assert_eq!(got, vec![oid(1), oid(4)]);
         // A failed row stays skipped for the cheaper want too.
         assert_eq!(
-            stats_targets(&commits, 0..4, &known, StatsWant::FilesOnly),
+            stats_targets(&commits, 0..4, &known, StatsWant::FilesOnly, None),
             vec![oid(1), oid(4)]
         );
     }
@@ -11291,12 +11340,12 @@ mod tests {
         );
 
         assert_eq!(
-            stats_targets(&commits, 0..2, &known, StatsWant::FilesAndLines),
+            stats_targets(&commits, 0..2, &known, StatsWant::FilesAndLines, None),
             vec![oid(1)],
             "the FilesOnly entry has no lines to show, so it must be recomputed"
         );
         assert!(
-            stats_targets(&commits, 0..2, &known, StatsWant::FilesOnly).is_empty(),
+            stats_targets(&commits, 0..2, &known, StatsWant::FilesOnly, None).is_empty(),
             "and it fully answers a FilesOnly want — as does the richer entry"
         );
     }
@@ -11305,6 +11354,29 @@ mod tests {
     /// list; the two-phase dispatch (visible rows, then `warm_band`) is what turns
     /// that into "visible first". Pinning the clamp here keeps a band that runs past
     /// the end of a short list from panicking.
+    /// A virtual row whose own diff the pane is loading is not a target: the install
+    /// hands the column its numbers, and a stats job would build a second full worktree
+    /// diff to say the same thing.
+    #[test]
+    fn stats_targets_leaves_a_row_the_pane_is_loading_to_the_pane() {
+        let commits = vec![ci(DiffSource::Uncommitted), ci(DiffSource::Commit(oid(1)))];
+        let known = HashMap::new();
+        assert_eq!(
+            stats_targets(
+                &commits,
+                0..2,
+                &known,
+                StatsWant::FilesAndLines,
+                Some(oid_uncommitted())
+            ),
+            vec![oid(1)]
+        );
+        assert_eq!(
+            stats_targets(&commits, 0..2, &known, StatsWant::FilesAndLines, None),
+            vec![oid_uncommitted(), oid(1)]
+        );
+    }
+
     #[test]
     fn stats_targets_is_limited_to_the_range_it_is_given() {
         let commits = vec![
@@ -11315,12 +11387,12 @@ mod tests {
         ];
         let known = HashMap::new();
         assert_eq!(
-            stats_targets(&commits, 1..3, &known, StatsWant::FilesAndLines),
+            stats_targets(&commits, 1..3, &known, StatsWant::FilesAndLines, None),
             vec![oid(2), oid(3)]
         );
         // A range past the end must clamp, not panic.
         assert_eq!(
-            stats_targets(&commits, 3..99, &known, StatsWant::FilesAndLines),
+            stats_targets(&commits, 3..99, &known, StatsWant::FilesAndLines, None),
             vec![oid(4)]
         );
     }
@@ -11338,7 +11410,7 @@ mod tests {
 
         // Phase 1: nothing known ⇒ exactly the visible rows.
         assert_eq!(
-            stats_targets(&commits, view.clone(), &known, want),
+            stats_targets(&commits, view.clone(), &known, want, None),
             (20..25).map(oid).collect::<Vec<_>>(),
             "visible rows only while any is unknown"
         );
@@ -11354,8 +11426,8 @@ mod tests {
                 }),
             );
         }
-        assert!(stats_targets(&commits, view.clone(), &known, want).is_empty());
-        let band = stats_targets(&commits, warm_band(&view), &known, want);
+        assert!(stats_targets(&commits, view.clone(), &known, want, None).is_empty());
+        let band = stats_targets(&commits, warm_band(&view), &known, want, None);
         assert_eq!(band.len(), 10, "band is 15 rows less the 5 already known");
         assert!(band.contains(&oid(15)), "one window above");
         assert!(band.contains(&oid(29)), "one window below");
@@ -11381,7 +11453,7 @@ mod tests {
         ];
         let known = HashMap::new();
         assert_eq!(
-            stats_targets(&commits, 0..5, &known, StatsWant::FilesAndLines),
+            stats_targets(&commits, 0..5, &known, StatsWant::FilesAndLines, None),
             vec![oid(1), oid(2), oid(3)]
         );
     }
@@ -11590,16 +11662,26 @@ mod tests {
             "the deferral's file count must not replace numbers the diff already gave"
         );
 
-        // `Withheld` is an ANSWER — the row saying it has none to give — so it
-        // installs, and so does a later `Counted`. Only the still-owed state is refused.
+        // `Withheld` is an ANSWER — the job saying it has none to give — so it installs
+        // where there are no counts, and a later `Counted` replaces it. But it never
+        // takes counts back: a driven virtual row's stats job withholds, and the pane's
+        // install of that row harvests the real numbers — a job still running then would
+        // otherwise blank what the sidebar shows.
         let withheld = CommitStats {
             files: 2,
             lines: LineStats::Withheld,
         };
         install_stats_result(&mut known, oid(1), Some(withheld));
-        assert_eq!(known.get(&oid(1)), Some(&Some(withheld)));
-        install_stats_result(&mut known, oid(1), Some(counted));
-        assert_eq!(known.get(&oid(1)), Some(&Some(counted)));
+        assert_eq!(
+            known.get(&oid(1)),
+            Some(&Some(counted)),
+            "a withheld answer must not replace real counts"
+        );
+        let mut asked: HashMap<git2::Oid, Option<CommitStats>> = HashMap::new();
+        install_stats_result(&mut asked, oid(1), Some(withheld));
+        assert_eq!(asked.get(&oid(1)), Some(&Some(withheld)));
+        install_stats_result(&mut asked, oid(1), Some(counted));
+        assert_eq!(asked.get(&oid(1)), Some(&Some(counted)));
 
         // And a row that has said nothing yet takes the file count, which is the
         // whole point of sending it early.
@@ -11694,10 +11776,51 @@ mod tests {
                  column now does"
             );
         }
-        // Virtual rows are content-keyed and evicted by `sync_virtual_stats`; harvesting
-        // one here would race that.
+        // Virtual rows never harvest here — this runs for the diff being REPLACED,
+        // which may predate an edit. Theirs come in `sync_virtual_stats`, where the
+        // installed content is recorded.
         assert!(!stats_harvestable(&k(oid_uncommitted(), now), now, 7));
         assert!(!stats_harvestable(&k(oid_staged(), now), now, 7));
+    }
+
+    /// The uncommitted row's numbers come off the diff the pane installs, in the same
+    /// step that records its content — so they are always that content's, a moved
+    /// content's old numbers are gone before the new ones land, and a reload that found
+    /// the same content still answers a row nothing else will count.
+    #[test]
+    fn installing_a_virtual_rows_diff_answers_its_stats_cell() {
+        let k = |content: u64| DiffCacheKey {
+            oid: oid_uncommitted(),
+            settings: ds(),
+            theme: highlight::EmbeddedThemeName::CatppuccinMocha,
+            enabled: true,
+            content,
+            drivers: 0,
+            languages: 0,
+        };
+        let st = |files| CommitStats {
+            files,
+            lines: LineStats::Counted(files, 0),
+        };
+        let mut seen: HashMap<git2::Oid, u64> = HashMap::new();
+        let mut known: HashMap<git2::Oid, Option<CommitStats>> = HashMap::new();
+
+        sync_virtual_stats(&mut seen, &mut known, &k(1), Some(st(2)));
+        assert_eq!(known.get(&oid_uncommitted()), Some(&Some(st(2))));
+
+        // Moved content: the new numbers, not the old ones.
+        sync_virtual_stats(&mut seen, &mut known, &k(2), Some(st(5)));
+        assert_eq!(known.get(&oid_uncommitted()), Some(&Some(st(5))));
+
+        // Same content, after something cleared the map (a `.git` reload does).
+        known.clear();
+        sync_virtual_stats(&mut seen, &mut known, &k(2), Some(st(5)));
+        assert_eq!(known.get(&oid_uncommitted()), Some(&Some(st(5))));
+
+        // Built under settings the column does not count under: no numbers, and
+        // moved content still evicts the old ones.
+        sync_virtual_stats(&mut seen, &mut known, &k(3), None);
+        assert_eq!(known.get(&oid_uncommitted()), None);
     }
 
     /// A worktree-only edit never touches `.git`, so the watcher's debounced
@@ -11730,14 +11853,14 @@ mod tests {
         known.insert(oid(9), st(3));
 
         // First sighting of each virtual diff: recorded, nothing evicted.
-        sync_virtual_stats(&mut seen, &mut known, &k(oid_uncommitted(), 10));
-        sync_virtual_stats(&mut seen, &mut known, &k(oid_staged(), 20));
+        sync_virtual_stats(&mut seen, &mut known, &k(oid_uncommitted(), 10), None);
+        sync_virtual_stats(&mut seen, &mut known, &k(oid_staged(), 20), None);
         assert_eq!(known.len(), 3, "a first sighting is not a change");
 
         // The same content again — re-selecting the row, a debounced refresh,
         // an apply that changed nothing. Must not evict, or the column would
         // blank and recompute on every visit to a virtual row.
-        sync_virtual_stats(&mut seen, &mut known, &k(oid_uncommitted(), 10));
+        sync_virtual_stats(&mut seen, &mut known, &k(oid_uncommitted(), 10), None);
         assert_eq!(
             known.len(),
             3,
@@ -11745,14 +11868,14 @@ mod tests {
         );
 
         // A real commit's diff is immutable; it can never invalidate anything.
-        sync_virtual_stats(&mut seen, &mut known, &k(oid(9), 99));
+        sync_virtual_stats(&mut seen, &mut known, &k(oid(9), 99), None);
         assert!(
             known.contains_key(&oid(9)),
             "a real commit is never evicted"
         );
 
         // The edit: same diff, new content hash.
-        sync_virtual_stats(&mut seen, &mut known, &k(oid_uncommitted(), 11));
+        sync_virtual_stats(&mut seen, &mut known, &k(oid_uncommitted(), 11), None);
         assert!(
             !known.contains_key(&oid_uncommitted()),
             "the edited row must be recomputed, not left showing pre-edit numbers"
@@ -11774,7 +11897,7 @@ mod tests {
             settings: DiffSettings { context: 9, ..ds() },
             ..k(oid_staged(), 21)
         };
-        sync_virtual_stats(&mut seen, &mut known, &wider);
+        sync_virtual_stats(&mut seen, &mut known, &wider, None);
         assert!(
             !known.contains_key(&oid_staged()),
             "a moved hash always recomputes — settings changed or not"
@@ -11791,7 +11914,7 @@ mod tests {
             settings: DiffSettings { context: 9, ..ds() },
             ..k(oid_uncommitted(), 12)
         };
-        sync_virtual_stats(&mut seen, &mut known, &edited_and_widened);
+        sync_virtual_stats(&mut seen, &mut known, &edited_and_widened, None);
         assert!(
             !known.contains_key(&oid_uncommitted()),
             "an edit arriving with a settings change must not be absorbed"
@@ -11804,7 +11927,7 @@ mod tests {
             settings: DiffSettings { context: 9, ..ds() },
             ..k(oid_staged(), 22)
         };
-        sync_virtual_stats(&mut seen, &mut known, &retimed);
+        sync_virtual_stats(&mut seen, &mut known, &retimed, None);
         assert!(
             !known.contains_key(&oid_staged()),
             "a re-theme must not mask a working-tree change"
@@ -11814,8 +11937,8 @@ mod tests {
         // the last install of each row, repeated, still changes nothing.
         known.insert(oid_uncommitted(), st(1));
         known.insert(oid_staged(), st(2));
-        sync_virtual_stats(&mut seen, &mut known, &edited_and_widened);
-        sync_virtual_stats(&mut seen, &mut known, &retimed);
+        sync_virtual_stats(&mut seen, &mut known, &edited_and_widened, None);
+        sync_virtual_stats(&mut seen, &mut known, &retimed, None);
         assert_eq!(
             known.len(),
             3,

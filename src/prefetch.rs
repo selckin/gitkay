@@ -1612,8 +1612,10 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
         // column still cannot disagree with the sidebar.
         // Real commits only, because deferring is a promise the diff will pay instead —
         // and only a real commit's diff does. A prefetch never warms a virtual row (its
-        // key is content-hashed only after the diff exists) and both harvest sites,
-        // `cache_diff` and `warm_row`, guard on `is_real_commit`. Deferring one would
+        // key is content-hashed only after the diff exists), the harvests off cached and
+        // warmed diffs (`cache_diff`, `warm_row`) guard on `is_real_commit`, and the one
+        // that does take a virtual row's numbers — `sync_virtual_stats`, off the diff the
+        // pane installs — runs only for a row somebody selected. Deferring one would
         // record its SENTINEL oid in the coordinator's `measured` map, which then filters
         // that row out of every future stats submission — so the uncommitted/staged/range
         // row would show a file count and a permanently blank `+`/`-`, and stay that way
@@ -1649,11 +1651,11 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
         // A DRIVEN virtual row answers its file count and nothing else. It cannot take
         // the deferral above, and the line counts here would be libgit2's RAW ones —
         // `Bin 13 -> 20 bytes` counts as `+0 -0` where the pane, built with the driver,
-        // shows the converted patch's numbers. Nothing ever corrects that: the harvest
-        // that fills a real commit's numbers in refuses a virtual oid, because
-        // `sync_virtual_stats` evicts these rows by content hash and would race it. So
-        // the column shows the one number no conversion can change rather than a
-        // `+`/`-` pair that contradicts the sidebar beside it, permanently.
+        // shows the converted patch's numbers. Only the pane corrects that, when the row
+        // is selected and its installed diff hands the column the converted counts
+        // (`sync_virtual_stats`) — a row nobody selects is never corrected. So the column
+        // shows the one number no conversion can change rather than a `+`/`-` pair that
+        // contradicts the sidebar beside it.
         //
         // It is reported as `Withheld`, not as the `NotAsked` a `FilesOnly` job would
         // produce, and the difference is the whole reason `LineStats` has three states:
@@ -1686,8 +1688,8 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
         // this arm would compute are libgit2's RAW ones", and a stored entry's are the
         // CONVERTED ones the pane shows. The two are unreachable together today — a
         // driven virtual row never keys into the store and a driven real one deferred
-        // above — but an arrangement where `Withheld` could overwrite real counts would
-        // look accidental rather than safe.
+        // above. (Real counts from the pane's install can race this result, which is why
+        // `install_stats_result` never lets a `Withheld` replace a `Counted`.)
         let stats = measured
             .stats(want)
             .inspect_err(|e| log::debug!("stats: {oid} failed: {e}"))
@@ -3329,8 +3331,8 @@ mod tests {
     /// LOAD-BEARING. The uncommitted row is DRIVEN too, and its column may not
     /// contradict the sidebar. It cannot take the deferral a real commit takes — a
     /// sentinel oid in `measured` would filter the row out of every later submission —
-    /// and the harvest that fills a real commit's numbers in refuses a virtual oid, so
-    /// a wrong `+`/`-` here is wrong forever. It answers the file count alone.
+    /// and only the pane's install of the row corrects its numbers, so a wrong `+`/`-`
+    /// here stays wrong for a row nobody selects. It answers the file count alone.
     ///
     /// Without the rule the column shows libgit2's RAW numbers (`+0 -0` for a binary
     /// change) beside a pane showing the converted patch's.
@@ -3414,7 +3416,7 @@ mod tests {
             None,
         )];
         assert!(
-            stats_targets(&commits, 0..1, &known, StatsWant::FilesAndLines).is_empty(),
+            stats_targets(&commits, 0..1, &known, StatsWant::FilesAndLines, None).is_empty(),
             "a withheld row must stop being offered, or the band phase is never reached"
         );
         // And the pane's own numbers for that row really are the converted ones, which

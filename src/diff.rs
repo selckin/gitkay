@@ -3424,17 +3424,28 @@ pub enum LineStats {
     /// lets `[commit_list] line_count` be switched on without blanking the file counts
     /// already on screen.
     NotAsked,
-    /// Asked for and deliberately WITHHELD — this row has said all it will ever say.
+    /// Asked for and deliberately WITHHELD — this job has said all it will say.
     /// `run_stats_job`'s driven-virtual arm is the one producer: the counts it could
     /// give are libgit2's raw ones (`+0 -0` on a binary change whose pane shows the
-    /// converted patch) and nothing ever corrects them, since `stats_harvestable`
-    /// refuses a virtual oid.
+    /// converted patch). The row's real counts arrive only when the pane installs its
+    /// own diff (`sync_virtual_stats`), and a `Withheld` never overwrites them.
     Withheld,
     /// `(additions, deletions)`.
     Counted(usize, usize),
 }
 
 impl LineStats {
+    /// How much this answer says: not asked < withheld < counted. A fresh result never
+    /// replaces a more informative one (`install_stats_result`). Not `Ord`, which would
+    /// also rank one count against another by their numbers.
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::NotAsked => 0,
+            Self::Withheld => 1,
+            Self::Counted(..) => 2,
+        }
+    }
+
     /// The numbers to draw, if there are any.
     pub const fn counted(self) -> Option<(usize, usize)> {
         match self {
