@@ -1049,7 +1049,8 @@ sorted drivers keep the same rows with the same rewritten parents.
   `SubmitStats` filters the row out of every later submission, while `stats_targets`
   reads `NotAsked` under a `FilesAndLines` want as still owed and re-lists it every
   frame — a cell blank for the session, and the band around it never warmed while the
-  row is on screen. `Withheld` is an answer and does install. The pathspec `commit_stats` diffs against (`paths` — under
+  row is on screen. `Withheld` is an answer and does install — but never over real
+  counts, which the pane's install of a driven virtual row supplies (below). The pathspec `commit_stats` diffs against (`paths` — under
   `--follow`, `CommitInfo::follow_path`, recomputed on every rebuild) is an
   input to the cached value but is part of neither the map's key nor
   `stats_relevant`; a scope-mutating feature must classify that deliberately
@@ -1078,6 +1079,17 @@ sorted drivers keep the same rows with the same rewritten parents.
   ambiguity resolves toward recomputing rather than toward a number that may be
   wrong forever. So the two virtual rows do blank briefly on a context change,
   unlike the real commits — two diffs, and only while those rows are visible.
+  **A virtual row's numbers come off the pane's own diff when there is one**:
+  `sync_virtual_stats` — where the installed diff's content hash is recorded, and old
+  numbers evicted if it moved — installs that diff's counts in the same step (when it was
+  built under settings and drivers the column counts under, `counts_match`), so the
+  numbers are always the recorded content's, and a reload that found the same content
+  still answers the row. `stats_harvestable` stays real-commits-only: it also runs for
+  the diff being REPLACED (`cache_diff`), which may predate an edit. And while the pane
+  is loading a virtual row — `DiffLoadState::oid` — `stats_targets` leaves it out
+  (`supplied_by_pane`): its stats job would be a second full worktree diff built only to
+  count what the install is about to count.
+  A row the pane never shows still gets its stats job, as before.
   Rendering is `draw_stats_cells`: fixed-width cells (`STATS_CELL_CHARS`)
   right-aligned between the summary and the SHA. Fixed width buys
   stability *within* a row — the slot exists before the number does, so a landing
@@ -1111,7 +1123,7 @@ sorted drivers keep the same rows with the same rewritten parents.
   nothing will read it again.
   `LineStats` has a **third** state for the row that was asked and has nothing to
   give — `Withheld`, produced only by the driven-virtual arm of `run_stats_job` (see
-  **Textconv**). It is not an `Option` because "not asked" and "asked, none to give"
+  **Textconv**); the row's real counts arrive when the pane installs its own diff. It is not an `Option` because "not asked" and "asked, none to give"
   differ in whether anything is still owed, and collapsing them left that row on the
   target list forever: the dispatcher never advanced to its band phase while the row
   was visible, and re-ran its whole worktree diff on every landing result. Neither
