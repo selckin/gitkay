@@ -30,7 +30,10 @@ pub struct RawArgs {
     pub help: bool,         // -h / --help: print usage and exit
     pub version: bool,      // -V / --version: print version and exit
     pub pre: Vec<String>,   // positional tokens before `--`
-    pub post: Vec<String>,  // positional tokens after `--` (always paths)
+    /// Positional tokens after `--` (always paths); `None` when there was no `--`,
+    /// which is a different command line from an empty `--`: with one, everything
+    /// before it is a revision.
+    pub post: Option<Vec<String>>,
 }
 
 /// The shape of a single `<rev>` token.
@@ -52,16 +55,15 @@ pub fn parse_flags(args: impl Iterator<Item = String>) -> Result<RawArgs, String
     let mut combined = false;
     let mut first_parent = false;
     let mut pre = Vec::new();
-    let mut post = Vec::new();
-    let mut after_dashdash = false;
+    let mut post: Option<Vec<String>> = None;
     let mut iter = args;
     while let Some(arg) = iter.next() {
-        if after_dashdash {
+        if let Some(post) = post.as_mut() {
             post.push(arg);
             continue;
         }
         if arg == "--" {
-            after_dashdash = true;
+            post = Some(Vec::new());
         } else if arg == "--help" || arg == "-h" {
             // Short-circuit so help wins even alongside other (or invalid) args.
             return Ok(RawArgs {
@@ -106,16 +108,24 @@ pub fn parse_flags(args: impl Iterator<Item = String>) -> Result<RawArgs, String
     })
 }
 
-/// Split positional tokens into revs and paths. Revs come first; the first token
-/// that is not a rev switches the rest to paths. A token that is both a rev and an
-/// existing path is ambiguous; one that is neither is an error. `post` tokens are
-/// paths verbatim.
+/// Split positional tokens into revs and paths, as git does. With a `--` (`post` is
+/// `Some`), every token before it is a revision — whatever the worktree happens to
+/// hold under the same name — and the tokens after it are paths verbatim. Without
+/// one, revs come first and the first token that is not a rev switches the rest to
+/// paths; a token that is both a rev and an existing path is ambiguous, and one that
+/// is neither is an error.
 pub fn classify(
     pre: &[String],
-    post: &[String],
+    post: Option<&[String]>,
     is_rev: impl Fn(&str) -> bool,
     is_path: impl Fn(&str) -> bool,
 ) -> Result<(Vec<String>, Vec<String>), String> {
+    if let Some(post) = post {
+        if let Some(tok) = pre.iter().find(|t| !is_rev(t)) {
+            return Err(format!("unknown revision: {tok}"));
+        }
+        return Ok((pre.to_vec(), post.to_vec()));
+    }
     let mut revs = Vec::new();
     let mut paths = Vec::new();
     let mut in_paths = false;
@@ -143,9 +153,6 @@ pub fn classify(
                 "unknown revision or path not in the working tree: {tok}"
             ));
         }
-    }
-    for tok in post {
-        paths.push(tok.clone());
     }
     Ok((revs, paths))
 }
@@ -455,7 +462,13 @@ mod tests {
         assert_eq!(r.repo_dir.as_deref(), Some("/repo"));
         assert!(r.all);
         assert_eq!(r.pre, v(&["main"]));
-        assert_eq!(r.post, v(&["a.rs", "b.rs"]));
+        assert_eq!(r.post, Some(v(&["a.rs", "b.rs"])));
+        // A trailing `--` is still a `--`; no `--` at all is not.
+        assert_eq!(
+            parse_flags(v(&["main", "--"]).into_iter()).unwrap().post,
+            Some(vec![])
+        );
+        assert_eq!(parse_flags(v(&["main"]).into_iter()).unwrap().post, None);
     }
 
     #[test]
@@ -470,7 +483,7 @@ mod tests {
     fn classify_revs_then_paths() {
         let is_rev = |t: &str| t == "main" || t == "dev";
         let is_path = |t: &str| t == "src" || t == "x.rs";
-        let (revs, paths) = classify(&v(&["main", "src", "x.rs"]), &[], is_rev, is_path).unwrap();
+        let (revs, paths) = classify(&v(&["main", "src", "x.rs"]), None, is_rev, is_path).unwrap();
         assert_eq!(revs, v(&["main"]));
         assert_eq!(paths, v(&["src", "x.rs"]));
     }
@@ -479,14 +492,30 @@ mod tests {
     fn classify_ambiguous_and_unknown_errors() {
         let is_rev = |t: &str| t == "main";
         let is_path = |t: &str| t == "main" || t == "x.rs";
-        assert!(classify(&v(&["main"]), &[], is_rev, is_path).is_err()); // both → ambiguous
-        assert!(classify(&v(&["nope"]), &[], |_| false, |_| false).is_err()); // neither
+        assert!(classify(&v(&["main"]), None, is_rev, is_path).is_err()); // both → ambiguous
+        assert!(classify(&v(&["nope"]), None, |_| false, |_| false).is_err()); // neither
+    }
+
+    /// With a `--`, what precedes it is a revision even when the worktree holds a
+    /// directory of the same name — `gitkay ai-search -- db/` next to an `ai-search/`
+    /// checkout was refused as ambiguous, the very error that tells you to add `--`.
+    #[test]
+    fn classify_before_dashdash_is_revisions_only() {
+        let is_rev = |t: &str| t == "ai-search";
+        let is_path = |t: &str| t == "ai-search" || t == "src";
+        let post = v(&["db/src/main/resources/"]);
+        let (revs, paths) = classify(&v(&["ai-search"]), Some(&post), is_rev, is_path).unwrap();
+        assert_eq!(revs, v(&["ai-search"]));
+        assert_eq!(paths, post);
+        // A path before `--` is not a revision, however real a path it is.
+        let err = classify(&v(&["src"]), Some(&[]), is_rev, is_path).unwrap_err();
+        assert_eq!(err, "unknown revision: src");
     }
 
     #[test]
     fn classify_post_dashdash_are_paths_verbatim() {
         // even a deleted path (is_path=false) is accepted after `--`
-        let (revs, paths) = classify(&[], &v(&["gone.rs"]), |_| false, |_| false).unwrap();
+        let (revs, paths) = classify(&[], Some(&v(&["gone.rs"])), |_| false, |_| false).unwrap();
         assert!(revs.is_empty());
         assert_eq!(paths, v(&["gone.rs"]));
     }
@@ -506,7 +535,7 @@ mod tests {
         // after `--`, `--help` is a path, not the flag
         let r = parse_flags(v(&["--", "--help"]).into_iter()).unwrap();
         assert!(!r.help);
-        assert_eq!(r.post, v(&["--help"]));
+        assert_eq!(r.post, Some(v(&["--help"])));
     }
 
     #[test]
