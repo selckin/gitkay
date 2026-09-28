@@ -90,7 +90,7 @@
 
 ### Quality of Life
 - **Click a commit** to copy its SHA to both clipboard and primary selection
-- **Uncommitted / staged rows** — working-tree and index changes appear as rows at the top of the list, whenever you haven't named a revision (or passed `--all`)
+- **Uncommitted / staged rows** — working-tree and index changes appear as rows at the top of the list, whenever you haven't named a revision (or passed `--all`). The uncommitted row includes untracked files, shown whole as additions, as `git status` lists them (ignored files stay out). Past 1000 untracked files or 16 MB they are all left out, and the diff says so — gitignore what should stay out
 - **Live view** — `.git` (refs, HEAD, index) is watched, so the graph reloads itself after a commit, fetch, or rebase
 - **Combined range row** — `gitkay v1.0..main` adds a row for the range as a whole, diffed end to end
 - **Warm across launches** — built diffs are cached on disk, so a commit with huge blobs but a small patch is not rebuilt every time you open it

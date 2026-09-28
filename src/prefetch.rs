@@ -3355,7 +3355,13 @@ mod tests {
         write_driver(&repo, "gktest", &cmd, false, "*.zip");
         commit_bytes(&repo, "a.zip", &[0, 1, b'A', 0], "one");
         std::fs::write(repo.workdir().unwrap().join("a.zip"), [0, 1, b'A', b'B', 0]).unwrap();
-        let scope = RowScope::new(DiffSource::Uncommitted);
+        // Scoped to the file under test: the uncommitted row lists untracked files,
+        // and the fixture's driver script and `.gitattributes` sit untracked in the
+        // worktree.
+        let scope = RowScope {
+            source: DiffSource::Uncommitted,
+            paths: vec!["a.zip".to_string()],
+        };
 
         let (stats_tx, stats_rx) = mpsc::channel();
         let worker = WorkerCtx {

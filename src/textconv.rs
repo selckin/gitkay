@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use git2::Repository;
 
-use crate::apply::path_from_bytes;
+use crate::diff::path_from_bytes;
 
 /// Most a driver may write before its conversion is abandoned. A converted archive
 /// listing is kilobytes; anything past this is a driver that has decided to dump the

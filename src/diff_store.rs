@@ -29,10 +29,12 @@ const MAGIC: &[u8; 8] = b"gitkayD\x00";
 /// layer refuses a hunk click on it, so an entry that lost the flag on the way to
 /// disk would come back applicable-by-hunk and fail as `Stale`. 5: `DiffData::tabless`
 /// joined the header beside `max_chars`, so a store hit does not pay the frame-loop tab
-/// census the build path stopped paying. Note this guards
+/// census the build path stopped paying. 6: `FileEntry::new_blob` joined the file
+/// record — the displayed new side's blob id, which a hunk click on an untracked file
+/// is checked against. Note this guards
 /// the LAYOUT only — a change to what the diff BUILDER emits is invisible here,
 /// which is why `StoreContext` mixes in the crate version.
-const VERSION: u16 = 5;
+const VERSION: u16 = 6;
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
@@ -160,8 +162,9 @@ impl<'a> Reader<'a> {
 /// encoder rather than restating by hand.
 const LINE_MIN_BYTES: usize = 1 + 8 + 4 + 4;
 /// The same for a file: two empty length-prefixed paths, the two optional-path
-/// tags, the status tag, the binary and converted flags, and three `u64`s.
-const FILE_MIN_BYTES: usize = 8 + 1 + 8 + 1 + 1 + 1 + 1 + 8 + 8 + 8;
+/// tags, the status tag, the binary and converted flags, the optional-blob tag, and
+/// three `u64`s.
+const FILE_MIN_BYTES: usize = 8 + 1 + 8 + 1 + 1 + 1 + 1 + 1 + 8 + 8 + 8;
 
 /// Exhaustive both ways: a new `LineKind` variant fails to compile here rather
 /// than silently decoding as something else.
@@ -266,6 +269,7 @@ fn encode(data: &DiffData) -> Vec<u8> {
         out.push(delta_tag(f.status));
         out.push(u8::from(f.is_binary));
         out.push(u8::from(f.is_converted));
+        put_opt_bytes(&mut out, f.new_blob.as_ref().map(git2::Oid::as_bytes));
         put_u64(&mut out, f.additions as u64);
         put_u64(&mut out, f.deletions as u64);
         // `usize + 1`, so 0 is `None` — the same sentinel trick the line numbers
@@ -347,6 +351,10 @@ fn decode_head(r: &mut Reader) -> Option<(usize, bool, Vec<FileEntry>)> {
         let status = delta_from_tag(r.u8()?)?;
         let is_binary = r.u8()? != 0;
         let is_converted = r.u8()? != 0;
+        let new_blob = match r.opt_bytes()? {
+            None => None,
+            Some(b) => Some(git2::Oid::from_bytes(&b).ok()?),
+        };
         let additions = usize::try_from(r.u64()?).ok()?;
         let deletions = usize::try_from(r.u64()?).ok()?;
         let diff_line_idx = match r.u64()? {
@@ -361,6 +369,7 @@ fn decode_head(r: &mut Reader) -> Option<(usize, bool, Vec<FileEntry>)> {
             status,
             is_binary,
             is_converted,
+            new_blob,
             additions,
             deletions,
             diff_line_idx,
@@ -1146,6 +1155,7 @@ mod tests {
                 status: git2::Delta::Renamed,
                 is_binary: false,
                 is_converted: false,
+                new_blob: Some(git2::Oid::from_bytes(&[7; 20]).unwrap()),
                 additions: 1,
                 deletions: 1,
                 diff_line_idx: Some(0),
@@ -1197,6 +1207,7 @@ mod tests {
                 status: git2::Delta::Added,
                 is_binary: false,
                 is_converted: false,
+                new_blob: None,
                 additions: 0,
                 deletions: 0,
                 diff_line_idx: None,
@@ -1740,6 +1751,7 @@ mod tests {
             assert_eq!(a.path_bytes, b.path_bytes);
             assert_eq!(a.old_path_bytes, b.old_path_bytes);
             assert_eq!(a.status, b.status);
+            assert_eq!(a.new_blob, b.new_blob);
             assert_eq!((a.additions, a.deletions), (b.additions, b.deletions));
             assert_eq!(a.diff_line_idx, b.diff_line_idx);
         }
