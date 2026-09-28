@@ -779,12 +779,13 @@ pub(super) mod tests {
         )
         .unwrap();
         let tc = Textconv::new();
-        let data = get_diff_data(
-            &repo,
-            &RowScope::new(DiffSource::Uncommitted),
-            conv_settings(),
-            BuildEnv::of(Some(&tc)),
-        );
+        // Scoped to the file under test: the uncommitted row lists untracked files,
+        // and `driven_repo`'s script and `.gitattributes` sit untracked in the worktree.
+        let scope = RowScope {
+            source: DiffSource::Uncommitted,
+            paths: vec!["a.zip".to_string()],
+        };
+        let data = get_diff_data(&repo, &scope, conv_settings(), BuildEnv::of(Some(&tc)));
         let named: Vec<&str> = data
             .lines
             .iter()
@@ -1409,7 +1410,7 @@ pub(super) mod tests {
 
         let scope = RowScope::new(DiffSource::Uncommitted);
         let mut opts = scoped_diff_opts(conv_settings(), &[]);
-        let raw = source_diff(&repo, &scope, &mut opts).unwrap();
+        let raw = source_diff(&repo, &scope, conv_settings(), &mut opts).unwrap();
         assert!(
             raw.deltas().any(|d| d.status() == git2::Delta::Conflicted),
             "the fixture must really produce a conflicted delta"
@@ -1473,7 +1474,7 @@ pub(super) mod tests {
         // emits one fewer raw line than there are deltas, so every entry came back
         // `Unknown` and nothing could be converted.
         let mut opts = scoped_diff_opts(conv_settings(), &[]);
-        let raw = source_diff(&repo, &scope, &mut opts).unwrap();
+        let raw = source_diff(&repo, &scope, conv_settings(), &mut opts).unwrap();
         let zip = raw
             .deltas()
             .position(|d| delta_path_bytes(&d) == b"a.zip")

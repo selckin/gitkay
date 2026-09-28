@@ -18,7 +18,7 @@ use crate::cli;
 use crate::datefmt::{local_tz_offset_min, now_unix_secs};
 use crate::diff::{
     self, commit_parent_diff, is_real_commit, oid_staged, pathspec_opts, staged_git_diff,
-    worktree_git_diff,
+    worktree_has_changes,
 };
 
 /// How many hex characters a row's abbreviated SHA carries.
@@ -1377,10 +1377,12 @@ impl LocalProbes {
     }
 }
 
-/// Staged = index vs HEAD tree; uncommitted = workdir vs index. Both are scoped to
-/// the active `-- <path>` filter, so a change outside the path doesn't add a virtual
-/// row on its own lane. The probes and the rows they gate stay symmetric — one probe
-/// helper and one row builder — so a change to one can't silently miss the other.
+/// Staged = index vs HEAD tree; uncommitted = workdir vs index, untracked files
+/// included. Both are scoped to the active `-- <path>` filter, so a change outside the
+/// path doesn't add a virtual row on its own lane. The staged probe counts the deltas of
+/// `staged_git_diff`, the very diff its row shows; the uncommitted one asks
+/// `worktree_has_changes`, because that row's diff may withhold untracked files the row
+/// must still exist to explain.
 pub fn run_local_probes(repo: &Repository, paths: &[String]) -> (bool, bool) {
     let probe = |label: &str,
                  build: for<'r> fn(
@@ -1396,10 +1398,16 @@ pub fn run_local_probes(repo: &Repository, paths: &[String]) -> (bool, bool) {
         );
         hit
     };
-    (
-        probe("staged (diff_tree_to_index)", staged_git_diff),
-        probe("uncommitted (diff_index_to_workdir)", worktree_git_diff),
-    )
+    let staged = probe("staged (diff_tree_to_index)", staged_git_diff);
+    // Not a delta count: the uncommitted row lists untracked files, which the diff may
+    // withhold, and the row must exist to say so — see `worktree_has_changes`.
+    let t = std::time::Instant::now();
+    let uncommitted = worktree_has_changes(repo, paths);
+    log::debug!(
+        "perf: load_commits: uncommitted (worktree) probe -> {uncommitted} {:?}",
+        t.elapsed()
+    );
+    (staged, uncommitted)
 }
 
 pub fn spawn_local_probes(repo: &Repository, paths: &[String], show_local: bool) -> LocalProbes {
@@ -4085,6 +4093,31 @@ mod tests {
             vec![c1],
             "parent must be rewritten across the dropped head commit to the nearest kept ancestor"
         );
+    }
+
+    /// A worktree whose only change is a new, never-added file still has something
+    /// uncommitted — `git status` lists it, so the row is there to show it.
+    #[test]
+    fn an_untracked_file_alone_gives_the_uncommitted_row() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.txt", "1", "a-1");
+        write_file(&repo, "new.txt", "fresh");
+        let commits = load_commits(&repo, 100, &cli::Scope::default());
+        assert!(commits.iter().any(|c| c.oid == oid_uncommitted()));
+    }
+
+    /// Over the untracked budget the row's diff withholds them all, but the row is
+    /// still there: its existence asks what `git status` lists, and the pane is where
+    /// the withheld files are explained.
+    #[test]
+    fn an_over_budget_untracked_tree_still_gives_the_uncommitted_row() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.txt", "1", "a-1");
+        for i in 0..=crate::diff::MAX_UNTRACKED_FILES {
+            write_file(&repo, &format!("junk/f{i}"), "x");
+        }
+        let commits = load_commits(&repo, 100, &cli::Scope::default());
+        assert!(commits.iter().any(|c| c.oid == oid_uncommitted()));
     }
 
     #[test]

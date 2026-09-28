@@ -1,6 +1,6 @@
 //! The write layer: stage, unstage, and revert a hunk or a file.
 
-use crate::diff::{CommitKind, DiffSource, HunkRange};
+use crate::diff::{CommitKind, DiffSource, HunkRange, path_from_bytes};
 
 /// What a right-click acts on, derived from the row the diff belongs to. Delegates
 /// to `CommitKind::of` — the single oid→kind rule the whole app shares — so a new
@@ -71,6 +71,8 @@ pub struct ApplyRequest {
     /// `FileEntry::is_converted` rather than re-derived from the driver config
     /// here: a driven path whose delta was left unconverted still applies by hunk.
     pub converted: bool,
+    /// The displayed new side's blob id — see `FileEntry::new_blob`.
+    pub new_blob: Option<git2::Oid>,
     pub hunk: Option<HunkRange>,
 }
 
@@ -89,6 +91,7 @@ impl ApplyRequest {
             old_path: file.old_path_bytes.clone(),
             status: file.status,
             converted: file.is_converted,
+            new_blob: file.new_blob,
             hunk,
         }
     }
@@ -135,22 +138,6 @@ impl ApplyRequest {
     pub fn display_path(&self) -> std::borrow::Cow<'_, str> {
         String::from_utf8_lossy(&self.path)
     }
-}
-
-/// A raw git path as a `Path`, without laundering it through a lossy `String`.
-///
-/// git stores paths as bytes and unix filesystems accept any byte but NUL and
-/// `/`, so a name need not be valid UTF-8; this is the free reinterpret that
-/// makes the whole write layer byte-exact. There is no portable equivalent, and
-/// no portable fallback is offered: a lossy one would silently reintroduce the
-/// "matches nothing, reports success" bug this exists to prevent. gitkay is
-/// unix-only anyway (see the `compile_error!` in main.rs).
-///
-/// Shared with `textconv`, which hands the same raw bytes to `get_attr_bytes` and
-/// to the driver: an attribute lookup on a laundered name matches the wrong rules.
-pub fn path_from_bytes(bytes: &[u8]) -> &std::path::Path {
-    use std::os::unix::ffi::OsStrExt;
-    std::path::Path::new(std::ffi::OsStr::from_bytes(bytes))
 }
 
 /// Why a write did not happen. Distinguished from a bare `git2::Error` so the
@@ -335,7 +322,7 @@ pub const fn hunk_fit(clicked: &HunkRange, generated: &HunkRange, reversed: bool
 }
 
 use crate::diff::{
-    DiffSettings, detect_similar, diff_opts, staged_diff_against, worktree_git_diff,
+    DiffSettings, detect_similar, diff_opts, staged_diff_against, worktree_tracked_diff,
 };
 use git2::{ApplyLocation, ApplyOptions, DiffOptions, Repository};
 use std::cell::Cell;
@@ -440,7 +427,11 @@ fn build_action_diff<'r>(
     let reversed = !matches!(action, ApplyAction::Stage);
     let mut opts = action_diff_opts(req, settings, reversed);
     let (mut diff, target) = match action {
-        ApplyAction::Stage => (worktree_git_diff(repo, &mut opts)?, ActionTarget::Index),
+        // The same literal paths `action_diff_opts` scopes the other two routes to.
+        // Tracked changes only: an untracked target never reaches here —
+        // `apply_request` stages it through `stage_untracked_as_shown`, and a whole
+        // untracked file through `stage_file`.
+        ApplyAction::Stage => (worktree_tracked_diff(repo, &mut opts)?, ActionTarget::Index),
         ApplyAction::Unstage => (
             staged_diff_against(repo, head_tree_for_write(repo)?.as_ref(), &mut opts)?,
             ActionTarget::Index,
@@ -1272,6 +1263,67 @@ fn bypasses_hunk_callback(diff: &git2::Diff<'_>, path: &[u8]) -> bool {
         .any(|d| matches!(d.status(), git2::Delta::Deleted | git2::Delta::Renamed))
 }
 
+/// Stage or unstage `req`'s whole file straight in the index — no patch.
+///
+/// One shell for both index routes. They differ only in which helper runs; the shape
+/// around it — open the index, act on the rename's old path and then the new one,
+/// write ONCE — is the atomicity guarantee, and it has to stay identical for the two.
+/// Written twice it drifted (the
+/// staleness check landed on Stage alone), so it is written once.
+fn index_whole_file(
+    repo: &Repository,
+    req: &ApplyRequest,
+    action: ApplyAction,
+) -> Result<(), ApplyError> {
+    let staging = matches!(action, ApplyAction::Stage);
+    let act = |index: &mut git2::Index, path: &[u8], shown_deleted: bool| {
+        if staging {
+            stage_file(repo, index, path, shown_deleted)
+        } else {
+            unstage_file(repo, index, path)
+        }
+    };
+    let mut index = repo.index()?;
+    if let Some(old) = req.rename_source() {
+        // A rename's old path is gone from the worktree BY DEFINITION — that absence
+        // is the rename's delete half, not a stale diff — so it is always "shown
+        // deleted".
+        act(&mut index, old, true)?;
+    }
+    act(&mut index, &req.path, req.shown_deleted())?;
+    // Our own index mutation, so unlike repo.apply this needs an explicit write.
+    index.write()?;
+    Ok(())
+}
+
+/// Stage an untracked file with exactly the content the pane showed, or refuse.
+///
+/// A hunk click on one cannot be checked the way a tracked file's is: `hunk_fit` reads
+/// the display's OLD side, which a new file has none of, and its hunk header
+/// (`@@ -0,0 +1,N @@`) says only how many lines there were. So the check is the
+/// content itself: the blob `git add` would record must be the one the pane displayed
+/// (`FileEntry::new_blob`). `add_path` is what makes it that blob — the same clean
+/// filters (`text`, `eol`, `ident`), `core.fileMode` and symlink rules as `git add` and
+/// the whole-file Stage, which hashing the raw bytes here would each disagree with —
+/// and the id is read back off the entry it staged, so what is checked is what gets
+/// written. On a mismatch the index is re-read from disk, dropping the entry unwritten.
+fn stage_untracked_as_shown(repo: &Repository, req: &ApplyRequest) -> Result<(), ApplyError> {
+    let shown = req.new_blob.ok_or(ApplyError::Stale)?;
+    let path = path_from_bytes(&req.path);
+    let mut index = repo.index()?;
+    let staged = match index.add_path(path) {
+        Ok(()) => index.get_path(path, 0).map(|e| e.id),
+        Err(e) if e.code() == git2::ErrorCode::NotFound => None,
+        Err(e) => return Err(ApplyError::Git(e)),
+    };
+    if staged != Some(shown) {
+        index.read(true)?;
+        return Err(ApplyError::Stale);
+    }
+    index.write()?;
+    Ok(())
+}
+
 /// Perform one requested write.
 ///
 /// Whole-file requests take their own routes (Tasks 5 and 6); this is the hunk
@@ -1290,33 +1342,7 @@ pub fn apply_request(
         // rename that touches two paths must not leave the index half-migrated on
         // disk if the second mutation fails.
         return match action {
-            // One shell for both index routes. They differ only in which helper
-            // runs; the shape around it — open the index, act on the rename's old
-            // path and then the new one, write ONCE — is the atomicity guarantee,
-            // and it has to stay identical for the two. Written twice it drifted
-            // (the staleness check landed on Stage alone), so it is written once.
-            ApplyAction::Stage | ApplyAction::Unstage => {
-                let staging = matches!(action, ApplyAction::Stage);
-                let act = |index: &mut git2::Index, path: &[u8], shown_deleted: bool| {
-                    if staging {
-                        stage_file(repo, index, path, shown_deleted)
-                    } else {
-                        unstage_file(repo, index, path)
-                    }
-                };
-                let mut index = repo.index()?;
-                if let Some(old) = req.rename_source() {
-                    // A rename's old path is gone from the worktree BY
-                    // DEFINITION — that absence is the rename's delete half, not
-                    // a stale diff — so it is always "shown deleted".
-                    act(&mut index, old, true)?;
-                }
-                act(&mut index, &req.path, req.shown_deleted())?;
-                // Our own index mutation, so unlike repo.apply this needs an
-                // explicit write.
-                index.write()?;
-                Ok(())
-            }
+            ApplyAction::Stage | ApplyAction::Unstage => index_whole_file(repo, req, action),
             ApplyAction::Revert => revert_file(repo, req, settings),
         };
     };
@@ -1337,6 +1363,15 @@ pub fn apply_request(
     // blames a change nothing made, forever.
     if req.converted {
         return Err(ApplyError::TextconvNotApplicable);
+    }
+    // An untracked file cannot go through `repo.apply`, which wants an index preimage
+    // and refuses ("index does not contain …"), and its one hunk is the whole file —
+    // so the click stages the file, as it was SHOWN.
+    if req.status == git2::Delta::Untracked {
+        return match action {
+            ApplyAction::Stage => stage_untracked_as_shown(repo, req),
+            ApplyAction::Unstage | ApplyAction::Revert => Err(ApplyError::Unsupported),
+        };
     }
     let (diff, target, reversed) = action_diff(repo, req, settings)?;
 
@@ -2025,6 +2060,170 @@ mod tests {
 
         let staged = index_blob(&repo, "f.txt");
         assert!(staged.contains("EDITED 3") && staged.contains("EDITED 17"));
+    }
+
+    /// The uncommitted row lists untracked files, so its Stage verb reaches one: the
+    /// whole-file route adds it to the index as `git add` would.
+    #[test]
+    fn stage_file_adds_an_untracked_file() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", &body(&[]), "base");
+        write_file(&repo, "new.txt", "brand new\n");
+
+        apply_request(
+            &repo,
+            &req(DiffSource::Uncommitted, "new.txt", None),
+            settings(),
+        )
+        .unwrap();
+
+        assert_eq!(index_blob(&repo, "new.txt"), "brand new\n");
+    }
+
+    /// The same file's one hunk, clicked in the pane: staging it stages the file.
+    #[test]
+    fn staging_an_untracked_files_hunk_adds_it() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", &body(&[]), "base");
+        write_file(&repo, "new.txt", "one\ntwo\n");
+
+        let data = crate::diff::get_working_tree_diff(
+            &repo,
+            settings(),
+            &RowScope::new(DiffSource::Uncommitted),
+            BuildEnv::NONE,
+        );
+        let row = data
+            .lines
+            .iter()
+            .position(|l| &*l.text == "+two")
+            .expect("the untracked file's content is in the diff");
+        let hunk = hunk_at_line(&data.lines, row).expect("that row is inside a hunk");
+        let file = data.files.iter().find(|f| f.path == "new.txt").unwrap();
+
+        apply_request(
+            &repo,
+            &ApplyRequest::for_entry(DiffSource::Uncommitted, file, Some(hunk)),
+            settings(),
+        )
+        .unwrap();
+        assert_eq!(index_blob(&repo, "new.txt"), "one\ntwo\n");
+    }
+
+    /// The Stage aims its action diff at the one file, literally — which libgit2's
+    /// listing could not see inside a new directory, so this click was Stale every time.
+    #[test]
+    fn staging_the_hunk_of_an_untracked_file_inside_a_new_directory() {
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "f.txt", &body(&[]), "base");
+        write_file(&repo, "fresh/dir/new.txt", "one\ntwo\n");
+        let data = crate::diff::get_working_tree_diff(
+            &repo,
+            settings(),
+            &RowScope::new(DiffSource::Uncommitted),
+            BuildEnv::NONE,
+        );
+        let row = data.lines.iter().position(|l| &*l.text == "+two").unwrap();
+        let hunk = hunk_at_line(&data.lines, row).unwrap();
+        let file = data
+            .files
+            .iter()
+            .find(|f| f.path == "fresh/dir/new.txt")
+            .unwrap();
+        apply_request(
+            &repo,
+            &ApplyRequest::for_entry(DiffSource::Uncommitted, file, Some(hunk)),
+            settings(),
+        )
+        .unwrap();
+        assert_eq!(index_blob(&repo, "fresh/dir/new.txt"), "one\ntwo\n");
+    }
+
+    /// Stage-hunk on an untracked file records what `git add` would — and what the
+    /// whole-file Stage does: clean filters applied (a CRLF file under `text=auto` is
+    /// stored with LF), and no exec bit where `core.fileMode` is off. Hashing and
+    /// staging the raw bytes got both wrong, and the filtered case refused every click
+    /// as Stale, since the pane's id is of the FILTERED content.
+    #[test]
+    fn staging_an_untracked_files_hunk_follows_git_adds_rules() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, ".gitattributes", "* text=auto\n", "base");
+        crate::test_repo::set_config(&repo, "core.fileMode", "false");
+        write_file(&repo, "new.txt", "one\r\ntwo\r\n");
+        let full = repo.workdir().unwrap().join("new.txt");
+        std::fs::set_permissions(&full, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let data = crate::diff::get_working_tree_diff(
+            &repo,
+            settings(),
+            &RowScope::new(DiffSource::Uncommitted),
+            BuildEnv::NONE,
+        );
+        let row = data
+            .lines
+            .iter()
+            .position(|l| l.text.starts_with("+two"))
+            .unwrap();
+        let hunk = hunk_at_line(&data.lines, row).unwrap();
+        let file = data.files.iter().find(|f| f.path == "new.txt").unwrap();
+        // Through a fresh handle, as the write worker has: libgit2 reads `core.fileMode`
+        // when a handle first loads its index, and this one loaded it before the config.
+        let writer = open_repo(repo.workdir().unwrap());
+        apply_request(
+            &writer,
+            &ApplyRequest::for_entry(DiffSource::Uncommitted, file, Some(hunk)),
+            settings(),
+        )
+        .unwrap();
+
+        let reopened = open_repo(repo.workdir().unwrap());
+        let entry = reopened
+            .index()
+            .unwrap()
+            .get_path(std::path::Path::new("new.txt"), 0)
+            .unwrap();
+        assert_eq!(entry.mode, 0o100_644);
+        assert_eq!(index_blob(&reopened, "new.txt"), "one\ntwo\n");
+    }
+
+    /// An untracked file's hunk is the whole file, and its header says only how many
+    /// lines there were — so what a click is checked against is the CONTENT the pane
+    /// showed. A file rewritten since, even to the same number of lines, is refused and
+    /// nothing is staged.
+    #[test]
+    fn staging_an_untracked_files_hunk_refuses_content_changed_since_it_was_shown() {
+        for rewrite in ["one\ntwo\nthree\n", "ONE\nSECRET\n"] {
+            let (_d, repo) = temp_repo();
+            commit_file(&repo, "f.txt", &body(&[]), "base");
+            write_file(&repo, "new.txt", "one\ntwo\n");
+            let data = crate::diff::get_working_tree_diff(
+                &repo,
+                settings(),
+                &RowScope::new(DiffSource::Uncommitted),
+                BuildEnv::NONE,
+            );
+            let row = data.lines.iter().position(|l| &*l.text == "+two").unwrap();
+            let hunk = hunk_at_line(&data.lines, row).unwrap();
+            let file = data.files.iter().find(|f| f.path == "new.txt").unwrap();
+            write_file(&repo, "new.txt", rewrite);
+
+            let err = apply_request(
+                &repo,
+                &ApplyRequest::for_entry(DiffSource::Uncommitted, file, Some(hunk)),
+                settings(),
+            )
+            .unwrap_err();
+            assert!(matches!(err, ApplyError::Stale), "{rewrite:?}: {err:?}");
+            assert!(
+                open_repo(repo.workdir().unwrap())
+                    .index()
+                    .unwrap()
+                    .get_path(std::path::Path::new("new.txt"), 0)
+                    .is_none(),
+                "{rewrite:?}: nothing staged"
+            );
+        }
     }
 
     #[test]

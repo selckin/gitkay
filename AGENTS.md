@@ -1791,8 +1791,11 @@ sorted drivers keep the same rows with the same rewritten parents.
   the reader ticks a box, a save to an unrelated key unticks it, and nothing says
   why. Sidebar rendering goes through `rename_brace` git-style braces
   (`wm/{foo ⇒ baz}/Bar.java`); in `Grouped` layout the file groups under the directory
-  common to old and new (the brace prefix). **Limitations**: working-tree detection is
-  tracked-only (index→workdir diff — an untracked file never forms the old side), and a
+  common to old and new (the brace prefix). **Limitations**: working-tree detection
+  never pairs a deleted file with an UNTRACKED one (a `mv` not yet `git add`ed reads as a
+  delete plus a new file, as `git status` shows it — libgit2 only does so under
+  `GIT_DIFF_FIND_FOR_UNTRACKED`, which is not set), an untracked file never forms the
+  old side, and a
   rename whose old path falls outside an active pathspec is undetectable
   (`apply_pathspec` filters before `detect_similar`). The `--follow` tracer
   (`rename_source`) walks parent trees directly and is unaffected by both.
@@ -1935,6 +1938,64 @@ The invariants:
   routes. Modes are read
   from the **trees** via `TreeEntry::filemode` — `DiffFile::mode()` `panic!`s outside
   git2's canonical seven and a tree-to-tree diff carries the tree's mode verbatim.
+- **The uncommitted row lists UNTRACKED files** (`worktree_git_diff` — the one
+  definition the pane, the stats column and the cost probe share; ignored files, nested
+  repositories and anything but files and symlinks stay out, and a repository with
+  `status.showUntrackedFiles = no` gets none, as it asked), **under a budget**:
+  `MAX_UNTRACKED_FILES` (1000) and `MAX_UNTRACKED_BYTES` (16 MB). Past either, EVERY
+  untracked file is withheld — the tracked changes still show — and the pane's header
+  says so (`UntrackedTally::notice`), because a stray build tree or `node_modules/`
+  nobody gitignored would otherwise be read whole and listed row by row in a sidebar that
+  is not virtualized.
+  **libgit2 is never asked to walk untracked files, because nothing about how it does so
+  can be bounded or scoped**, and each way it was asked has already been a bug. Its
+  recursion into a new directory has no budget. Without recursion it lists the directory
+  as ONE entry (`fresh/`) and matches a pathspec against that entry — so `-- fresh/dir`,
+  and a Stage (whose action diff is scoped to the one file), found nothing inside it. And
+  deciding whether a new directory is wholly ignored scans it, unbounded, unless
+  `enable_fast_untracked_dirs` is set. So `worktree_diff_reporting` is: an UNSCOPED
+  listing (`worktree_listing` — untracked entries, no content, no recursion, fast dirs);
+  `tally_untracked`, OUR walk of the new directories under the budget, applying the
+  user pathspec itself through libgit2's own `Pathspec` matcher (`path_matcher`),
+  pruning directories it cannot reach, skipping ignored entries and nested repositories,
+  and stopping at the first file past a limit — or past `MAX_UNTRACKED_WALK` entries
+  LOOKED AT, ignored ones included, since those cost an ignore lookup each and never
+  count toward the file budget (the notice's counts are lower bounds). **Running out of
+  walk is "over" only once a file has been found**: a walk that met nothing but ignored
+  entries found nothing, and treating it as over put a row and a notice on a clean
+  worktree whose only novelty was a big gitignored build tree. **The listing is the ONE
+  walk of the worktree** — what any worktree diff costs, `git status`'s own cost — and the
+  diff is then taken over EXACTLY the changed tracked paths the pathspec covers (read off
+  the listing, filtered by the same matcher) plus the untracked files found, which
+  libgit2 reaches by path rather than by walking. The listing cannot be that diff itself
+  — a new directory is one entry there and its untracked files carry no content — and a
+  `git2::Diff` has no way to drop entries, so reusing it would mean a second full walk
+  to rebuild the tracked half. An empty pathspec means everything, so "no paths" is answered with an
+  empty diff rather than spelled; an unfiltered view with nothing untracked takes the
+  listing as it is. `source_diff` therefore takes the settings: the worktree arm builds
+  its own options rather than using the pipeline's. The Stage write's action diff is
+  tracked-only (`worktree_tracked_diff`), an untracked target never reaching it.
+  The row's EXISTENCE asks `worktree_has_changes` (the listing plus a tally that stops
+  at the first file), not the
+  diff, so an over-budget tree alone still gets the row, and its pane is where the
+  withheld files are explained — which is also why `build_diff_data` takes its header as
+  a closure, built after the diff. Whole-file Stage needs nothing new (`index.add_path`),
+  but **a hunk click on one cannot go through `repo.apply`**, which wants an index
+  preimage for an `Untracked` delta and refuses ("index does not contain …"). Its one
+  hunk is the whole file, and nothing about the hunk can say whether the file still holds
+  what was shown: `hunk_fit` reads the display's OLD side, which a new file has none of,
+  and the header (`@@ -0,0 +1,N @@`) is only a line count. So the check is the CONTENT —
+  `FileEntry::new_blob`, the displayed blob id, recorded at print time because libgit2
+  only knows an untracked file's id once it has read it. `stage_untracked_as_shown`
+  stages through `add_path` — `git add`'s own clean filters, `core.fileMode` and symlink
+  rules, which the displayed id was computed under too, where hashing and staging the
+  raw bytes disagreed with both and refused every click on a filtered file — then reads
+  the id back off the entry it just staged and writes the index only if it matches,
+  re-reading it from disk otherwise, so what is checked is what gets written
+  (`staging_an_untracked_files_hunk_refuses_content_changed_since_it_was_shown`,
+  including a same-line-count rewrite, and `…_follows_git_adds_rules`). The cost probe
+  charges any side whose blob is not in the odb — the worktree side of every
+  uncommitted delta, modified or untracked — at its `stat` size.
 - **The context menu takes its oid from `current_diff_key`, never `selected_oid()`**, and
   is pinned to the diff it was opened over by `diff_menu_salt` — otherwise an open menu
   survives the diff being replaced and writes a file the user never right-clicked.

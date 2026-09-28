@@ -946,6 +946,11 @@ pub struct FileEntry {
     /// config at click time, because a driven path whose delta was left unconverted
     /// (a symlink, a gitlink, a failed driver) still applies by hunk perfectly well.
     pub is_converted: bool,
+    /// The new side's blob id as the pane showed it, where libgit2 knew one — for an
+    /// untracked file, the hash of the content displayed. What a hunk click on one is
+    /// checked and staged against (`apply::stage_untracked_as_shown`): its only hunk is
+    /// the whole file, so no range can say whether the file still says what was shown.
+    pub new_blob: Option<git2::Oid>,
     pub additions: usize,
     pub deletions: usize,
     /// `Some(n)`: this file's patch starts at `diff_lines[n]`. `None`: the file
@@ -1713,10 +1718,27 @@ pub fn get_diff_data(
         settings,
         scope,
         env,
-        header,
+        || header,
         &format!("commit {oid}"),
         |repo, opts| commit_parent_diff(repo, &commit, Some(opts)),
     )
+}
+
+/// A raw git path as a `Path`, without laundering it through a lossy `String`.
+///
+/// git stores paths as bytes and unix filesystems accept any byte but NUL and
+/// `/`, so a name need not be valid UTF-8; this is the free reinterpret that
+/// makes the whole write layer byte-exact. There is no portable equivalent, and
+/// no portable fallback is offered: a lossy one would silently reintroduce the
+/// "matches nothing, reports success" bug this exists to prevent. gitkay is
+/// unix-only anyway (see the `compile_error!` in main.rs).
+///
+/// Here, in the layer every user sits on: the write layer, `textconv` — which hands
+/// the same raw bytes to `get_attr_bytes` and to the driver, where an attribute lookup
+/// on a laundered name matches the wrong rules — and the untracked-file tally.
+pub fn path_from_bytes(bytes: &[u8]) -> &std::path::Path {
+    use std::os::unix::ffi::OsStrExt;
+    std::path::Path::new(std::ffi::OsStr::from_bytes(bytes))
 }
 
 /// The path for a diff delta as raw bytes — the new side, falling back to the old
@@ -1872,6 +1894,7 @@ fn append_diff_body(
             status: delta.status(),
             is_binary: false,
             is_converted: false,
+            new_blob: Some(delta.new_file().id()).filter(|id| !id.is_zero()),
             additions: 0,
             deletions: 0,
             diff_line_idx: None,
@@ -2054,6 +2077,11 @@ fn append_diff_body(
             substituting = false;
             if let Some(fi) = current_file_idx {
                 files[fi].diff_line_idx = Some(lines.len());
+                // An untracked file's id exists only once its content has been read,
+                // which is what printing it just did — the entry was built before.
+                if files[fi].new_blob.is_none() {
+                    files[fi].new_blob = Some(delta.new_file().id()).filter(|id| !id.is_zero());
+                }
             }
             push_patch_line(lines, files, current_file_idx, &line, &mut buf);
             let header = String::from_utf8_lossy(line.content());
@@ -2451,7 +2479,7 @@ fn parallel_delta_patches(
                     #[cfg(test)]
                     crate::test_repo::confine_config_to_the_repo(&repo);
                     let mut opts = scoped_diff_opts(settings, &scope.paths);
-                    let mut diff = source_diff(&repo, scope, &mut opts).ok()?;
+                    let mut diff = source_diff(&repo, scope, settings, &mut opts).ok()?;
                     detect_similar(&mut diff, settings);
                     // The rebuild is the same trees under the same options, so this
                     // holds — and if it ever does not, the whole pass is abandoned
@@ -2533,6 +2561,7 @@ const fn blank_entry() -> FileEntry {
         status: git2::Delta::Unmodified,
         is_binary: false,
         is_converted: false,
+        new_blob: None,
         additions: 0,
         deletions: 0,
         diff_line_idx: None,
@@ -2716,7 +2745,7 @@ pub fn build_diff_data<'r>(
     settings: DiffSettings,
     scope: &RowScope,
     env: BuildEnv<'_>,
-    header: Vec<DiffLine>,
+    header: impl FnOnce() -> Vec<DiffLine>,
     what: &str,
     build: impl FnOnce(&'r Repository, &mut DiffOptions) -> Result<git2::Diff<'r>, git2::Error>,
 ) -> DiffData {
@@ -2728,7 +2757,8 @@ pub fn build_diff_data<'r>(
             return DiffData::empty();
         }
     };
-    let mut rows = DiffRows::new(header);
+    // The header is built AFTER the diff, so a builder can say what it left out.
+    let mut rows = DiffRows::new(header());
     let mut files = Vec::new();
     let t = std::time::Instant::now();
     let PatchPass { failed, sizes } =
@@ -2755,22 +2785,13 @@ pub fn build_diff_data<'r>(
     }
 }
 
-/// `build_diff_data` under a single title line — the header shape the two virtual
-/// (working-tree / staged) diffs share.
-pub fn virtual_diff<'r>(
-    repo: &'r Repository,
-    settings: DiffSettings,
-    scope: &RowScope,
-    env: BuildEnv<'_>,
-    title: &str,
-    what: &str,
-    build: impl FnOnce(&'r Repository, &mut DiffOptions) -> Result<git2::Diff<'r>, git2::Error>,
-) -> DiffData {
-    let header = vec![
-        DiffLine::new(title, LineKind::Meta),
-        DiffLine::new("", LineKind::Blank),
-    ];
-    build_diff_data(repo, settings, scope, env, header, what, build)
+/// The header the two virtual (working-tree / staged) diffs share: a title line,
+/// then the builder's notice when it has one, then a blank.
+fn virtual_header(title: &str, notice: Option<String>) -> Vec<DiffLine> {
+    let mut header = vec![DiffLine::new(title, LineKind::Meta)];
+    header.extend(notice.map(|n| DiffLine::new(n, LineKind::Meta)));
+    header.push(DiffLine::new("", LineKind::Blank));
+    header
 }
 
 /// The HEAD commit's tree, or `None` on an unborn HEAD (fresh `git init`) — a staged
@@ -2810,14 +2831,381 @@ pub fn staged_diff_against<'r>(
     repo.diff_tree_to_index(head, None, Some(opts))
 }
 
-/// The git diff that defines "uncommitted changes" (workdir vs index — tracked files
-/// only). Shared by the virtual-row probe and `get_working_tree_diff`, like
-/// `staged_git_diff`.
-pub fn worktree_git_diff<'r>(
+/// Most untracked files the uncommitted row will load. Past it — or past
+/// `MAX_UNTRACKED_BYTES` — every untracked file is withheld and the pane says so
+/// (`UntrackedTally::notice`): a stray build tree or `node_modules/` nobody gitignored
+/// would otherwise be read whole, and listed row by row in a sidebar that is not
+/// virtualized, every time the row is looked at.
+pub const MAX_UNTRACKED_FILES: usize = 1000;
+/// Most untracked BYTES the uncommitted row will load — see `MAX_UNTRACKED_FILES`.
+pub const MAX_UNTRACKED_BYTES: u64 = 16 << 20;
+/// Most directory entries `walk_untracked_dir` will look at, IGNORED ones included.
+/// The file budget only counts what would be shown, so a new directory holding
+/// 100k gitignored logs would otherwise be read entry by entry — an ignore lookup
+/// each — to find nothing; past this the tally is simply over.
+const MAX_UNTRACKED_WALK: usize = 20 * MAX_UNTRACKED_FILES;
+
+/// libgit2's own matcher over a user pathspec (`-- <path>…`) — the rules a diff's
+/// pathspec applies — for the worktree paths the uncommitted row filters itself. `None`
+/// for an empty pathspec, which covers everything.
+///
+/// It filters them itself because its listing has to be UNSCOPED: libgit2 matches a
+/// pathspec against a new directory's ONE listing entry (`fresh/`), so a scoped listing
+/// would find nothing inside it under `-- fresh/dir`.
+fn path_matcher(paths: &[String]) -> Result<Option<git2::Pathspec>, git2::Error> {
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    git2::Pathspec::new(paths.iter().map(String::as_str)).map(Some)
+}
+
+/// Does `path_matcher`'s answer cover `path`?
+fn covered_by(matcher: Option<&git2::Pathspec>, path: &[u8]) -> bool {
+    matcher
+        .is_none_or(|spec| spec.matches_path(path_from_bytes(path), git2::PathspecFlags::DEFAULT))
+}
+
+/// Could anything under directory `dir` (`/`-terminated) be covered by `paths`? For
+/// pruning the walk only, so it may say yes too often: a pattern is compared by the
+/// literal part in front of its first glob character.
+fn may_cover_under(paths: &[String], dir: &[u8]) -> bool {
+    paths.is_empty()
+        || paths.iter().any(|p| {
+            let p = p.as_bytes();
+            let lit = &p[..p
+                .iter()
+                .position(|b| b"*?[\\".contains(b))
+                .unwrap_or(p.len())];
+            lit.starts_with(dir) || dir.starts_with(lit)
+        })
+}
+
+/// Does this repository want untracked files listed at all? `status.showUntrackedFiles
+/// = no` is how a repository says it does not — a dotfiles repo whose worktree is `$HOME`
+/// is the usual one, where every entry of the home directory is "untracked".
+fn lists_untracked(repo: &Repository) -> bool {
+    let setting = repo
+        .config()
+        .and_then(|c| c.get_string("status.showUntrackedFiles"));
+    !setting.is_ok_and(|v| {
+        ["no", "false", "off", "0"]
+            .iter()
+            .any(|off| v.eq_ignore_ascii_case(off))
+    })
+}
+
+/// The untracked files a worktree listing names, counted until the first one past
+/// a limit — so, when over, lower bounds: stopping is what keeps a huge directory
+/// from costing a `stat` per file just to be told it is too big.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UntrackedTally {
+    pub files: usize,
+    pub bytes: u64,
+    /// Entries `walk_untracked_dir` looked at, ignored ones included.
+    walked: usize,
+}
+
+impl UntrackedTally {
+    /// Over budget, so every untracked file is withheld. Running out of walk counts
+    /// only once a file has been found: a walk that met nothing but ignored entries
+    /// found nothing, and calling that "over" put an uncommitted row — and a notice —
+    /// on a clean worktree whose only novelty was a big gitignored build tree.
+    const fn over(self) -> bool {
+        self.files > MAX_UNTRACKED_FILES
+            || self.bytes > MAX_UNTRACKED_BYTES
+            || (self.exhausted() && self.files > 0)
+    }
+
+    /// The walk has looked at all it may — see `MAX_UNTRACKED_WALK`.
+    const fn exhausted(self) -> bool {
+        self.walked > MAX_UNTRACKED_WALK
+    }
+
+    /// Stop counting: over, out of walk, or — `first_only` — an answer already.
+    const fn done(self, first_only: bool) -> bool {
+        self.over() || self.exhausted() || (first_only && self.files > 0)
+    }
+
+    /// The pane's notice line, for a tally that was over.
+    pub fn notice(self) -> String {
+        if self.files <= MAX_UNTRACKED_FILES && self.bytes <= MAX_UNTRACKED_BYTES {
+            return format!(
+                "Untracked files not shown: a new directory holds more than \
+                 {MAX_UNTRACKED_WALK} entries to look through, gitignored ones included \
+                 (stopped at {} files). Add it to .gitignore to keep it out.",
+                self.files,
+            );
+        }
+        format!(
+            "Untracked files not shown: more than gitkay's limit of {MAX_UNTRACKED_FILES} \
+             files / {} (stopped counting at {} files, {}). Add them to .gitignore to \
+             keep them out.",
+            size_label(MAX_UNTRACKED_BYTES),
+            self.files,
+            size_label(self.bytes),
+        )
+    }
+}
+
+/// `n` bytes as a short, rounded-up size: `16 MB`, `340 KB`, `12 B`.
+fn size_label(n: u64) -> String {
+    const KB: u64 = 1 << 10;
+    const MB: u64 = 1 << 20;
+    match n {
+        0..KB => format!("{n} B"),
+        KB..MB => format!("{} KB", n.div_ceil(KB)),
+        _ => format!("{} MB", n.div_ceil(MB)),
+    }
+}
+
+/// The untracked files `paths` covers, found from a worktree `listing` and counted
+/// under the budget — the tally, and the files themselves unless it was over.
+/// `first_only` stops at the first one, for a caller asking only whether there is any.
+///
+/// A file comes straight off the listing, its size from libgit2's own `stat`. A
+/// directory the listing reported whole (`fresh/`: it was not asked to descend) is
+/// walked HERE, under the same budget — libgit2's recursion has none, so letting it
+/// descend a directory of a million files to find out it is too big would cost the
+/// million. A nested repository is one opaque entry to libgit2 and to this.
+fn tally_untracked(
+    repo: &Repository,
+    listing: &git2::Diff<'_>,
+    paths: &[String],
+    first_only: bool,
+) -> Result<(UntrackedTally, Vec<Vec<u8>>), git2::Error> {
+    let mut tally = UntrackedTally::default();
+    let mut found = Vec::new();
+    let Some(workdir) = repo.workdir() else {
+        return Ok((tally, found));
+    };
+    let matcher = path_matcher(paths)?;
+    let covered = |path: &[u8]| covered_by(matcher.as_ref(), path);
+    for delta in listing.deltas() {
+        if delta.status() != git2::Delta::Untracked {
+            continue;
+        }
+        let path = delta_path_bytes(&delta);
+        if path.ends_with(b"/") {
+            let dir = workdir.join(path_from_bytes(path));
+            if may_cover_under(paths, path) && !dir.join(".git").exists() {
+                let walk = UntrackedWalk {
+                    repo,
+                    workdir,
+                    paths,
+                    covered: &covered,
+                    first_only,
+                };
+                walk.dir(path, &mut tally, &mut found);
+            }
+        } else if covered(path) {
+            tally.files += 1;
+            tally.bytes = tally.bytes.saturating_add(delta.new_file().size());
+            found.push(path.to_vec());
+        }
+        if tally.done(first_only) {
+            break;
+        }
+    }
+    if tally.over() {
+        found.clear();
+    }
+    Ok((tally, found))
+}
+
+/// What `tally_untracked`'s walk of a wholly-untracked directory needs to know, beside
+/// the tally it adds to.
+struct UntrackedWalk<'a> {
+    repo: &'a Repository,
+    workdir: &'a std::path::Path,
+    paths: &'a [String],
+    covered: &'a dyn Fn(&[u8]) -> bool,
+    first_only: bool,
+}
+
+impl UntrackedWalk<'_> {
+    /// Walk `rel` (relative to the worktree, `/`-terminated): depth-first, symlinks
+    /// counted rather than followed, ignored entries and nested repositories skipped the
+    /// way libgit2's own walk skips them, subdirectories the paths cannot reach pruned,
+    /// an unreadable directory simply not counted — and only regular files and symlinks
+    /// counted, since a socket, FIFO or device is nothing git lists. Returns as soon as
+    /// the tally is done.
+    fn dir(&self, rel: &[u8], tally: &mut UntrackedTally, found: &mut Vec<Vec<u8>>) {
+        let mut stack = vec![rel.to_vec()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(self.workdir.join(path_from_bytes(&dir))) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                tally.walked += 1;
+                if tally.done(self.first_only) {
+                    return;
+                }
+                let child = {
+                    use std::os::unix::ffi::OsStrExt;
+                    [dir.as_slice(), entry.file_name().as_bytes()].concat()
+                };
+                if self
+                    .repo
+                    .is_path_ignored(path_from_bytes(&child))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                // `DirEntry`'s type and metadata do not follow symlinks, and the type
+                // is usually free — only a file's size costs a `stat`.
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                if kind.is_dir() {
+                    let child = [child, b"/".to_vec()].concat();
+                    // A nested repository is one opaque entry to libgit2, never descended.
+                    if may_cover_under(self.paths, &child) && !entry.path().join(".git").exists() {
+                        stack.push(child);
+                    }
+                    continue;
+                }
+                if !(kind.is_file() || kind.is_symlink()) || !(self.covered)(&child) {
+                    continue;
+                }
+                tally.files += 1;
+                tally.bytes = tally
+                    .bytes
+                    .saturating_add(entry.metadata().map_or(0, |m| m.len()));
+                found.push(child);
+                if tally.done(self.first_only) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// What `git status` would list as unstaged, over the WHOLE worktree: tracked changes
+/// plus untracked entries, a wholly-new directory as ONE entry, no untracked content
+/// read, and — `enable_fast_untracked_dirs` — a new directory not scanned to decide
+/// whether everything in it is ignored, which libgit2 otherwise does WITHOUT a budget
+/// (a new `out/` of 500k `*.class` files read in full). Unscoped on purpose: see
+/// `path_matcher`. `opts` shape it — the caller's settings — so that, when it
+/// turns out to hold nothing untracked over an unfiltered view, it IS the final diff.
+/// A repository that asks for no untracked files (`lists_untracked`) gets none.
+fn worktree_listing(
+    repo: &Repository,
+    mut opts: DiffOptions,
+) -> Result<git2::Diff<'_>, git2::Error> {
+    opts.include_untracked(lists_untracked(repo))
+        .recurse_untracked_dirs(false)
+        .show_untracked_content(false)
+        .enable_fast_untracked_dirs(true);
+    repo.diff_index_to_workdir(None, Some(&mut opts))
+}
+
+/// The TRACKED half of the uncommitted changes: workdir vs index, no untracked files —
+/// under `opts`' settings and pathspec. All the Stage write's action diff needs,
+/// untracked files being staged by `apply::stage_untracked_as_shown` rather than
+/// through a diff.
+pub fn worktree_tracked_diff<'r>(
     repo: &'r Repository,
     opts: &mut DiffOptions,
 ) -> Result<git2::Diff<'r>, git2::Error> {
+    opts.include_untracked(false);
     repo.diff_index_to_workdir(None, Some(opts))
+}
+
+/// The git diff that defines "uncommitted changes": workdir vs index over the pathspec
+/// `paths`, untracked files included — what `git status` lists, each new file shown
+/// whole as an addition. Ignored files and nested repositories stay out, and untracked
+/// files past `MAX_UNTRACKED_FILES` / `MAX_UNTRACKED_BYTES` are withheld whole; see
+/// `worktree_diff_reporting` for which. The one definition the pane, the stats column
+/// and the cost probe share, like `staged_git_diff`; the row's existence asks
+/// `worktree_has_changes`.
+pub fn worktree_git_diff<'r>(
+    repo: &'r Repository,
+    settings: DiffSettings,
+    paths: &[String],
+) -> Result<git2::Diff<'r>, git2::Error> {
+    worktree_diff_reporting(repo, settings, paths).map(|(diff, _)| diff)
+}
+
+/// `worktree_git_diff`, plus the tally of the untracked files it withheld for being
+/// over budget (`None`: nothing withheld).
+///
+/// ONE walk of the worktree — the listing, which is what any worktree diff costs,
+/// `git status`'s own cost — and libgit2 never walks anything unbounded. The listing
+/// names every changed path without reading content or descending into a new
+/// directory; `tally_untracked` turns its untracked entries into files under the budget;
+/// and the diff is then taken over EXACTLY the changed tracked paths the pathspec covers
+/// plus those files, which libgit2 reaches by path rather than by walking. The listing
+/// cannot be that diff itself — a new directory is one entry there, and its untracked
+/// files carry no content — and a `git2::Diff` has no way to drop entries, so reusing it
+/// would mean a second full walk to rebuild the tracked half, which is what this did.
+/// Only an unfiltered view with nothing untracked takes the listing as it is.
+pub fn worktree_diff_reporting<'r>(
+    repo: &'r Repository,
+    settings: DiffSettings,
+    paths: &[String],
+) -> Result<(git2::Diff<'r>, Option<UntrackedTally>), git2::Error> {
+    let listing = worktree_listing(repo, diff_opts(settings))?;
+    let untracked_listed = listing
+        .deltas()
+        .any(|d| d.status() == git2::Delta::Untracked);
+    if paths.is_empty() && !untracked_listed {
+        return Ok((listing, None));
+    }
+    let (tally, found) = tally_untracked(repo, &listing, paths, false)?;
+    let withheld = tally.over().then_some(tally);
+    let matcher = path_matcher(paths)?;
+    let tracked: Vec<&[u8]> = listing
+        .deltas()
+        .filter(|d| d.status() != git2::Delta::Untracked)
+        .map(|d| delta_path_bytes(&d))
+        .filter(|p| covered_by(matcher.as_ref(), p))
+        .collect();
+    let mut opts = diff_opts(settings);
+    if tracked.is_empty() && found.is_empty() {
+        // An empty pathspec means EVERYTHING, so "these paths" cannot be spelled when
+        // there are none — and the answer is known: no changes.
+        return Ok((
+            repo.diff_tree_to_tree(None, None, Some(&mut opts))?,
+            withheld,
+        ));
+    }
+    opts.include_untracked(!found.is_empty())
+        .recurse_untracked_dirs(true)
+        .show_untracked_content(true)
+        .disable_pathspec_match(true);
+    for path in tracked
+        .iter()
+        .copied()
+        .chain(found.iter().map(Vec::as_slice))
+    {
+        opts.pathspec(path);
+    }
+    Ok((repo.diff_index_to_workdir(None, Some(&mut opts))?, withheld))
+}
+
+/// Does the uncommitted row have anything to show over the pathspec `paths` — a
+/// tracked change, or an untracked file? What decides whether the row exists, so it
+/// asks what `git status` would list rather than what the diff loads: an over-budget
+/// untracked tree alone still gets the row, whose pane is where the withheld files are
+/// explained. Stops at the first untracked file, which answers it.
+pub fn worktree_has_changes(repo: &Repository, paths: &[String]) -> bool {
+    let run = || -> Result<bool, git2::Error> {
+        let listing = worktree_listing(repo, DiffOptions::new())?;
+        let matcher = path_matcher(paths)?;
+        let tracked = listing.deltas().any(|d| {
+            d.status() != git2::Delta::Untracked
+                && covered_by(matcher.as_ref(), delta_path_bytes(&d))
+        });
+        if tracked {
+            return Ok(true);
+        }
+        let (tally, found) = tally_untracked(repo, &listing, paths, true)?;
+        Ok(tally.over() || !found.is_empty())
+    };
+    run().unwrap_or_else(|e| {
+        log::warn!("gitkay: cannot probe the working tree: {e}");
+        false
+    })
 }
 
 /// Generate diff for uncommitted working tree changes (workdir vs index).
@@ -2827,14 +3215,27 @@ pub fn get_working_tree_diff(
     scope: &RowScope,
     env: BuildEnv<'_>,
 ) -> DiffData {
-    virtual_diff(
+    let withheld = std::cell::Cell::new(None);
+    build_diff_data(
         repo,
         settings,
         scope,
         env,
-        "Uncommitted changes (working tree)",
+        || {
+            virtual_header(
+                "Uncommitted changes (working tree)",
+                withheld.get().map(UntrackedTally::notice),
+            )
+        },
         "working tree",
-        worktree_git_diff,
+        // The pipeline's `opts` are settings plus a pathspec, and the worktree builds
+        // its own from the same two — see `worktree_diff_reporting`.
+        |repo, _opts| {
+            worktree_diff_reporting(repo, settings, &scope.paths).map(|(diff, w)| {
+                withheld.set(w);
+                diff
+            })
+        },
     )
 }
 
@@ -2845,12 +3246,12 @@ pub fn get_staged_diff(
     scope: &RowScope,
     env: BuildEnv<'_>,
 ) -> DiffData {
-    virtual_diff(
+    build_diff_data(
         repo,
         settings,
         scope,
         env,
-        "Staged changes (index)",
+        || virtual_header("Staged changes (index)", None),
         "staged changes",
         staged_git_diff,
     )
@@ -2942,7 +3343,7 @@ pub fn get_range_diff(
         settings,
         scope,
         env,
-        header,
+        || header,
         &format!("range {}..{}", ends.base, ends.head),
         |repo, opts| range_git_diff(repo, ends, opts),
     )
@@ -3055,13 +3456,18 @@ impl LineStats {
 /// The single place a `DiffSource` becomes a `git2::Diff`, so `commit_stats` and
 /// `RowCostProbe` cannot drift and a new row kind cannot reach one while missing the
 /// other. Exhaustive on `CommitKind`'s four shapes for the same reason.
+///
+/// `opts` are `scoped_diff_opts(settings, &scope.paths)`; the worktree arm builds its
+/// own from the same `settings` and paths, since it runs more than one libgit2 pass
+/// (see `worktree_diff_reporting`).
 pub fn source_diff<'r>(
     repo: &'r Repository,
     scope: &RowScope,
+    settings: DiffSettings,
     opts: &mut DiffOptions,
 ) -> Result<git2::Diff<'r>, git2::Error> {
     match scope.source {
-        DiffSource::Uncommitted => worktree_git_diff(repo, opts),
+        DiffSource::Uncommitted => worktree_git_diff(repo, settings, &scope.paths),
         DiffSource::Staged => staged_git_diff(repo, opts),
         DiffSource::Range(ends) => range_git_diff(repo, ends, opts),
         DiffSource::Commit(oid) => {
@@ -3289,13 +3695,19 @@ fn probe_deltas(
         }
         let mut bytes: u64 = 0;
         for file in [delta.old_file(), delta.new_file()] {
+            // A side whose blob is not in the odb — the worktree side of the uncommitted
+            // row, a modified file's as much as an untracked one's — is read off the
+            // disk, and its `stat` size is on the delta already. Charged, or that side
+            // is built on the ordinary lane as though it were free. An absent side (an
+            // add's old one, a delete's new one) has size 0 either way.
             let id = file.id();
-            if id.is_zero() {
-                continue; // that side has no blob (an add, or a delete)
-            }
-            if let Ok((size, _)) = odb.read_header(id) {
-                bytes = bytes.saturating_add(size as u64);
-            }
+            let size = if id.is_zero() {
+                file.size()
+            } else {
+                odb.read_header(id)
+                    .map_or_else(|_| file.size(), |(size, _)| size as u64)
+            };
+            bytes = bytes.saturating_add(size);
         }
         probe.charge_delta(bytes);
     }
@@ -3314,7 +3726,7 @@ pub fn probe_row_cost(
     tc: Option<&Textconv>,
 ) -> Result<RowCostProbe, git2::Error> {
     let mut opts = scoped_diff_opts(settings, &scope.paths);
-    let diff = source_diff(repo, scope, &mut opts)?;
+    let diff = source_diff(repo, scope, settings, &mut opts)?;
     probe_deltas(repo, &diff, tc)
 }
 
@@ -3355,7 +3767,7 @@ pub fn measured_row_diff<'r>(
         repo,
         settings,
         &scope.paths,
-        |repo, opts| source_diff(repo, scope, opts),
+        |repo, opts| source_diff(repo, scope, settings, opts),
         |repo, diff| probe_deltas(repo, diff, tc),
     )?;
     Ok(MeasuredDiff { diff, cost: cost? })
@@ -3408,7 +3820,7 @@ pub fn commit_stats(
     want: StatsWant,
 ) -> Result<CommitStats, git2::Error> {
     let diff = scoped_diff(repo, settings, &scope.paths, |repo, opts| {
-        source_diff(repo, scope, opts)
+        source_diff(repo, scope, settings, opts)
     })?;
     stats_of(&diff, want)
 }
@@ -4388,6 +4800,309 @@ pub mod tests {
             "added and deleted inside the range cancels out, got {:?}",
             data.files.iter().map(|f| &f.path).collect::<Vec<_>>()
         );
+    }
+
+    /// The uncommitted row lists what `git status` does: an untracked file — nested
+    /// inside an untracked directory too — shown whole as an addition, and an ignored
+    /// one not at all.
+    #[test]
+    fn the_worktree_diff_shows_untracked_files_whole_and_skips_ignored_ones() {
+        use crate::test_repo::{commit_file, temp_repo, write_file};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, ".gitignore", "*.log\n", "base");
+        write_file(&repo, "new.txt", "one\ntwo\n");
+        write_file(&repo, "fresh/dir/deep.txt", "deep\n");
+        write_file(&repo, "noise.log", "ignored\n");
+
+        let data = get_working_tree_diff(
+            &repo,
+            base_settings(),
+            &RowScope::new(DiffSource::Uncommitted),
+            BuildEnv::NONE,
+        );
+        let paths: Vec<&str> = data.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["fresh/dir/deep.txt", "new.txt"]);
+        let new = &data.files[1];
+        assert_eq!((new.additions, new.deletions), (2, 0));
+        assert!(data.lines.iter().any(|l| &*l.text == "+two"), "shown whole");
+    }
+
+    /// A path filter reaches INTO a new directory: libgit2's listing names the directory
+    /// once (`fresh/`) and matches a pathspec against that entry, so `-- fresh/dir` used
+    /// to find nothing there. The walk applies the filter to the files themselves.
+    #[test]
+    fn a_path_filter_reaches_untracked_files_inside_a_new_directory() {
+        use crate::test_repo::{commit_file, temp_repo, write_file};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.txt", "1\n", "base");
+        write_file(&repo, "a.txt", "2\n");
+        write_file(&repo, "fresh/dir/deep.txt", "deep\n");
+        write_file(&repo, "fresh/other.txt", "o\n");
+        let scope = RowScope {
+            source: DiffSource::Uncommitted,
+            paths: vec!["fresh/dir".to_string()],
+        };
+        let data = get_working_tree_diff(&repo, base_settings(), &scope, BuildEnv::NONE);
+        let paths: Vec<&str> = data.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["fresh/dir/deep.txt"]);
+        assert!(data.lines.iter().any(|l| &*l.text == "+deep"));
+
+        assert!(worktree_has_changes(&repo, &["fresh/dir".into()]));
+        assert!(!worktree_has_changes(&repo, &["nowhere".into()]));
+    }
+
+    /// Under a pathspec the diff is taken over exactly the covered paths, tracked and
+    /// untracked alike, off the one unscoped listing — a deletion and a modification in
+    /// scope, one out of it, and a new file inside a new directory.
+    #[test]
+    fn a_path_filter_selects_tracked_and_untracked_paths_off_one_listing() {
+        use crate::test_repo::{commit_file, temp_repo, write_file};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "keep/a.txt", "1\n", "a");
+        commit_file(&repo, "keep/gone.txt", "g\n", "gone");
+        commit_file(&repo, "other.txt", "o\n", "o");
+        write_file(&repo, "keep/a.txt", "2\n");
+        std::fs::remove_file(repo.workdir().unwrap().join("keep/gone.txt")).unwrap();
+        write_file(&repo, "other.txt", "changed\n");
+        write_file(&repo, "keep/fresh/new.txt", "n\n");
+        let paths = ["keep".to_string()];
+        let (diff, withheld) = worktree_diff_reporting(&repo, base_settings(), &paths).unwrap();
+        assert_eq!(withheld, None);
+        let got: Vec<_> = diff
+            .deltas()
+            .map(|d| {
+                (
+                    String::from_utf8_lossy(delta_path_bytes(&d)).into_owned(),
+                    d.status(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("keep/a.txt".to_string(), git2::Delta::Modified),
+                ("keep/fresh/new.txt".to_string(), git2::Delta::Untracked),
+                ("keep/gone.txt".to_string(), git2::Delta::Deleted),
+            ]
+        );
+    }
+
+    /// A nested clone is one opaque entry to git: never walked, never counted, and
+    /// never a row — nor is a new directory holding nothing but one, which used to come
+    /// back as a bodyless `vendor/` "file".
+    #[test]
+    fn a_nested_repository_is_neither_counted_nor_listed() {
+        use crate::test_repo::{commit_file, temp_repo, write_file};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.txt", "1\n", "base");
+        let wd = repo.workdir().unwrap().to_path_buf();
+        for nested in ["nested", "vendor/lib"] {
+            git2::Repository::init(wd.join(nested)).unwrap();
+            for i in 0..=MAX_UNTRACKED_FILES {
+                write_file(&repo, &format!("{nested}/f{i}.txt"), "x\n");
+            }
+        }
+        write_file(&repo, "real.txt", "r\n");
+
+        let (diff, withheld) = worktree_diff_reporting(&repo, base_settings(), &[]).unwrap();
+        assert_eq!(withheld, None, "the clones' files are not ours to count");
+        let paths: Vec<_> = diff
+            .deltas()
+            .map(|d| String::from_utf8_lossy(delta_path_bytes(&d)).into_owned())
+            .collect();
+        assert_eq!(paths, ["real.txt"]);
+    }
+
+    /// Over the file budget every untracked file is withheld — the tracked change
+    /// still shows — and the header says so. Counting stops at the first file past
+    /// the limit, however many more there are: that is the whole cost bound.
+    #[test]
+    fn too_many_untracked_files_are_withheld_with_a_notice() {
+        use crate::test_repo::{commit_file, temp_repo, write_file};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.txt", "1\n", "base");
+        write_file(&repo, "a.txt", "2\n");
+        write_file(&repo, "top.txt", "t\n");
+        for i in 0..MAX_UNTRACKED_FILES + 50 {
+            write_file(&repo, &format!("gen/{}/f{i}.txt", i % 7), "x\n");
+        }
+
+        let (diff, withheld) = worktree_diff_reporting(&repo, base_settings(), &[]).unwrap();
+        let w = withheld.expect("over budget");
+        assert_eq!(
+            w.files,
+            MAX_UNTRACKED_FILES + 1,
+            "counting stops past the limit"
+        );
+        assert_eq!(diff.deltas().len(), 1, "only the tracked change is left");
+
+        let data = get_working_tree_diff(
+            &repo,
+            base_settings(),
+            &RowScope::new(DiffSource::Uncommitted),
+            BuildEnv::NONE,
+        );
+        let paths: Vec<&str> = data.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["a.txt"]);
+        assert_eq!(&*data.lines[1].text, &*w.notice());
+        assert!(data.lines[1].text.starts_with("Untracked files not shown"));
+    }
+
+    /// One file can spend the byte budget on its own.
+    #[test]
+    fn untracked_bytes_over_budget_are_withheld() {
+        use crate::test_repo::{commit_file, temp_repo, write_file};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.txt", "1\n", "base");
+        write_file(&repo, "small.txt", "s\n");
+        let big = usize::try_from(MAX_UNTRACKED_BYTES).unwrap() + 1;
+        std::fs::write(repo.workdir().unwrap().join("dump.sql"), vec![b'x'; big]).unwrap();
+
+        let (diff, withheld) = worktree_diff_reporting(&repo, base_settings(), &[]).unwrap();
+        assert!(withheld.is_some_and(|w| w.bytes > MAX_UNTRACKED_BYTES));
+        assert_eq!(diff.deltas().len(), 0);
+    }
+
+    /// The walk of a new directory skips what `.gitignore` excludes, as libgit2's own
+    /// walk does — or an ignored build tree inside it would spend the budget on files
+    /// the diff was never going to show.
+    #[test]
+    fn ignored_files_in_a_new_directory_do_not_count_against_the_budget() {
+        use crate::test_repo::{commit_file, temp_repo, write_file};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, ".gitignore", "target/\n*.log\n", "base");
+        write_file(&repo, "module/src/Main.java", "class Main {}\n");
+        for i in 0..MAX_UNTRACKED_FILES + 10 {
+            write_file(&repo, &format!("module/target/c{i}.class"), "x");
+        }
+        write_file(&repo, "module/build.log", "noise\n");
+
+        let (diff, withheld) = worktree_diff_reporting(&repo, base_settings(), &[]).unwrap();
+        assert_eq!(withheld, None);
+        let paths: Vec<_> = diff
+            .deltas()
+            .map(|d| String::from_utf8_lossy(delta_path_bytes(&d)).into_owned())
+            .collect();
+        assert_eq!(paths, ["module/src/Main.java"]);
+    }
+
+    /// Ignored entries cost a look each even though they never count, so the walk has
+    /// its own cap. Running out of it AFTER finding a file is over budget — what else
+    /// is there cannot be known — and the notice names that limit, not a file count.
+    /// (`a/` lists before `b/`, so the file is found before the cap, whatever order the
+    /// filesystem hands a directory's entries back in.)
+    #[test]
+    fn running_out_of_walk_after_a_file_is_over_budget() {
+        use crate::test_repo::{commit_file, temp_repo, write_file};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, ".gitignore", "*.log\n", "base");
+        write_file(&repo, "a/keep.txt", "k\n");
+        for i in 0..=MAX_UNTRACKED_WALK {
+            write_file(&repo, &format!("b/l{i}.log"), "");
+        }
+        let (_, withheld) = worktree_diff_reporting(&repo, base_settings(), &[]).unwrap();
+        let w = withheld.expect("the walk gives up");
+        assert_eq!(w.files, 1);
+        assert!(
+            w.notice().contains("entries to look through"),
+            "{}",
+            w.notice()
+        );
+    }
+
+    /// Running out of walk having found NOTHING is nothing found: a clean worktree
+    /// whose only novelty is a big gitignored build tree got an uncommitted row, and a
+    /// notice, while `git status` said clean.
+    #[test]
+    fn a_new_directory_of_only_ignored_files_is_nothing() {
+        use crate::test_repo::{commit_file, temp_repo, write_file};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, ".gitignore", "*.class\n", "base");
+        for i in 0..=MAX_UNTRACKED_WALK {
+            write_file(&repo, &format!("out/production/C{i}.class"), "");
+        }
+        let (diff, withheld) = worktree_diff_reporting(&repo, base_settings(), &[]).unwrap();
+        assert_eq!(withheld, None);
+        assert_eq!(diff.deltas().len(), 0);
+        assert!(!worktree_has_changes(&repo, &[]));
+    }
+
+    /// `status.showUntrackedFiles = no` is a repository asking for none — a dotfiles
+    /// repo over `$HOME` is the usual one — and it gets none, nor a row for them.
+    #[test]
+    fn a_repository_that_hides_untracked_files_lists_none() {
+        use crate::test_repo::{commit_file, set_config, temp_repo, write_file};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.txt", "1\n", "base");
+        write_file(&repo, "new.txt", "n\n");
+        write_file(&repo, "fresh/deep.txt", "d\n");
+        set_config(&repo, "status.showUntrackedFiles", "no");
+        let diff = worktree_git_diff(&repo, base_settings(), &[]).unwrap();
+        assert_eq!(diff.deltas().len(), 0);
+        assert!(!worktree_has_changes(&repo, &[]));
+    }
+
+    /// Only files and symlinks are untracked files: a socket in a new directory is
+    /// nothing git lists, so it is no row either.
+    #[test]
+    fn a_socket_is_not_an_untracked_file() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.txt", "1\n", "base");
+        let run = repo.workdir().unwrap().join("run");
+        std::fs::create_dir(&run).unwrap();
+        let _sock = std::os::unix::net::UnixListener::bind(run.join("app.sock")).unwrap();
+        assert!(!worktree_has_changes(&repo, &[]));
+        let (diff, withheld) = worktree_diff_reporting(&repo, base_settings(), &[]).unwrap();
+        assert_eq!((diff.deltas().len(), withheld), (0, None));
+    }
+
+    /// The cost probe charges an untracked file's size: it has no odb blob for the
+    /// header read every other delta is charged through.
+    #[test]
+    fn the_cost_probe_charges_untracked_content() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "a.txt", "1\n", "base");
+        std::fs::write(
+            repo.workdir().unwrap().join("dump.sql"),
+            vec![b'x'; 300_000],
+        )
+        .unwrap();
+        let probe = probe_row_cost(
+            &repo,
+            &RowScope::new(DiffSource::Uncommitted),
+            base_settings(),
+            None,
+        )
+        .unwrap();
+        assert!(probe.total_blob_bytes >= 300_000, "{probe:?}");
+    }
+
+    /// The same rule for a MODIFIED tracked file: its worktree side is not in the odb
+    /// either, and used to be charged nothing — half a big file's real cost.
+    #[test]
+    fn the_cost_probe_charges_a_modified_files_worktree_side() {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "big.txt", &"x".repeat(300_000), "base");
+        std::fs::write(repo.workdir().unwrap().join("big.txt"), "y".repeat(300_000)).unwrap();
+        let probe = probe_row_cost(
+            &repo,
+            &RowScope::new(DiffSource::Uncommitted),
+            base_settings(),
+            None,
+        )
+        .unwrap();
+        assert!(probe.total_blob_bytes >= 600_000, "{probe:?}");
+    }
+
+    #[test]
+    fn size_labels_round_up() {
+        assert_eq!(size_label(12), "12 B");
+        assert_eq!(size_label(1025), "2 KB");
+        assert_eq!(size_label(16 << 20), "16 MB");
+        assert_eq!(size_label((16 << 20) + 1), "17 MB");
     }
 
     #[test]

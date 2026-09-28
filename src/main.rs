@@ -3,7 +3,7 @@
 // symlink tests). Stating it once, here, is what lets the write layer treat git
 // paths as the raw bytes they are: the alternative is a lossy per-platform
 // fallback that silently matches nothing and reports success — see
-// `apply::path_from_bytes`.
+// `diff::path_from_bytes`.
 #[cfg(not(unix))]
 compile_error!("gitkay is unix-only: git paths are raw bytes, with no portable equivalent");
 

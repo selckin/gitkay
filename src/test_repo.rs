@@ -171,6 +171,7 @@ pub fn file_entry(path: &str, diff_line_idx: Option<usize>) -> crate::diff::File
         status: git2::Delta::Modified,
         is_binary: false,
         is_converted: false,
+        new_blob: None,
         additions: 0,
         deletions: 0,
         diff_line_idx,
