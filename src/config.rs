@@ -473,7 +473,8 @@ fn default_template() -> String {
          # so set this to false to keep it from running external commands at all.\n\
          # textconv = true\n\
          # File-list sidebar layout. \"grouped\" (default) groups files under\n\
-         # directory headers with basenames indented, root-level files last;\n\
+         # directory headers with basenames indented, root-level files last,\n\
+         # and a Maven src/main/ package and its src/test/ mirror under one header;\n\
          # \"full\" shows each file's full repo-relative path; \"name\" shows just\n\
          # basenames. The diff pane lays its patches out in the same order.\n\
          # file_list = \"grouped\"\n\

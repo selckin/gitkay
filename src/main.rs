@@ -33,6 +33,7 @@ mod mem;
 mod prefetch;
 #[cfg(test)]
 mod test_repo;
+mod testcode;
 mod textconv;
 mod topo;
 mod word_diff;
@@ -647,16 +648,21 @@ fn right_elide(s: &str, max_width: f32, measure: impl Fn(&str) -> f32) -> String
 
 /// One rendered row of the file-list sidebar.
 enum FileListRow {
-    /// A directory header (grouped layout only): the full dir path with trailing `/`,
-    /// plus `dim_len` — the byte length of the leading path it shares with the header
-    /// above it. Precomputed at build time (the header sequence is fixed per rebuild) and
+    /// A directory header (grouped layout only): the dir path with trailing `/` — or,
+    /// for a Maven `src/main/` directory merged with its `src/test/` mirror, the
+    /// shorter `module · package/` label `dir_header` gives it — plus
+    /// `dim_len`, the byte length of the leading path it shares with the header above
+    /// it. Precomputed at build time (the header sequence is fixed per rebuild) and
     /// drawn dimmed by `draw_dir_header`, so the draw loop needn't re-derive it per frame.
-    Header { dir: String, dim_len: usize },
+    Header { label: String, dim_len: usize },
     /// A file row. `idx` indexes `diff_files`; `label` is what to draw.
     File {
         idx: usize,
         label: String,
         indented: bool,
+        /// Test code (`testcode::is_test_path`) — decided here, once, and read back
+        /// by `resync_file_layout` into the per-file `file_is_test` both bars draw from.
+        test: bool,
     },
 }
 
@@ -791,16 +797,49 @@ fn rename_brace(old: &str, new: &str) -> (String, String) {
     )
 }
 
+/// The grouped-layout header a directory lists under, as `(sort key, label)`. A plain
+/// directory is both. A Maven `src/main/` directory and its `src/test/` mirror
+/// (`testcode::maven_dir`) share one: the key is the `src/main/` spelling, so a
+/// module's `pom.xml` (`core/`) still sorts before its sources and `core/docs/`
+/// before both, and the label drops the `src/main/java` the key spells out —
+/// `core · be/acto/match/`. A language other than Java is kept
+/// (`core · resources · be/acto/`), as is Java's own name when no package follows,
+/// so a label is never empty.
+fn dir_header(dir: &str) -> (String, String) {
+    let Some(m) = testcode::maven_dir(dir) else {
+        return (dir.to_string(), dir.to_string());
+    };
+    // The root module is named `src`, so a merged header can never read as a plain
+    // top-level directory (`src · resources/`, not a `resources/` beside a real one).
+    let mut parts = vec![m.module.strip_suffix('/').unwrap_or("src")];
+    if m.lang != "java" || m.pkg.is_empty() {
+        parts.push(m.lang);
+    }
+    if let Some(pkg) = m.pkg.strip_suffix('/') {
+        parts.push(pkg);
+    }
+    (
+        format!("{}src/main/{}/{}", m.module, m.lang, m.pkg),
+        format!("{}/", parts.join(" · ")),
+    )
+}
+
 /// Turn the diff's files (new path + optional rename/copy source) into render rows
 /// for the given layout. `Name`/`Full` are flat (diff order); `Grouped` groups files
 /// by directory — one header per directory (alphabetical, parents before children),
 /// labels indented underneath, root-level files last without a header. A renamed or
 /// copied file is shown git-style (`rename_brace`) and grouped under the directory
 /// common to its old and new path, so the move reads clearly (`{ ⇒ admin}/File.java`
-/// under the `…/actions/` header) instead of a bare `File.java → File.java`.
+/// under the `…/actions/` header) instead of a bare `File.java → File.java`. A Maven
+/// `src/main/` directory and its `src/test/` mirror share one header, so a class and
+/// its test list next to each other (`dir_header`).
 fn build_file_rows(files: &[(&str, Option<&str>)], layout: FileListLayout) -> Vec<FileListRow> {
     let full = layout == FileListLayout::Full;
     let grouped = layout == FileListLayout::Grouped;
+    let test: Vec<bool> = files
+        .iter()
+        .map(|&(new, _)| testcode::is_test_path(new))
+        .collect();
     // (group directory, rendered label) per file. The group directory is read only
     // by the Grouped arm below, so the flat Name/Full layouts skip its allocation.
     let computed: Vec<(String, String)> = files
@@ -844,47 +883,73 @@ fn build_file_rows(files: &[(&str, Option<&str>)], layout: FileListLayout) -> Ve
                 idx,
                 label,
                 indented: false,
+                test: test[idx],
             })
             .collect(),
         FileListLayout::Grouped => {
-            // Group indices by directory so each directory gets exactly one header;
-            // BTreeMap keys sort directories alphabetically (parents before children).
-            // Root files ("") are split out and emitted last, headerless.
+            // Group indices by directory, then each directory under its header —
+            // one per directory, except that a Maven `src/test/` directory shares its
+            // `src/main/` mirror's (`dir_header`). The header's key sorts directories
+            // alphabetically (parents before children). Root files ("") are split out
+            // and emitted last, headerless.
             let mut by_dir: std::collections::BTreeMap<&str, Vec<usize>> =
                 std::collections::BTreeMap::new();
             for (idx, (dir, _)) in computed.iter().enumerate() {
                 by_dir.entry(dir.as_str()).or_default().push(idx);
             }
-            let root = by_dir.remove("");
+            let root = by_dir.remove("").unwrap_or_default();
+            let mut by_header: std::collections::BTreeMap<String, (String, Vec<usize>)> =
+                std::collections::BTreeMap::new();
+            for (dir, idxs) in by_dir {
+                let (key, label) = dir_header(dir);
+                let (_, group) = by_header.entry(key).or_insert_with(|| (label, Vec::new()));
+                group.extend(idxs);
+            }
             // Emit each directory's header then its files (sorted by label); root files
             // trail last, headerless. `dim_len` — the leading path a header shares with
             // the one above it — is fixed by the header sequence, so it's computed here
             // (once per rebuild) rather than re-derived every frame in the draw loop.
             // Labels are cloned out of `computed`: they're short (basenames / brace forms)
             // and this runs once per selection, not per frame.
-            let mut rows = Vec::with_capacity(computed.len() + by_dir.len() + 1);
-            let push_files = |rows: &mut Vec<FileListRow>, mut idxs: Vec<usize>, indented: bool| {
-                idxs.sort_by(|&a, &b| computed[a].1.cmp(&computed[b].1));
-                for idx in idxs {
-                    rows.push(FileListRow::File {
-                        idx,
-                        label: computed[idx].1.clone(),
-                        indented,
+            let mut rows = Vec::with_capacity(computed.len() + by_header.len());
+            //
+            // A merged Maven header can hold one file of a name from each set
+            // (`application.properties` in main and test resources). The header's key
+            // IS the `src/main/` directory, so a file whose own directory is not the
+            // key came from the `src/test/` mirror: the pair sorts main-first and the
+            // mirrored one says so, or the two rows are identical.
+            let push_files =
+                |rows: &mut Vec<FileListRow>, mut idxs: Vec<usize>, key: &str, indented: bool| {
+                    let mirrored = |idx: usize| computed[idx].0 != key;
+                    idxs.sort_by(|&a, &b| {
+                        (&computed[a].1, mirrored(a)).cmp(&(&computed[b].1, mirrored(b)))
                     });
-                }
-            };
-            let mut prev_dir = "";
-            for (dir, idxs) in by_dir {
+                    for (k, &idx) in idxs.iter().enumerate() {
+                        let label = &computed[idx].1;
+                        let twin = k > 0 && computed[idxs[k - 1]].1 == *label;
+                        let label = if twin && mirrored(idx) {
+                            format!("{label} (test)")
+                        } else {
+                            label.clone()
+                        };
+                        rows.push(FileListRow::File {
+                            idx,
+                            label,
+                            indented,
+                            test: test[idx],
+                        });
+                    }
+                };
+            let mut prev_label = String::new();
+            for (key, (label, idxs)) in by_header {
                 rows.push(FileListRow::Header {
-                    dim_len: diff::common_dir_prefix_len(prev_dir, dir),
-                    dir: dir.to_string(),
+                    dim_len: diff::common_dir_prefix_len(&prev_label, &label),
+                    label: label.clone(),
                 });
-                prev_dir = dir;
-                push_files(&mut rows, idxs, true);
+                prev_label = label;
+                push_files(&mut rows, idxs, &key, true);
             }
-            if let Some(idxs) = root {
-                push_files(&mut rows, idxs, false);
-            }
+            push_files(&mut rows, root, "", false);
             rows
         }
     }
@@ -1287,7 +1352,17 @@ struct DiffView<'a> {
     /// Which diff these rows belong to, mixed into each row's widget id so an
     /// open context menu cannot outlive it. See `diff_menu_salt`.
     menu_salt: u64,
+    /// Per file index, whether its rows get the test-code bar (`TEST_STRIPE`) in
+    /// the `DIFF_BAR_GUTTER` left of the pane. Indexed by what `row_menu_target`
+    /// answers, so a row outside every file gets none; empty ⇒ no bars.
+    test_files: &'a [bool],
 }
+
+/// The column the test-code bar is drawn in, left of the diff pane's `ScrollArea`.
+/// The pane's frame reserves it as margin, which is what keeps the bar still under
+/// horizontal scrolling and out from under the text — and, being margin, it is
+/// already gone from the width `wrap_cols` measures.
+const DIFF_BAR_GUTTER: i8 = 4;
 
 /// What the diff render observed about its own viewport this frame, handed to the
 /// caller's `on_visible` so `GitkApp` can publish it (`DiffViewport`).
@@ -1954,6 +2029,7 @@ fn diff_menu_salt(key: Option<&DiffCacheKey>) -> u64 {
 /// sub_row)` pair, so a wrapped line's second row is `(line, 1)`. `row_menu_target`
 /// answers "which file does this row act on, if any" — ONE lookup, so whether a menu
 /// is attached and what it acts on cannot disagree — and `row_menu` draws it. The
+/// same answer picks the row's test-code bar out of `DiffView::test_files`. The
 /// callbacks keep the scroll/offset/width scaffold here separate from the
 /// row-building policy in the (single) caller.
 ///
@@ -1980,8 +2056,14 @@ fn show_virtualized_diff(
         scroll_target,
         last_top_anchor,
         menu_salt,
+        test_files,
     } = view;
     let n_rows = map.total_rows();
+    // Taken OUTSIDE the ScrollArea: its painter is clipped to the pane's frame, which
+    // includes the `DIFF_BAR_GUTTER` margin the ScrollArea's own clip leaves out.
+    let bar_painter = ui.painter().clone();
+    let bar_left = ui.max_rect().left() - f32::from(DIFF_BAR_GUTTER);
+    let bar_x = egui::Rangef::new(bar_left, bar_left + ROW_BAR_W);
     let row_h = ui.fonts_mut(|f| f.row_height(font_id));
     let any_menu_open = egui::Popup::is_any_open(ui.ctx());
     // The pointer, read ONCE per frame rather than once per visible row.
@@ -2048,6 +2130,10 @@ fn show_virtualized_diff(
             ui.set_min_width(content_w);
             content_w
         };
+        // Clipped to the viewport's height, or the half-visible row at either end
+        // paints its bar over whatever sits above or below the pane.
+        let bar_painter = bar_painter
+            .with_clip_rect(egui::Rect::from_x_y_ranges(bar_x, ui.clip_rect().y_range()));
         // Report only real rows — the padding rows below aren't part of the diff —
         // plus the true viewport height (the real range clamps short over padding).
         let real = rows.start.min(n_rows.saturating_sub(1))..rows.end.min(n_rows);
@@ -2115,7 +2201,12 @@ fn show_virtualized_diff(
             // the re-wrap or stops being drawn, and egui closes a popup whose owner
             // stops calling in. Unwrapped, `line == i` and `sub == 0`, so this is the
             // id the pane has always used.
-            if let Some(file_idx) = row_menu_target(line)
+            let file = row_menu_target(line);
+            if file.and_then(|f| test_files.get(f)) == Some(&true) {
+                let gutter_row = egui::Rect::from_x_y_ranges(bar_x, rect.y_range());
+                paint_row_bar(&bar_painter, gutter_row, TEST_STRIPE);
+            }
+            if let Some(file_idx) = file
                 && (any_menu_open
                     || (pointer.is_some_and(|p| rect.contains(p))
                         && ui.rect_contains_pointer(rect)))
@@ -3089,6 +3180,19 @@ const SURFACE0: egui::Color32 = egui::Color32::from_rgb(49, 50, 68);
 const GREEN: egui::Color32 = egui::Color32::from_rgb(166, 227, 161);
 const RED: egui::Color32 = egui::Color32::from_rgb(243, 139, 168);
 const YELLOW: egui::Color32 = egui::Color32::from_rgb(249, 226, 175);
+/// The bar marking test code — on a sidebar row and down the pane beside its patch.
+/// Sky, because every warmer hue already means something: green/red are added/deleted,
+/// yellow a search match, mauve the selection.
+const TEST_STRIPE: egui::Color32 = egui::Color32::from_rgb(137, 220, 235);
+/// Width of a row's left-edge marker bar — the commit list's search match and the
+/// file list's test code (`paint_row_bar`), and the diff pane's test bar beside them.
+const ROW_BAR_W: f32 = 3.0;
+
+/// A `ROW_BAR_W` marker bar down `row`'s left edge.
+fn paint_row_bar(painter: &egui::Painter, row: egui::Rect, color: egui::Color32) {
+    let bar = egui::Rect::from_min_size(row.min, egui::vec2(ROW_BAR_W, row.height()));
+    painter.rect_filled(bar, 0.0, color);
+}
 
 /// `c` at a given alpha — for translucent tints derived from the named palette
 /// constants, so a palette retune can't leave a tint behind on the old colour.
@@ -3456,6 +3560,10 @@ struct GitkApp {
     /// Sorted `(patch start line, file index)` for the current diff — the
     /// binary-search structure behind the per-frame `file_index_at_line*` lookups.
     file_line_starts: Vec<(usize, usize)>,
+    /// Per `diff_files` index: is that file test code (`testcode::is_test_path`)?
+    /// Drawn as the `TEST_STRIPE` bar on its sidebar row and down its patch in the
+    /// pane. Built with the layout, because the re-lay moves the indices it is keyed on.
+    file_is_test: Vec<bool>,
     /// Lazily-created arboard connection for the primary selection, kept for the
     /// session instead of reconnecting to the display server on every SHA click.
     clipboard: Option<arboard::Clipboard>,
@@ -4235,6 +4343,7 @@ impl GitkApp {
             diff_tabless: false,
             sidebar_cache: SidebarCache::default(),
             file_line_starts: Vec::new(),
+            file_is_test: Vec::new(),
             clipboard: None,
             highlighter: None,
             languages_fingerprint: highlight::languages_fingerprint(&span_settings.languages),
@@ -6114,6 +6223,16 @@ impl GitkApp {
             self.diff_sides = None;
         }
         self.file_line_starts = file_line_starts(&self.diff_files);
+        // Row order IS file order after the renumbering above, so the rows' flags read
+        // off in sequence are indexed by file.
+        self.file_is_test = self
+            .file_rows
+            .iter()
+            .filter_map(|r| match *r {
+                FileListRow::File { test, .. } => Some(test),
+                FileListRow::Header { .. } => None,
+            })
+            .collect();
         // New rows ⇒ the per-row galleys no longer correspond; rebuild lazily.
         self.sidebar_cache = SidebarCache::default();
     }
@@ -6262,6 +6381,11 @@ impl GitkApp {
             frame.current_rect = Some(rect);
         } else if resp.hovered() {
             ui.painter().rect_filled(rect, 2.0, mauve(20));
+        }
+        // At the row's own edge rather than its indent, so the bars line up down the
+        // list whether or not a row sits under a header.
+        if self.file_is_test.get(idx) == Some(&true) {
+            paint_row_bar(ui.painter(), rect, TEST_STRIPE);
         }
 
         let left = rect.min.x + 4.0 + indent;
@@ -7033,11 +7157,7 @@ impl GitkApp {
                             // selection fill (drawn on top of it), so the selected
                             // commit still shows it when it's also a search match.
                             if is_search_match {
-                                let bar = egui::Rect::from_min_size(
-                                    row_rect.min,
-                                    egui::vec2(3.0, row_rect.height()),
-                                );
-                                painter.rect_filled(bar, 0.0, YELLOW);
+                                paint_row_bar(&painter, row_rect, YELLOW);
                             }
                             if self.selected != Some(idx)
                                 && hover.is_some_and(|p| row_rect.contains(p))
@@ -7436,13 +7556,14 @@ impl GitkApp {
                     let mut scroll_to: Option<usize> = None;
                     for row in &self.file_rows {
                         match row {
-                            FileListRow::Header { dir, dim_len } => {
-                                self.draw_dir_header(ui, dir, *dim_len, row_h);
+                            FileListRow::Header { label, dim_len } => {
+                                self.draw_dir_header(ui, label, *dim_len, row_h);
                             }
                             FileListRow::File {
                                 idx,
                                 label,
                                 indented,
+                                ..
                             } => {
                                 let indent = if *indented { FILE_INDENT } else { 0.0 };
                                 if let Some(li) =
@@ -8667,7 +8788,7 @@ impl eframe::App for GitkApp {
                 // when that sidebar is actually shown.
                 let diff_right_pad = if divider.is_some() { 10 } else { 0 };
                 let mut frame = egui::Frame::NONE.inner_margin(egui::Margin {
-                    left: 0,
+                    left: DIFF_BAR_GUTTER,
                     right: diff_right_pad,
                     top: 0,
                     bottom: 0,
@@ -8809,6 +8930,7 @@ impl eframe::App for GitkApp {
                         // that a future write to `file_line_starts` could forget.
                         last_top_anchor: self.file_line_starts.last().map(|&(s, _)| s),
                         menu_salt: diff_menu_salt(self.current_diff_key.as_ref()),
+                        test_files: &self.file_is_test,
                     };
                     // One render path for both modes. Syntax-on takes row colours from
                     // the theme's token spans plus an add/del tint; syntax-off uses one
@@ -10023,6 +10145,7 @@ mod tests {
                                 scroll_target: None,
                                 last_top_anchor: None,
                                 menu_salt: salt,
+                                test_files: &[],
                             },
                             |_| {},
                             |_, _| (egui::text::LayoutJob::default(), None, egui::Color32::WHITE),
@@ -10133,6 +10256,7 @@ mod tests {
                     scroll_target: None,
                     last_top_anchor: None,
                     menu_salt: 0,
+                    test_files: &[],
                 },
                 |v| seen = Some((v.top_row, v.lines)),
                 |line, sub| {
@@ -10152,6 +10276,72 @@ mod tests {
             menus: menus.into_inner(),
             top_row,
             lines,
+        }
+    }
+
+    /// The test-code bar, through the real renderer: a file flagged in
+    /// `DiffView::test_files` gets one bar per row it owns and an unflagged one none,
+    /// and every bar sits in the `DIFF_BAR_GUTTER` left of the pane — outside the
+    /// `ScrollArea`, so it is neither scrolled sideways nor drawn under the text — and
+    /// inside the clip it is painted with, which is the half that fails silently.
+    #[test]
+    fn the_test_bar_marks_only_a_test_files_rows_in_the_gutter() {
+        let mut pane_left = f32::NAN;
+        let shapes = run_headless_shapes(headless_screen(600.0, 400.0), |ui| {
+            egui::Frame::NONE
+                .inner_margin(egui::Margin {
+                    left: DIFF_BAR_GUTTER,
+                    ..Default::default()
+                })
+                .show(ui, |ui| {
+                    pane_left = ui.max_rect().left();
+                    show_virtualized_diff(
+                        ui,
+                        &egui::FontId::monospace(13.0),
+                        DiffView {
+                            map: diff::RowMap::new(12, None, None),
+                            content_chars: 0,
+                            scroll_target: None,
+                            last_top_anchor: None,
+                            menu_salt: 0,
+                            test_files: &[false, true],
+                        },
+                        |_| {},
+                        |_, _| (egui::text::LayoutJob::default(), None, egui::Color32::WHITE),
+                        // Lines 0-1 are the commit header, 2-6 file 0, 7-11 file 1.
+                        |line| match line {
+                            0..2 => None,
+                            2..7 => Some(0),
+                            _ => Some(1),
+                        },
+                        |_, _, _| {},
+                    );
+                });
+        });
+        let bars: Vec<(egui::Rect, egui::Rect)> = shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::epaint::Shape::Rect(r) if r.fill == TEST_STRIPE => {
+                    Some((r.rect, c.clip_rect))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            bars.len(),
+            5,
+            "one bar per row of the test file, none elsewhere"
+        );
+        for (bar, clip) in bars {
+            assert!(
+                bar.right() <= pane_left,
+                "{bar:?} is under the pane at {pane_left}"
+            );
+            assert!(bar.left() >= pane_left - f32::from(DIFF_BAR_GUTTER));
+            assert!(
+                clip.contains_rect(bar),
+                "{bar:?} is clipped away by {clip:?}"
+            );
         }
     }
 
@@ -11709,8 +11899,20 @@ mod tests {
     /// rendering a virtualized list, where the number of rows laid out is the thing
     /// under test and the default rect is not something to depend on.
     fn run_headless_input(input: egui::RawInput, f: impl FnMut(&mut egui::Ui)) {
+        run_headless_shapes(input, f);
+    }
+
+    /// `run_headless_input` for a test whose subject is what got PAINTED: returns the
+    /// frame's shapes, taken out of the output before its deltas are dropped.
+    fn run_headless_shapes(
+        input: egui::RawInput,
+        f: impl FnMut(&mut egui::Ui),
+    ) -> Vec<egui::epaint::ClippedShape> {
         let ctx = egui::Context::default();
-        ctx.run_ui(input, f).drop_without_applying_deltas();
+        let mut out = ctx.run_ui(input, f);
+        let shapes = std::mem::take(&mut out.shapes);
+        out.drop_without_applying_deltas();
+        shapes
     }
 
     /// A `RawInput` whose viewport is `w` × `h` points.
@@ -12118,11 +12320,10 @@ mod tests {
         // Diff order is unsorted; grouped groups by directory (alphabetical,
         // parents before children) with root files last.
         let files = [
-            ("src/main/java/com/acme/Foo.java", None),     // 0
-            ("src/main/java/com/acme/Bar.java", None),     // 1
-            ("src/test/java/com/acme/FooTest.java", None), // 2
-            ("docs/guide.md", None),                       // 3
-            ("README.md", None),                           // 4
+            ("src/main/java/com/acme/Foo.java", None), // 0
+            ("src/main/java/com/acme/Bar.java", None), // 1
+            ("docs/guide.md", None),                   // 2
+            ("README.md", None),                       // 3
         ];
         let rows = build_file_rows(&files, FileListLayout::Grouped);
         let desc: Vec<String> = rows.iter().map(row_desc).collect();
@@ -12130,13 +12331,114 @@ mod tests {
             desc,
             vec![
                 "H:docs/",
-                "F:3:guide.md:true",
-                "H:src/main/java/com/acme/",
+                "F:2:guide.md:true",
+                "H:src · com/acme/",
                 "F:1:Bar.java:true", // Bar sorts before Foo
                 "F:0:Foo.java:true",
-                "H:src/test/java/com/acme/",
-                "F:2:FooTest.java:true",
-                "F:4:README.md:false", // root, no header, last
+                "F:3:README.md:false", // root, no header, last
+            ]
+        );
+    }
+
+    #[test]
+    fn dir_header_labels() {
+        let label = |dir: &str| dir_header(dir).1;
+        assert_eq!(label("docs/"), "docs/");
+        // The root module is `src`, so it cannot pass for a top-level directory.
+        assert_eq!(label("src/main/java/be/acto/"), "src · be/acto/");
+        assert_eq!(label("src/main/resources/"), "src · resources/");
+        assert_eq!(
+            label("xam/mod/src/test/resources/be/"),
+            "xam/mod · resources · be/"
+        );
+        assert_eq!(label("core/src/main/resources/"), "core · resources/");
+        // Java's name stays when no package follows, so the label is never bare.
+        assert_eq!(label("core/src/main/java/"), "core · java/");
+        assert_eq!(label("src/main/java/"), "src · java/");
+        // Both sets key on the `src/main/` spelling.
+        assert_eq!(
+            dir_header("core/src/test/java/be/").0,
+            "core/src/main/java/be/"
+        );
+    }
+
+    /// A Maven `src/main/` package and its `src/test/` mirror are ONE header, so a
+    /// class and its test read next to each other — in the pane too, which follows
+    /// this order. Headers still sort by path (the `src/main/` spelling), so a
+    /// module's `pom.xml` precedes its sources and modules stay apart.
+    #[test]
+    fn build_file_rows_grouped_merges_maven_main_and_test() {
+        let files = [
+            ("core/src/test/java/be/acto/MatcherTest.java", None), // 0
+            ("core/src/main/java/be/acto/Matcher.java", None),     // 1
+            ("core/pom.xml", None),                                // 2
+            ("core/src/test/resources/cv.json", None),             // 3
+            ("api/src/main/java/be/Api.java", None),               // 4
+            ("core/src/main/java/be/acto/sub/Deep.java", None),    // 5
+            ("core/src/it/java/be/acto/MatcherIT.java", None),     // 6: not paired
+        ];
+        let rows = build_file_rows(&files, FileListLayout::Grouped);
+        let desc: Vec<String> = rows.iter().map(row_desc).collect();
+        assert_eq!(
+            desc,
+            vec![
+                "H:api · be/",
+                "F:4:Api.java:true",
+                "H:core/",
+                "F:2:pom.xml:true",
+                "H:core/src/it/java/be/acto/",
+                "F:6:MatcherIT.java:true",
+                "H:core · be/acto/",
+                "F:1:Matcher.java:true",
+                "F:0:MatcherTest.java:true",
+                "H:core · be/acto/sub/",
+                "F:5:Deep.java:true",
+                "H:core · resources/",
+                "F:3:cv.json:true",
+            ]
+        );
+        // Each row carries its own classification, which `resync_file_layout` reads
+        // back per file: under the merged header only the test class is marked.
+        let tests: Vec<(usize, bool)> = rows
+            .iter()
+            .filter_map(|r| match *r {
+                FileListRow::File { idx, test, .. } => Some((idx, test)),
+                FileListRow::Header { .. } => None,
+            })
+            .filter(|&(idx, _)| idx <= 1)
+            .collect();
+        assert_eq!(tests, vec![(1, false), (0, true)]);
+        // The breadcrumb dimming reads the LABELS, so a sub-package dims the
+        // package header it repeats.
+        let dims: Vec<usize> = rows
+            .iter()
+            .filter_map(|r| match r {
+                FileListRow::Header { dim_len, .. } => Some(*dim_len),
+                FileListRow::File { .. } => None,
+            })
+            .collect();
+        assert_eq!(dims, vec![0, 0, 5, 0, "core · be/acto/".len(), 0]);
+    }
+
+    /// The one collision a merged header makes: a file of the same name in each
+    /// set. The pair lists main first and the test one says so, where it used to be
+    /// two identical rows.
+    #[test]
+    fn build_file_rows_names_the_test_twin_under_a_merged_header() {
+        let files = [
+            ("core/src/test/resources/app.properties", None), // 0
+            ("core/src/main/resources/app.properties", None), // 1
+            ("core/src/test/resources/only-test.json", None), // 2
+        ];
+        let rows = build_file_rows(&files, FileListLayout::Grouped);
+        let desc: Vec<String> = rows.iter().map(row_desc).collect();
+        assert_eq!(
+            desc,
+            vec![
+                "H:core · resources/",
+                "F:1:app.properties:true",
+                "F:0:app.properties (test):true",
+                "F:2:only-test.json:true",
             ]
         );
     }
@@ -12242,7 +12544,7 @@ mod tests {
     fn build_file_rows_grouped_multibyte_dir() {
         let files = [("α/β.rs", None), ("α/γ.rs", None)];
         let rows = build_file_rows(&files, FileListLayout::Grouped);
-        assert!(matches!(&rows[0], FileListRow::Header { dir, .. } if dir == "α/"));
+        assert!(matches!(&rows[0], FileListRow::Header { label, .. } if label == "α/"));
         assert_eq!(rows.len(), 3); // header + 2 files
     }
 
@@ -12332,11 +12634,12 @@ mod tests {
     /// Compact one row to a string for assertions.
     fn row_desc(r: &FileListRow) -> String {
         match r {
-            FileListRow::Header { dir, .. } => format!("H:{dir}"),
+            FileListRow::Header { label, .. } => format!("H:{label}"),
             FileListRow::File {
                 idx,
                 label,
                 indented,
+                ..
             } => {
                 format!("F:{idx}:{label}:{indented}")
             }

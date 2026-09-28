@@ -57,6 +57,7 @@
 - True syntax-highlighted diffs (syntect): language-aware token colors over the chosen theme's background, with green/red row tints and a +/- gutter for additions/deletions
 - Selectable color theme via `[diff] theme` in the config (any of 29 bundled themes — a curated allowlist; default Catppuccin Mocha), applied live on save; or turn highlighting off for the original flat per-line coloring
 - File list sidebar with per-file `+/-` stats, grouped under directory headers by default (`[diff] file_list` = `grouped`/`full`/`name`)
+- **Test code is marked** with a blue bar — on its sidebar row and beside its patch in the diff — so tests and production code are told apart at a glance. Recognised from the path: Maven/Gradle `src/test/` (and `src/it/`, `testFixtures`, …), `test`/`tests`/`__tests__`/`testdata` directories, and test file names (`*.spec.ts`, `*.test.js`, `*_test.go`, `test_*.py`, …). In the grouped layout a Maven `src/main/` package and its `src/test/` mirror share one header, so a class and its test sit next to each other
 - Renamed/copied files shown git-style — one `dir/{old ⇒ new}` entry instead of a delete + add pair
 - **Word diff** toggle — highlights the exact words that changed, aligning a change block whole so a rewrapped paragraph shows the words that moved rather than every line the rewrap touched
 - Optional line numbers beside every patch line — old and new, in columns sized once per diff so they line up across every file in it
@@ -324,7 +325,7 @@ per-role change belongs; the zoom multiplies all of them at once.
 | `syntax` | `true` | Syntax-highlight diffs. `false` restores flat per-role colouring — no theme, no highlighter |
 | `theme` | `"catppuccin-mocha"` | Highlight theme; one of the 29 slugs below. An unknown value warns and falls back |
 | `show_stats` | `true` | Show the diffstat block between the commit message and the patch. The file sidebar is independent and always shown |
-| `file_list` | `"grouped"` | Sidebar layout, and the order the diff pane lays its patches out in: `"grouped"` puts files under directory headers with root-level files last, `"full"` shows full repo-relative paths, `"name"` shows basenames only |
+| `file_list` | `"grouped"` | Sidebar layout, and the order the diff pane lays its patches out in: `"grouped"` puts files under directory headers with root-level files last (a Maven `src/main/` package and its `src/test/` mirror share one header), `"full"` shows full repo-relative paths, `"name"` shows basenames only |
 | `textconv` | `true` | Run `diff.<driver>.textconv` when `.gitattributes` names a driver for a path, as git does — what turns an archive or a PDF into a readable diff instead of "Binary files … differ" |
 
 **Everything on the diff's hover toolbar is set there, not here** — context width,

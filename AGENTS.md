@@ -406,6 +406,9 @@ advisory, `None` ⇒ the caller uses its static default. One consumer:
 its own module rather than `diff.rs`'s, where it had ended up by accident: it is the
 commit LIST's concern, and the relative form is a port of git's `show_date_relative`
 whose rounding is the whole of it),
+`src/testcode.rs` (which files are test code, and the Maven `src/main/`/`src/test/`
+directories the grouped sidebar merges headers over — both from the path alone, pure;
+see **Bottom panel**),
 `src/cli.rs` (pure argv parser, rev-vs-path classification, pathspec
 resolution, window-title suffix, help/version text), and
 `src/word_diff.rs` (pure word diff: tokenizer + LCS alignment. A change block is
@@ -1414,6 +1417,32 @@ sorted drivers keep the same rows with the same rewritten parents.
   What that pass costs is filling a second buffer, so it scales with LINES and not
   with how far anything moved; a big commit pays one extra half-frame at install,
   against the seconds its diff took to build.
+  **Test code is marked, not separated.** `testcode::is_test_path` classifies each
+  file from its path, ONCE — in `build_file_rows`, carried on each file row — and
+  `resync_file_layout` reads the flags back off the renumbered rows into
+  `file_is_test`, beside `file_line_starts` for the same reason (the re-lay moves the
+  indices it is keyed on); a test file gets a `TEST_STRIPE` bar on its sidebar row and down the pane
+  beside every row it owns. A Maven/Gradle source set is authoritative where there is
+  one — under `src/main/` a `test` package is a test-support LIBRARY, production code
+  of its module — so a false one marks a whole tree: a Gradle custom set
+  (`integrationTest`) counts only with a JVM source dir under it, `src/testimonials/`
+  being an app folder. The file-name rules (`*.spec.ts`, `*_test.go`, …) apply
+  everywhere, but each only in its own language's extensions — `api_spec.yaml` and
+  `test_plan.md` are not tests. The order is untouched except in `grouped`, where
+  `dir_header` (over `testcode::maven_dir`) gives a `src/test/` directory its
+  `src/main/` mirror's key, so a class and its test share one header
+  (`core · be/acto/match/`; the root module reads `src ·`, so it never passes for a
+  top-level directory) and read next to each other in the pane too. A name present in
+  both sets lists main first and the test one as `name (test)`, or the two rows would
+  be identical — decided from the merge itself (the header's key IS the `src/main/`
+  directory, so a file whose own directory differs came from the mirror), not by
+  asking the classifier again. Only main↔test pair: they are the one mirror a build tool
+  guarantees. The pane's bar lives in `DIFF_BAR_GUTTER`, the left margin of the
+  pane's frame, painted with a painter taken OUTSIDE the `ScrollArea` — whose own clip
+  would erase it — so it neither scrolls sideways nor sits under the text, and, being
+  margin, is already gone from the width `wrap_cols` measures.
+  `the_test_bar_marks_only_a_test_files_rows_in_the_gutter` pins the clip half,
+  which is the one that fails silently.
   The **line-number gutter** (`diff::LineNoGutter`, a persisted toolbar checkbox,
   off until ticked) is render-only in the strongest sense:
   the numbers are `DiffLine::old_lineno`/`new_lineno`, which every diff already
@@ -1956,7 +1985,10 @@ hidden run wraps too, so what it removes is its ROWS and not its lines),
 over real temp repos, the entry cap from both sides — the measured 76.5M-line shape
 refused from its line count alone, and a few enormous lines refused only after
 encoding — and the pruner's eviction + temp sweep), `word_diff` (LCS word
-alignment), `prefetch` (the coordinator's scheduling decisions, driven through its message
+alignment), `testcode` (test-path classification per convention, including the
+negatives a looser rule would catch — a test-SUPPORT package under `src/main/`, a
+directory merely containing `test`, an API `spec/` — and the Maven directory parse),
+`prefetch` (the coordinator's scheduling decisions, driven through its message
 protocol rather than by reaching into its fields: the heavy lane's two admission
 bounds and the stampede a whole dispatch would otherwise commit, the deferral round
 trip — and the band boundary it must not cross, the one way a superseded target can
@@ -2029,7 +2061,9 @@ the wrong side of the profile split: CI's gating suite runs dev and fails, while
 same test passes for the packagers. `run_headless` calls egui's own
 `FullOutput::drop_without_applying_deltas`. A test whose subject is how many rows a
 virtualized list lays out takes `run_headless_input(headless_screen(w, h), …)`
-instead, so the viewport is a stated size rather than whatever egui defaults to.
+instead, so the viewport is a stated size rather than whatever egui defaults to, and
+one whose subject is what got painted takes `run_headless_shapes`, which hands back
+the frame's shapes — the one path all three share, so none drops the deltas itself.
 
 **No test may depend on the developer's own git config or attributes, and that is
 enforced by construction rather than by convention.** `temp_repo` builds a repo the
@@ -2197,7 +2231,7 @@ ones that actually fail when the write is removed.
 - `collect_refs` per commit is O(commits × refs) → precompute ref map once
 - Working-tree edits do not touch `.git`; refresh commits/diff on selection changes to keep virtual staged/uncommitted entries current without a recursive worktree watcher
 - Branch highlighting walks first-parent children upward, but all parents downward, so merge commits keep merged history highlighted
-- File-list sidebar is not row-virtualized — every row draws each frame, so per-row file text goes through `SidebarCache`: elided labels (laid out in `Color32::PLACEHOLDER` so normal/hover color applies at paint time) and `+n`/`-n` stat galleys are built once per (diff, width, scale, font) — `resync_file_layout` and a font reload reset the cache, `ensure` re-keys it on the row width and on `pixels_per_point`, which is what covers a zoom step and a monitor-DPI change (see **UI zoom**). Both stat galleys always exist, a zero count included (`+0`/`-0`, as in the commit list), so `StatGalleys` holds no `Option` and the row's stats block is a fixed distance from its right edge instead of sliding when one side is empty. `build_file_rows` (pure) turns `(new_path, Option<old_path>)` pairs into header/file rows per `[diff] file_list` (`grouped` = one header per directory, files sorted by label, root-level files last; renames/copies group under their `rename_brace` common directory) — and it is the single decision of what order files are read in, the **diff pane** included (see **Bottom panel**); `left_elide` left-truncates labels, measuring the full string once and binary-searching only when it overflows (directory headers still elide per frame — they're the minority of rows). `grouped` directory headers are drawn breadcrumb-style (`draw_dir_header` + `diff::common_dir_prefix_len` — shared with the diffstat block's `dir/{old => new}` factoring, which is libgit2's own rule and was a second copy of it): the ancestor path a header shares with the header drawn just above it is dimmed (`SUBTEXT_DIM`) and the distinguishing tail is `SUBTEXT`, so deep trees don't repeat the same long prefix on every header
+- File-list sidebar is not row-virtualized — every row draws each frame, so per-row file text goes through `SidebarCache`: elided labels (laid out in `Color32::PLACEHOLDER` so normal/hover color applies at paint time) and `+n`/`-n` stat galleys are built once per (diff, width, scale, font) — `resync_file_layout` and a font reload reset the cache, `ensure` re-keys it on the row width and on `pixels_per_point`, which is what covers a zoom step and a monitor-DPI change (see **UI zoom**). Both stat galleys always exist, a zero count included (`+0`/`-0`, as in the commit list), so `StatGalleys` holds no `Option` and the row's stats block is a fixed distance from its right edge instead of sliding when one side is empty. `build_file_rows` (pure) turns `(new_path, Option<old_path>)` pairs into header/file rows per `[diff] file_list` (`grouped` = one header per directory, files sorted by label, root-level files last; renames/copies group under their `rename_brace` common directory; a Maven `src/test/` directory shares its `src/main/` mirror's header, labelled `module · package/` — `dir_header`) — and it is the single decision of what order files are read in, the **diff pane** included (see **Bottom panel**); `left_elide` left-truncates labels, measuring the full string once and binary-searching only when it overflows (directory headers still elide per frame — they're the minority of rows). `grouped` directory headers are drawn breadcrumb-style (`draw_dir_header` + `diff::common_dir_prefix_len` — shared with the diffstat block's `dir/{old => new}` factoring, which is libgit2's own rule and was a second copy of it): the ancestor path a header shares with the header drawn just above it — measured over the LABELS, so a merged Maven header dims the package it repeats — is dimmed (`SUBTEXT_DIM`) and the distinguishing tail is `SUBTEXT`, so deep trees don't repeat the same long prefix on every header
 - Any new diff-*data*-affecting setting goes in `DiffSettings` only. `GitkApp` holds one `DiffSettings` field (the diff-shaping state — `context`/`ignore_ws`/`ignore_blank_lines`/`detect_renames`/`detect_copies` are toolbar-owned + persisted, grouped as `ToolbarDiffSettings`; `show_stats`/`textconv` come from `[diff]` config), and `DiffCacheKey` *embeds* a `DiffSettings`. (It also carries a `drivers` fingerprint, which is NOT a setting — it is the repo's own `diff.<name>.textconv` config, and it is in the key for the same reason: an edited driver changes a driven file's whole body without moving the oid. See **Textconv**.) So a field added to `DiffSettings` is automatically (a) part of the cache key — cached diffs invalidate when it changes, no second edit site — and (b) covered by the config-reload's whole-struct comparison (`new_settings != self.diff_settings`), which triggers the re-diff. The prefetch mapping reads it back as `key.settings`. Settings that only change *spans* (theme, syntax on/off, `diff_bg`, `[diff.languages]`) or *render* (`file_list`) are handled by their own branches in the config-reload block, not `DiffSettings`. The four render-only settings the TOOLBAR owns — `word_diff`, `line_numbers`, `wrap` and `side` — have no reload branch at all, because they have no config key to reload from; a render-only setting added later has to choose which of those two shapes it is. `file_list` decides the order the pane's patch bodies are laid out in as well as the sidebar's rows, which is a re-lay of built data and not a re-diff — it stays out here because `diff::order_files` is idempotent, so a cached or stored diff is re-laid on install rather than rebuilt (see **Bottom panel**). `wrap` is the third shape and not a config setting at all: it is toolbar-owned like `word_diff` and `line_numbers`, so it has no reload branch to forget, and it needs no re-lay either — the wrap index is measured by the render on the first frame that wants one and `resync_wrap_index`'s own `!wrap` arm drops it, reporting that drop as a move so the reader's line is pinned (see **Soft wrapping**). `side` is that same third shape, and its index composes with `wrap`'s rather than replacing it — the composition living in `diff::RowMap`, which is what the pane addresses rows through (see **Reading one side**).
   The span half is **one struct too** (`SpanSettings`, held as `GitkApp::span_settings`), compared and assigned whole for the same reason `DiffSettings` is: as four loose fields the reload's test was a four-term `||` chain that a fifth setting could silently miss, and missing it is not a lost frame — every cached diff keeps yesterday's colours, sticky via `diff_cache.contains`, for the session with nothing logged. Which of the four are in `DiffCacheKey` is unchanged and is the next paragraph's subject.
   **Three of those four span settings are in `DiffCacheKey`, and the fourth shapes no span** — so a stale entry simply misses, and the reload neither clears the cache nor carries an epoch. `theme` and `enabled` are their own key fields; `[diff.languages]` is a `u64` from `highlight::languages_fingerprint`, cached on `GitkApp` because `diff_cache_key` runs ~54 times per dispatch and the map is a `BTreeMap`. `diff_bg` is **not** in the key and must not be: it decides `DiffPalette::added_bg`/`deleted_bg`, which `diff_row_job` reads live from `self.diff_palette` at render time, and the one palette-derived span (`tokenize`'s grammar-hiccup fallback) takes `foreground`, which is theme-derived. Nothing bakes it into a `Span`. `set_span_settings` is the sole later writer of the map and the fingerprint both, so the cached value cannot describe a map that is gone — which would be silent and permanent, every key hitting entries tokenized with the wrong grammar while `diff_cache.contains` kept any dispatch from rebuilding them.
