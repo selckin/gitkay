@@ -4524,6 +4524,40 @@ pub mod tests {
         (d, repo, oid)
     }
 
+    /// One file of `lines` lines, then a commit rewriting every one of them: a diff of
+    /// `2 × lines` patch rows in a single hunk, plus the header and diffstat. Returns
+    /// the repo and the rewriting commit's oid.
+    ///
+    /// The row-memory fixture: the rewrite keeps every line's length, so the `-` and
+    /// `+` halves weigh the same and nothing in the diff is shared. `pub` because the
+    /// store's codec bench measures the same diff the row benches do.
+    pub fn synthetic_rewrite_repo(lines: usize) -> (tempfile::TempDir, Repository, git2::Oid) {
+        use crate::test_repo::{commit_index, stage, temp_repo};
+        use std::fmt::Write as _;
+        let body = |word: &str| {
+            let mut s = String::with_capacity(lines * 40);
+            for i in 0..lines {
+                let _ = writeln!(s, "{word} {i:08x} padding padding padding");
+            }
+            s
+        };
+        let (d, repo) = temp_repo();
+        let path = repo.workdir().unwrap().join("big.txt");
+        std::fs::write(&path, body("line")).unwrap();
+        stage(&repo, "big.txt");
+        {
+            let mut index = repo.index().unwrap();
+            commit_index(&repo, &mut index, "base");
+        }
+        std::fs::write(&path, body("LINE")).unwrap();
+        stage(&repo, "big.txt");
+        let oid = {
+            let mut index = repo.index().unwrap();
+            commit_index(&repo, &mut index, "rewrite every line")
+        };
+        (d, repo, oid)
+    }
+
     /// The shared-directory rule, at the boundaries it actually turns on. Both of this
     /// helper's callers had their own suite of these; the cases are the union, since a
     /// case either of them covered is one the other's caller now depends on too.
@@ -7064,7 +7098,8 @@ mod parallel_patch_tests {
     ///
     /// It prints the commit's `parallel_ceiling` first, because that is the number the
     /// speedup has to be read against — a commit whose bytes sit in one blob cannot go
-    /// faster than 1.0x however many threads there are.
+    /// faster than 1.0x however many threads there are. Every build is followed by its
+    /// `heap_bytes` and the time its `drop` took.
     #[test]
     #[ignore = "a benchmark; see the doc comment for how to run it"]
     fn bench_real_repo() {
@@ -7101,8 +7136,10 @@ mod parallel_patch_tests {
                 get_diff_data(&repo, &scope, s, BuildEnv::tracked(None, &progress))
             });
             let took = t.elapsed();
-            println!("  {label}: {took:?} ({} rows)", data.lines.len());
-            (took, data.lines.len())
+            let rows = data.lines.len();
+            println!("  {label}: {took:?} ({rows} rows)");
+            report_heap_and_drop(data);
+            (took, rows)
         };
 
         // `BENCH_ONLY=<n>` runs ONE build and nothing else — 0 for the sequential pass,
@@ -7232,6 +7269,188 @@ mod parallel_patch_tests {
         println!(
             "  as shipped: {shipped:?} ({} rows) = {ratio:.2}x",
             data.lines.len()
+        );
+        report_heap_and_drop(data);
+    }
+
+    /// What a built diff weighs (`heap_bytes`, the cache's own measure) and what freeing
+    /// it costs, timed inline: the drop is the cost under measurement here, so it is not
+    /// handed to `reaper::dispose` as the app would.
+    fn report_heap_and_drop(data: DiffData) {
+        let heap = data.heap_bytes();
+        let rows = data.lines.len();
+        let held = vm_rss_kib();
+        let dropped = timed_drop(data);
+        println!(
+            "    heap_bytes {heap} ({} B/row), drop {dropped:?}, VmRSS {held:?} KiB held -> {:?} KiB after drop",
+            heap.checked_div(rows).unwrap_or(0),
+            vm_rss_kib()
+        );
+    }
+
+    /// This process's resident set, from `/proc/self/status`: what a drop actually gave
+    /// back to the OS, which `heap_bytes` cannot say — per-row frees can stay in glibc's
+    /// arenas. `None` off Linux or on a parse failure.
+    fn vm_rss_kib() -> Option<u64> {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()?
+            .lines()
+            .find_map(|l| l.strip_prefix("VmRSS:"))?
+            .trim()
+            .trim_end_matches("kB")
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// Drop `value` here, on this thread, and say how long it took.
+    fn timed_drop<T>(value: T) -> std::time::Duration {
+        let t = std::time::Instant::now();
+        drop(value);
+        t.elapsed()
+    }
+
+    /// The middle sample — the upper middle of an even count. Sorts `samples`.
+    fn median(samples: &mut [std::time::Duration]) -> std::time::Duration {
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    }
+
+    /// ROW-MEMORY BENCH: what a diff's rows cost to build, to hold and to free, over
+    /// `tests::synthetic_rewrite_repo` — one file of `BENCH_LINES` lines (default
+    /// 900,000) rewritten whole, so twice that many patch rows.
+    ///
+    /// ```text
+    /// BENCH_LINES=900000 BENCH_REPS=3 \
+    ///   cargo test --release bench_synthetic_rows -- --ignored --nocapture
+    /// ```
+    ///
+    /// It prints the bare `Diff::print` under a no-op callback (what libgit2 costs on
+    /// its own) and `get_diff_data` forced sequential, each the median of `BENCH_REPS`
+    /// (default 3), and their difference: the CONSTRUCTION, what gitkay spends turning
+    /// printed lines into rows. Then the rows, the diff's `heap_bytes` and the median
+    /// time its `drop` takes, timed inline rather than handed to `reaper::dispose`,
+    /// and the O(rows) passes the UI thread runs over an installed diff:
+    /// `pending_files` over blank spans, `LineNoGutter::measure`, and
+    /// `WrapIndex::build` at 100 columns. Every line starts `synthetic`, so a run
+    /// under `/usr/bin/time -v` can be filtered down to it; `BENCH_REPS=1` holds one
+    /// diff at a time, so the peak RSS is that diff's.
+    #[test]
+    #[ignore = "a benchmark; see the doc comment for how to run it"]
+    fn bench_synthetic_rows() {
+        use crate::diff_highlight::pending_files;
+        use crate::test_repo::open_repo;
+        use std::time::Instant;
+
+        let lines: usize = std::env::var("BENCH_LINES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(900_000);
+        let reps: usize = std::env::var("BENCH_REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3)
+            .max(1);
+
+        let t = Instant::now();
+        let (_d, repo, oid) = super::tests::synthetic_rewrite_repo(lines);
+        let git_dir = repo.path().to_path_buf();
+        drop(repo);
+        println!(
+            "synthetic fixture: {lines} lines rewritten, built in {:?}",
+            t.elapsed()
+        );
+        let scope = RowScope::new(DiffSource::Commit(oid));
+        let s = base_settings();
+
+        // A fresh handle per run, as `bench_split_patch_pass` has it: libgit2 caches
+        // inflated objects per `git_repository`, so a reused handle would read the blobs
+        // warm on every run after the first and the two medians would not compare.
+        let mut prints = Vec::with_capacity(reps);
+        for _ in 0..reps {
+            let repo = open_repo(&git_dir);
+            let diff = scoped_diff(&repo, s, &scope.paths, |r, o| {
+                commit_parent_diff(r, &r.find_commit(oid)?, Some(o))
+            })
+            .expect("diffs");
+            let t = Instant::now();
+            diff.print(git2::DiffFormat::Patch, |_, _, _| true)
+                .expect("prints");
+            prints.push(t.elapsed());
+        }
+        let print = median(&mut prints);
+
+        // Every build but the last is freed as soon as it is timed, so no more than one
+        // diff is alive at a time; the last stays for the UI passes below.
+        let mut builds = Vec::with_capacity(reps);
+        let mut drops = Vec::with_capacity(reps);
+        let mut last = None;
+        for rep in 0..reps {
+            let repo = open_repo(&git_dir);
+            let progress = DiffProgress::default();
+            let t = Instant::now();
+            let data = super::tests::with_parallel_patch_pass(0, || {
+                get_diff_data(&repo, &scope, s, BuildEnv::tracked(None, &progress))
+            });
+            builds.push(t.elapsed());
+            if rep + 1 == reps {
+                last = Some(data);
+            } else {
+                drops.push(timed_drop(data));
+            }
+        }
+        let data = last.expect("at least one rep");
+        let build = median(&mut builds);
+        let rows = data.lines.len();
+        assert!(
+            rows >= 2 * lines,
+            "a whole rewrite is a `-` and a `+` row per line: {rows} rows for {lines} lines"
+        );
+        let heap = data.heap_bytes();
+
+        let blank = RowSpans::blank(rows);
+        let (mut pendings, mut gutters, mut wraps) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut pending, mut wrapped_rows) = (0, 0);
+        for _ in 0..reps {
+            let t = Instant::now();
+            pending = pending_files(&data.lines, &blank, &data.files).len();
+            pendings.push(t.elapsed());
+            let t = Instant::now();
+            let gutter = LineNoGutter::measure(&data.lines);
+            gutters.push(t.elapsed());
+            let t = Instant::now();
+            let index = WrapIndex::build(&data.lines, 100, gutter, data.tabless);
+            wraps.push(t.elapsed());
+            wrapped_rows = index.total_rows();
+        }
+        let rss_held = vm_rss_kib();
+        drops.push(timed_drop(data));
+        let rss_after = vm_rss_kib();
+
+        println!("synthetic rows: {rows} ({lines} lines rewritten)");
+        println!("synthetic VmRSS: {rss_held:?} KiB held -> {rss_after:?} KiB after the last drop");
+        println!("synthetic bare print: {print:?} (median of {reps})");
+        println!("synthetic build, sequential: {build:?} (median of {reps})");
+        println!(
+            "synthetic construction (build - print): {:?}",
+            build.saturating_sub(print)
+        );
+        println!(
+            "synthetic heap_bytes: {heap} ({} B/row)",
+            heap.checked_div(rows).unwrap_or(0)
+        );
+        println!(
+            "synthetic drop: {:?} (median of {reps})",
+            median(&mut drops)
+        );
+        println!(
+            "synthetic pending_files, blank spans: {:?} ({pending} pending)",
+            median(&mut pendings)
+        );
+        println!("synthetic gutter measure: {:?}", median(&mut gutters));
+        println!(
+            "synthetic wrap build, 100 cols: {:?} ({wrapped_rows} rows)",
+            median(&mut wraps)
         );
     }
 

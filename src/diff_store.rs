@@ -2037,4 +2037,72 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         prune(&dir.path().join("nope"), 100);
     }
+
+    /// CODEC BENCH: `encode` and `decode` over the row-memory bench's diff
+    /// (`diff::tests::synthetic_rewrite_repo`, `BENCH_LINES` lines rewritten, default
+    /// 900,000), each the median of `BENCH_REPS` (default 3), and the encoded size.
+    ///
+    /// ```text
+    /// cargo test --release bench_store_codec -- --ignored --nocapture
+    /// ```
+    ///
+    /// The codec functions are called directly rather than through `save`/`load`, so
+    /// `MAX_ENTRY_BYTES` does not refuse an entry this size and no disk is involved.
+    #[test]
+    #[ignore = "a benchmark; see the doc comment for how to run it"]
+    fn bench_store_codec() {
+        use crate::diff::{DiffSource, RowScope, get_diff_data};
+        use std::time::Instant;
+
+        let lines: usize = std::env::var("BENCH_LINES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(900_000);
+        let reps: usize = std::env::var("BENCH_REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3)
+            .max(1);
+
+        let (_d, repo, oid) = crate::diff::tests::synthetic_rewrite_repo(lines);
+        let data = get_diff_data(
+            &repo,
+            &RowScope::new(DiffSource::Commit(oid)),
+            settings(),
+            BuildEnv::of(None),
+        );
+        let rows = data.lines.len();
+
+        let mut encodes = Vec::with_capacity(reps);
+        let mut bytes = Vec::new();
+        for _ in 0..reps {
+            let t = Instant::now();
+            bytes = encode(&data);
+            encodes.push(t.elapsed());
+        }
+        let mut decodes = Vec::with_capacity(reps);
+        for _ in 0..reps {
+            let t = Instant::now();
+            let back = decode(&bytes).expect("decodes");
+            decodes.push(t.elapsed());
+            assert_eq!(back.lines.len(), rows, "the round trip keeps every row");
+        }
+        encodes.sort_unstable();
+        decodes.sort_unstable();
+
+        println!("store rows: {rows} ({lines} lines rewritten)");
+        println!(
+            "store encode: {:?} (median of {reps})",
+            encodes[encodes.len() / 2]
+        );
+        println!(
+            "store decode: {:?} (median of {reps})",
+            decodes[decodes.len() / 2]
+        );
+        println!(
+            "store bytes: {} ({} B/row)",
+            bytes.len(),
+            bytes.len().checked_div(rows).unwrap_or(0)
+        );
+    }
 }
