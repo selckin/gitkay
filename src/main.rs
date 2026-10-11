@@ -60,9 +60,10 @@ use history::{
     diff_paths_for, load_history, provisional_commits, provisional_scope, scope_notice,
 };
 use prefetch::{
-    InflightClaim, InflightKeys, PoolHandle, PrefetchBudget, PrefetchTarget, StatsJob, StatsResult,
-    WarmDisposition, WarmFacts, WarmResult, lock_inflight, prefetch_anchor, prefetch_targets,
-    spawn_prefetch_pool, view_moved_enough, warm_band, warm_disposition,
+    ClaimKind, InflightClaim, InflightKeys, PoolHandle, PrefetchBudget, PrefetchTarget, StatsJob,
+    StatsResult, WarmDisposition, WarmFacts, WarmResult, adopt_warm, is_claimed, lock_inflight,
+    prefetch_anchor, prefetch_targets, spawn_prefetch_pool, unadopt_warm, view_moved_enough,
+    warm_band, warm_disposition,
 };
 use textconv::Textconv;
 use workers::{
@@ -3290,6 +3291,10 @@ struct DiffLoadState {
     /// (`supplied_by_pane`). Carried rather than read off the selection, which is a
     /// different fact that merely coincides with it.
     oid: git2::Oid,
+    /// The wait is on a prefetch warm the click adopted (`GitkApp::adopted_warm`), not
+    /// on a foreground build: `progress` is a fresh handle nothing writes into, so the
+    /// placeholder says the diff is being built in the background instead of a phase.
+    adopted: bool,
 }
 
 /// Drives the one-time deferral of the startup diff. `GitkApp::new` runs during
@@ -3753,6 +3758,13 @@ struct GitkApp {
     /// (normal, failed, superseded bail, panic), so the drain always clears the entry.
     /// Real commits only; a virtual row's key moves under it.
     inflight_loads: HashMap<DiffCacheKey, Arc<DiffProgress>>,
+    /// The key whose prefetch warm the reader's click adopted instead of building it
+    /// again (`dispatch_diff_load`). Watched by `drain_worker_results`: if the warm's
+    /// claim goes without its result being installed, the foreground load is
+    /// dispatched after all. Cleared by `load_selected_diff` (a fresh decision — and
+    /// `unadopt_warm`ed there when the reader left it) and by `apply_loaded_diff` (the
+    /// wait is over).
+    adopted_warm: Option<DiffCacheKey>,
     /// Background history loads (lazy-load extension + watcher rebuild). Results
     /// return over this channel; `history_epoch` supersedes stale ones; the
     /// in-flight flag stops the scroll trigger from re-dispatching every frame.
@@ -4018,12 +4030,22 @@ fn tail_elide(s: &str, max: usize) -> String {
 /// inside a 265MB blob sits on `1/1` for eleven seconds — there the file NAME is the
 /// answer, and the clock is what says it is still moving.
 ///
+/// An `adopted` load is a prefetch warm the click waited for instead of building the
+/// diff again. Nothing writes into its progress handle, so its report is ignored —
+/// it would say "comparing trees" for as long as the wait lasted — and the line says
+/// where the build is happening instead.
+///
 /// Pure, so the phrasing is testable without a build, a worker or a frame.
-fn loading_diff_text(elapsed: std::time::Duration, report: Option<&DiffProgressReport>) -> String {
+fn loading_diff_text(
+    elapsed: std::time::Duration,
+    report: Option<&DiffProgressReport>,
+    adopted: bool,
+) -> String {
     // Infallible into a String; the results are discarded for that reason.
     use std::fmt::Write as _;
     let mut s = String::from("Loading diff…");
     match report {
+        _ if adopted => s.push_str(" — already being built in the background"),
         // Only before the first report — the handle is created with the dispatch, so
         // in practice this is the frame before the worker starts.
         None => {}
@@ -4048,6 +4070,87 @@ fn loading_diff_text(elapsed: std::time::Duration, report: Option<&DiffProgressR
         let _ = write!(s, " ({:.1}s)", elapsed.as_secs_f32());
     }
     s
+}
+
+/// Whether an adopted warm ended without delivering: its claim had gone by the time
+/// this frame looked (read BEFORE the drain, so a result sent before the claim's
+/// release has been drained), and the reader is still waiting on it
+/// (`waits_on_adopted`).
+///
+/// The ordering is the whole argument. Every warm path sends its `WarmResult` before
+/// its claim is released (the prefetch tests pin it, per path), and the UI reads
+/// "claim gone" before it drains `prefetch_rx`, deciding only after (`drain_warms`).
+/// So a claim seen gone means the result — if there was one — has been drained, and
+/// either installed, which ends the wait, or found unusable. Reading the claim AFTER
+/// the drain instead would race: a warm sending and releasing between the drain and
+/// the read would look undelivered, and its key would be built a second time.
+const fn adopted_warm_undelivered(claim_gone_before_drain: bool, still_waiting: bool) -> bool {
+    claim_gone_before_drain && still_waiting
+}
+
+/// Whether the reader is still waiting on the warm adopted for `oid`: the armed load is
+/// an adopted one for that row, and that row is still selected.
+///
+/// Read off the load state, never off the key. A span-settings reload (theme, syntax
+/// on/off, `[diff.languages]`) moves the current key without dispatching anything, so
+/// the adopted wait carries on under a key `awaiting` no longer matches — and the
+/// fallback, asking `awaiting`, would leave the placeholder up for good.
+fn waits_on_adopted(
+    load: Option<&DiffLoadState>,
+    selected: Option<git2::Oid>,
+    oid: git2::Oid,
+) -> bool {
+    load.is_some_and(|l| l.adopted && l.oid == oid) && selected == Some(oid)
+}
+
+/// Whether `arrived` differs from `current` in the span fields alone — theme, syntax
+/// on/off, the grammar map — which decide a diff's colours and nothing about its rows.
+/// Such a result is still the diff its key's row shows today, once re-keyed.
+///
+/// Built by overwriting exactly those fields, so a key field added later counts as
+/// diff-shaping until someone shows otherwise — the safe direction.
+fn spans_alone_moved(arrived: &DiffCacheKey, current: &DiffCacheKey) -> bool {
+    DiffCacheKey {
+        theme: current.theme,
+        enabled: current.enabled,
+        languages: current.languages,
+        ..arrived.clone()
+    } == *current
+}
+
+/// Whether a result built under `from` carries spans that are wrong under `to`: the
+/// theme or syntax on/off moved between them. Shared by both re-keying installs
+/// (`GitkApp::rekey_for_install`).
+fn spans_outlived(from: &DiffCacheKey, to: &DiffCacheKey) -> bool {
+    from.theme != to.theme || from.enabled != to.enabled
+}
+
+/// One frame's prefetch drain, as `drain_warms` needs to see it. A trait so the frame
+/// order can be driven by a scripted warm in the tests; `GitkApp` is the only real
+/// implementation.
+trait WarmDrain {
+    type Warm;
+    /// An adopted warm's claim is gone. `false` when nothing is adopted.
+    fn adopted_claim_gone(&self) -> bool;
+    /// The next result in the channel, if one has arrived.
+    fn next_warm(&mut self) -> Option<Self::Warm>;
+    /// Install, cache or drop one result.
+    fn take_warm(&mut self, warm: Self::Warm);
+    /// The reader is still waiting on the adopted warm. `false` when nothing is adopted.
+    fn waiting_on_adopted(&self) -> bool;
+}
+
+/// Read the adopted claim, drain every arrived warm, then decide: `true` when the
+/// adopted warm ended undelivered and the foreground load has to be dispatched.
+///
+/// The order is the correctness argument (`adopted_warm_undelivered`), which is why it
+/// lives here once rather than spread across the drain.
+fn drain_warms(d: &mut impl WarmDrain) -> bool {
+    let claim_gone = d.adopted_claim_gone();
+    while let Some(warm) = d.next_warm() {
+        d.take_warm(warm);
+    }
+    adopted_warm_undelivered(claim_gone, d.waiting_on_adopted())
 }
 
 fn show_toast(
@@ -4440,6 +4543,7 @@ impl GitkApp {
             prefetched_view: 0..0,
             inflight_diffs: Arc::default(),
             inflight_loads: HashMap::new(),
+            adopted_warm: None,
             highlight_settled: true,
             // Empty until the panel has rendered once, NOT a generous estimate: the
             // band is derived from this length, so an over-guess is tripled. The old
@@ -4645,6 +4749,22 @@ impl GitkApp {
         // re-enter here for the same selection, cancelling that click's
         // in-flight load through the early-return path's epoch bump.
         self.deferred_diff_load_at = None;
+        // The reader moved on, or a fresh decision is being made: whichever, a warm
+        // adopted for the last one is no longer what this load waits on. If the reader
+        // LEFT it — the selection or its key moved — it goes back to being speculative,
+        // or it would keep skipping colour and shipping an oversized row nobody waits
+        // for to the UI thread to be freed there. Not for the same key: the dispatch
+        // below re-adopts it, and dropping the flag in between would let the warm see
+        // an instant in which nobody had adopted it. A return to the row re-adopts too.
+        if let Some(adopted) = self.adopted_warm.take()
+            && self
+                .selected_oid()
+                .map(|oid| self.diff_cache_key(oid))
+                .as_ref()
+                != Some(&adopted)
+        {
+            unadopt_warm(&self.inflight_diffs, &adopted);
+        }
         // Already showing this exact diff (same commit + options)? Then there's nothing
         // to load. Two cases converge here: a reload/refresh of the unchanged current
         // commit (e.g. a fetch/rebase debounce), and navigating back to the on-screen
@@ -5038,6 +5158,42 @@ impl GitkApp {
             && self.key_is_current(key)
     }
 
+    /// The key a finished diff installs under, re-derived from CURRENT state, with
+    /// `data`'s spans blanked when they were coloured under settings that have moved.
+    ///
+    /// The dispatch-time `key` pins theme/enabled/the grammar map — a config reload of
+    /// those while the build ran (which bumps only the highlight generation, not the
+    /// load epoch, and dispatches nothing) would otherwise install (and later stash)
+    /// under the stale key, serving wrong-theme spans on a later revisit. Callers
+    /// install only results whose ROWS are still current: a foreground result of the
+    /// current epoch (data-affecting changes always re-dispatch), or an adopted warm
+    /// whose key moved in span fields alone (`spans_alone_moved`).
+    ///
+    /// The spans: the re-key used to rest on "the diff data itself is
+    /// theme-independent" — true before pre-highlighting existed, false now that a
+    /// same-oid rebuild's worker can bake spans under the highlighter it captured at
+    /// dispatch time (`PreHighlight`, see `dispatch_diff_load`), and a warm can arrive
+    /// coloured. If a live config reload's theme branch raced that build, `data`'s
+    /// spans were coloured under `key`'s theme/enabled but are about to be installed
+    /// under the fresh key's — wrong colours that `pending_files` would then find
+    /// nothing to re-do for, and that would get cached under the new key. Blank them
+    /// exactly like `handle_config_reload`'s own re-highlight reset does for the live
+    /// diff (`self.diff_spans.clear()`) so the post-install pass recolours from
+    /// scratch — same mechanism, applied to the arriving result instead of the field.
+    fn rekey_for_install(&self, key: &DiffCacheKey, data: &mut DiffData) -> DiffCacheKey {
+        let fresh = finalize_diff_key(self.diff_cache_key(key.oid), CommitKind::of(key.oid), data);
+        if spans_outlived(key, &fresh) {
+            data.spans.clear();
+        }
+        fresh
+    }
+
+    /// Whether the reader is still waiting on the warm adopted for `oid`
+    /// (`waits_on_adopted`, over this app's load state and selection).
+    fn waiting_on_adopted_warm(&self, oid: git2::Oid) -> bool {
+        waits_on_adopted(self.diff_load.as_ref(), self.selected_oid(), oid)
+    }
+
     /// Swap `key`/`data` in as the displayed diff and run the install tail every
     /// installer needs: reset the scroll top, rebuild the file-list rows, resize the
     /// h-scroll, and (re)arm highlighting.
@@ -5136,6 +5292,7 @@ impl GitkApp {
             );
         }
         self.diff_load = None;
+        self.adopted_warm = None;
         // Harvest the INCOMING diff's numbers, not only the outgoing one's.
         // `stash_current_diff` → `cache_diff` covers the diff being replaced, which
         // left the SELECTED row — the one commit whose diff is guaranteed to exist —
@@ -5231,12 +5388,19 @@ impl GitkApp {
     /// `is_rebuild` is likewise rewritten on every dispatch and not just the first of a
     /// burst, so a load that changes character mid-flight is classified by its latest
     /// dispatch.
-    fn arm_diff_load(&mut self, oid: git2::Oid, progress: Arc<DiffProgress>, is_rebuild: bool) {
+    fn arm_diff_load(
+        &mut self,
+        oid: git2::Oid,
+        progress: Arc<DiffProgress>,
+        is_rebuild: bool,
+        adopted: bool,
+    ) {
         match &mut self.diff_load {
             Some(state) => {
                 state.progress = progress;
                 state.is_rebuild = is_rebuild;
                 state.oid = oid;
+                state.adopted = adopted;
             }
             None => {
                 self.diff_load = Some(DiffLoadState {
@@ -5244,6 +5408,7 @@ impl GitkApp {
                     progress,
                     is_rebuild,
                     oid,
+                    adopted,
                 });
             }
         }
@@ -5273,7 +5438,26 @@ impl GitkApp {
             && let Some(running) = self.inflight_loads.get(&key).map(Arc::clone)
         {
             log::debug!("diff-load: adopt in-flight worker for {}", key.oid);
-            self.arm_diff_load(key.oid, running, same_oid_rebuild);
+            self.arm_diff_load(key.oid, running, same_oid_rebuild, false);
+            return;
+        }
+        // A prefetch warm is already building this key, and it is one worth waiting
+        // for (`adopt_warm`: a single-blob row, where splitting the build gains
+        // nothing). Adopting it marks it so the warm side delivers it the moment it
+        // has it, uncoloured, rather than ranking it behind others — so no claim and
+        // no foreground job here. The wait ends when the drain installs that result,
+        // or, if the warm's claim goes without one, when the drain's fallback
+        // (`adopted_warm_undelivered`) dispatches the foreground load after all.
+        // Any other claim — a multi-delta warm, a cheap row — proceeds as below and
+        // accepts the duplicate.
+        if is_real_commit(key.oid) && adopt_warm(&self.inflight_diffs, &key) {
+            log::debug!(
+                "diff-load: {} is already being built by a warm; waiting for it",
+                key.oid
+            );
+            let progress = Arc::new(DiffProgress::default());
+            self.arm_diff_load(key.oid, progress, same_oid_rebuild, true);
+            self.adopted_warm = Some(key);
             return;
         }
         let progress = Arc::new(DiffProgress::default());
@@ -5281,7 +5465,7 @@ impl GitkApp {
         // The render path only blanks to the "Loading diff…" placeholder once the load
         // outlives DIFF_PLACEHOLDER_DELAY, so a fast uncached load swaps straight to the
         // new diff without a blank / sidebar-collapse strobe.
-        self.arm_diff_load(key.oid, Arc::clone(&progress), same_oid_rebuild);
+        self.arm_diff_load(key.oid, Arc::clone(&progress), same_oid_rebuild, false);
 
         let oid = key.oid;
         // The job owns its inputs: paths and key are moved in (not cloned) — on the
@@ -5293,7 +5477,8 @@ impl GitkApp {
         // user is waiting on THIS result now, and the prefetch may sit behind other
         // queue targets, so blocking on it would trade bounded duplicate work for
         // unbounded latency.
-        let claim = InflightClaim::try_claim(&self.inflight_diffs, key.clone());
+        let claim =
+            InflightClaim::try_claim(&self.inflight_diffs, key.clone(), ClaimKind::Foreground);
         // For the inflight_loads tracking below — `key` itself moves into the worker.
         let tracked_key = is_real_commit(oid).then(|| key.clone());
         // Colour the new content before installing it, so a same-oid rebuild
@@ -5934,7 +6119,7 @@ impl GitkApp {
                 .filter(|t| {
                     !self.diff_cache.contains(&t.key)
                         && self.current_diff_key.as_ref() != Some(&t.key)
-                        && !inflight.contains(&t.key)
+                        && !inflight.contains_key(&t.key)
                 })
                 .collect()
         };
@@ -8307,36 +8492,10 @@ impl GitkApp {
             let awaited = !current && self.awaiting(&key);
             match data {
                 Some(mut data) if current || awaited => {
-                    // Re-key from CURRENT state before installing: the dispatch-
-                    // time key pins theme/enabled — a config theme change while
-                    // the load ran (which bumps only the highlight generation,
-                    // not this epoch) would otherwise install (and later stash)
-                    // under the stale key, serving wrong-theme spans on a later
-                    // revisit. Data-affecting settings changes always re-dispatch
-                    // (bumping the epoch), so a current-epoch result's data is
-                    // always valid.
-                    let fresh = finalize_diff_key(
-                        self.diff_cache_key(key.oid),
-                        CommitKind::of(key.oid),
-                        &data,
-                    );
-                    // The re-key above used to rest on "the diff data itself is
-                    // theme-independent" — true before pre-highlighting existed,
-                    // false now that a same-oid rebuild's worker can bake spans
-                    // under the highlighter it captured at dispatch time
-                    // (`PreHighlight`, see `dispatch_diff_load`). If a live
-                    // config reload's theme branch raced that worker, `data`'s
-                    // spans were coloured under `key`'s theme/enabled but are
-                    // about to be installed under `fresh`'s — wrong colours that
-                    // `pending_files` would then find nothing to re-do for, and that
-                    // would get cached under the new key. Blank them exactly like
-                    // `handle_config_reload`'s own re-highlight reset does for the
-                    // live diff (`self.diff_spans.clear()`) so the post-install pass
-                    // recolours from scratch — same mechanism, applied to the arriving
-                    // result instead of the field.
-                    if key.theme != fresh.theme || key.enabled != fresh.enabled {
-                        data.spans.clear();
-                    }
+                    // Data-affecting settings changes always re-dispatch (bumping the
+                    // epoch), so a current-epoch result's data is always valid; only
+                    // its key can be behind.
+                    let fresh = self.rekey_for_install(&key, &mut data);
                     self.install_preferring_cache(fresh, data);
                 }
                 Some(data) => {
@@ -8420,33 +8579,28 @@ impl GitkApp {
         // an old context/theme/etc finishes with a key pinning those old settings, so
         // it could never be hit again and would only bloat the LRU. (Settings unchanged
         // but selection moved still matches — those neighbour diffs stay useful.)
-        while let Ok(WarmResult { key, data }) = self.prefetch_rx.try_recv() {
-            match warm_disposition(WarmFacts {
-                awaiting: self.awaiting(&key),
-                key_current: self.key_is_current(&key),
-                is_live: self.current_diff_key.as_ref() == Some(&key),
-            }) {
-                // The user is sitting on "Loading diff…" for exactly this key and
-                // the prefetch got there first (its head start beat the diff-load
-                // worker spawned alongside it) — install it now instead of waiting
-                // out the duplicate, and supersede that worker so its later result
-                // is cached rather than installed over this one.
-                WarmDisposition::Install => {
-                    self.diff_load_epoch.bump();
-                    self.install_preferring_cache(key, data);
-                }
-                WarmDisposition::Cache => self.cache_diff(key, data),
-                // Settings, theme or the grammar map changed while the worker ran;
-                // the key can never be hit again. This covers the spans too — the
-                // grammar map is in the key — so a result tokenized under an edited
-                // `[diff.languages]` is dropped here rather than caching a neighbour
-                // that stays flat for the rest of the session.
-                // Logged: this completed prefetch was wasted work.
-                WarmDisposition::DropStaleKey => {
-                    log::debug!("prefetch: drop stale-keyed result for {}", key.oid);
-                }
-                WarmDisposition::AlreadyLive => {}
+        //
+        // An adopted warm's claim is read BEFORE the drain and decided after it
+        // (`drain_warms`): a warm sends before it releases its claim, so a claim already
+        // gone here means its result, if any, is drained below. `true` means it ended
+        // undelivered — it failed or was dropped before it built, or it was delivered
+        // under a key whose diff-shaping inputs moved after it was adopted, which
+        // `take_warm` declines to install — so build it in the foreground. With the
+        // claim gone `adopt_warm` cannot adopt again, so this is a real load.
+        if drain_warms(self) {
+            if let Some(k) = self.adopted_warm.take() {
+                log::debug!(
+                    "diff-load: the warm for {} ended undelivered; building it",
+                    k.oid
+                );
             }
+            self.load_selected_diff();
+        }
+        // Nothing wakes the UI when a claim is released without a send, and a
+        // same-oid rebuild's wait schedules no ticks of its own: keep looking while
+        // the reader waits on a warm.
+        if self.waiting_on_adopted() {
+            ctx.request_repaint_after(LOADING_TICK);
         }
         // Once the current diff is fully coloured, warm the band around the visible
         // rows (nearest-first): once per settled diff, and again whenever the view has
@@ -8684,6 +8838,87 @@ impl Drop for GitkApp {
              to the OS in {:?}",
             t.elapsed()
         );
+    }
+}
+
+/// The real prefetch drain behind `drain_warms`.
+impl WarmDrain for GitkApp {
+    type Warm = WarmResult;
+
+    fn adopted_claim_gone(&self) -> bool {
+        self.adopted_warm
+            .as_ref()
+            .is_some_and(|k| !is_claimed(&self.inflight_diffs, k))
+    }
+
+    fn next_warm(&mut self) -> Option<WarmResult> {
+        self.prefetch_rx.try_recv().ok()
+    }
+
+    fn take_warm(&mut self, warm: WarmResult) {
+        let WarmResult {
+            key,
+            mut data,
+            cacheable,
+        } = warm;
+        // The adopted warm, still awaited, delivered under a key a span-settings reload
+        // (theme, syntax on/off, `[diff.languages]`) moved while it built: its rows are
+        // still the diff the reader is waiting for, so it is re-keyed the way the
+        // foreground drain re-keys a result, and `awaiting` then installs it. A key
+        // moved by anything else is not re-keyed — its rows are not this view's — and
+        // falls through to be dropped, after which the claim-gone fallback dispatches
+        // the real load. Only real commits are adopted, so the key carries no content
+        // hash a re-key could miss.
+        let key = if self.adopted_warm.as_ref() == Some(&key)
+            && self.waiting_on_adopted_warm(key.oid)
+            && spans_alone_moved(&key, &self.diff_cache_key(key.oid))
+        {
+            self.rekey_for_install(&key, &mut data)
+        } else {
+            key
+        };
+        match warm_disposition(WarmFacts {
+            awaiting: self.awaiting(&key),
+            key_current: self.key_is_current(&key),
+            is_live: self.current_diff_key.as_ref() == Some(&key),
+            cacheable,
+        }) {
+            // The user is sitting on "Loading diff…" for exactly this key and the
+            // prefetch got there first (its head start beat the diff-load worker
+            // spawned alongside it, or the click adopted it) — install it now instead
+            // of waiting out the duplicate, and supersede that worker so its later
+            // result is cached rather than installed over this one.
+            WarmDisposition::Install => {
+                self.diff_load_epoch.bump();
+                self.install_preferring_cache(key, data);
+            }
+            WarmDisposition::Cache => self.cache_diff(key, data),
+            // Settings, theme or the grammar map changed while the worker ran; the key
+            // can never be hit again. This covers the spans too — the grammar map is in
+            // the key — so a result tokenized under an edited `[diff.languages]` is
+            // dropped here rather than caching a neighbour that stays flat for the rest
+            // of the session. Logged: this completed prefetch was wasted work.
+            WarmDisposition::DropStaleKey => {
+                log::debug!("prefetch: drop stale-keyed result for {}", key.oid);
+            }
+            WarmDisposition::AlreadyLive => {}
+            // Only an adopted warm is sent uncacheable, and only the reader moving away
+            // between adopting it — or the diff-shaping settings moving under it — and
+            // its delivery lands it here: it was never meant for the cache, so it is
+            // freed rather than kept.
+            WarmDisposition::DropUncacheable => {
+                log::debug!(
+                    "prefetch: drop uncacheable adopted result for {} — no longer awaited",
+                    key.oid
+                );
+            }
+        }
+    }
+
+    fn waiting_on_adopted(&self) -> bool {
+        self.adopted_warm
+            .as_ref()
+            .is_some_and(|k| self.waiting_on_adopted_warm(k.oid))
     }
 }
 
@@ -8937,7 +9172,8 @@ impl eframe::App for GitkApp {
                     if let Some(elapsed) = diff_load_elapsed {
                         if showing_placeholder {
                             let report = self.diff_load.as_ref().map(|l| l.progress.report());
-                            let text = loading_diff_text(elapsed, report.as_ref());
+                            let adopted = self.diff_load.as_ref().is_some_and(|l| l.adopted);
+                            let text = loading_diff_text(elapsed, report.as_ref(), adopted);
                             ui.centered_and_justified(|ui| {
                                 ui.label(egui::RichText::new(text).color(SUBTEXT));
                             });
@@ -12936,22 +13172,22 @@ mod tests {
         let quick = std::time::Duration::from_millis(200);
         let r = progress_at(DiffPhase::Preparing, 0, 0, "");
         assert_eq!(
-            loading_diff_text(quick, Some(&r)),
+            loading_diff_text(quick, Some(&r), false),
             "Loading diff… comparing trees"
         );
         let r = progress_at(DiffPhase::Patching, 0, 0, "");
         assert_eq!(
-            loading_diff_text(quick, Some(&r)),
+            loading_diff_text(quick, Some(&r), false),
             "Loading diff… generating the patch"
         );
         let r = progress_at(DiffPhase::Patching, 7, 20, "src/a.rs");
         assert_eq!(
-            loading_diff_text(quick, Some(&r)),
+            loading_diff_text(quick, Some(&r), false),
             "Loading diff… 7/20 files · src/a.rs"
         );
         // Before the worker has reported anything, and for a load with no handle at
         // all, the line is exactly what it always was.
-        assert_eq!(loading_diff_text(quick, None), "Loading diff…");
+        assert_eq!(loading_diff_text(quick, None, false), "Loading diff…");
     }
 
     /// The clock is the half that keeps moving when the counter cannot — a huge blob
@@ -12961,9 +13197,9 @@ mod tests {
     fn the_loading_line_starts_counting_seconds_once_the_wait_is_real() {
         let r = progress_at(DiffPhase::Patching, 1, 1, "big.bin");
         let just_under = LOADING_ELAPSED_FLOOR.saturating_sub(std::time::Duration::from_millis(1));
-        assert!(!loading_diff_text(just_under, Some(&r)).contains('('));
+        assert!(!loading_diff_text(just_under, Some(&r), false).contains('('));
         assert_eq!(
-            loading_diff_text(std::time::Duration::from_millis(11_500), Some(&r)),
+            loading_diff_text(std::time::Duration::from_millis(11_500), Some(&r), false),
             "Loading diff… 1/1 files · big.bin (11.5s)"
         );
     }
@@ -12977,11 +13213,255 @@ mod tests {
         let out = loading_diff_text(
             std::time::Duration::ZERO,
             Some(&progress_at(DiffPhase::Patching, 1, 2, &long)),
+            false,
         );
         let shown = out.rsplit(" · ").next().expect("the path is last");
         assert_eq!(shown.chars().count(), LOADING_PATH_CHARS, "{out}");
         assert!(shown.starts_with('…'), "{out}");
         assert!(shown.ends_with("αβγδε.rs"), "{out}");
+    }
+
+    /// An adopted warm reports no progress — its handle is fresh and nothing writes
+    /// into it — so the line says where the build is happening instead of claiming a
+    /// phase. The clock still runs: it is what says the wait is moving.
+    #[test]
+    fn the_loading_line_says_an_adopted_warm_is_building_in_the_background() {
+        let quick = std::time::Duration::from_millis(200);
+        let untouched = DiffProgressReport::default();
+        assert_eq!(
+            loading_diff_text(quick, Some(&untouched), true),
+            "Loading diff… — already being built in the background"
+        );
+        assert_eq!(
+            loading_diff_text(std::time::Duration::from_millis(11_500), None, true),
+            "Loading diff… — already being built in the background (11.5s)"
+        );
+    }
+
+    /// The fallback fires only when both halves hold: the warm's claim was already gone
+    /// before this frame drained (so anything it sent has been drained), and the reader
+    /// is still waiting on that key (so nothing it sent was installed).
+    #[test]
+    fn an_adopted_warm_is_undelivered_only_when_its_claim_went_and_the_reader_still_waits() {
+        assert!(adopted_warm_undelivered(true, true));
+        assert!(
+            !adopted_warm_undelivered(true, false),
+            "delivered, or the reader left"
+        );
+        assert!(!adopted_warm_undelivered(false, true), "still building");
+        assert!(!adopted_warm_undelivered(false, false));
+    }
+
+    fn adopted_load(oid: git2::Oid, adopted: bool) -> DiffLoadState {
+        DiffLoadState {
+            started: std::time::Instant::now(),
+            progress: Arc::new(DiffProgress::default()),
+            is_rebuild: false,
+            oid,
+            adopted,
+        }
+    }
+
+    /// "Still waiting" is a property of the LOAD STATE, not of the key: a span-settings
+    /// reload moves the current key under an adopted wait without dispatching anything,
+    /// so a key comparison would say the reader stopped waiting while the placeholder is
+    /// still up — and the fallback would never fire.
+    #[test]
+    fn waiting_on_an_adopted_warm_is_read_off_the_load_state() {
+        let (a, b) = (oid(1), oid(2));
+        assert!(waits_on_adopted(Some(&adopted_load(a, true)), Some(a), a));
+        assert!(
+            !waits_on_adopted(Some(&adopted_load(a, false)), Some(a), a),
+            "a foreground load is not an adopted wait"
+        );
+        assert!(
+            !waits_on_adopted(Some(&adopted_load(b, true)), Some(a), a),
+            "the load is for another row"
+        );
+        assert!(
+            !waits_on_adopted(Some(&adopted_load(a, true)), Some(b), a),
+            "the reader selected another row"
+        );
+        assert!(!waits_on_adopted(None, Some(a), a), "nothing is loading");
+    }
+
+    /// An adopted warm delivered under a key that only a span-settings reload moved is
+    /// still the diff the reader is waiting for — the span fields decide colour, not
+    /// content — so it is re-keyed and installed. Anything else that moved (settings,
+    /// drivers, content) means its rows are not that diff.
+    #[test]
+    fn only_a_key_moved_by_span_settings_alone_is_rekeyed_for_an_adopted_wait() {
+        use highlight::EmbeddedThemeName as T;
+        let current = DiffCacheKey {
+            oid: oid(1),
+            settings: ds(),
+            theme: T::CatppuccinMocha,
+            enabled: true,
+            content: 0,
+            drivers: 0,
+            languages: 0,
+        };
+        let moved = |f: fn(&mut DiffCacheKey)| {
+            let mut k = current.clone();
+            f(&mut k);
+            k
+        };
+        assert!(spans_alone_moved(&current, &current));
+        assert!(spans_alone_moved(
+            &moved(|k| k.theme = T::CatppuccinLatte),
+            &current
+        ));
+        assert!(spans_alone_moved(&moved(|k| k.enabled = false), &current));
+        assert!(spans_alone_moved(&moved(|k| k.languages = 7), &current));
+        assert!(!spans_alone_moved(
+            &moved(|k| k.settings.context += 1),
+            &current
+        ));
+        assert!(!spans_alone_moved(&moved(|k| k.drivers = 7), &current));
+        assert!(!spans_alone_moved(&moved(|k| k.content = 7), &current));
+        assert!(!spans_alone_moved(&moved(|k| k.oid = oid(2)), &current));
+
+        // Which re-keys blank the arriving spans: the foreground drain's rule, shared.
+        assert!(spans_outlived(
+            &moved(|k| k.theme = T::CatppuccinLatte),
+            &current
+        ));
+        assert!(spans_outlived(&moved(|k| k.enabled = false), &current));
+        assert!(!spans_outlived(&current, &current));
+    }
+
+    /// A scripted warm on the far side of `prefetch_rx`, for `drain_warms`. Each poll
+    /// first takes what is already in the channel, THEN lets the warm act — the
+    /// instant after the drain looked, which is the window the frame order exists for.
+    #[derive(Default)]
+    struct ScriptedWarm {
+        adopted: bool,
+        claimed: bool,
+        waiting: bool,
+        channel: VecDeque<u32>,
+        /// At this poll (1-based, counted across frames) the warm sends its result.
+        sends_at: Option<usize>,
+        /// At this poll the warm releases its claim.
+        releases_at: Option<usize>,
+        polls: usize,
+        installed: Vec<u32>,
+    }
+
+    /// The adopted warm's own result; anything else in the channel is a neighbour.
+    const ADOPTED: u32 = 7;
+
+    impl WarmDrain for ScriptedWarm {
+        type Warm = u32;
+        fn adopted_claim_gone(&self) -> bool {
+            self.adopted && !self.claimed
+        }
+        fn next_warm(&mut self) -> Option<u32> {
+            let got = self.channel.pop_front();
+            self.polls += 1;
+            if self.sends_at == Some(self.polls) {
+                self.channel.push_back(ADOPTED);
+            }
+            if self.releases_at == Some(self.polls) {
+                self.claimed = false;
+            }
+            got
+        }
+        fn take_warm(&mut self, warm: u32) {
+            if warm == ADOPTED && self.waiting {
+                self.installed.push(warm);
+                self.waiting = false;
+            }
+        }
+        fn waiting_on_adopted(&self) -> bool {
+            self.adopted && self.waiting
+        }
+    }
+
+    fn adopted_and_building() -> ScriptedWarm {
+        ScriptedWarm {
+            adopted: true,
+            claimed: true,
+            waiting: true,
+            ..ScriptedWarm::default()
+        }
+    }
+
+    /// The warm sends and releases its claim in the instant after this frame's drain
+    /// looked at the channel. The claim was read BEFORE the drain, so this frame does
+    /// not fall back; the next one drains the result and installs it. Reading the claim
+    /// after the drain instead would have seen it gone with the result still in flight,
+    /// and built the diff a second time.
+    #[test]
+    fn a_warm_that_sends_and_releases_mid_drain_is_installed_not_rebuilt() {
+        let mut w = ScriptedWarm {
+            sends_at: Some(1),
+            releases_at: Some(1),
+            ..adopted_and_building()
+        };
+        assert!(
+            !drain_warms(&mut w),
+            "the claim was held when this frame read it"
+        );
+        assert!(
+            w.installed.is_empty(),
+            "the send landed after the drain looked"
+        );
+        assert!(
+            adopted_warm_undelivered(!w.claimed, w.waiting_on_adopted()),
+            "control: a claim read AFTER the drain would have fallen back here"
+        );
+        assert!(!drain_warms(&mut w), "the next frame installs instead");
+        assert_eq!(w.installed, [ADOPTED]);
+    }
+
+    /// The same, but the send lands while a neighbour is being drained: the drain's
+    /// next poll takes it in the same frame.
+    #[test]
+    fn a_warm_that_sends_while_the_drain_runs_is_installed_that_frame() {
+        let mut w = ScriptedWarm {
+            channel: VecDeque::from([1]),
+            sends_at: Some(1),
+            releases_at: Some(1),
+            ..adopted_and_building()
+        };
+        assert!(!drain_warms(&mut w));
+        assert_eq!(w.installed, [ADOPTED]);
+    }
+
+    /// A warm released without sending (it failed, or was dropped before it built)
+    /// strands nothing: the frame that first sees the claim gone falls back.
+    #[test]
+    fn a_warm_released_without_sending_falls_back_to_a_real_load() {
+        let mut w = ScriptedWarm {
+            releases_at: Some(1),
+            ..adopted_and_building()
+        };
+        assert!(
+            !drain_warms(&mut w),
+            "the claim was held when this frame read it"
+        );
+        assert!(
+            drain_warms(&mut w),
+            "gone, nothing delivered, still waiting"
+        );
+        assert!(w.installed.is_empty());
+
+        let mut gone = ScriptedWarm {
+            claimed: false,
+            ..adopted_and_building()
+        };
+        assert!(drain_warms(&mut gone), "already gone when the frame began");
+    }
+
+    /// Nothing adopted, nothing to fall back from — whatever the channel holds.
+    #[test]
+    fn without_an_adopted_warm_the_drain_never_falls_back() {
+        let mut w = ScriptedWarm {
+            channel: VecDeque::from([1, 2]),
+            ..ScriptedWarm::default()
+        };
+        assert!(!drain_warms(&mut w));
+        assert!(w.channel.is_empty(), "the neighbours were drained");
     }
 
     /// egui's default `InputOptions::zoom_modifier`, which is what the app reads

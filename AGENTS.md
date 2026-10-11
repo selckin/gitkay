@@ -391,7 +391,57 @@ boundary now enforces rather than merely asserting; see **Startup & timing**. A 
 thread ends it — except that an outcome the coordinator must RECORD (`TooBig`, `Oversized`,
 `Unconverted`) carries the claim back, and `finish` drops it only after the record, so a
 band re-submitted while the report is queued can never find the row free and unrecorded and
-hand it out twice. A warm's colour pass is handed to the `gitkay-colour-{k}` tokenizer
+hand it out twice. The in-flight set is a map from key to `ClaimKind` (`Foreground`, or
+`Warm { adoptable, adopted }`), not a bare set: a warm is claimed adoptable when its
+measured `RowCost::parallel_ceiling` is under `ADOPT_MAX_CEILING` (one blob dominates, so
+the foreground's split patch pass cannot beat it), and `adopt_warm` /
+`InflightClaim::adopted` are the UI's and the holder's two sides of that flag,
+`unadopt_warm` the UI's way back; `try_claim` goes through the map's `entry`, so it never
+overwrites a holder. **A warm the reader adopted skips speculative colour and is delivered
+even when it cannot be cached**: the worker sends it at once, uncoloured (no hand-off, no
+inline pass — the highlight thread colours it on install), and an oversized or unconverted
+row it would otherwise drop is sent too, as `WarmResult { cacheable: false }`, BEFORE the
+outcome carrying its claim goes back — every warm path sends before its claim is released.
+The tokenizer honours adoption as well: a job adopted after the hand-off is delivered
+uncoloured as it is accepted or before the next pass, waiting behind at most the pass in
+progress. An uncacheable result is installed if still awaited and otherwise dropped
+(`WarmDisposition::DropUncacheable`), never cached by the drain; once installed it is the
+reader's diff, cached on stash like any diff they opened. An adopted `Unconverted` result is
+installed as the raw-content fallback (`textconv_failed` set), not retried — what a
+foreground build would have shown. A warm nobody adopted still drops its oversized and
+unconverted rows on the worker. **The click adopts an adoptable warm instead of building the
+diff twice**: `dispatch_diff_load`, right after its `inflight_loads` check, calls
+`adopt_warm` for a real commit and, when it adopts, arms the loading state with a fresh
+handle and `DiffLoadState::adopted` (the placeholder says "already being built in the
+background" rather than a phase nothing reports), records the key in
+`GitkApp::adopted_warm`, and claims nothing and queues no foreground job. Limited to rows
+one blob dominates (parallel ceiling < `ADOPT_MAX_CEILING`) because that is where waiting
+costs nothing: elsewhere the foreground's split patch pass gains up to 4.5x over the
+single-threaded warm (see **Startup & timing**), so a multi-delta or cheap row keeps the old
+behaviour — the foreground proceeds and the duplicate is accepted. **The fallback is
+structural**: `drain_warms` reads whether the adopted key is still claimed BEFORE it drains
+`prefetch_rx` and decides AFTER (`adopted_warm_undelivered`); since every warm sends before
+it releases its claim, a claim seen gone means its result, if any, has been drained — and
+installed, unless it was not this view's diff — so a reader still waiting means it ended
+undelivered and `load_selected_diff` dispatches the real foreground load (`adopt_warm`
+cannot adopt a released claim). Reading the claim after the drain would race a warm that
+sends and releases in between, and build the key twice; `drain_warms` is the one place that
+order lives, behind a `WarmDrain` trait so the tests drive it with a scripted warm. **"Still
+waiting" is read off the load state, never off a key** (`waits_on_adopted`: the armed load
+is adopted, for that row, and the row is still selected). A span-settings reload — theme,
+syntax on/off, `[diff.languages]` — moves the current key under the wait without dispatching
+anything, so `awaiting`'s key equality would leave the placeholder up for good. The same
+reload is why the drain re-keys an adopted result whose key moved in span fields alone
+(`spans_alone_moved`) through `rekey_for_install`, the foreground drain's own re-key (spans
+blanked when theme or syntax moved), and installs it; a key moved in anything diff-shaping
+(settings, drivers) is not this view's diff, is dropped, and the claim-gone fallback builds
+the real one. While the reader waits on an adopted warm the drain asks for a repaint every
+`LOADING_TICK`, because a claim released without a send wakes nothing. `adopted_warm` is
+cleared by `load_selected_diff` (a fresh decision) and `apply_loaded_diff` (the wait is
+over). When `load_selected_diff` finds the reader LEFT it — the selection or its key moved —
+it also `unadopt_warm`s the claim, so the warm goes back to colouring and to dropping an
+oversized row on the worker instead of shipping it to the UI thread to be freed; a return to
+the row adopts it again. A warm's colour pass is handed to the `gitkay-colour-{k}` tokenizer
 (`SPECULATIVE_TOKENIZERS`) together with the built diff and the row's in-flight claim, and
 the worker returns at once. The tokenizer keeps up to `TOKENIZER_QUEUE_CAP` warms ordered
 nearest to where the reader is NOW (`PrefetchTarget::row` against the anchor — `prefetch_anchor`,
@@ -844,7 +894,10 @@ The invariants:
   folds in the git dir, an attributes fingerprint, the diff-affecting config and the
   crate version. That list has been wrong three times — extend it, don't trust it.
 - **Every diff-load worker exit reports a `DiffLoadResult`** — success, failure,
-  supersession or panic. The loading state and `inflight_loads` both depend on it.
+  supersession or panic. The loading state and `inflight_loads` both depend on it. An
+  adopted load has no worker to report: it relies on the warm's claim instead, the drain
+  dispatching the foreground load once that claim is gone with nothing installed (see
+  `prefetch.rs` under **Architecture**).
 
 ### The commit order
 
@@ -2108,7 +2161,11 @@ first, re-ranked when it moves, evicting the farthest) and every way a handed-of
 delivered — coloured by the tokenizer (on its own channel, so an inline send cannot pass
 for it), evicted through `accept`, left in the queue or the channel by an exiting
 tokenizer, or coloured inline when it is gone — each releasing the claim only after its
-send, and `warm_disposition`'s precedence),
+send; an adopted warm delivered at once and uncoloured, by the worker or ahead of the
+tokenizer's next pass, and an adopted oversized or unconverted one sent uncacheable before its
+claim goes back (the unadopted control still dropped on the worker), and a warm the reader
+left unadopted — still claimed, adoptable again; and
+`warm_disposition`'s precedence, an uncacheable result only ever installed or dropped),
 `commitgraph` (the file format, over fixtures this suite writes itself so it depends
 on no `git` binary: both on-disk shapes, a zeroed generation refused as the
 pre-2.19 marker it is, a chunk whose claimed end is past the real end of the file,
@@ -2153,9 +2210,13 @@ fixture a `/bin/sh` script, so the suite depends on nothing else), `apply` (the 
 as pure units, then stage/unstage/revert end-to-end over real temp repos: renames,
 binaries, symlinks, modes, and every refusal the write layer owes the user), and `main` (graph
 layout, diff integration over temp repos, and UI helpers — including
-`loading_diff_text`, whose three cases are each a sentence the reader will stare at
-while they wait, and the soft-wrap seam: a wrapped line's rows tiling it under one
-gutter, the spans rebased to the window each row draws, and — headless, through
+`loading_diff_text`, whose cases (three phases, and an adopted warm building in the
+background) are each a sentence the reader will stare at while they wait;
+`adopted_warm_undelivered`'s truth table and `drain_warms`' frame order against a scripted
+warm (one that sends and releases mid-drain is installed, never rebuilt; one released without
+sending falls back), the load-state "still waiting" predicate and the span-only re-key; and
+the soft-wrap seam: a wrapped line's rows tiling it under one gutter,
+the spans rebased to the window each row draws, and — headless, through
 `show_virtualized_diff` itself — the pane laying out VISUAL rows while reporting
 LINES, with a `wrap: None` control that pins the default as the identity). The graph-layout suite uses fake
 OIDs via `oid(n)` — no real repo needed — and pins the layout invariants (lane

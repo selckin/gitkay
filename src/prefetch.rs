@@ -360,14 +360,65 @@ pub fn prefetch_anchor(selected: usize, view: &std::ops::Range<usize>) -> usize 
 /// releases when the result is sent, a frame before the drain caches it, so an
 /// exactly-raced dispatch can still duplicate — harmless, the cache insert is
 /// idempotent.
-pub type InflightKeys = Arc<Mutex<HashSet<DiffCacheKey>>>;
+///
+/// The set records WHAT each claim is (`ClaimKind`), not only that it exists: the
+/// UI may adopt a warm that one blob dominates instead of building the same diff
+/// a second time.
+pub type InflightKeys = Arc<Mutex<HashMap<DiffCacheKey, ClaimKind>>>;
+
+/// Below this, one blob dominates the row and the foreground's split patch pass
+/// cannot beat a warm already building it (measured 1.00x on a single-blob commit,
+/// 3.7-4.5x on spread ones), so the click waits for the warm instead of reading the
+/// same blobs twice.
+pub const ADOPT_MAX_CEILING: f64 = 1.5;
+
+/// What holds a key in an `InflightKeys` set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimKind {
+    /// The clicked diff's own load; the user is waiting on it.
+    Foreground,
+    /// A speculative warm. `adoptable` is decided when it is claimed (one blob
+    /// dominates the row); `adopted` is set by the UI when it chooses to wait for it.
+    Warm { adoptable: bool, adopted: bool },
+}
 
 /// Lock an `InflightKeys` set, recovering the guard from poisoning. The set is
 /// never poisoned in practice (holders only insert/remove), but a poisoned
 /// dedupe set must degrade to duplicate work, not panic every worker.
-pub fn lock_inflight(set: &InflightKeys) -> std::sync::MutexGuard<'_, HashSet<DiffCacheKey>> {
+pub fn lock_inflight(
+    set: &InflightKeys,
+) -> std::sync::MutexGuard<'_, HashMap<DiffCacheKey, ClaimKind>> {
     set.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The UI's side: adopt the warm holding `key`, if it is adoptable. `true` once adopted.
+pub fn adopt_warm(set: &InflightKeys, key: &DiffCacheKey) -> bool {
+    match lock_inflight(set).get_mut(key) {
+        Some(ClaimKind::Warm {
+            adoptable: true,
+            adopted,
+        }) => {
+            *adopted = true;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The UI's side again: the reader left an adopted warm, so it is speculative once
+/// more — coloured, ranked, and an oversized or unconverted row dropped on the worker
+/// rather than sent. A no-op on anything but a `Warm` claim. The claim itself stays, so
+/// a return to the row adopts it again.
+pub fn unadopt_warm(set: &InflightKeys, key: &DiffCacheKey) {
+    if let Some(ClaimKind::Warm { adopted, .. }) = lock_inflight(set).get_mut(key) {
+        *adopted = false;
+    }
+}
+
+/// Is anything claiming `key`?
+pub fn is_claimed(set: &InflightKeys, key: &DiffCacheKey) -> bool {
+    lock_inflight(set).contains_key(key)
 }
 
 /// RAII claim on one `DiffCacheKey` in an `InflightKeys` set.
@@ -377,13 +428,26 @@ pub struct InflightClaim {
 }
 
 impl InflightClaim {
-    /// Claim `key`, or `None` when another worker already holds it.
-    pub fn try_claim(set: &InflightKeys, key: DiffCacheKey) -> Option<Self> {
-        let claimed = lock_inflight(set).insert(key.clone());
-        claimed.then(|| Self {
-            set: Arc::clone(set),
-            key,
-        })
+    /// Claim `key` as `kind`, or `None` when another worker already holds it.
+    pub fn try_claim(set: &InflightKeys, key: DiffCacheKey, kind: ClaimKind) -> Option<Self> {
+        match lock_inflight(set).entry(key.clone()) {
+            std::collections::hash_map::Entry::Occupied(_) => None,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(kind);
+                Some(Self {
+                    set: Arc::clone(set),
+                    key,
+                })
+            }
+        }
+    }
+
+    /// Has the UI adopted this (warm) claim? `false` for a foreground claim.
+    pub fn adopted(&self) -> bool {
+        matches!(
+            lock_inflight(&self.set).get(&self.key),
+            Some(ClaimKind::Warm { adopted: true, .. })
+        )
     }
 }
 
@@ -442,6 +506,9 @@ impl PrefetchTarget {
 pub struct RowCost {
     /// `RowCostProbe::total_blob_bytes`.
     pub bytes: u64,
+    /// `RowCostProbe::max_delta_bytes` — the largest single delta, the floor a
+    /// parallel patch pass is taken against.
+    pub max_delta_bytes: u64,
     /// `RowCostProbe::may_be_driven` — the loose reading, since that is what routed the
     /// row here and what predicts a conversion running.
     pub driven: bool,
@@ -452,8 +519,23 @@ impl RowCost {
     pub const fn of(probe: &diff::RowCostProbe) -> Self {
         Self {
             bytes: probe.total_blob_bytes,
+            max_delta_bytes: probe.max_delta_bytes,
             driven: probe.may_be_driven(),
         }
+    }
+
+    /// `bytes / max_delta_bytes`, at least 1.0 (and 1.0 when no delta was measured):
+    /// the same arithmetic as `RowCostProbe::parallel_ceiling`.
+    pub fn parallel_ceiling(&self) -> f64 {
+        if self.max_delta_bytes == 0 {
+            return 1.0;
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a ratio compared against a threshold; the inputs are byte counts"
+        )]
+        let ceiling = self.bytes as f64 / self.max_delta_bytes as f64;
+        ceiling.max(1.0)
     }
 }
 
@@ -1371,7 +1453,14 @@ impl Coordinator {
     /// holds it — that result will be cached when it lands, so recomputing it here
     /// would be pure duplicate work.
     fn claim_warm(&self, target: PrefetchTarget) -> Option<Job> {
-        let claim = InflightClaim::try_claim(&self.inflight, target.key.clone())?;
+        // Only a measured row can be adoptable: cheap rows are not worth waiting for.
+        let kind = ClaimKind::Warm {
+            adoptable: target
+                .probed
+                .is_some_and(|c| c.parallel_ceiling() < ADOPT_MAX_CEILING),
+            adopted: false,
+        };
+        let claim = InflightClaim::try_claim(&self.inflight, target.key.clone(), kind)?;
         Some(Job::Warm {
             target,
             stats_epoch: self.band_stats_epoch,
@@ -1626,6 +1715,11 @@ impl<T: Ranked> ColourQueue<T> {
         Some(self.items.swap_remove(best))
     }
 
+    /// Take every item `pred` picks out, leaving the rest queued.
+    fn take_where(&mut self, pred: impl FnMut(&mut T) -> bool) -> Vec<T> {
+        self.items.extract_if(.., pred).collect()
+    }
+
     const fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
@@ -1662,6 +1756,9 @@ impl Ranked for ColourJob {
 enum Delivered {
     /// No pass was wanted: the row is too far, too big, or syntax is off.
     Uncoloured,
+    /// The reader adopted the warm: it is waiting on exactly this row, so no
+    /// speculative pass runs and the highlight thread colours it once installed.
+    Adopted,
     /// A pass ran, and took this long (queueing excluded). The tokenizer also notes how
     /// far the row was from the reader when it was picked.
     Coloured(ColourPass, Duration, Option<usize>),
@@ -1696,6 +1793,9 @@ fn applied_label(
     }
     let applied = match (hl, how) {
         (Some(_), Delivered::Panicked) => "DiffOnly (colour pass panicked)".to_owned(),
+        (Some(_), Delivered::Adopted) => {
+            "DiffOnly (adopted by the reader; coloured on install)".to_owned()
+        }
         (Some(_), Delivered::Evicted(distance)) => {
             format!("DiffOnly (tokenizer queue full, distance {distance})")
         }
@@ -1751,7 +1851,14 @@ fn deliver(tx: &mpsc::Sender<WarmResult>, ctx: &egui::Context, job: ColourJob, h
     let with_tokenizer = handed_at.elapsed();
     let (oid, lines) = (key.oid, data.lines.len());
     let label = applied_label(Some(&hl), &data.files, &how);
-    if tx.send(WarmResult { key, data }).is_err() {
+    if tx
+        .send(WarmResult {
+            key,
+            data,
+            cacheable: true,
+        })
+        .is_err()
+    {
         return; // the UI is gone, and the claim with this frame
     }
     drop(claim); // only now: the result is on its way to the cache
@@ -1816,6 +1923,9 @@ impl Tokenizer {
             while let Some(job) = self.try_recv() {
                 self.accept(job);
             }
+            // Before each pass: a warm the reader adopted while it waited is the row they
+            // are on, and waits for no other warm's colour.
+            self.deliver_adopted();
             let anchor = self.anchor();
             if let Some(job) = self.queue.pop(anchor) {
                 let distance = job.row.abs_diff(anchor);
@@ -1825,10 +1935,24 @@ impl Tokenizer {
     }
 
     fn accept(&mut self, job: ColourJob) {
+        // Adopted after the worker handed it off: the reader is waiting on exactly this
+        // row, so it is delivered now, uncoloured, rather than ranked behind others.
+        if job.claim.adopted() {
+            deliver(&self.tx, &self.ctx, job, Delivered::Adopted);
+            return;
+        }
         let anchor = self.anchor();
         if let Some(evicted) = self.queue.push(job, anchor) {
             let distance = evicted.row.abs_diff(anchor);
             deliver(&self.tx, &self.ctx, evicted, Delivered::Evicted(distance));
+        }
+    }
+
+    /// Deliver, uncoloured, every queued warm the reader has adopted since it was
+    /// accepted. The highlight thread colours it once it is installed.
+    fn deliver_adopted(&mut self) {
+        for job in self.queue.take_where(|job| job.claim.adopted()) {
+            deliver(&self.tx, &self.ctx, job, Delivered::Adopted);
         }
     }
 
@@ -1889,7 +2013,11 @@ impl Drop for Tokenizer {
                 key, data, claim, ..
             } = job;
             abandoned += 1;
-            let _gone = self.tx.send(WarmResult { key, data });
+            let _gone = self.tx.send(WarmResult {
+                key,
+                data,
+                cacheable: true,
+            });
             drop(claim); // after the send, as in `deliver`
         }
         if abandoned > 0 {
@@ -2202,6 +2330,11 @@ fn send_row_stats(ctx: &WorkerCtx, epoch: u64, oid: git2::Oid, data: &DiffData) 
 pub struct WarmResult {
     pub key: DiffCacheKey,
     pub data: DiffData,
+    /// `false` for a diff the cache must never hold — over the speculative cap, or
+    /// fallen back to raw content by a failed textconv driver. Only a warm the reader
+    /// ADOPTED is ever sent like that (see `InflightClaim::adopted`): it is installed if
+    /// it is still awaited, and dropped otherwise (`WarmDisposition::DropUncacheable`).
+    pub cacheable: bool,
 }
 
 /// What the prefetch drain should do with a completed warm.
@@ -2216,9 +2349,13 @@ pub enum WarmDisposition {
     /// Its SPANS were tokenized under settings that have since changed.
     /// It is already the live diff; `load_selected_diff` owns that key.
     AlreadyLive,
+    /// An adopted warm the cache must not hold (`WarmResult::cacheable`), and the
+    /// reader is no longer waiting on it — they moved away between adopting it and its
+    /// delivery.
+    DropUncacheable,
 }
 
-/// The three facts the drain decides from. A struct rather than three `bool`
+/// The facts the drain decides from. A struct rather than four `bool`
 /// parameters, which trips `clippy::fn_params_excessive_bools` — and would be
 /// easy to transpose at the one call site besides.
 #[derive(Clone, Copy)]
@@ -2229,9 +2366,11 @@ pub struct WarmFacts {
     pub key_current: bool,
     /// This key is already the diff on screen.
     pub is_live: bool,
+    /// The result may be cached (`WarmResult::cacheable`).
+    pub cacheable: bool,
 }
 
-/// The drain's decision, as a pure function of those three facts.
+/// The drain's decision, as a pure function of those facts.
 ///
 /// There is deliberately no separate "are the spans current" fact. There used to
 /// be — a `span_gen` epoch stamped on every job — because two of the four
@@ -2244,15 +2383,45 @@ pub struct WarmFacts {
 /// `diff_bg` shapes no span at all — it decides row backgrounds the renderer reads
 /// live. So `key_current` answers for the spans too, and the epoch, the extra fact
 /// and the `DropStaleSpans` verdict all went away with it.
+///
+/// An uncacheable result is decided before any of the cache questions: it can only be
+/// installed (awaited) or dropped, never cached, whatever else holds.
 pub const fn warm_disposition(f: WarmFacts) -> WarmDisposition {
     if f.awaiting {
         WarmDisposition::Install
+    } else if !f.cacheable {
+        WarmDisposition::DropUncacheable
     } else if !f.key_current {
         WarmDisposition::DropStaleKey
     } else if f.is_live {
         WarmDisposition::AlreadyLive
     } else {
         WarmDisposition::Cache
+    }
+}
+
+/// An uncacheable warm — over the speculative cap, or fallen back to raw content by a
+/// failed driver — is normally dropped right here on the worker, so a huge diff is never
+/// sent to the UI thread just to be freed there. Adopted, it is the row the reader is
+/// waiting on instead, so it is sent marked uncacheable: installed if still awaited,
+/// never cached.
+///
+/// Called BEFORE the caller returns its `Oversized`/`Unconverted` outcome, which carries
+/// the claim back for the coordinator to release after its record — so the result is
+/// on its way before the claim can disappear.
+fn deliver_if_adopted(ctx: &WorkerCtx, claim: &InflightClaim, key: &DiffCacheKey, data: DiffData) {
+    if !claim.adopted() {
+        return;
+    }
+    let (oid, lines) = (key.oid, data.lines.len());
+    let result = WarmResult {
+        key: key.clone(),
+        data,
+        cacheable: false,
+    };
+    if ctx.tx.send(result).is_ok() {
+        log::debug!("prefetch: deliver {oid} ({lines} lines, uncacheable) — adopted by the reader");
+        ctx.ctx.request_repaint();
     }
 }
 
@@ -2355,6 +2524,7 @@ fn warm_row(
         // `FileEntry` list already in hand, and this is the exact moment the gap
         // becomes knowable.
         send_row_stats(ctx, stats_epoch, oid, &data);
+        deliver_if_adopted(ctx, &claim, &target.key, data);
         return Outcome::Oversized {
             key: target.key,
             lines,
@@ -2397,6 +2567,7 @@ fn warm_row(
             };
             send_stats_result(ctx, stats_epoch, oid, Some(stats));
         }
+        deliver_if_adopted(ctx, &claim, &target.key, data);
         return Outcome::Unconverted {
             key: target.key,
             lines,
@@ -2425,7 +2596,12 @@ fn warm_row(
     // channel send. `cache_diff` still harvests when the result lands: the values are
     // identical, so the later one is a no-op, and it is what covers the foreground.
     send_row_stats(ctx, stats_epoch, oid, &data);
-    let colour = target.depth == WarmDepth::Highlighted && lines <= PREFETCH_MAX_HIGHLIGHT_LINES;
+    // A warm the reader adopted is the row they are waiting on: no speculative colour
+    // (no hand-off, no inline pass) — it is sent now and the highlight thread colours
+    // it once installed, the landing screenful first.
+    let adopted = claim.adopted();
+    let colour =
+        !adopted && target.depth == WarmDepth::Highlighted && lines <= PREFETCH_MAX_HIGHLIGHT_LINES;
     // Bounded in TIME as well as in lines, because the two measure different things and
     // the line cap's rate assumption is a property of the grammar rather than of the
     // repo: a 5,310-line row under the 10,000-line cap coloured for 29.6s. See
@@ -2484,13 +2660,22 @@ fn warm_row(
             );
             Delivered::Coloured(pass, colour_start.elapsed(), None)
         }
+        _ if adopted => Delivered::Adopted,
         _ => Delivered::Uncoloured,
     };
     // Derived here because `data` is moved into the send below.
     let applied = applied_label(hl, &data.files, &how);
     // A send failure means the UI is gone, i.e. the process is on its way out; there is
     // nothing useful left to do, but nothing to clean up either.
-    if ctx.tx.send(WarmResult { key, data }).is_err() {
+    if ctx
+        .tx
+        .send(WarmResult {
+            key,
+            data,
+            cacheable: true,
+        })
+        .is_err()
+    {
         return Outcome::Nothing;
     }
     drop(claim); // only now: the result is on its way to the cache
@@ -2615,23 +2800,81 @@ mod tests {
         _dir: tempfile::TempDir,
     }
 
-    fn start_highlighted_warm(
-        colour: impl FnOnce(&mpsc::Sender<WarmResult>) -> mpsc::Sender<ColourJob>,
-    ) -> StartedWarm {
+    /// A commit for a test warm to build, and how to build it.
+    struct WarmFixture {
+        dir: tempfile::TempDir,
+        repo: Repository,
+        oid: git2::Oid,
+        settings: DiffSettings,
+        /// `Some` skips the cost probe — what a driven row needs, the probe deferring
+        /// every one of them to the heavy lane.
+        probed: Option<RowCost>,
+    }
+
+    /// A small Rust commit: two lines of code, a grammar for them.
+    fn rust_fixture() -> WarmFixture {
         use crate::test_repo::commit_file;
         let (dir, repo) = temp_repo();
         commit_file(&repo, "a.rs", "fn main() {}\n", "one");
         let oid = commit_file(&repo, "a.rs", "fn main() {\n    todo!()\n}\n", "two");
+        WarmFixture {
+            dir,
+            repo,
+            oid,
+            settings: probe_settings(),
+            probed: None,
+        }
+    }
+
+    /// A commit whose one delta is driven by a textconv command that fails, so its
+    /// diff falls back to raw content (`DiffData::textconv_failed`).
+    fn failing_driver_fixture() -> WarmFixture {
+        use crate::test_repo::{commit_bytes, write_driver};
+        let (dir, repo) = temp_repo();
+        write_driver(&repo, "gktest", "/bin/false", false, "*.zip");
+        commit_bytes(&repo, "a.zip", &[0, 1, b'A', 0], "one");
+        let oid = commit_bytes(&repo, "a.zip", &[0, 1, b'A', b'B', 0], "two");
+        WarmFixture {
+            dir,
+            repo,
+            oid,
+            settings: DiffSettings {
+                textconv: true,
+                ..probe_settings()
+            },
+            probed: Some(cost(1)),
+        }
+    }
+
+    /// Limits nothing in a fixture comes near.
+    const fn roomy_limits() -> Limits {
+        Limits {
+            max_blob_bytes: u64::MAX,
+            max_entry_lines: usize::MAX,
+            max_entry_bytes: usize::MAX,
+            highlight_budget: Duration::from_secs(30),
+        }
+    }
+
+    fn start_highlighted_warm(
+        colour: impl FnOnce(&mpsc::Sender<WarmResult>) -> mpsc::Sender<ColourJob>,
+    ) -> StartedWarm {
+        start_warm(rust_fixture(), roomy_limits(), false, colour)
+    }
+
+    /// Warm `fx`'s commit as a `Highlighted` row under `limits`, holding an ADOPTABLE warm
+    /// claim — which the reader adopts before the worker starts when `adopted`.
+    fn start_warm(
+        fx: WarmFixture,
+        limits: Limits,
+        adopted: bool,
+        colour: impl FnOnce(&mpsc::Sender<WarmResult>) -> mpsc::Sender<ColourJob>,
+    ) -> StartedWarm {
         let hl = Arc::new(highlight::test_highlighter());
         let (tx, rx) = mpsc::channel();
         let ctx = WorkerCtx {
             id: 0,
-            limits: Limits {
-                max_blob_bytes: u64::MAX,
-                max_entry_lines: usize::MAX,
-                max_entry_bytes: usize::MAX,
-                highlight_budget: Duration::from_secs(30),
-            },
+            limits,
             coord: mpsc::channel().0,
             tx: tx.clone(),
             stats_tx: mpsc::channel().0,
@@ -2641,20 +2884,33 @@ mod tests {
             tokenizer_loss_logged: std::cell::Cell::new(false),
         };
         let mut target = heavy_target(1);
-        target.key.oid = oid;
-        target.scope = RowScope::new(DiffSource::Commit(oid));
+        target.key.oid = fx.oid;
+        target.key.settings = fx.settings;
+        target.scope = RowScope::new(DiffSource::Commit(fx.oid));
         target.depth = WarmDepth::Highlighted;
+        target.probed = fx.probed;
         let key = target.key.clone();
         let inflight = InflightKeys::default();
-        let claim = InflightClaim::try_claim(&inflight, key.clone()).unwrap();
-        let outcome = warm_row(&ctx, &repo, target, Some(&hl), 0, claim);
+        let claim = InflightClaim::try_claim(
+            &inflight,
+            key.clone(),
+            ClaimKind::Warm {
+                adoptable: true,
+                adopted: false,
+            },
+        )
+        .unwrap();
+        if adopted {
+            assert!(adopt_warm(&inflight, &key), "an adoptable warm is adopted");
+        }
+        let outcome = warm_row(&ctx, &fx.repo, target, Some(&hl), 0, claim);
         StartedWarm {
             outcome,
             rx,
             tx,
             inflight,
             key,
-            _dir: dir,
+            _dir: fx.dir,
         }
     }
 
@@ -2669,7 +2925,7 @@ mod tests {
     /// just AFTER the send the caller has seen arrive.
     fn released_within(inflight: &InflightKeys, key: &DiffCacheKey, limit: Duration) -> bool {
         let t = std::time::Instant::now();
-        while lock_inflight(inflight).contains(key) {
+        while lock_inflight(inflight).contains_key(key) {
             if t.elapsed() > limit {
                 return false;
             }
@@ -2728,7 +2984,7 @@ mod tests {
             "the inline fallback coloured the code rows"
         );
         assert!(
-            !lock_inflight(&warm.inflight).contains(&warm.key),
+            !lock_inflight(&warm.inflight).contains_key(&warm.key),
             "released by the worker, after its send"
         );
     }
@@ -2743,7 +2999,7 @@ mod tests {
         assert!(matches!(warm.outcome, Outcome::Warmed { .. }));
         assert!(warm.rx.try_recv().is_err(), "the worker did not deliver it");
         assert!(
-            lock_inflight(&warm.inflight).contains(&warm.key),
+            lock_inflight(&warm.inflight).contains_key(&warm.key),
             "held while it waits"
         );
         drop(Tokenizer {
@@ -2759,11 +3015,11 @@ mod tests {
             .expect("delivered as the tokenizer went")
             .data;
         assert_eq!(coloured_rows(&data), 0, "uncoloured");
-        assert!(!lock_inflight(&warm.inflight).contains(&warm.key));
+        assert!(!lock_inflight(&warm.inflight).contains_key(&warm.key));
     }
 
-    /// A built warm of commit-list row `row`, as a worker hands it off, holding a claim
-    /// on `key` in `inflight`.
+    /// A built warm of commit-list row `row`, as a worker hands it off, holding an
+    /// adoptable (not yet adopted) warm claim on `key` in `inflight`.
     fn colour_job(inflight: &InflightKeys, key: &DiffCacheKey, row: usize) -> ColourJob {
         ColourJob {
             key: key.clone(),
@@ -2773,7 +3029,15 @@ mod tests {
             row,
             built: Duration::ZERO,
             handed_at: std::time::Instant::now(),
-            claim: InflightClaim::try_claim(inflight, key.clone()).unwrap(),
+            claim: InflightClaim::try_claim(
+                inflight,
+                key.clone(),
+                ClaimKind::Warm {
+                    adoptable: true,
+                    adopted: false,
+                },
+            )
+            .unwrap(),
         }
     }
 
@@ -2794,7 +3058,10 @@ mod tests {
         let got = rx.try_recv().expect("an evicted warm is still delivered");
         assert!(got.key == key, "the warm handed off is the one delivered");
         assert_eq!(coloured_rows(&got.data), 0, "uncoloured");
-        assert!(!lock_inflight(&inflight).contains(&key), "released after");
+        assert!(
+            !lock_inflight(&inflight).contains_key(&key),
+            "released after"
+        );
 
         drop(rx);
         deliver(
@@ -2804,7 +3071,7 @@ mod tests {
             Delivered::Evicted(9),
         );
         assert!(
-            !lock_inflight(&inflight).contains(&key),
+            !lock_inflight(&inflight).contains_key(&key),
             "the UI gone, the claim is not leaked"
         );
     }
@@ -2844,10 +3111,14 @@ mod tests {
         let got = rx.try_recv().expect("the evicted warm is delivered");
         assert!(got.key == far, "the farthest warm is the one evicted");
         assert_eq!(coloured_rows(&got.data), 0, "uncoloured");
-        assert!(!lock_inflight(&inflight).contains(&far), "and unclaimed");
+        assert!(
+            !lock_inflight(&inflight).contains_key(&far),
+            "and unclaimed"
+        );
         assert!(rx.try_recv().is_err(), "exactly one delivered");
         assert!(
-            kept.iter().all(|k| lock_inflight(&inflight).contains(k)),
+            kept.iter()
+                .all(|k| lock_inflight(&inflight).contains_key(k)),
             "the queued warms stay claimed"
         );
     }
@@ -2870,8 +3141,166 @@ mod tests {
         for key in &keys {
             let result = got.iter().find(|r| r.key == *key).expect("delivered");
             assert_eq!(coloured_rows(&result.data), 0, "uncoloured");
-            assert!(!lock_inflight(&inflight).contains(key), "and unclaimed");
+            assert!(!lock_inflight(&inflight).contains_key(key), "and unclaimed");
         }
+    }
+
+    /// Limits under which every fixture's diff is over the speculative cap.
+    const fn tight_limits() -> Limits {
+        Limits {
+            max_entry_lines: 1,
+            ..roomy_limits()
+        }
+    }
+
+    /// A warm the reader ADOPTED is delivered even though the cache could not hold it —
+    /// over the speculative cap — marked uncacheable; and its claim still goes back to
+    /// the coordinator with the `Oversized` record, so it is released after the send.
+    #[test]
+    fn an_adopted_oversized_warm_is_delivered_uncacheable_before_its_claim_goes_back() {
+        let (colour, _held) = mpsc::channel();
+        let warm = start_warm(rust_fixture(), tight_limits(), true, |_| colour);
+        let Outcome::Oversized { key, claim, .. } = warm.outcome else {
+            panic!("still recorded as oversized, so the band does not rebuild it")
+        };
+        assert!(key == warm.key);
+        let got = warm
+            .rx
+            .try_recv()
+            .expect("sent by the worker, before warm_row returned");
+        assert!(got.key == warm.key);
+        assert!(!got.cacheable, "the cache must never hold it");
+        assert!(
+            !got.data.lines.is_empty(),
+            "control: the whole diff was sent"
+        );
+        assert!(
+            is_claimed(&warm.inflight, &warm.key),
+            "the claim travels back with the record"
+        );
+        drop(claim);
+        assert!(!is_claimed(&warm.inflight, &warm.key));
+    }
+
+    /// The same for a row whose textconv driver failed: adopted, it is delivered
+    /// uncacheable, and its claim goes back with the `Unconverted` record.
+    #[test]
+    fn an_adopted_warm_whose_driver_failed_is_delivered_uncacheable() {
+        let (colour, _held) = mpsc::channel();
+        let warm = start_warm(failing_driver_fixture(), roomy_limits(), true, |_| colour);
+        let Outcome::Unconverted { claim, .. } = warm.outcome else {
+            panic!("still recorded as unconverted, so the driver is not re-run")
+        };
+        let got = warm
+            .rx
+            .try_recv()
+            .expect("sent by the worker, before warm_row returned");
+        assert!(
+            got.data.textconv_failed,
+            "control: the driver really failed"
+        );
+        assert!(!got.cacheable, "the cache must never hold it");
+        assert!(
+            is_claimed(&warm.inflight, &warm.key),
+            "the claim travels back with the record"
+        );
+        drop(claim);
+        assert!(!is_claimed(&warm.inflight, &warm.key));
+    }
+
+    /// Control: NOT adopted, an oversized or unconverted row is dropped on the worker as
+    /// before — a huge diff is never sent to the UI thread just to be freed there.
+    #[test]
+    fn an_uncacheable_warm_nobody_adopted_is_dropped_on_the_worker() {
+        let (colour, _held) = mpsc::channel();
+        let oversized = start_warm(rust_fixture(), tight_limits(), false, |_| colour.clone());
+        assert!(matches!(oversized.outcome, Outcome::Oversized { .. }));
+        assert!(oversized.rx.try_recv().is_err(), "nothing sent");
+        let unconverted = start_warm(failing_driver_fixture(), roomy_limits(), false, |_| colour);
+        assert!(matches!(unconverted.outcome, Outcome::Unconverted { .. }));
+        assert!(unconverted.rx.try_recv().is_err(), "nothing sent");
+    }
+
+    /// An adopted `Highlighted` warm skips the speculative colour pass: the WORKER sends
+    /// it at once, uncoloured and cacheable, rather than handing it to a tokenizer that
+    /// may have other warms ahead of it. The tokenizer's channel is held and never
+    /// drained, so a hand-off would leave the result missing.
+    #[test]
+    fn an_adopted_warm_skips_speculative_colour_and_the_worker_delivers_it() {
+        let (colour, handed) = mpsc::channel();
+        let warm = start_warm(rust_fixture(), roomy_limits(), true, |_| colour);
+        assert!(matches!(warm.outcome, Outcome::Warmed { .. }));
+        assert!(
+            handed.try_recv().is_err(),
+            "nothing handed to the tokenizer"
+        );
+        let got = warm
+            .rx
+            .try_recv()
+            .expect("sent by the worker itself, before warm_row returned");
+        assert!(got.cacheable);
+        assert!(!got.data.lines.is_empty(), "control: the fixture has rows");
+        assert_eq!(
+            coloured_rows(&got.data),
+            0,
+            "uncoloured: the highlight thread colours it on install"
+        );
+        assert!(
+            !is_claimed(&warm.inflight, &warm.key),
+            "released by the worker, after its send"
+        );
+    }
+
+    /// A warm adopted while it waits in the tokenizer's queue is delivered at once,
+    /// uncoloured — ahead of the nearer warm the tokenizer would otherwise colour first.
+    #[test]
+    fn a_warm_adopted_in_the_tokenizers_queue_is_delivered_ahead_of_the_pass() {
+        let inflight = InflightKeys::default();
+        let (tx, rx) = mpsc::channel();
+        let mut tokenizer = idle_tokenizer(&tx, 0);
+        let (ahead, adopted) = (heavy_target(1).key, heavy_target(2).key);
+        tokenizer.accept(colour_job(&inflight, &ahead, 0));
+        tokenizer.accept(colour_job(&inflight, &adopted, 50));
+        assert!(rx.try_recv().is_err(), "control: both are queued");
+        assert!(adopt_warm(&inflight, &adopted));
+        // Returns once its queue is empty: the idle tokenizer has no worker left.
+        tokenizer.run();
+        let got: Vec<WarmResult> = rx.try_iter().collect();
+        assert_eq!(got.len(), 2, "each delivered once");
+        assert!(
+            got[0].key == adopted,
+            "the adopted warm does not wait behind the pass on the one ahead of it"
+        );
+        assert_eq!(coloured_rows(&got[0].data), 0, "uncoloured");
+        assert!(got[0].cacheable);
+        assert!(got[1].key == ahead);
+        assert!(
+            coloured_rows(&got[1].data) > 0,
+            "control: the pass ran on the warm ahead"
+        );
+        assert!(!is_claimed(&inflight, &adopted) && !is_claimed(&inflight, &ahead));
+    }
+
+    /// A warm adopted before the tokenizer even accepts it is delivered on the spot,
+    /// uncoloured, however far down the queue it would have ranked.
+    #[test]
+    fn a_warm_adopted_before_the_tokenizer_accepts_it_is_delivered_at_once() {
+        let inflight = InflightKeys::default();
+        let (tx, rx) = mpsc::channel();
+        let mut tokenizer = idle_tokenizer(&tx, 0);
+        let (ahead, adopted) = (heavy_target(1).key, heavy_target(2).key);
+        tokenizer.accept(colour_job(&inflight, &ahead, 0));
+        let job = colour_job(&inflight, &adopted, 50);
+        assert!(adopt_warm(&inflight, &adopted));
+        tokenizer.accept(job);
+        let got = rx.try_recv().expect("delivered as it is accepted");
+        assert!(got.key == adopted);
+        assert_eq!(coloured_rows(&got.data), 0, "uncoloured");
+        assert!(!is_claimed(&inflight, &adopted), "released after the send");
+        assert!(
+            is_claimed(&inflight, &ahead),
+            "control: the other one still waits"
+        );
     }
 
     #[test]
@@ -2889,12 +3318,9 @@ mod tests {
         );
     }
 
-    /// The shared in-flight claim set: one claim per key at a time, released on
-    /// drop — including a panicking worker's unwind — so overlapping prefetch /
-    /// diff-load dispatches dedupe without ever leaking a claim.
-    #[test]
-    fn inflight_claim_excludes_duplicates_and_releases_on_drop() {
-        let test_key = |n| DiffCacheKey {
+    /// A cache key for `oid(n)` under the probe settings.
+    fn test_key(n: u32) -> DiffCacheKey {
+        DiffCacheKey {
             oid: oid(n),
             settings: probe_settings(),
             theme: highlight::DEFAULT_THEME,
@@ -2902,21 +3328,124 @@ mod tests {
             content: 0,
             drivers: 0,
             languages: 0,
+        }
+    }
+
+    #[test]
+    fn only_an_adoptable_warm_can_be_adopted_and_adoption_is_visible_to_its_holder() {
+        let set = InflightKeys::default();
+        let (fg, warm_one, warm_many) = (test_key(1), test_key(2), test_key(3));
+        let _f = InflightClaim::try_claim(&set, fg.clone(), ClaimKind::Foreground).unwrap();
+        let one = InflightClaim::try_claim(
+            &set,
+            warm_one.clone(),
+            ClaimKind::Warm {
+                adoptable: true,
+                adopted: false,
+            },
+        )
+        .unwrap();
+        let _m = InflightClaim::try_claim(
+            &set,
+            warm_many.clone(),
+            ClaimKind::Warm {
+                adoptable: false,
+                adopted: false,
+            },
+        )
+        .unwrap();
+        assert!(!adopt_warm(&set, &fg), "a foreground load is never adopted");
+        assert!(
+            !adopt_warm(&set, &warm_many),
+            "a warm the split could beat is not adopted"
+        );
+        assert!(!one.adopted());
+        assert!(adopt_warm(&set, &warm_one));
+        assert!(one.adopted(), "the warm's holder sees it was adopted");
+        assert!(!adopt_warm(&set, &test_key(9)), "nothing to adopt");
+        drop(one);
+        assert!(!is_claimed(&set, &warm_one));
+    }
+
+    /// A reader who leaves an adopted warm takes the adoption with them: the warm goes
+    /// back to being speculative (coloured, ranked, its oversized row dropped on the
+    /// worker), keeps its claim, and can be adopted again by a return to the row.
+    #[test]
+    fn unadopting_a_warm_returns_it_to_speculative_and_it_can_be_adopted_again() {
+        let set = InflightKeys::default();
+        let (fg, warm) = (test_key(1), test_key(2));
+        let _f = InflightClaim::try_claim(&set, fg.clone(), ClaimKind::Foreground).unwrap();
+        let held = InflightClaim::try_claim(
+            &set,
+            warm.clone(),
+            ClaimKind::Warm {
+                adoptable: true,
+                adopted: false,
+            },
+        )
+        .unwrap();
+        assert!(adopt_warm(&set, &warm));
+        assert!(held.adopted());
+
+        unadopt_warm(&set, &warm);
+        assert!(!held.adopted(), "the holder sees the reader left");
+        assert_eq!(
+            lock_inflight(&set).get(&warm),
+            Some(&ClaimKind::Warm {
+                adoptable: true,
+                adopted: false
+            }),
+            "still claimed, still adoptable"
+        );
+        assert!(adopt_warm(&set, &warm), "a return to the row re-adopts it");
+        assert!(held.adopted());
+
+        unadopt_warm(&set, &fg);
+        assert_eq!(
+            lock_inflight(&set).get(&fg),
+            Some(&ClaimKind::Foreground),
+            "a foreground claim is untouched"
+        );
+        unadopt_warm(&set, &test_key(9));
+        assert!(!is_claimed(&set, &test_key(9)), "nothing is claimed by it");
+    }
+
+    #[test]
+    fn a_row_dominated_by_one_blob_has_a_parallel_ceiling_near_one() {
+        let one_blob = RowCost {
+            bytes: 556_000_000,
+            max_delta_bytes: 556_000_000,
+            driven: false,
         };
+        let spread = RowCost {
+            bytes: 3_200_000_000,
+            max_delta_bytes: 871_000_000,
+            driven: false,
+        };
+        assert!(one_blob.parallel_ceiling() < ADOPT_MAX_CEILING);
+        assert!(spread.parallel_ceiling() > ADOPT_MAX_CEILING);
+    }
+
+    /// The shared in-flight claim set: one claim per key at a time, released on
+    /// drop — including a panicking worker's unwind — so overlapping prefetch /
+    /// diff-load dispatches dedupe without ever leaking a claim.
+    #[test]
+    fn inflight_claim_excludes_duplicates_and_releases_on_drop() {
         let set: InflightKeys = Arc::default();
 
-        let claim = InflightClaim::try_claim(&set, test_key(1)).expect("first claim wins");
+        let claim = InflightClaim::try_claim(&set, test_key(1), ClaimKind::Foreground)
+            .expect("first claim wins");
         assert!(
-            InflightClaim::try_claim(&set, test_key(1)).is_none(),
+            InflightClaim::try_claim(&set, test_key(1), ClaimKind::Foreground).is_none(),
             "second claim on the same key must be refused"
         );
         assert!(
-            InflightClaim::try_claim(&set, test_key(2)).is_some(),
+            InflightClaim::try_claim(&set, test_key(2), ClaimKind::Foreground).is_some(),
             "a different key is independent"
         );
         drop(claim);
         assert!(
-            InflightClaim::try_claim(&set, test_key(1)).is_some(),
+            InflightClaim::try_claim(&set, test_key(1), ClaimKind::Foreground).is_some(),
             "dropping the claim must release the key"
         );
 
@@ -2924,11 +3453,12 @@ mod tests {
         let panicked: InflightKeys = Arc::default();
         let inner = Arc::clone(&panicked);
         let _ = std::panic::catch_unwind(move || {
-            let _claim = InflightClaim::try_claim(&inner, test_key(1)).unwrap();
+            let _claim =
+                InflightClaim::try_claim(&inner, test_key(1), ClaimKind::Foreground).unwrap();
             panic!("worker died");
         });
         assert!(
-            InflightClaim::try_claim(&panicked, test_key(1)).is_some(),
+            InflightClaim::try_claim(&panicked, test_key(1), ClaimKind::Foreground).is_some(),
             "a panicked holder must not leak its claim"
         );
     }
@@ -3140,8 +3670,12 @@ mod tests {
             target.key.oid = oid;
             target.scope = RowScope::new(DiffSource::Commit(oid));
             target.depth = WarmDepth::Highlighted;
-            let claim =
-                InflightClaim::try_claim(&InflightKeys::default(), target.key.clone()).unwrap();
+            let claim = InflightClaim::try_claim(
+                &InflightKeys::default(),
+                target.key.clone(),
+                ClaimKind::Foreground,
+            )
+            .unwrap();
             let outcome = warm_row(&ctx, &repo, target, Some(&hl), 0, claim);
             let data = rx.recv().expect("the diff comes back either way").data;
             let coloured = (0..data.lines.len())
@@ -3199,7 +3733,12 @@ mod tests {
         target.key.oid = oid;
         target.scope = RowScope::new(DiffSource::Commit(oid));
         target.depth = WarmDepth::Highlighted;
-        let claim = InflightClaim::try_claim(&InflightKeys::default(), target.key.clone()).unwrap();
+        let claim = InflightClaim::try_claim(
+            &InflightKeys::default(),
+            target.key.clone(),
+            ClaimKind::Foreground,
+        )
+        .unwrap();
         warm_row(&ctx, &repo, target, Some(&hl), 7, claim);
 
         let sent = stats_rx
@@ -3220,13 +3759,14 @@ mod tests {
     /// Whether `key` is claimed in the set the coordinator shares with the foreground
     /// diff-load — i.e. whether either side may start building it right now.
     fn held(coord: &Coordinator, key: &DiffCacheKey) -> bool {
-        lock_inflight(&coord.inflight).contains(key)
+        lock_inflight(&coord.inflight).contains_key(key)
     }
 
     /// A claim on `key` in a set of its own, for a test that hands `finish` an outcome
     /// without dispatching the row first.
     fn loose_claim(key: &DiffCacheKey) -> InflightClaim {
-        InflightClaim::try_claim(&InflightKeys::default(), key.clone()).expect("a fresh set")
+        InflightClaim::try_claim(&InflightKeys::default(), key.clone(), ClaimKind::Foreground)
+            .expect("a fresh set")
     }
 
     /// A one-row band, dispatched and taken out of whichever mailbox it landed in, as
@@ -3418,6 +3958,7 @@ mod tests {
     const fn cost(bytes: u64) -> RowCost {
         RowCost {
             bytes,
+            max_delta_bytes: bytes,
             driven: false,
         }
     }
@@ -3429,6 +3970,7 @@ mod tests {
     fn driven_target(n: u32, bytes: u64) -> PrefetchTarget {
         heavy_target(n).measured(RowCost {
             bytes,
+            max_delta_bytes: bytes,
             driven: true,
         })
     }
@@ -4033,7 +4575,7 @@ mod tests {
         assert_eq!(got, vec![oid(3), oid(4), oid(5), oid(6)]);
     }
 
-    /// The drain's precedence over the three facts it now decides from.
+    /// The drain's precedence over the facts it now decides from.
     ///
     /// There was a fourth — `spans_current`, from a `span_gen` epoch — which
     /// outranked all of these, because `[diff.languages]` and `[diff.bands]` were
@@ -4043,12 +4585,31 @@ mod tests {
     /// result gets.
     #[test]
     fn the_drain_prefers_an_awaited_warm_and_drops_a_stale_keyed_one() {
-        use WarmDisposition::{AlreadyLive, Cache, DropStaleKey, Install};
+        use WarmDisposition::{AlreadyLive, Cache, DropStaleKey, DropUncacheable, Install};
         let facts = |awaiting, key_current, is_live| WarmFacts {
             awaiting,
             key_current,
             is_live,
+            cacheable: true,
         };
+        let uncacheable = |awaiting, key_current, is_live| WarmFacts {
+            cacheable: false,
+            ..facts(awaiting, key_current, is_live)
+        };
+        for key_current in [false, true] {
+            for is_live in [false, true] {
+                assert_eq!(
+                    warm_disposition(uncacheable(true, key_current, is_live)),
+                    Install,
+                    "an adopted result the reader still awaits is shown, cacheable or not"
+                );
+                assert_eq!(
+                    warm_disposition(uncacheable(false, key_current, is_live)),
+                    DropUncacheable,
+                    "never cached, whatever else holds"
+                );
+            }
+        }
         assert_eq!(warm_disposition(facts(true, true, false)), Install);
         assert_eq!(
             warm_disposition(facts(true, false, false)),
