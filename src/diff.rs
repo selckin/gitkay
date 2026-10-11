@@ -11,6 +11,10 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 mod anchor;
+// Wired in by the arena-rows swap, which deletes this `allow`. `allow`, not
+// `expect`: dead in the bin target, live in the test target (AGENTS.md).
+#[allow(dead_code)]
+mod arena;
 mod convert;
 mod lines;
 mod side;

@@ -369,6 +369,10 @@ block**),
 codec for a diff's structure, key derivation, atomic load/save under its own
 `MAX_ENTRY_BYTES` — an entry the budget could never keep is refused before it is
 even encoded — and the budget-and-temp-sweep pruner),
+`src/diff/arena.rs` (the chunked text arena a diff's rows will point into —
+`ArenaWriter` writing into chunks of at most `CHUNK_CAP`, the sealed `TextArena`, and
+the 20 B `Row` holding chunk, offset and length; not wired in yet, so its `mod` carries
+the one `#[allow(dead_code)]` the arena-rows swap deletes),
 `src/diff/convert.rs` (turning a delta a driver applies to into a readable patch
 body: the substitution point, the synthesized header, the `ignore_ws` sweep, and the
 two mode sources — see **Textconv**),
@@ -2238,7 +2242,26 @@ resolving to its run's collapse point, the runs strictly increasing in view row 
 invariant both binary searches rest on), a run at the very start and a diff hidden
 entirely, `lines_of_rows` spanning the hidden lines it covers, an over-cap build
 falling back to the identity, and the composition with a real `WrapIndex` where the
-hidden run wraps too, so what it removes is its ROWS and not its lines),
+hidden run wraps too, so what it removes is its ROWS and not its lines; and `arena`,
+whose oracle is a `Vec<String>` that cannot get an offset wrong, driven by random
+pushes, reserved rows filled by `set`, nested marks and rewinds, and split-pass parts
+(built the same way, one level of their own parts included) appended anywhere — inside
+a mark later rewound too — under every `adopt_min` either side of 8-to-100-BYTE caps — runs of one-row parts
+alternating adopted and copied chunks among them, each append whose copies fit held to
+keeping the tail it found —
+so the shapes a 64 MiB cap meets on a huge diff happen within a few rows; it also holds
+`heap_bytes` to exactly the rows' text, the one check that sees dead text a rewind left
+behind — plus pins for the first chunk growing and the tail allocated whole after the
+first seal — a rewound one included, checked after every write the oracle makes into the tail (a push, a `set`, a merge's copies) too —
+`with_capacity`, `finish` shrinking the rows, a row over the cap getting its
+own exactly-sized chunk while the tail keeps its slot, a rewind across a seal and one
+onto an empty tail (which starts a fresh tail rather than reviving the chunk pushed past
+it), a merge alternating adopted and copied parts filling ONE tail under one whole-cap
+reservation, a split part reading back
+the same adopted or copied (and adopted chunks moved, not copied), running out of `u16`
+chunk indices failing rather than wrapping — and staying failed across a rewind — the
+merge copying instead of adopting near that limit (pinned by allocation, since adopting
+there ends at the same chunk count), and an over-long row cut on a char boundary),
 `diff_cache` (LRU eviction, and what `insert`/`retain_keys` hand back: the
 overwritten value, the LRU victims in order, the purged values), `reaper` (a disposed
 value is dropped on `gitkay-drop`, not the caller's thread; with no thread, or one that
