@@ -441,10 +441,11 @@ state, and what the rows were BUILT under (settings, drivers, content hash) stay
 reload once re-keyed the displayed diff wholesale from `diff_cache_key`, which gave
 old-settings rows the settings of a still-pending toolbar rebuild; that rebuild then looked
 already shown and was dropped, leaving the old content up. `respan` destructures the key
-exhaustively, so a new `DiffCacheKey` field must be classified there to compile. While the reader waits on an adopted warm the drain asks for a repaint every
+exhaustively, so a new `DiffCacheKey` field must be classified there to compile.
+While the reader waits on an adopted warm the drain asks for a repaint every
 `LOADING_TICK`, because a claim released without a send wakes nothing. `adopted_warm` is
-cleared by `load_selected_diff` (a fresh decision) and `apply_loaded_diff` (the wait is
-over). When `load_selected_diff` finds the reader LEFT it — the selection or its key moved —
+cleared by `load_selected_diff` (a fresh decision), `apply_loaded_diff` (the wait is
+over) and the claim-gone fallback itself (which `take`s it before dispatching the real load). When `load_selected_diff` finds the reader LEFT it — the selection or its key moved —
 it also `unadopt_warm`s the claim, so the warm goes back to colouring and to dropping an
 oversized row on the worker instead of shipping it to the UI thread to be freed; a return to
 the row adopts it again. A warm's colour pass is handed to the `gitkay-colour-{k}` tokenizer

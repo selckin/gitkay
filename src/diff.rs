@@ -3712,15 +3712,7 @@ impl RowCostProbe {
     /// one 435MB blob against a 1.2GB commit is 1.4, and a single-file 92MB one is
     /// exactly 1.0.
     pub fn parallel_ceiling(&self) -> f64 {
-        if self.max_delta_bytes == 0 {
-            return 1.0;
-        }
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "a ratio for a log line; the inputs are byte counts"
-        )]
-        let ceiling = self.total_blob_bytes as f64 / self.max_delta_bytes as f64;
-        ceiling.max(1.0)
+        parallel_ceiling(self.total_blob_bytes, self.max_delta_bytes)
     }
 
     /// Did a driver certainly match a changed path?
@@ -4195,6 +4187,22 @@ pub fn next_file_line(starts: &[(usize, usize)], top: usize, down: bool) -> Opti
     } else {
         starts.filter(|&s| s < top).max()
     }
+}
+
+/// The best speedup a per-delta parallel patch pass could reach over `total` bytes
+/// whose largest single delta is `max_delta`: `total / max_delta`, at least 1.0, and
+/// 1.0 when nothing was measured. One definition for the probe (`RowCostProbe`) and the
+/// prefetch's stored measurement (`prefetch::RowCost`), which both decide by it.
+pub fn parallel_ceiling(total: u64, max_delta: u64) -> f64 {
+    if max_delta == 0 {
+        return 1.0;
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a ratio compared against thresholds and logged; the inputs are byte counts"
+    )]
+    let ceiling = total as f64 / max_delta as f64;
+    ceiling.max(1.0)
 }
 
 #[cfg(test)]

@@ -536,18 +536,9 @@ impl RowCost {
         }
     }
 
-    /// `bytes / max_delta_bytes`, at least 1.0 (and 1.0 when no delta was measured):
-    /// the same arithmetic as `RowCostProbe::parallel_ceiling`.
+    /// `diff::parallel_ceiling` over this measurement — the probe's own arithmetic.
     pub fn parallel_ceiling(&self) -> f64 {
-        if self.max_delta_bytes == 0 {
-            return 1.0;
-        }
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "a ratio compared against a threshold; the inputs are byte counts"
-        )]
-        let ceiling = self.bytes as f64 / self.max_delta_bytes as f64;
-        ceiling.max(1.0)
+        diff::parallel_ceiling(self.bytes, self.max_delta_bytes)
     }
 }
 
