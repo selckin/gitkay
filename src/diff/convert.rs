@@ -586,9 +586,6 @@ pub(super) fn emit_converted(
             lines.extend(swept_header_lines(delta, prefixes));
         }
     }
-    // One buffer for this whole converted patch, for the reason `push_patch_line`
-    // states: it runs per row, and a converted archive is as long as any other file.
-    let mut buf = String::new();
     let printed = patch.print(&mut |_, _, line| {
         // The generated patch's own file header is never used: in the substitution
         // case the REAL one — `diff --git`, `index`, mode and rename lines, which is
@@ -596,7 +593,7 @@ pub(super) fn emit_converted(
         // has just been replaced by one that does not claim object ids no odb holds
         // (see `swept_header_lines`).
         if line.origin() != 'F' {
-            push_patch_line(lines, files, Some(fi), &line, &mut buf);
+            push_patch_line(lines, files, Some(fi), &line);
         }
         true
     });

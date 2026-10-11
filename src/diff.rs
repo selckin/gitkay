@@ -467,8 +467,8 @@ pub struct DiffLine {
 impl DiffLine {
     /// `impl Into<Arc<str>>` so a `&str` becomes one allocation and a `String` is
     /// consumed. The patch pass does NOT come through here with a `format!` result —
-    /// see `push_patch_line`, which builds each row's text in a reused buffer, since
-    /// this is one allocation per line of the whole diff.
+    /// see `DiffRows::push_parts`, which builds each row's text in a reused buffer,
+    /// since this is one allocation per line of the whole diff.
     pub fn new(text: impl Into<Arc<str>>, kind: LineKind) -> Self {
         Self {
             text: text.into(),
@@ -1212,9 +1212,9 @@ fn row_chars(text: &str) -> usize {
 /// the same inequality `diff::wrap` builds its whole index on. The widest row turns up
 /// early in a build and every row after it costs one `usize` comparison, where this
 /// used to decode every character of every row pushed.
-fn widen(max: &mut usize, line: &DiffLine) {
-    if line.text.len() > *max {
-        *max = (*max).max(row_chars(&line.text));
+fn widen(max: &mut usize, text: &str) {
+    if text.len() > *max {
+        *max = (*max).max(row_chars(text));
     }
 }
 
@@ -1227,8 +1227,8 @@ fn widen(max: &mut usize, line: &DiffLine) {
 ///
 /// `memchr` rather than a byte loop, for the reason `diff::wrap` gives: 699µs against
 /// 7.4ms over the 8.3MB single line that module exists for.
-fn holds_tab(line: &DiffLine) -> bool {
-    memchr::memchr(b'\t', line.text.as_bytes()).is_some()
+fn holds_tab(text: &str) -> bool {
+    memchr::memchr(b'\t', text.as_bytes()).is_some()
 }
 
 /// The rows a diff build is accumulating, with the widest one measured as they go.
@@ -1240,17 +1240,46 @@ fn holds_tab(line: &DiffLine) -> bool {
 /// just wrote.
 ///
 /// A type rather than a running counter carried beside the `Vec`, for two reasons.
-/// Every row a build emits goes through `push`/`extend`/`set`, so none can be added
-/// without being measured — the commit-message header and the diffstat block are as
-/// able to hold the widest row as a patch line is, and a missed one under-reports,
-/// which is the direction that truncates the scroll range. And the three signatures
-/// that carry the rows (`append_diff_body`, `push_patch_line`, `emit_converted`) keep
-/// their argument counts, two of them sitting at clippy's limit already.
+/// Every row a build emits goes through `push_parts`/`push`/`extend`/`set`, so none
+/// can be added without being measured — the commit-message header and the diffstat
+/// block are as able to hold the widest row as a patch line is, and a missed one
+/// under-reports, which is the direction that truncates the scroll range. And the
+/// three signatures that carry the rows (`append_diff_body`, `push_patch_line`,
+/// `emit_converted`) gain no argument for it — `append_diff_body` sits at clippy's
+/// limit already.
+///
+/// A patch row is written from its PARTS (`push_parts`: the `+`/`-` marker and the
+/// piece), so no caller assembles a row's text: where it is assembled is this type's
+/// business, and so is the buffer it is assembled in.
 struct DiffRows {
     lines: Vec<DiffLine>,
+    /// Where `push_parts` assembles a row before it is copied into its `Arc` — the
+    /// reused buffer every patch pass used to carry as a fourth argument.
+    ///
+    /// Reused rather than a `format!` per row: a patch row is pushed once per line of
+    /// the diff, and `format!` allocates a `String` that is then copied again into the
+    /// `Arc`. Reused, the row costs one allocation — measured at 36% off the per-line
+    /// construction over a 900k-line diff.
+    buf: String,
     max_chars: usize,
     /// Is every row pushed so far free of TABs? See `DiffData::tabless`.
     tabless: bool,
+}
+
+/// One split-pass worker's rows and what was measured over them. Opaque outside
+/// `DiffRows`: the merge hands it to `extend_measured` whole, so what a part carries can
+/// change without its users noticing.
+struct RowsPart {
+    rows: Vec<DiffLine>,
+    max_chars: usize,
+    tabless: bool,
+}
+
+impl RowsPart {
+    /// Did the worker write no rows at all — a delta whose patch printed nothing?
+    const fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
 }
 
 /// A point in a `DiffRows` a build can rewind to. Carries the widest row seen at that
@@ -1268,6 +1297,7 @@ impl DiffRows {
     fn new(lines: Vec<DiffLine>) -> Self {
         let mut rows = Self {
             lines: Vec::new(),
+            buf: String::new(),
             max_chars: 0,
             tabless: true,
         };
@@ -1279,9 +1309,33 @@ impl DiffRows {
         self.lines.len()
     }
 
+    /// One row whose text is the concatenation of `parts`, assembled in `buf` — a patch
+    /// row is its `+`/`-` marker and its piece, and the caller hands them over apart.
+    fn push_parts(
+        &mut self,
+        kind: LineKind,
+        old_lineno: Option<NonZeroU32>,
+        new_lineno: Option<NonZeroU32>,
+        parts: &[&str],
+    ) {
+        self.buf.clear();
+        for p in parts {
+            self.buf.push_str(p);
+        }
+        widen(&mut self.max_chars, &self.buf);
+        self.tabless &= !holds_tab(&self.buf);
+        self.lines.push(DiffLine::with_linenos(
+            self.buf.as_str(),
+            kind,
+            old_lineno,
+            new_lineno,
+        ));
+    }
+
+    /// A row the caller already holds — a header or file-name row — moved in whole.
     fn push(&mut self, line: DiffLine) {
-        widen(&mut self.max_chars, &line);
-        self.tabless &= !holds_tab(&line);
+        widen(&mut self.max_chars, &line.text);
+        self.tabless &= !holds_tab(&line.text);
         self.lines.push(line);
     }
 
@@ -1299,14 +1353,15 @@ impl DiffRows {
             .resize_with(self.lines.len() + n, || DiffLine::new("", kind));
     }
 
-    /// Overwrite a row `reserve_blank` put there. Out of range is a no-op, as the
-    /// `get_mut` this replaced was: the reservation is exact by construction, and a
-    /// mismatch must not panic in the middle of a build.
-    fn set(&mut self, i: usize, line: DiffLine) {
+    /// Write `text` into a row `reserve_blank` put there, as a `kind` row with no line
+    /// numbers, measuring it. Out of range is a no-op, as the `get_mut` this replaced
+    /// was: the reservation is exact by construction, and a mismatch must not panic in
+    /// the middle of a build.
+    fn set(&mut self, i: usize, kind: LineKind, text: &str) {
         if let Some(slot) = self.lines.get_mut(i) {
-            widen(&mut self.max_chars, &line);
-            self.tabless &= !holds_tab(&line);
-            *slot = line;
+            widen(&mut self.max_chars, text);
+            self.tabless &= !holds_tab(text);
+            *slot = DiffLine::new(text, kind);
         }
     }
 
@@ -1329,23 +1384,39 @@ impl DiffRows {
         self.tabless = mark.tabless;
     }
 
-    /// Append rows ALREADY measured, with what was measured over them.
+    /// Append a worker's rows, ALREADY measured, with what was measured over them.
     ///
     /// The one way into this type that does not measure, and it does not weaken the
-    /// rule the others keep: a caller here is handing over both the rows and the two
-    /// facts a `push` would have derived from them. It exists for the parallel patch
-    /// pass, whose workers each accumulate into a `DiffRows` of their own — re-deriving
-    /// at the merge would be a second traversal of every row of the diff, on the thread
-    /// that just avoided the first.
-    fn extend_measured(&mut self, rows: Vec<DiffLine>, max_chars: usize, tabless: bool) {
-        self.max_chars = self.max_chars.max(max_chars);
-        self.tabless &= tabless;
-        self.lines.extend(rows);
+    /// rule the others keep: a `RowsPart` is only made by `finish_part`, so it carries
+    /// both the rows and the two facts a `push` derived from them. It exists for the
+    /// parallel patch pass, whose workers each accumulate into a `DiffRows` of their
+    /// own — re-deriving at the merge would be a second traversal of every row of the
+    /// diff, on the thread that just avoided the first.
+    fn extend_measured(&mut self, part: RowsPart) {
+        self.max_chars = self.max_chars.max(part.max_chars);
+        self.tabless &= part.tabless;
+        self.lines.extend(part.rows);
     }
 
     /// The rows and what was measured over them, for `build_diff_data`.
-    fn finish(self) -> (Vec<DiffLine>, usize, bool) {
-        (self.lines, self.max_chars, self.tabless)
+    ///
+    /// The rows grew by doubling, so up to half the buffer is spare — 1.84GB of it on a
+    /// 76.5M-row sequential build, all of it charged to the cache by `heap_bytes`. On a
+    /// buffer that large the shrink is an `mremap`, not a copy.
+    fn finish(mut self) -> (DiffLines, usize, bool) {
+        self.lines.shrink_to_fit();
+        (DiffLines::from(self.lines), self.max_chars, self.tabless)
+    }
+
+    /// A split-pass worker's rows, for the merge to append with `extend_measured`.
+    /// Not shrunk: the merge moves the rows on into the build's own `DiffRows`, whose
+    /// `finish` gives the spare capacity back once.
+    fn finish_part(self) -> RowsPart {
+        RowsPart {
+            rows: self.lines,
+            max_chars: self.max_chars,
+            tabless: self.tabless,
+        }
     }
 }
 
@@ -1810,7 +1881,6 @@ fn push_patch_line(
     files: &mut [FileEntry],
     file_idx: Option<usize>,
     line: &git2::DiffLine<'_>,
-    buf: &mut String,
 ) {
     let kind = match line.origin() {
         '+' => {
@@ -1882,19 +1952,7 @@ fn push_patch_line(
         // A content row is always a single piece — git splits the patch on
         // newlines — so the per-piece loop only ever multiplies header rows,
         // which carry no numbers anyway.
-        // Assembled in the caller's buffer rather than a `format!` per row: this runs
-        // once per line of the diff, and `format!` allocates a String that is then
-        // copied again into the `Arc`. Reused, the row costs one allocation — measured
-        // at 36% off the per-line construction over a 900k-line diff.
-        buf.clear();
-        buf.push_str(prefix);
-        buf.push_str(piece);
-        lines.push(DiffLine::with_linenos(
-            buf.as_str(),
-            piece_kind,
-            old_lineno,
-            new_lineno,
-        ));
+        lines.push_parts(piece_kind, old_lineno, new_lineno, &[prefix, piece]);
     }
 }
 
@@ -2037,8 +2095,6 @@ fn append_diff_body(
     // libgit2 had to C-quote — falls back to `DEFAULT_PREFIXES`.
     let mut prefixes: Option<(String, String)> = None;
     let mut failed = false;
-    // Reused by every row this pass builds — see `push_patch_line`.
-    let mut buf = String::new();
     // The delta count is the denominator the placeholder shows. `files` is one entry
     // per delta (built above), so this is the count libgit2 is about to walk.
     env.start_patch(files.len());
@@ -2127,7 +2183,7 @@ fn append_diff_body(
                     files[fi].new_blob = Some(delta.new_file().id()).filter(|id| !id.is_zero());
                 }
             }
-            push_patch_line(lines, files, current_file_idx, &line, &mut buf);
+            push_patch_line(lines, files, current_file_idx, &line);
             let header = String::from_utf8_lossy(line.content());
             let driven = current_file_idx.filter(|fi| tc.is_some() && driver_at(*fi).is_some());
             // Read back off THIS delta's header, and only when something needs it:
@@ -2190,7 +2246,7 @@ fn append_diff_body(
             // stops treating a side as binary once a textconv applies.
             return true;
         }
-        push_patch_line(lines, files, current_file_idx, &line, &mut buf);
+        push_patch_line(lines, files, current_file_idx, &line);
         true
     });
     if let Err(e) = printed {
@@ -2297,12 +2353,10 @@ const PARALLEL_PATCH_MAX_WORKERS: usize = 8;
 /// One delta's patch, generated on a worker: the rows, and the counts `push_patch_line`
 /// accumulated while building them.
 struct DeltaPatch {
-    rows: Vec<DiffLine>,
+    /// The rows, with what the worker's own `DiffRows` measured over them, so the merge
+    /// appends rather than re-measuring — see `DiffRows::extend_measured`.
+    part: RowsPart,
     entry: FileEntry,
-    /// What the worker's own `DiffRows` measured over `rows`, so the merge appends
-    /// rather than re-measuring — see `DiffRows::extend_measured`.
-    max_chars: usize,
-    tabless: bool,
     /// `(old, new)` blob sizes, which the diffstat block prints for a binary file.
     ///
     /// Read from the WORKER's delta, after its patch printed, because that is the only
@@ -2537,7 +2591,6 @@ fn parallel_delta_patches(
                         return None;
                     }
                     let mut out = Vec::new();
-                    let mut buf = String::new();
                     loop {
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if i >= expected.len() {
@@ -2553,26 +2606,16 @@ fn parallel_delta_patches(
                                     std::slice::from_mut(&mut entry),
                                     Some(0),
                                     &line,
-                                    &mut buf,
                                 );
                                 true
                             });
                             ok.ok()?;
                         }
-                        let (rows, max_chars, tabless) = rows.finish();
+                        let part = rows.finish_part();
                         // After the print, which is when the sizes exist.
                         let d = diff.get_delta(i)?;
                         let sizes = (d.old_file().size(), d.new_file().size());
-                        out.push((
-                            i,
-                            DeltaPatch {
-                                rows,
-                                entry,
-                                max_chars,
-                                tabless,
-                                sizes,
-                            },
-                        ));
+                        out.push((i, DeltaPatch { part, entry, sizes }));
                     }
                     Some(out)
                 })
@@ -2645,14 +2688,14 @@ fn merge_delta_patches(lines: &mut DiffRows, files: &mut [FileEntry], patches: V
         // A delta that printed nothing — an option that hides changes suppressing every hunk, an
         // unchanged file — keeps `diff_line_idx: None`, exactly as the sequential pass
         // leaves it when the 'F' callback never fires.
-        if patch.rows.is_empty() {
+        if patch.part.is_empty() {
             continue;
         }
         files[fi].diff_line_idx = Some(lines.len());
         files[fi].additions = patch.entry.additions;
         files[fi].deletions = patch.entry.deletions;
         files[fi].is_binary = patch.entry.is_binary;
-        lines.extend_measured(patch.rows, patch.max_chars, patch.tabless);
+        lines.extend_measured(patch.part);
     }
 }
 
@@ -2689,7 +2732,7 @@ fn finish_stats_block(
         .into_iter()
         .enumerate()
     {
-        lines.set(at + row, DiffLine::new(text, LineKind::Stat));
+        lines.set(at + row, LineKind::Stat, &text);
     }
 }
 
@@ -2821,15 +2864,11 @@ pub fn build_diff_data<'r>(
             bytes.parallel_ceiling()
         );
     }
-    let (mut lines, max_chars, tabless) = rows.finish();
-    // The rows grew by doubling, so up to half the buffer is spare — 1.84GB of it on a
-    // 76.5M-row sequential build, all of it charged to the cache by `heap_bytes`. On a
-    // buffer that large the shrink is an `mremap`, not a copy.
-    lines.shrink_to_fit();
+    let (lines, max_chars, tabless) = rows.finish();
     DiffData {
         textconv_failed: failed,
         tabless,
-        ..DiffData::with_max_chars(DiffLines::from(lines), files, max_chars)
+        ..DiffData::with_max_chars(lines, files, max_chars)
     }
 }
 
@@ -4877,7 +4916,7 @@ pub mod tests {
             let (lines, max_chars, _) = rows.finish();
             assert_eq!(
                 max_chars,
-                lines.iter().map(|l| row_chars(&l.text)).max().unwrap()
+                lines.iter().map(|l| row_chars(l.text)).max().unwrap()
             );
             assert_eq!(max_chars, 21);
         }
@@ -4900,8 +4939,154 @@ pub mod tests {
         let (lines, max_chars, _) = rows.finish();
         assert_eq!(
             max_chars,
-            lines.iter().map(|l| row_chars(&l.text)).max().unwrap()
+            lines.iter().map(|l| row_chars(l.text)).max().unwrap()
         );
+    }
+
+    /// A row written from its parts is their concatenation, measured like any other
+    /// row; `set` measures what it writes and ignores a slot out of range; and the
+    /// finished rows carry no spare capacity.
+    #[test]
+    fn pushing_parts_stores_their_concatenation_and_measures_it() {
+        let mut rows = DiffRows::new(vec![DiffLine::new("head", LineKind::Meta)]);
+        rows.push_parts(
+            LineKind::Add,
+            None,
+            NonZeroU32::new(7),
+            &["+", "a\tbcdefgh"],
+        );
+        rows.push_parts(
+            LineKind::Context,
+            NonZeroU32::new(3),
+            NonZeroU32::new(8),
+            &["", ""],
+        );
+        rows.reserve_blank(1, LineKind::Stat);
+        rows.set(3, LineKind::Stat, "wider than anything else");
+        rows.set(9, LineKind::Stat, "out of range is a no-op");
+        let (lines, max_chars, tabless) = rows.finish();
+        assert_eq!(lines.len(), 4);
+        assert_eq!(
+            lines.line(1),
+            LineRef {
+                text: "+a\tbcdefgh",
+                kind: LineKind::Add,
+                old_lineno: None,
+                new_lineno: NonZeroU32::new(7),
+            }
+        );
+        assert_eq!(lines.text(2), "");
+        assert_eq!(lines.linenos(2), (NonZeroU32::new(3), NonZeroU32::new(8)));
+        assert_eq!(lines.text(3), "wider than anything else");
+        assert_eq!(max_chars, "wider than anything else".len());
+        assert!(!tabless, "the tab in the second part was seen");
+        assert_eq!(
+            lines.row_capacity(),
+            lines.len(),
+            "finish gives back the spare capacity"
+        );
+    }
+
+    /// The split pass's merge is the one way into `DiffRows` that does not measure: it
+    /// trusts what `finish_part` carried. So a host merged with two parts — one holding
+    /// a row wider than anything in the host, one holding a tab — has to come out as if
+    /// the same rows had been pushed into it one by one: same rows, same widest row,
+    /// same tab census. And `finish_part` hands its rows on unshrunk, as it documents —
+    /// the merge moves them on and `finish` shrinks once.
+    #[test]
+    fn merging_parts_measures_what_pushing_the_same_rows_does() {
+        type Row = (
+            LineKind,
+            Option<NonZeroU32>,
+            Option<NonZeroU32>,
+            [&'static str; 2],
+        );
+        let host: [Row; 1] = [(
+            LineKind::Context,
+            NonZeroU32::new(1),
+            NonZeroU32::new(1),
+            [" ", "host"],
+        )];
+        let wide: [Row; 5] = [
+            (
+                LineKind::Add,
+                None,
+                NonZeroU32::new(2),
+                ["+", "a row much wider than the host's"],
+            ),
+            (LineKind::Del, NonZeroU32::new(2), None, ["-", "x"]),
+            (
+                LineKind::Context,
+                NonZeroU32::new(3),
+                NonZeroU32::new(3),
+                [" ", "y"],
+            ),
+            (LineKind::Add, None, NonZeroU32::new(4), ["+", "z"]),
+            (LineKind::Add, None, NonZeroU32::new(5), ["+", "w"]),
+        ];
+        let tabbed: [Row; 2] = [
+            (LineKind::Add, None, NonZeroU32::new(6), ["+", "\tindented"]),
+            (
+                LineKind::Context,
+                NonZeroU32::new(7),
+                NonZeroU32::new(7),
+                [" ", "plain"],
+            ),
+        ];
+        let push_all = |rows: &mut DiffRows, from: &[Row]| {
+            for (kind, old, new, parts) in from {
+                rows.push_parts(*kind, *old, *new, parts);
+            }
+        };
+        let header = || vec![DiffLine::new("head", LineKind::Meta)];
+
+        let mut sequential = DiffRows::new(header());
+        for block in [&host[..], &wide, &tabbed] {
+            push_all(&mut sequential, block);
+        }
+
+        let mut merged = DiffRows::new(header());
+        push_all(&mut merged, &host);
+        assert!(merged.tabless, "control: the host holds no tab");
+        let mut parts = Vec::new();
+        for block in [&wide[..], &tabbed] {
+            let mut part = DiffRows::new(Vec::new());
+            push_all(&mut part, block);
+            let capacity = part.lines.capacity();
+            let part = part.finish_part();
+            assert_eq!(
+                part.rows.capacity(),
+                capacity,
+                "finish_part does not shrink"
+            );
+            parts.push(part);
+        }
+        assert!(
+            parts[0].rows.capacity() > parts[0].rows.len(),
+            "control: the part has spare capacity to lose"
+        );
+        assert!(
+            parts[0].tabless && !parts[1].tabless,
+            "control: only the second holds a tab"
+        );
+        assert!(
+            parts[0].max_chars > merged.max_chars,
+            "control: the first is the wider"
+        );
+        for part in parts {
+            merged.extend_measured(part);
+        }
+
+        let (want, want_chars, want_tabless) = sequential.finish();
+        let (got, got_chars, got_tabless) = merged.finish();
+        assert_eq!(
+            got.iter().collect::<Vec<_>>(),
+            want.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(got_chars, want_chars);
+        assert_eq!(got_chars, "+a row much wider than the host's".len());
+        assert_eq!(got_tabless, want_tabless);
+        assert!(!got_tabless, "the second part's tab survives the merge");
     }
 
     /// A reserved row is measured when it is WRITTEN, not when it is reserved: the
@@ -4913,11 +5098,11 @@ pub mod tests {
         let mut rows = DiffRows::new(Vec::new());
         rows.reserve_blank(2, LineKind::Stat);
         assert_eq!(rows.max_chars, 0, "an empty placeholder widens nothing");
-        rows.set(1, DiffLine::new("a filled stat row", LineKind::Stat));
+        rows.set(1, LineKind::Stat, "a filled stat row");
         let (lines, max_chars, _) = rows.finish();
         assert_eq!(
             max_chars,
-            lines.iter().map(|l| row_chars(&l.text)).max().unwrap()
+            lines.iter().map(|l| row_chars(l.text)).max().unwrap()
         );
         assert_eq!(max_chars, "a filled stat row".len());
     }

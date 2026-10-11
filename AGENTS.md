@@ -296,7 +296,7 @@ emphasis driver, the content hash, the file-boundary lookups and `order_files` (
 display-order re-lay the file-list sidebar drives — see **Bottom panel**),
 `DiffLine`'s text being an `Arc<str>` rather than an `Arc<String>` — the bytes live
 inside the allocation, so a row costs ONE allocation on the build's hottest path
-instead of two, and `push_patch_line` assembles each row in a reused buffer rather
+instead of two, and `DiffRows::push_parts` assembles each row in a reused buffer rather
 than a `format!` (measured 36% off the per-line construction; the row itself grows
 8 B and the heap per row shrinks ~24 B — the `String` header that is no longer
 between the `Arc` and the bytes — which is 1.8GB on a 76.5M-line diff),
@@ -304,11 +304,18 @@ between the `Arc` and the bytes — which is 1.8GB on a 76.5M-line diff),
 PUSHED — `DiffData::max_chars` sizes the pane's horizontal scroll range and used to be
 rescanned off the finished diff, a second traversal of rows that are cache-cold by
 then, at 16ms per 900k lines. A type rather than a counter carried beside the `Vec` for
-two reasons: every writer goes through `push`/`extend`/`set`, so no row can be added
-without being measured — the commit-message header and the diffstat block are as able
-to hold the widest row as a patch line is, and a missed one UNDER-reports, which is the
-direction that truncates the scroll range — and the three signatures carrying the rows
-keep their argument counts, two of them being at clippy's limit already. `mark`/`rewind`
+two reasons: every writer goes through `push_parts`/`push`/`extend`/`set`, so no row
+can be added without being measured — the commit-message header and the diffstat block
+are as able to hold the widest row as a patch line is, and a missed one UNDER-reports,
+which is the direction that truncates the scroll range — and the three signatures
+carrying the rows gain no argument for it, `append_diff_body` being at clippy's limit
+already. A patch row is written from its PARTS
+(`push_parts(kind, linenos, &[prefix, piece])`) and `set` takes the text it writes, so
+no caller assembles a row: the reused buffer `push_patch_line` used to carry as an
+argument through three callers is `DiffRows`' own, and `finish` hands back
+`DiffLines` already shrunk to fit. A split-pass worker hands back a `RowsPart` (its rows
+plus what was measured over them, opaque outside `DiffRows`, from `finish_part`, which
+does not shrink), and the merge appends it with `extend_measured`. `mark`/`rewind`
 rather than `truncate`, because a running maximum cannot be un-maxed by dropping rows:
 `emit_converted` abandons a half-written converted patch, and its width would otherwise
 outlive the text. `DiffData::new`, which rescans, is now `#[cfg(test)]` — nothing in the
