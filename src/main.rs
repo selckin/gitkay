@@ -4119,10 +4119,10 @@ fn spans_alone_moved(arrived: &DiffCacheKey, current: &DiffCacheKey) -> bool {
 }
 
 /// Whether a result built under `from` carries spans that are wrong under `to`: the
-/// theme or syntax on/off moved between them. Shared by both re-keying installs
-/// (`GitkApp::rekey_for_install`).
+/// theme, syntax on/off, or the grammar map moved between them. Shared by both
+/// re-keying installs (`GitkApp::rekey_for_install`).
 fn spans_outlived(from: &DiffCacheKey, to: &DiffCacheKey) -> bool {
-    from.theme != to.theme || from.enabled != to.enabled
+    from.theme != to.theme || from.enabled != to.enabled || from.languages != to.languages
 }
 
 /// One frame's prefetch drain, as `drain_warms` needs to see it. A trait so the frame
@@ -5174,8 +5174,8 @@ impl GitkApp {
     /// same-oid rebuild's worker can bake spans under the highlighter it captured at
     /// dispatch time (`PreHighlight`, see `dispatch_diff_load`), and a warm can arrive
     /// coloured. If a live config reload's theme branch raced that build, `data`'s
-    /// spans were coloured under `key`'s theme/enabled but are about to be installed
-    /// under the fresh key's — wrong colours that `pending_files` would then find
+    /// spans were coloured under `key`'s theme/enabled/grammar map but are about to be
+    /// installed under the fresh key's — wrong colours that `pending_files` would then find
     /// nothing to re-do for, and that would get cached under the new key. Blank them
     /// exactly like `handle_config_reload`'s own re-highlight reset does for the live
     /// diff (`self.diff_spans.clear()`) so the post-install pass recolours from
@@ -13327,6 +13327,8 @@ mod tests {
             &current
         ));
         assert!(spans_outlived(&moved(|k| k.enabled = false), &current));
+        // A grammar-map change alone: spans tokenized with the old grammar are wrong.
+        assert!(spans_outlived(&moved(|k| k.languages = 7), &current));
         assert!(!spans_outlived(&current, &current));
     }
 

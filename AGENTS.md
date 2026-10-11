@@ -433,7 +433,7 @@ syntax on/off, `[diff.languages]` — moves the current key under the wait witho
 anything, so `awaiting`'s key equality would leave the placeholder up for good. The same
 reload is why the drain re-keys an adopted result whose key moved in span fields alone
 (`spans_alone_moved`) through `rekey_for_install`, the foreground drain's own re-key (spans
-blanked when theme or syntax moved), and installs it; a key moved in anything diff-shaping
+blanked when theme, syntax or the grammar map moved), and installs it; a key moved in anything diff-shaping
 (settings, drivers) is not this view's diff, is dropped, and the claim-gone fallback builds
 the real one. While the reader waits on an adopted warm the drain asks for a repaint every
 `LOADING_TICK`, because a claim released without a send wakes nothing. `adopted_warm` is
