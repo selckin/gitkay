@@ -14878,4 +14878,97 @@ mod tests {
         );
         assert!(!data.lines.is_empty());
     }
+
+    /// Times the UI frame that installs a big diff, and the frames right after it.
+    ///
+    /// The install frame is where whole-diff scans (the line-number gutter measure, the
+    /// wrap index build) land, so a regression shows up as a slow
+    /// `frame: install+first`, and a per-frame scan as a slow `frame: max after`.
+    /// Headless: a real [`GitkApp`] driven through `eframe::App::ui` on a bare
+    /// `egui::Context` — no GL or window, but the same `ui` body the app runs.
+    /// `BENCH_REPO` and `BENCH_REV` are required; `BENCH_LINENOS=1` and `BENCH_WRAP=1`
+    /// switch the line-number gutter and wrapping on. Use fresh cache dirs so a cache
+    /// hit cannot hide the build:
+    ///
+    /// ```fish
+    /// env XDG_CACHE_HOME=(mktemp -d) XDG_DATA_HOME=(mktemp -d) BENCH_REPO=… BENCH_REV=… BENCH_WRAP=1 BENCH_LINENOS=1 $bin bench_frame_after_install --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "a benchmark; see the doc comment for how to run it"]
+    fn bench_frame_after_install() {
+        const MAX_FRAMES: usize = 4000;
+        const FRAMES_AFTER: usize = 20;
+        let _ = env_logger::Builder::new()
+            .parse_filters("gitkay=debug")
+            .is_test(true)
+            .try_init();
+        let repo = std::env::var("BENCH_REPO").expect("BENCH_REPO is required");
+        let rev = std::env::var("BENCH_REV").expect("BENCH_REV is required");
+        let oid = git2::Repository::open(&repo)
+            .and_then(|r| Ok(r.revparse_single(&rev)?.peel_to_commit()?.id()))
+            .expect("BENCH_REV resolves to a commit in BENCH_REPO");
+        let scope = cli::Scope {
+            all: false,
+            revs: vec![rev],
+            paths: vec![],
+            reflog: false,
+            follow: false,
+            combined: false,
+            first_parent: false,
+        };
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let service = HighlightService::spawn();
+        let prewarm_rx = crate::diff_highlight::spawn_prewarm(repo.clone(), service.clone());
+        let history_rx = mpsc::channel().1;
+        let font_rx = mpsc::channel().1;
+        let mut app = GitkApp::new(
+            &cc,
+            repo,
+            scope,
+            history_rx,
+            None,
+            font_rx,
+            StartupHighlight {
+                prewarm_rx,
+                service,
+            },
+        )
+        .unwrap();
+        app.line_numbers = std::env::var("BENCH_LINENOS").is_ok();
+        app.wrap = std::env::var("BENCH_WRAP").is_ok();
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut installed_at = None;
+        let mut max_after = std::time::Duration::ZERO;
+        for n in 0..MAX_FRAMES {
+            let started = std::time::Instant::now();
+            let out = ctx.run_ui(headless_screen(900.0, 1150.0), |ui| {
+                eframe::App::ui(&mut app, ui, &mut frame);
+            });
+            out.drop_without_applying_deltas();
+            let took = started.elapsed();
+            let installed = app.diff_load.is_none()
+                && app.current_diff_key.as_ref().is_some_and(|k| k.oid == oid);
+            match installed_at {
+                None if installed => {
+                    installed_at = Some(n);
+                    eprintln!("frame: install+first {took:?}");
+                }
+                Some(first) if n > first => {
+                    max_after = max_after.max(took);
+                    if n >= first + FRAMES_AFTER {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        }
+        assert!(
+            installed_at.is_some(),
+            "the diff for {oid} was not installed within {MAX_FRAMES} frames"
+        );
+        eprintln!("frame: max after {max_after:?}");
+        eprintln!("rows {}", app.diff_lines.len());
+    }
 }

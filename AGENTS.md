@@ -2550,6 +2550,17 @@ or without the `index.write()`. That blind spot is why the whole-file routes wen
 unpinned; `stage_file_persists_to_the_index_file_on_disk` and its unstage twin are the
 ones that actually fail when the write is removed.
 
+`bench_frame_after_install` (in `src/main.rs`, `#[ignore]`) times the UI frame that
+installs a big diff and the 20 after it, headless: a real `GitkApp` driven through
+`eframe::App::ui` without GL. It prints `frame: install+first`, `frame: max after` and
+the row count. Whole-diff scans per frame (the gutter measure, the wrap index) show up
+there. It needs `BENCH_REPO` and `BENCH_REV`, optionally `BENCH_LINENOS=1` and
+`BENCH_WRAP=1`; use fresh cache dirs so a cache hit cannot hide the build:
+
+```fish
+env XDG_CACHE_HOME=(mktemp -d) XDG_DATA_HOME=(mktemp -d) BENCH_REPO=… BENCH_REV=… BENCH_WRAP=1 BENCH_LINENOS=1 $bin bench_frame_after_install --ignored --nocapture
+```
+
 ## Common Pitfalls
 
 - Both scrolled lists (commit list + diff pane) virtualize with egui `show_rows`. An early-egui bottom-gap bug once forced manual pre/post spacers on the commit list; that's fixed as of 0.34 (verified — no gap at end-of-list / few commits / on resize), so `show_rows` is used throughout. Don't reintroduce manual spacers.
