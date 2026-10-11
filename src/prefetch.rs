@@ -703,7 +703,7 @@ pub struct StatsResult {
 /// worker and nothing else.
 ///
 /// Here rather than in `workers`, beside `Job::Stats` and `run_stats_job` that are its
-/// only readers — the rule `WarmResult`/`WarmFacts` follow. It was left behind by the
+/// only readers — the rule `WarmResult` follows. It was left behind by the
 /// retired dedicated `gitkay-stats` worker, which made `prefetch` depend on `workers`
 /// for a pair of types `workers` never mentions, against a module boundary whose whole
 /// content is that a foreground job is one somebody is waiting on.
@@ -2340,71 +2340,8 @@ pub struct WarmResult {
     /// `false` for a diff the cache must never hold — over the speculative cap, or
     /// fallen back to raw content by a failed textconv driver. Only a warm the reader
     /// ADOPTED is ever sent like that (see `InflightClaim::adopted`): it is installed if
-    /// it is still awaited, and dropped otherwise (`WarmDisposition::DropUncacheable`).
+    /// it is still awaited, and dropped otherwise (`arrival` in main.rs, row 10).
     pub cacheable: bool,
-}
-
-/// What the prefetch drain should do with a completed warm.
-#[derive(PartialEq, Eq, Debug, Clone, Copy)]
-pub enum WarmDisposition {
-    /// The user is waiting on exactly this key — show it now.
-    Install,
-    /// A useful neighbour: put it in the LRU.
-    Cache,
-    /// Its key pins settings that have since changed, so it could never be hit.
-    DropStaleKey,
-    /// Its SPANS were tokenized under settings that have since changed.
-    /// It is already the live diff; `load_selected_diff` owns that key.
-    AlreadyLive,
-    /// An adopted warm the cache must not hold (`WarmResult::cacheable`), and the
-    /// reader is no longer waiting on it — they moved away between adopting it and its
-    /// delivery.
-    DropUncacheable,
-}
-
-/// The facts the drain decides from. A struct rather than four `bool`
-/// parameters, which trips `clippy::fn_params_excessive_bools` — and would be
-/// easy to transpose at the one call site besides.
-#[derive(Clone, Copy)]
-pub struct WarmFacts {
-    /// The user is on "Loading diff…" for exactly this key.
-    pub awaiting: bool,
-    /// The key still pins the current diff-shaping AND span settings.
-    pub key_current: bool,
-    /// This key is already the diff on screen.
-    pub is_live: bool,
-    /// The result may be cached (`WarmResult::cacheable`).
-    pub cacheable: bool,
-}
-
-/// The drain's decision, as a pure function of those facts.
-///
-/// There is deliberately no separate "are the spans current" fact. There used to
-/// be — a `span_gen` epoch stamped on every job — because two of the four
-/// span-affecting settings were absent from `DiffCacheKey`, so a warm dispatched
-/// under the old grammar map came back with a key that WAS current, passed
-/// `key_current`, and was cached carrying plain-text spans; every later dispatch
-/// then skipped it via `diff_cache.contains` and it stayed flat for the session.
-///
-/// `[diff.languages]` is in the key now (as a fingerprint, beside `drivers`), and
-/// `diff_bg` shapes no span at all — it decides row backgrounds the renderer reads
-/// live. So `key_current` answers for the spans too, and the epoch, the extra fact
-/// and the `DropStaleSpans` verdict all went away with it.
-///
-/// An uncacheable result is decided before any of the cache questions: it can only be
-/// installed (awaited) or dropped, never cached, whatever else holds.
-pub const fn warm_disposition(f: WarmFacts) -> WarmDisposition {
-    if f.awaiting {
-        WarmDisposition::Install
-    } else if !f.cacheable {
-        WarmDisposition::DropUncacheable
-    } else if !f.key_current {
-        WarmDisposition::DropStaleKey
-    } else if f.is_live {
-        WarmDisposition::AlreadyLive
-    } else {
-        WarmDisposition::Cache
-    }
 }
 
 /// An uncacheable warm — over the speculative cap, or fallen back to raw content by a
@@ -4605,57 +4542,6 @@ mod tests {
             .map(|(oid, ..)| oid)
             .collect();
         assert_eq!(got, vec![oid(3), oid(4), oid(5), oid(6)]);
-    }
-
-    /// The drain's precedence over the facts it now decides from.
-    ///
-    /// There was a fourth — `spans_current`, from a `span_gen` epoch — which
-    /// outranked all of these, because `[diff.languages]` and `[diff.bands]` were
-    /// absent from `DiffCacheKey` and so a warm carrying stale spans passed
-    /// `key_current`. The grammar map is in the key now and `diff_bg` shapes no
-    /// span, so `key_current` covers both and `DropStaleKey` is the verdict such a
-    /// result gets.
-    #[test]
-    fn the_drain_prefers_an_awaited_warm_and_drops_a_stale_keyed_one() {
-        use WarmDisposition::{AlreadyLive, Cache, DropStaleKey, DropUncacheable, Install};
-        let facts = |awaiting, key_current, is_live| WarmFacts {
-            awaiting,
-            key_current,
-            is_live,
-            cacheable: true,
-        };
-        let uncacheable = |awaiting, key_current, is_live| WarmFacts {
-            cacheable: false,
-            ..facts(awaiting, key_current, is_live)
-        };
-        for key_current in [false, true] {
-            for is_live in [false, true] {
-                assert_eq!(
-                    warm_disposition(uncacheable(true, key_current, is_live)),
-                    Install,
-                    "an adopted result the reader still awaits is shown, cacheable or not"
-                );
-                assert_eq!(
-                    warm_disposition(uncacheable(false, key_current, is_live)),
-                    DropUncacheable,
-                    "never cached, whatever else holds"
-                );
-            }
-        }
-        assert_eq!(warm_disposition(facts(true, true, false)), Install);
-        assert_eq!(
-            warm_disposition(facts(true, false, false)),
-            Install,
-            "awaiting wins: the reader is on the placeholder for exactly this key"
-        );
-        assert_eq!(warm_disposition(facts(false, false, false)), DropStaleKey);
-        assert_eq!(
-            warm_disposition(facts(false, false, true)),
-            DropStaleKey,
-            "a stale key cannot be the live diff, but the order must not depend on it"
-        );
-        assert_eq!(warm_disposition(facts(false, true, true)), AlreadyLive);
-        assert_eq!(warm_disposition(facts(false, true, false)), Cache);
     }
 
     /// LOAD-BEARING. A driven row must never spawn a driver on the commit-list

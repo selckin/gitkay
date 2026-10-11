@@ -61,9 +61,8 @@ use history::{
 };
 use prefetch::{
     ClaimKind, InflightClaim, InflightKeys, PoolHandle, PrefetchBudget, PrefetchTarget, StatsJob,
-    StatsResult, WarmDisposition, WarmFacts, WarmResult, adopt_warm, is_claimed, lock_inflight,
-    prefetch_anchor, prefetch_targets, spawn_prefetch_pool, unadopt_warm, view_moved_enough,
-    warm_band, warm_disposition,
+    StatsResult, WarmResult, adopt_warm, is_claimed, lock_inflight, prefetch_anchor,
+    prefetch_targets, spawn_prefetch_pool, unadopt_warm, view_moved_enough, warm_band,
 };
 use textconv::Textconv;
 use workers::{
@@ -3804,8 +3803,8 @@ struct GitkApp {
     /// again (`dispatch_diff_load`). Watched by `drain_worker_results`: if the warm's
     /// claim goes without its result being installed, the foreground load is
     /// dispatched after all. Cleared by `load_selected_diff` (a fresh decision — and
-    /// `unadopt_warm`ed there when the reader left it) and by `apply_loaded_diff` (the
-    /// wait is over).
+    /// `unadopt_warm`ed there when the reader left it), and by `apply_loaded_diff` (the
+    /// wait is over) and `clear_failed_load` (nothing waits), both via `end_adoption`.
     adopted_warm: Option<DiffCacheKey>,
     /// Background history loads (lazy-load extension + watcher rebuild). Results
     /// return over this channel; `history_epoch` supersedes stale ones; the
@@ -4166,6 +4165,11 @@ fn spans_alone_moved(arrived: &DiffCacheKey, current: &DiffCacheKey) -> bool {
 /// key under a waiting load without dispatching anything, so exact equality left it
 /// neither installed nor cached — the installers `respan` the key and blank the spans
 /// instead (`GitkApp::rekey_for_install`).
+///
+/// Deliberately blind to WHICH row the armed load is for: during the search debounce row
+/// X's load is armed when a stale result for the newly selected row Y lands, and
+/// installing Y is right — `install` supersedes X's worker, so X's result is cached
+/// instead of flashing in over Y. Requiring the load's own row cached Y and let X install.
 fn awaits(
     load_armed: bool,
     selected: Option<git2::Oid>,
@@ -4206,6 +4210,213 @@ const fn respan(built: &DiffCacheKey, fresh: &DiffCacheKey) -> DiffCacheKey {
 /// re-keying installs (`GitkApp::rekey_for_install`).
 fn spans_outlived(from: &DiffCacheKey, to: &DiffCacheKey) -> bool {
     from.theme != to.theme || from.enabled != to.enabled || from.languages != to.languages
+}
+
+/// The foreground drain's line for a result that computed but never reached the
+/// screen — repeats of it are the duplicate-work signal.
+fn log_superseded_result(key: &DiffCacheKey, data: &DiffData) {
+    log::debug!(
+        "diff-load: superseded result for {} ({} lines)",
+        key.oid,
+        data.lines.len()
+    );
+}
+
+/// One wording for a failed build kept out of the LRU, whether `cache_diff` refuses it
+/// or `arrival` drops it before it gets there.
+fn log_failed_build_not_cached(oid: git2::Oid) {
+    log::debug!("diff cache: not keeping {oid} — the build failed");
+}
+
+/// Where a finished diff came from — the one difference between the two drains that
+/// the arrival decision needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArrivalSource {
+    /// A diff-load worker's result; `current_epoch` = its epoch is the latest dispatch.
+    Foreground { current_epoch: bool },
+    /// A prefetch warm; `cacheable` = false for an adopted oversized/unconverted row
+    /// (`WarmResult::cacheable`).
+    Warm { cacheable: bool },
+}
+
+/// What a drain knows about one finished diff, gathered before `arrival` decides it.
+/// A struct rather than loose `bool`s, which would be easy to transpose at the two
+/// call sites and trip `clippy::fn_params_excessive_bools` besides.
+#[derive(Clone, Copy, Debug)]
+struct ArrivalFacts {
+    source: ArrivalSource,
+    /// Rows arrived (a warm always has them; a foreground `None` is a bail or failure).
+    has_data: bool,
+    /// `DiffData::build_failed` on the rows that arrived.
+    build_failed: bool,
+    /// `GitkApp::awaiting(&key)` — the reader is waiting on exactly this row (modulo
+    /// span fields). The foreground drain asks it only for a stale epoch, as every row
+    /// that reads it is already decided for a current one.
+    awaited: bool,
+    /// `GitkApp::key_is_current(&key)` — EXACT, span fields included (caching a
+    /// span-stale result would keep blanked spans the band then never re-colours).
+    key_current: bool,
+    real_commit: bool,
+    /// The diff on screen is this key (`current_diff_key == Some(key)`).
+    shown: bool,
+    /// The LRU already holds this key (don't clobber a possibly coloured entry).
+    /// Consulted for foreground results only.
+    cached: bool,
+}
+
+/// What a drain does with a finished diff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Arrival {
+    /// The reader's diff: `GitkApp::install` it.
+    Install,
+    /// A useful neighbour: `cache_diff`.
+    Cache,
+    /// The reader's diff, and there is none to show: stop the spinner, stash what is on
+    /// screen and blank the pane, so re-selecting the row retries.
+    ClearPane,
+    /// An adopted foreground worker bailed before computing: dispatch a fresh load.
+    Redispatch,
+    /// Nothing to do but log why.
+    Drop(DropReason),
+}
+
+/// Why `arrival` dropped a finished diff. Decided by the table and nowhere else, so a
+/// drain logs from the reason rather than re-deriving it from the facts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DropReason {
+    /// Row 4b: a superseded foreground result that is no cache entry (a virtual row, a
+    /// stale key, the key on screen, or one already cached).
+    Superseded,
+    /// Row 7: a superseded foreground worker that reported no rows (a bail or failure).
+    Bailed,
+    /// Row 10: an adopted warm the reader left before it was delivered, or whose
+    /// diff-shaping settings moved under it.
+    Uncacheable,
+    /// Row 11: built under settings that have since moved; the key can never be hit.
+    StaleKey,
+    /// Row 12: the warm's key is the one on screen.
+    Shown,
+    /// Rows 4a and 13: a cache entry but for the failed build.
+    BuildFailed,
+}
+
+/// Every finished diff — a foreground `DiffLoadResult` or a prefetch `WarmResult` — is
+/// decided here, by one table; the drains only gather the facts and act on the answer.
+/// First match wins:
+///
+/// | # | Source | Condition | → |
+/// |---|---|---|---|
+/// | 1 | Fg | rows, `!build_failed`, `current_epoch \|\| awaited` | `Install` |
+/// | 2 | Fg | rows, `build_failed`, `current_epoch \|\| awaited` | `ClearPane` |
+/// | 3 | Fg | rows, `real_commit && key_current && !shown && !cached && !build_failed` | `Cache` |
+/// | 4a | Fg | rows, row 3 but `build_failed` | `Drop(BuildFailed)` |
+/// | 4b | Fg | rows, otherwise | `Drop(Superseded)` |
+/// | 5 | Fg | no rows, `current_epoch` | `ClearPane` |
+/// | 6 | Fg | no rows, `awaited` | `Redispatch` |
+/// | 7 | Fg | no rows, otherwise | `Drop(Bailed)` |
+/// | 8 | Warm | `awaited`, `build_failed` | `ClearPane` |
+/// | 9 | Warm | `awaited` | `Install` |
+/// | 10 | Warm | `!cacheable` | `Drop(Uncacheable)` |
+/// | 11 | Warm | `!key_current` | `Drop(StaleKey)` |
+/// | 12 | Warm | `shown` | `Drop(Shown)` |
+/// | 13 | Warm | `build_failed` | `Drop(BuildFailed)` |
+/// | 14 | Warm | otherwise | `Cache` |
+///
+/// Why the rows are what they are:
+/// - 1: data-affecting settings always re-dispatch (bumping the epoch), so a
+///   current-epoch result's ROWS are valid and only its span fields can lag — the
+///   install re-keys. It installs whatever is selected: during a search debounce the
+///   latest dispatch installs while another row is selected. A stale-epoch result is
+///   installed only when awaited: the reader bounced back and the dispatch adopted the
+///   still-running worker (`dispatch_diff_load`).
+/// - 2 and 8: an error is not an answer. Installed, the empty diff became the shown
+///   key, and `load_selected_diff`'s identical-key return then refused every retry.
+///   Clearing leaves no key on screen, so re-selecting the row rebuilds it. Row 8
+///   deliberately does not bump the epoch: a still-running foreground duplicate of the
+///   same key stays current, so its good result can install — a free retry.
+/// - 3: superseded work is still a valid cache entry — but only for a real commit (a
+///   virtual row's content-keyed result may already be stale; the range row is left
+///   out too), under a key that is current EXACTLY (a stale-keyed one could never be
+///   hit), not the key on screen (the displayed diff is moved out of the LRU, so this
+///   would be a second copy beside it), not over an existing entry (which may already
+///   be coloured), and not a failed build (`cache_diff` refuses one anyway).
+/// - 4a and 13: a failed build is the one thing keeping it out of the cache, which is
+///   the reason worth logging; any other reason (4b, 10–12) outranks it.
+/// - 5: keeping the previous diff would misattribute it to the selected row.
+/// - 6: the adopted worker bailed pre-compute and nothing else will deliver this diff.
+///   No loop: the fresh load is current-epoch, so its failure takes row 5.
+/// - 9: the warm beat (or was adopted instead of) the foreground job. Installed even
+///   when uncacheable — that is an adopted oversized/unconverted row, sent only so the
+///   reader who adopted it gets it.
+/// - 10: only an adopted warm is sent uncacheable; the reader left before delivery, so
+///   it was never meant for the cache.
+/// - 11: settings, theme or the grammar map moved while it built; the key can never be
+///   hit. Covers the spans too — the grammar map is in the key.
+/// - 12: `load_selected_diff` owns the key on screen.
+/// - 14: unlike row 3, `cached` is not consulted — a warm overwrites an existing entry,
+///   because a warm is never less coloured than a superseded foreground copy: the pool
+///   colours it speculatively before delivery, where a foreground build colours at most
+///   a pre-highlight window.
+const fn arrival(f: ArrivalFacts) -> Arrival {
+    match f.source {
+        ArrivalSource::Foreground { current_epoch } => {
+            if !f.has_data {
+                if current_epoch {
+                    Arrival::ClearPane
+                } else if f.awaited {
+                    Arrival::Redispatch
+                } else {
+                    Arrival::Drop(DropReason::Bailed)
+                }
+            } else if current_epoch || f.awaited {
+                if f.build_failed {
+                    Arrival::ClearPane
+                } else {
+                    Arrival::Install
+                }
+            } else if f.real_commit && f.key_current && !f.shown && !f.cached {
+                if f.build_failed {
+                    Arrival::Drop(DropReason::BuildFailed)
+                } else {
+                    Arrival::Cache
+                }
+            } else {
+                Arrival::Drop(DropReason::Superseded)
+            }
+        }
+        ArrivalSource::Warm { cacheable } => {
+            if f.awaited {
+                if f.build_failed {
+                    Arrival::ClearPane
+                } else {
+                    Arrival::Install
+                }
+            } else if !cacheable {
+                Arrival::Drop(DropReason::Uncacheable)
+            } else if !f.key_current {
+                Arrival::Drop(DropReason::StaleKey)
+            } else if f.shown {
+                Arrival::Drop(DropReason::Shown)
+            } else if f.build_failed {
+                Arrival::Drop(DropReason::BuildFailed)
+            } else {
+                Arrival::Cache
+            }
+        }
+    }
+}
+
+/// `highlight_settled` after `GitkApp::install`: unsettled while
+/// `ensure_diff_highlighted` has yet to look at the diff now on screen
+/// (`needs_highlight`), and otherwise unchanged.
+///
+/// Not a plain `false`: an install that kept the on-screen copy of an identical key
+/// (`install_preferring_cache`) swaps nothing and leaves `diff_needs_highlight` clear,
+/// so `ensure_diff_highlighted` returns at its first line and never writes `true` back
+/// — the band would stay shut until some later install. When it IS set, that call's
+/// first statement is `highlight_settled = true`, so the band waits one frame at most.
+const fn settled_after_install(settled: bool, needs_highlight: bool) -> bool {
+    settled && !needs_highlight
 }
 
 /// One frame's prefetch drain, as `drain_warms` needs to see it. A trait so the frame
@@ -4958,9 +5169,9 @@ impl GitkApp {
                 "perf: diff cache hit ({} lines) for {oid}",
                 data.lines.len()
             );
-            // Supersede any in-flight worker so its (now stale) result is dropped.
-            self.diff_load_epoch.bump();
-            self.apply_loaded_diff(key, data);
+            // `install` supersedes any in-flight worker, so its (now stale) result is
+            // dropped; the key is the current one, so its re-key is a no-op.
+            self.install(&key, data);
             return;
         }
 
@@ -5162,7 +5373,7 @@ impl GitkApp {
         if data.build_failed() {
             // Kept out for the reason `worth_persisting` refuses it: an error is not
             // an answer, and a revisit should retry rather than serve the blank.
-            log::debug!("diff cache: not keeping {} — the build failed", key.oid);
+            log_failed_build_not_cached(key.oid);
             return;
         }
         let weight = data.heap_bytes();
@@ -5358,6 +5569,31 @@ impl GitkApp {
         }
     }
 
+    /// The wait on an adopted warm is over. A warm adopted for anything but the diff now
+    /// installed (`installed`) is unadopted, so it goes back to colouring and to dropping
+    /// an oversized row on the worker instead of shipping it to the UI thread to be freed:
+    /// an install of the selected row can land while the adoption was for another key
+    /// (a stale result for a newly selected row during the search debounce).
+    fn end_adoption(&mut self, installed: Option<&DiffCacheKey>) {
+        if let Some(adopted) = self.adopted_warm.take()
+            && installed != Some(&adopted)
+        {
+            unadopt_warm(&self.inflight_diffs, &adopted);
+        }
+    }
+
+    /// `Arrival::ClearPane`: the reader's load ended with nothing to show. Stop the
+    /// spinner, stash what is on screen (a revisit is instant) and blank the pane, so
+    /// nothing is misattributed to the selected row and re-selecting it retries.
+    fn clear_failed_load(&mut self) {
+        self.diff_load = None;
+        // Nothing waits on an adopted warm once no load is armed: hand a still-running
+        // one back to the band (colour, drop an oversized row on the worker).
+        self.end_adoption(None);
+        self.stash_current_diff();
+        self.clear_diff_pane();
+    }
+
     /// Clear the diff pane to empty (no current diff, no file rows). Callers that want
     /// the outgoing diff preserved call `stash_current_diff` first.
     fn clear_diff_pane(&mut self) {
@@ -5388,7 +5624,7 @@ impl GitkApp {
             );
         }
         self.diff_load = None;
-        self.adopted_warm = None;
+        self.end_adoption(Some(&key));
         // Harvest the INCOMING diff's numbers, not only the outgoing one's.
         // `stash_current_diff` → `cache_diff` covers the diff being replaced, which
         // left the SELECTED row — the one commit whose diff is guaranteed to exist —
@@ -5431,6 +5667,27 @@ impl GitkApp {
                 mem.diff_row = row;
             }
         }
+    }
+
+    /// Put a finished diff on screen — the one way any source does it: the foreground
+    /// drain, the prefetch drain (`Arrival::Install`) and `load_selected_diff`'s
+    /// synchronous cache hit.
+    ///
+    /// Re-keys it to current span state (`rekey_for_install`), supersedes every other
+    /// in-flight load, installs it (`install_preferring_cache`), and marks colouring
+    /// unsettled while `ensure_diff_highlighted` has yet to look at the diff (which also
+    /// covers a pending highlight with an unchanged diff). That last step is for the prefetch
+    /// band: an install can land after this frame's `ensure_diff_highlighted` (the
+    /// prefetch drain runs after it, and a cache hit from input can too), and with the
+    /// previous diff's `highlight_settled` still standing the band would dispatch in
+    /// the same frame, before the new diff's colour pass has started.
+    fn install(&mut self, key: &DiffCacheKey, mut data: DiffData) {
+        let fresh = self.rekey_for_install(key, &mut data);
+        self.diff_load_epoch.bump();
+        self.install_preferring_cache(fresh, data);
+        self.highlight_settled =
+            settled_after_install(self.highlight_settled, self.diff_needs_highlight);
+        self.egui_ctx.request_repaint();
     }
 
     /// Install a freshly computed diff, but prefer an already-available copy of the
@@ -8589,62 +8846,61 @@ impl GitkApp {
             // can re-dispatch, or the new dispatch would "adopt" the dead worker.
             // (A virtual result's content-keyed `key` was never tracked; no-op.)
             self.inflight_loads.remove(&key);
-            let current = self.diff_load_epoch.is_current(epoch);
-            // A stale-epoch result the UI is nonetheless waiting on: the user
-            // bounced back to this commit while its (superseded, but tracked and
-            // adopted) load was still running. Install it like a current one.
-            let awaited = !current && self.awaiting(&key);
-            match data {
-                Some(mut data) if current || awaited => {
-                    // Data-affecting settings changes always re-dispatch (bumping the
-                    // epoch), so a current-epoch result's data is always valid; only
-                    // its key can be behind.
-                    let fresh = self.rekey_for_install(&key, &mut data);
-                    self.install_preferring_cache(fresh, data);
+            let current_epoch = self.diff_load_epoch.is_current(epoch);
+            let facts = ArrivalFacts {
+                source: ArrivalSource::Foreground { current_epoch },
+                has_data: data.is_some(),
+                build_failed: data.as_ref().is_some_and(DiffData::build_failed),
+                // A stale-epoch result the UI is nonetheless waiting on: the user
+                // bounced back to this commit while its (superseded, but tracked and
+                // adopted) load was still running. Install it like a current one.
+                // Asked only for a stale epoch — every row that reads it is decided
+                // by `current_epoch` first.
+                awaited: !current_epoch && self.awaiting(&key),
+                key_current: self.key_is_current(&key),
+                real_commit: is_real_commit(key.oid),
+                shown: self.current_diff_key.as_ref() == Some(&key),
+                cached: self.diff_cache.contains(&key),
+            };
+            match (arrival(facts), data) {
+                // Only its key can be behind (span fields; `arrival`, row 1), which
+                // `install` re-keys.
+                (Arrival::Install, Some(data)) => self.install(&key, data),
+                (Arrival::Cache, Some(data)) => {
+                    // Superseded but successfully computed, and still a valid entry
+                    // (`arrival`, row 3). Logged: this compute never reached the
+                    // screen — repeats of this line are the duplicate-work signal that
+                    // exposed the pre-dedupe stacking.
+                    log_superseded_result(&key, &data);
+                    self.cache_diff(key, data);
                 }
-                Some(data) => {
-                    // Superseded but successfully computed. Cache real commits
-                    // (immutable) without clobbering an existing (possibly already
-                    // highlighted) entry — but only when the key still matches the
-                    // current settings/theme (same rule as the prefetch drain): a
-                    // stale-settings key could never be hit again and would only
-                    // bloat the LRU. Virtual entries are skipped, their content-
-                    // keyed result may already be stale. Logged: this compute never
-                    // reached the screen — repeats of this line are the duplicate-
-                    // work signal that exposed the pre-dedupe stacking.
-                    log::debug!(
-                        "diff-load: superseded result for {} ({} lines)",
-                        key.oid,
-                        data.lines.len()
-                    );
-                    if is_real_commit(key.oid)
-                        && self.key_is_current(&key)
-                        && !self.diff_cache.contains(&key)
-                    {
-                        self.cache_diff(key, data);
-                    }
-                }
-                None if current => {
-                    // The current load failed (the repo was momentarily unavailable).
-                    // Stop the spinner and clear the pane — keeping the previous commit's
-                    // diff would misattribute it to the now-selected commit. Stash it
-                    // first so a revisit is instant; re-selecting this commit retries.
-                    self.diff_load = None;
-                    self.stash_current_diff();
-                    self.clear_diff_pane();
-                }
-                None if awaited => {
-                    // The adopted worker turned out to have bailed pre-compute (it
-                    // was superseded before it started, then the user bounced back).
-                    // Nothing else will deliver this diff — dispatch a fresh load.
-                    // No retry loop: that fresh load runs under the current epoch,
-                    // so its failure takes the `None if current` arm above.
-                    self.load_selected_diff();
-                }
+                // The current load failed (the repo was momentarily unavailable, or the
+                // build itself failed). Stop the spinner and clear the pane — keeping
+                // the previous commit's diff would misattribute it to the now-selected
+                // commit. Stashed first so a revisit is instant; re-selecting this
+                // commit retries.
+                (Arrival::ClearPane, _) => self.clear_failed_load(),
+                // The adopted worker turned out to have bailed pre-compute (it was
+                // superseded before it started, then the user bounced back). Nothing
+                // else will deliver this diff — dispatch a fresh load. No retry loop:
+                // that fresh load runs under the current epoch, so its failure clears.
+                (Arrival::Redispatch, _) => self.load_selected_diff(),
                 // A superseded failure or pre-compute bail: nothing to install,
                 // but log it — during the dedupe diagnosis the open question was
                 // "did that worker ever report?", and this line is the answer.
-                None => log::debug!("diff-load: superseded bail/failure for {}", key.oid),
+                (Arrival::Drop(DropReason::Bailed), _) => {
+                    log::debug!("diff-load: superseded bail/failure for {}", key.oid);
+                }
+                (Arrival::Drop(reason), Some(data)) => {
+                    log_superseded_result(&key, &data);
+                    // `cache_diff` used to be the one refusing this, and said so.
+                    if reason == DropReason::BuildFailed {
+                        log_failed_build_not_cached(key.oid);
+                    }
+                }
+                (Arrival::Install | Arrival::Cache | Arrival::Drop(_), None) => {
+                    unreachable!("arrival installs, caches or drops rows only when they arrived")
+                }
             }
         }
 
@@ -8962,64 +9218,51 @@ impl WarmDrain for GitkApp {
     fn take_warm(&mut self, warm: WarmResult) {
         let WarmResult {
             key,
-            mut data,
+            data,
             cacheable,
         } = warm;
-        // The adopted warm, still awaited, delivered under a key a span-settings reload
-        // (theme, syntax on/off, `[diff.languages]`) moved while it built: its rows are
-        // still the diff the reader is waiting for, so it is re-keyed the way the
-        // foreground drain re-keys a result, and `awaiting` then installs it. A key
-        // moved by anything else is not re-keyed — its rows are not this view's — and
-        // falls through to be dropped, after which the claim-gone fallback dispatches
-        // the real load. Only real commits are adopted, so the key carries no content
-        // hash a re-key could miss.
-        let key = if self.adopted_warm.as_ref() == Some(&key)
-            && self.waiting_on_adopted_warm(key.oid)
-            && spans_alone_moved(&key, &self.diff_cache_key(key.oid))
-        {
-            self.rekey_for_install(&key, &mut data)
-        } else {
-            key
-        };
-        match warm_disposition(WarmFacts {
-            awaiting: self.awaiting(&key),
+        // No re-key before deciding: `awaiting` already accepts a key a span-settings
+        // reload moved under the adopted warm (`awaits`), and the install re-keys.
+        let facts = ArrivalFacts {
+            source: ArrivalSource::Warm { cacheable },
+            has_data: true,
+            build_failed: data.build_failed(),
+            awaited: self.awaiting(&key),
             key_current: self.key_is_current(&key),
-            is_live: self.current_diff_key.as_ref() == Some(&key),
-            cacheable,
-        }) {
+            real_commit: is_real_commit(key.oid),
+            shown: self.current_diff_key.as_ref() == Some(&key),
+            cached: self.diff_cache.contains(&key),
+        };
+        match arrival(facts) {
             // The user is sitting on "Loading diff…" for exactly this key and the
             // prefetch got there first (its head start beat the diff-load worker
             // spawned alongside it, or the click adopted it) — install it now instead
             // of waiting out the duplicate, and supersede that worker so its later
             // result is cached rather than installed over this one.
-            WarmDisposition::Install => {
-                self.diff_load_epoch.bump();
-                // Awaited may mean "differs in span fields only" (`awaits`): install
-                // under the current key, with spans coloured under old settings blanked.
-                let mut data = data;
-                let fresh = self.rekey_for_install(&key, &mut data);
-                self.install_preferring_cache(fresh, data);
-            }
-            WarmDisposition::Cache => self.cache_diff(key, data),
-            // Settings, theme or the grammar map changed while the worker ran; the key
-            // can never be hit again. This covers the spans too — the grammar map is in
-            // the key — so a result tokenized under an edited `[diff.languages]` is
-            // dropped here rather than caching a neighbour that stays flat for the rest
-            // of the session. Logged: this completed prefetch was wasted work.
-            WarmDisposition::DropStaleKey => {
-                log::debug!("prefetch: drop stale-keyed result for {}", key.oid);
-            }
-            WarmDisposition::AlreadyLive => {}
+            //
+            // Awaited may mean "differs in span fields only" (`awaits`): `install`
+            // re-keys it to the current key, with spans coloured under old settings
+            // blanked.
+            Arrival::Install => self.install(&key, data),
+            Arrival::Cache => self.cache_diff(key, data),
+            Arrival::ClearPane => self.clear_failed_load(),
             // Only an adopted warm is sent uncacheable, and only the reader moving away
             // between adopting it — or the diff-shaping settings moving under it — and
             // its delivery lands it here: it was never meant for the cache, so it is
             // freed rather than kept.
-            WarmDisposition::DropUncacheable => {
-                log::debug!(
-                    "prefetch: drop uncacheable adopted result for {} — no longer awaited",
-                    key.oid
-                );
+            Arrival::Drop(DropReason::Uncacheable) => log::debug!(
+                "prefetch: drop uncacheable adopted result for {} — no longer awaited",
+                key.oid
+            ),
+            // Logged: this completed prefetch was wasted work.
+            Arrival::Drop(DropReason::StaleKey) => {
+                log::debug!("prefetch: drop stale-keyed result for {}", key.oid);
             }
+            Arrival::Drop(DropReason::BuildFailed) => log_failed_build_not_cached(key.oid),
+            // Only a foreground bail redispatches; a warm always carries rows. The key
+            // on screen is `load_selected_diff`'s, and needs no word.
+            Arrival::Redispatch
+            | Arrival::Drop(DropReason::Shown | DropReason::Superseded | DropReason::Bailed) => {}
         }
     }
 
@@ -13437,6 +13680,252 @@ mod tests {
         assert!(
             !awaits(true, Some(oid(2)), &current, &current),
             "reader moved on"
+        );
+    }
+
+    /// `arrival`'s table, row by row: each assertion is a baseline with the one
+    /// deciding fact flipped, so a row that stops deciding — or one that starts deciding
+    /// for another — fails on its own line. Then the precedence cases, where two rows
+    /// would match and the first must win, and the old `warm_disposition` truth table
+    /// over every combination of its four facts. A drop is asserted with its reason,
+    /// which is what the drains log from.
+    #[test]
+    fn arrival_decides_every_finished_diff() {
+        use Arrival::{Cache, ClearPane, Drop, Install, Redispatch};
+        use DropReason::{Bailed, BuildFailed, Shown, StaleKey, Superseded, Uncacheable};
+        let fg = |current_epoch| ArrivalFacts {
+            source: ArrivalSource::Foreground { current_epoch },
+            has_data: true,
+            build_failed: false,
+            awaited: false,
+            key_current: true,
+            real_commit: true,
+            shown: false,
+            cached: false,
+        };
+        let warm = |cacheable| ArrivalFacts {
+            source: ArrivalSource::Warm { cacheable },
+            ..fg(false)
+        };
+
+        // Foreground, rows arrived. A superseded result is the cache baseline.
+        let superseded = fg(false);
+        assert_eq!(arrival(superseded), Cache, "3: a valid superseded result");
+        assert_eq!(arrival(fg(true)), Install, "1: the latest dispatch");
+        let awaited = ArrivalFacts {
+            awaited: true,
+            ..superseded
+        };
+        assert_eq!(
+            arrival(awaited),
+            Install,
+            "1: a bounced-back adopted worker"
+        );
+        let failed = |f: ArrivalFacts| ArrivalFacts {
+            build_failed: true,
+            ..f
+        };
+        assert_eq!(arrival(failed(fg(true))), ClearPane, "2: current, failed");
+        assert_eq!(arrival(failed(awaited)), ClearPane, "2: awaited, failed");
+        assert_eq!(
+            arrival(failed(superseded)),
+            Drop(BuildFailed),
+            "4a: superseded, the build failed"
+        );
+        for (why, f) in [
+            (
+                "virtual",
+                ArrivalFacts {
+                    real_commit: false,
+                    ..superseded
+                },
+            ),
+            (
+                "stale key",
+                ArrivalFacts {
+                    key_current: false,
+                    ..superseded
+                },
+            ),
+            (
+                "on screen",
+                ArrivalFacts {
+                    shown: true,
+                    ..superseded
+                },
+            ),
+            (
+                "already cached",
+                ArrivalFacts {
+                    cached: true,
+                    ..superseded
+                },
+            ),
+        ] {
+            assert_eq!(arrival(f), Drop(Superseded), "4b: superseded, {why}");
+            assert_eq!(
+                arrival(failed(f)),
+                Drop(Superseded),
+                "4b before 4a: superseded, {why}, and the build failed"
+            );
+        }
+
+        // Foreground, nothing arrived (a bail or failure).
+        let bail = |f: ArrivalFacts| ArrivalFacts {
+            has_data: false,
+            ..f
+        };
+        assert_eq!(
+            arrival(bail(fg(true))),
+            ClearPane,
+            "5: the current load failed"
+        );
+        assert_eq!(
+            arrival(bail(awaited)),
+            Redispatch,
+            "6: the adopted worker bailed"
+        );
+        assert_eq!(
+            arrival(bail(superseded)),
+            Drop(Bailed),
+            "7: a superseded bail"
+        );
+
+        // Warms. A neighbour is the cache baseline.
+        let neighbour = warm(true);
+        assert_eq!(arrival(neighbour), Cache, "14: a useful neighbour");
+        let awaited_warm = ArrivalFacts {
+            awaited: true,
+            ..neighbour
+        };
+        assert_eq!(arrival(awaited_warm), Install, "9: the reader waits on it");
+        assert_eq!(
+            arrival(failed(awaited_warm)),
+            ClearPane,
+            "8: awaited, failed"
+        );
+        assert_eq!(
+            arrival(warm(false)),
+            Drop(Uncacheable),
+            "10: uncacheable, not awaited"
+        );
+        let stale = ArrivalFacts {
+            key_current: false,
+            ..neighbour
+        };
+        assert_eq!(arrival(stale), Drop(StaleKey), "11: stale key");
+        let live = ArrivalFacts {
+            shown: true,
+            ..neighbour
+        };
+        assert_eq!(arrival(live), Drop(Shown), "12: already on screen");
+        assert_eq!(
+            arrival(failed(neighbour)),
+            Drop(BuildFailed),
+            "13: build failed"
+        );
+        assert_eq!(
+            arrival(ArrivalFacts {
+                cached: true,
+                ..neighbour
+            }),
+            Cache,
+            "14: a warm overwrites a cached copy — never less coloured than it"
+        );
+
+        // First match wins.
+        assert_eq!(
+            arrival(ArrivalFacts {
+                awaited: true,
+                ..warm(false)
+            }),
+            Install,
+            "9 before 10: an adopted uncacheable warm the reader awaits is shown"
+        );
+        assert_eq!(
+            arrival(ArrivalFacts {
+                awaited: true,
+                ..fg(true)
+            }),
+            Install,
+            "1: current and awaited"
+        );
+        assert_eq!(
+            arrival(bail(ArrivalFacts {
+                awaited: true,
+                ..fg(true)
+            })),
+            ClearPane,
+            "5 before 6: a current failure clears rather than re-dispatching"
+        );
+        assert_eq!(
+            arrival(ArrivalFacts {
+                key_current: false,
+                ..failed(awaited_warm)
+            }),
+            ClearPane,
+            "8 before 11: awaited wins over a stale key"
+        );
+        for (why, f, reason) in [
+            ("10", warm(false), Uncacheable),
+            ("11", stale, StaleKey),
+            ("12", live, Shown),
+        ] {
+            assert_eq!(
+                arrival(failed(f)),
+                Drop(reason),
+                "{why} before 13: a failed build is not the reason it was dropped"
+            );
+        }
+
+        // The retired `warm_disposition` truth table, every combination of its facts:
+        // awaited wins (installed, cacheable or not); then uncacheable, stale key and
+        // live drop, in that order; otherwise cache.
+        for awaited in [false, true] {
+            for cacheable in [false, true] {
+                for key_current in [false, true] {
+                    for shown in [false, true] {
+                        let f = ArrivalFacts {
+                            awaited,
+                            key_current,
+                            shown,
+                            ..warm(cacheable)
+                        };
+                        let want = if awaited {
+                            Install
+                        } else if !cacheable {
+                            Drop(Uncacheable)
+                        } else if !key_current {
+                            Drop(StaleKey)
+                        } else if shown {
+                            Drop(Shown)
+                        } else {
+                            Cache
+                        };
+                        assert_eq!(arrival(f), want, "{f:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// An install that swapped the diff on screen holds the prefetch band shut until
+    /// `ensure_diff_highlighted` has looked at it; one that kept the identical on-screen
+    /// copy leaves nothing for that call to look at, so it must not shut the band, which
+    /// nothing would then reopen.
+    #[test]
+    fn an_install_unsettles_colouring_only_when_the_new_diff_awaits_its_colour_pass() {
+        assert!(
+            !band_warmable(true, true, settled_after_install(true, true)),
+            "a swapped-in diff: the band waits for its colour pass"
+        );
+        assert!(
+            band_warmable(true, true, settled_after_install(true, false)),
+            "the on-screen copy kept: the band stays open"
+        );
+        assert!(
+            !settled_after_install(false, false),
+            "a pass already running keeps the band shut"
         );
     }
 

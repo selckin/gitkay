@@ -405,7 +405,7 @@ outcome carrying its claim goes back — every warm path sends before its claim 
 The tokenizer honours adoption as well: a job adopted after the hand-off is delivered
 uncoloured as it is accepted or before the next pass, waiting behind at most the pass in
 progress. An uncacheable result is installed if still awaited and otherwise dropped
-(`WarmDisposition::DropUncacheable`), never cached by the drain; once installed it is the
+(`arrival`, row 10), never cached by the drain; once installed it is the
 reader's diff, cached on stash like any diff they opened. An adopted `Unconverted` result is
 installed as the raw-content fallback (`textconv_failed` set), not retried — what a
 foreground build would have shown. A warm nobody adopted still drops its oversized and
@@ -422,7 +422,7 @@ behaviour — the foreground proceeds and the duplicate is accepted. **The fallb
 structural**: `drain_warms` reads whether the adopted key is still claimed BEFORE it drains
 `prefetch_rx` and decides AFTER (`adopted_warm_undelivered`); since every warm sends before
 it releases its claim, a claim seen gone means its result, if any, has been drained — and
-installed, unless it was not this view's diff — so a reader still waiting means it ended
+installed (or, a failed build, cleared), unless it was not this view's diff — so a reader still waiting means it ended
 undelivered and `load_selected_diff` dispatches the real foreground load (`adopt_warm`
 cannot adopt a released claim). Reading the claim after the drain would race a warm that
 sends and releases in between, and build the key twice; `drain_warms` is the one place that
@@ -431,11 +431,12 @@ waiting" is read off the load state, never off a key** (`waits_on_adopted`: the 
 is adopted, for that row, and the row is still selected). A span-settings reload — theme,
 syntax on/off, `[diff.languages]` — moves the current key under the wait without dispatching
 anything, so `awaiting`'s key equality would leave the placeholder up for good. The same
-reload is why the drain re-keys an adopted result whose key moved in span fields alone
-(`spans_alone_moved`) through `rekey_for_install`, the foreground drain's own re-key (spans
-blanked when theme, syntax or the grammar map moved), and installs it; a key moved in anything diff-shaping
-(settings, drivers) is not this view's diff, is dropped, and the claim-gone fallback builds
-the real one. **Every re-key of a built diff goes through `respan`** — the config reload's
+reload is why `awaiting` (`awaits`) still accepts an adopted result whose key moved in span
+fields alone (`spans_alone_moved`), and the install re-keys it through `rekey_for_install`,
+the same re-key every install takes (spans blanked when theme, syntax or the grammar map
+moved) — there is no separate re-key ahead of the decision; a key moved in anything
+diff-shaping (settings, drivers) is not this view's diff, is dropped, and the claim-gone
+fallback builds the real one. **Every re-key of a built diff goes through `respan`** — the config reload's
 re-key of the displayed diff and `rekey_for_install` alike: span fields follow the current
 state, and what the rows were BUILT under (settings, drivers, content hash) stays. The
 reload once re-keyed the displayed diff wholesale from `diff_cache_key`, which gave
@@ -444,12 +445,37 @@ already shown and was dropped, leaving the old content up. `respan` destructures
 exhaustively, so a new `DiffCacheKey` field must be classified there to compile. The
 same holds for a FOREGROUND load the reader is waiting on: `awaiting` (`awaits`) accepts a
 result whose key differs from the current one in span fields only, and both drains install
-it through `rekey_for_install`; with exact equality a bounced-back load hit by a theme or
+it re-keyed through `rekey_for_install`. It does NOT ask whether the armed load is for that
+row: during the search debounce row X's load is still armed when a stale result for the
+newly selected row Y lands, and installing Y there is right — the install supersedes X's
+worker (the epoch bump), so X's result is cached rather than flashing in over Y, and the
+debounced dispatch of Y then finds Y on screen. Requiring the load's own row was tried, and
+cached Y instead, letting X's current result install while Y was selected; with exact equality a bounced-back load hit by a theme or
 grammar reload was neither installed nor cached, and nothing re-dispatched it.
+**What happens to a finished diff is one decision**: both drains gather `ArrivalFacts` and
+act on `arrival()`, one table (src/main.rs) — read it there. Its doc gives each row's
+reason, among them why a superseded result is cached only for a real commit under an
+exactly current key (row 3: a virtual row's content-keyed result may already be stale, and
+a stale-keyed one could never be hit) and never as a second copy of the key on screen, and
+why a warm overwrites a cached entry where a superseded foreground result does not (row 14).
+A dropped result carries its `DropReason` out of the table, and the drains log from that
+rather than re-deriving it from the facts.
+**Every install goes through `GitkApp::install`** — the foreground drain's, the prefetch
+drain's and `load_selected_diff`'s synchronous cache hit: re-key (`rekey_for_install`),
+supersede every other in-flight load (bump `diff_load_epoch`), install
+(`install_preferring_cache`), and mark colouring unsettled while `ensure_diff_highlighted`
+has yet to look at the diff (`settled_after_install`; this also covers a pending highlight
+with an unchanged diff). That last step exists because an install can land after the
+frame's `ensure_diff_highlighted` — the prefetch drain runs after it — and the previous
+diff's `highlight_settled` would otherwise let the band dispatch in that same frame, before
+the new diff's colour pass has started. It is conditional because an install that kept the
+identical on-screen copy leaves nothing for `ensure_diff_highlighted` to look at, so nothing
+would write `true` back and the band would stay shut.
 While the reader waits on an adopted warm the drain asks for a repaint every
 `LOADING_TICK`, because a claim released without a send wakes nothing. `adopted_warm` is
 cleared by `load_selected_diff` (a fresh decision), `apply_loaded_diff` (the wait is
-over) and the claim-gone fallback itself (which `take`s it before dispatching the real load). When `load_selected_diff` finds the reader LEFT it — the selection or its key moved —
+over) and `clear_failed_load` (no load is armed to wait) — those two through `end_adoption`,
+which unadopts a warm adopted for any key but the one installed — and the claim-gone fallback itself (which `take`s it before dispatching the real load). When `load_selected_diff` finds the reader LEFT it — the selection or its key moved —
 it also `unadopt_warm`s the claim, so the warm goes back to colouring and to dropping an
 oversized row on the worker instead of shipping it to the UI thread to be freed; a return to
 the row adopts it again. A warm's colour pass is handed to the `gitkay-colour-{k}` tokenizer
@@ -680,7 +706,9 @@ The big picture, ahead of the detail sections below:
   out of the LRU (`cache_diff`), the persistent store (`worth_persisting`) and every stats
   harvest (`diff::built_stats`): served from any of them, a transient error (EMFILE, a pack
   replaced under `git gc`) became a blank pane on every revisit and a "0 files" cell that
-  stood as a real answer.
+  stood as a real answer. **Nor is one installed**: a failed build the reader is waiting
+  on clears the pane (`arrival`, rows 2 and 8). Installed, the empty diff became the key
+  on screen, and `load_selected_diff`'s identical-key return then refused every retry.
 
 ### Startup & timing
 Startup work is structured so the window paints as soon as possible; the heavy/IO-bound
@@ -2192,8 +2220,7 @@ tokenizer, or coloured inline when it is gone — each releasing the claim only 
 send; an adopted warm delivered at once and uncoloured, by the worker or ahead of the
 tokenizer's next pass, and an adopted oversized or unconverted one sent uncacheable before its
 claim goes back (the unadopted control still dropped on the worker), and a warm the reader
-left unadopted — still claimed, adoptable again; and
-`warm_disposition`'s precedence, an uncacheable result only ever installed or dropped),
+left unadopted — still claimed, adoptable again),
 `commitgraph` (the file format, over fixtures this suite writes itself so it depends
 on no `git` binary: both on-disk shapes, a zeroed generation refused as the
 pre-2.19 marker it is, a chunk whose claimed end is past the real end of the file,
@@ -2240,6 +2267,10 @@ binaries, symlinks, modes, and every refusal the write layer owes the user), and
 layout, diff integration over temp repos, and UI helpers — including
 `loading_diff_text`, whose cases (three phases, and an adopted warm building in the
 background) are each a sentence the reader will stare at while they wait;
+`arrival`'s table row by row — each row a baseline with its one deciding fact flipped, every
+drop with its reason, the precedence where two rows match, and the retired
+`warm_disposition` truth table ported whole — `settled_after_install` against
+`band_warmable` (an install that kept the on-screen copy must not shut the band),
 `adopted_warm_undelivered`'s truth table and `drain_warms`' frame order against a scripted
 warm (one that sends and releases mid-drain is installed, never rebuilt; one released without
 sending falls back), the load-state "still waiting" predicate and the span-only re-key; and
@@ -2439,7 +2470,7 @@ ones that actually fail when the write is removed.
 - Any new diff-*data*-affecting setting goes in `DiffSettings` only. `GitkApp` holds one `DiffSettings` field (the diff-shaping state — `context`/`ignore_ws`/`ignore_blank_lines`/`detect_renames`/`detect_copies` are toolbar-owned + persisted, grouped as `ToolbarDiffSettings`; `show_stats`/`textconv` come from `[diff]` config), and `DiffCacheKey` *embeds* a `DiffSettings`. (It also carries a `drivers` fingerprint, which is NOT a setting — it is the repo's own `diff.<name>.textconv` config, and it is in the key for the same reason: an edited driver changes a driven file's whole body without moving the oid. See **Textconv**.) So a field added to `DiffSettings` is automatically (a) part of the cache key — cached diffs invalidate when it changes, no second edit site — and (b) covered by the config-reload's whole-struct comparison (`new_settings != self.diff_settings`), which triggers the re-diff. The prefetch mapping reads it back as `key.settings`. Settings that only change *spans* (theme, syntax on/off, `diff_bg`, `[diff.languages]`) or *render* (`file_list`) are handled by their own branches in the config-reload block, not `DiffSettings`. The four render-only settings the TOOLBAR owns — `word_diff`, `line_numbers`, `wrap` and `side` — have no reload branch at all, because they have no config key to reload from; a render-only setting added later has to choose which of those two shapes it is. `file_list` decides the order the pane's patch bodies are laid out in as well as the sidebar's rows, which is a re-lay of built data and not a re-diff — it stays out here because `diff::order_files` is idempotent, so a cached or stored diff is re-laid on install rather than rebuilt (see **Bottom panel**). `wrap` is the third shape and not a config setting at all: it is toolbar-owned like `word_diff` and `line_numbers`, so it has no reload branch to forget, and it needs no re-lay either — the wrap index is measured by the render on the first frame that wants one and `resync_wrap_index`'s own `!wrap` arm drops it, reporting that drop as a move so the reader's line is pinned (see **Soft wrapping**). `side` is that same third shape, and its index composes with `wrap`'s rather than replacing it — the composition living in `diff::RowMap`, which is what the pane addresses rows through (see **Reading one side**).
   The span half is **one struct too** (`SpanSettings`, held as `GitkApp::span_settings`), compared and assigned whole for the same reason `DiffSettings` is: as four loose fields the reload's test was a four-term `||` chain that a fifth setting could silently miss, and missing it is not a lost frame — every cached diff keeps yesterday's colours, sticky via `diff_cache.contains`, for the session with nothing logged. Which of the four are in `DiffCacheKey` is unchanged and is the next paragraph's subject.
   **Three of those four span settings are in `DiffCacheKey`, and the fourth shapes no span** — so a stale entry simply misses, and the reload neither clears the cache nor carries an epoch. `theme` and `enabled` are their own key fields; `[diff.languages]` is a `u64` from `highlight::languages_fingerprint`, cached on `GitkApp` because `diff_cache_key` runs ~54 times per dispatch and the map is a `BTreeMap`. `diff_bg` is **not** in the key and must not be: it decides `DiffPalette::added_bg`/`deleted_bg`, which `diff_row_job` reads live from `self.diff_palette` at render time, and the one palette-derived span (`tokenize`'s grammar-hiccup fallback) takes `foreground`, which is theme-derived. Nothing bakes it into a `Span`. `set_span_settings` is the sole later writer of the map and the fingerprint both, so the cached value cannot describe a map that is gone — which would be silent and permanent, every key hitting entries tokenized with the wrong grammar while `diff_cache.contains` kept any dispatch from rebuilding them.
-  **This replaced a cache clear plus a `span_gen` epoch, and the epoch is the part worth understanding.** The clear could not reach warms already queued or running: they were dispatched under the OLD span settings, and with `diff_bg`/`languages` absent from the key `key_is_current` waved their results through, so they landed back in the just-cleared cache carrying the old colours — after which every dispatch skipped them via `contains` and those rows stayed flat for the session. The fix at the time was to stamp a generation on every warm job (on the job, like `hl`, so a reload could not race a worker mid-row) and check it on return, which cost a `u64` threaded through seven layers: `GitkApp` → `PoolHandle::submit` → `CoordMsg::Submit` → `Coordinator` → `Job::Warm` → `warm_row` → `WarmResult` → `WarmFacts::spans_current` → `WarmDisposition::DropStaleSpans`. Putting `languages` in the key retires all of it: such a warm now fails `key_is_current` and is dropped as **stale-KEYED**, by the mechanism that already existed for every other setting. It is also strictly better than the clear, which threw away the whole warm band for a `diff_bg` tweak that invalidated nothing. `DiffCacheKey.drivers` had already solved the identical problem — a config-shaped input that changes a diff without moving the oid — the same way; this is that lesson applied to the last input that had not learned it. **A span setting added later joins the KEY**, unless it can be shown to reach no span.
+  **This replaced a cache clear plus a `span_gen` epoch, and the epoch is the part worth understanding.** The clear could not reach warms already queued or running: they were dispatched under the OLD span settings, and with `diff_bg`/`languages` absent from the key `key_is_current` waved their results through, so they landed back in the just-cleared cache carrying the old colours — after which every dispatch skipped them via `contains` and those rows stayed flat for the session. The fix at the time was to stamp a generation on every warm job (on the job, like `hl`, so a reload could not race a worker mid-row) and check it on return, which cost a `u64` threaded through seven layers: `GitkApp` → `PoolHandle::submit` → `CoordMsg::Submit` → `Coordinator` → `Job::Warm` → `warm_row` → `WarmResult` → `WarmFacts::spans_current` → `WarmDisposition::DropStaleSpans` (both since retired with `warm_disposition`, which `arrival` replaced). Putting `languages` in the key retires all of it: such a warm now fails `key_is_current` and is dropped as **stale-KEYED**, by the mechanism that already existed for every other setting. It is also strictly better than the clear, which threw away the whole warm band for a `diff_bg` tweak that invalidated nothing. `DiffCacheKey.drivers` had already solved the identical problem — a config-shaped input that changes a diff without moving the oid — the same way; this is that lesson applied to the last input that had not learned it. **A span setting added later joins the KEY**, unless it can be shown to reach no span.
 - **A missing grammar is invisible unless something reports it.** `Highlighter::new_file_state` resolves a syntax from the path's extension and falls back to syntect's **plain text** — which still sets a span on every line. So `pending_files` comes back empty, `ensure_diff_highlighted` skips the diff on selection, and it renders in one flat colour for the session with every log line calling it highlighted. `highlight::DEFAULT_LANGUAGES` maps the few suffixes syntect has a grammar for but does
   not claim (`.mjs`/`.cjs` → JavaScript), config entries overriding it; an extension where
   plain text is the CORRECT rendering (`.pem`) is deliberately absent, since mapping it to
