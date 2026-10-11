@@ -316,7 +316,10 @@ write layer: `ApplyAction`/`ApplyRequest`/`ApplyError`, the
 (`resolve_diff_bg`), `[diff.languages]`, fontdb resolution + cache,
 role→FontId map), `src/highlight.rs` (syntect highlighter, theme/palette
 resolution, grammar selection, per-line tokenization — no diff knowledge; the
-diff-side orchestration is `src/diff_highlight.rs`), `src/diff_cache.rs` (line-budget LRU cache),
+diff-side orchestration is `src/diff_highlight.rs`), `src/diff_cache.rs` (weight-budget LRU cache; the app weighs a diff by `DiffData::heap_bytes`
+— rows measured where they are assembled, spans kept by `PerRow` as they are written — under
+`diff_cache_byte_budget`, which is the line budget at `BYTES_PER_CACHED_LINE`, so the prefetch
+bounds and the cache still turn on one dial),
 `src/diffstat.rs` (the `--stat` block above a patch, formatted from the counts the
 build already has — a port of libgit2's own formatter, which exists so `Diff::stats`
 (a whole second pass over every blob, 38% of a build) never runs; see **Diffstat

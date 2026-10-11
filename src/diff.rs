@@ -289,6 +289,21 @@ pub struct PerRow<T> {
     /// One entry per chunk; an EMPTY inner vector means nothing in that chunk has been
     /// written, and allocates nothing.
     chunks: Vec<Vec<Option<T>>>,
+    /// Heap bytes owned by the values currently set, kept exact by `set`/`take`/`clear`
+    /// so `heap_bytes` never walks the rows.
+    owned: usize,
+}
+
+/// What a value owns on the heap beyond its own `size_of` — the part a container holding
+/// it cannot see. The diff cache weighs entries by it.
+pub trait HeapSize {
+    fn heap_size(&self) -> usize;
+}
+
+impl<T> HeapSize for Vec<T> {
+    fn heap_size(&self) -> usize {
+        self.capacity() * std::mem::size_of::<T>()
+    }
 }
 
 /// Rows per `PerRow` chunk. 4096 slots is 96KB for a span chunk — small enough that a
@@ -319,6 +334,7 @@ impl<T> PerRow<T> {
             chunks: std::iter::repeat_with(Vec::new)
                 .take(rows.div_ceil(PER_ROW_CHUNK))
                 .collect(),
+            owned: 0,
         }
     }
 
@@ -343,6 +359,18 @@ impl<T> PerRow<T> {
         self.get(row).is_some()
     }
 
+    /// Back to "nothing computed", keeping the room — a theme change invalidates every
+    /// span without changing a single row. The chunks go with them: what a re-highlight
+    /// wants back is the memory, not the empty slots.
+    pub fn clear(&mut self) {
+        for chunk in &mut self.chunks {
+            *chunk = Vec::new();
+        }
+        self.owned = 0;
+    }
+}
+
+impl<T: HeapSize> PerRow<T> {
     /// Record this row's value, allocating its chunk if this is the first write into
     /// that chunk. A row past the end is dropped: highlight batches are computed
     /// against a snapshot of the diff and can outlive it.
@@ -355,25 +383,33 @@ impl<T> PerRow<T> {
         if chunk.is_empty() {
             chunk.resize_with(PER_ROW_CHUNK, || None);
         }
-        chunk[row % PER_ROW_CHUNK] = Some(value);
+        self.owned += value.heap_size();
+        if let Some(old) = chunk[row % PER_ROW_CHUNK].replace(value) {
+            self.owned -= old.heap_size();
+        }
     }
 
     /// Remove this row's value and return it — the re-lay's half of `set`, so a
     /// permutation moves what was computed rather than copying it.
     pub fn take(&mut self, row: usize) -> Option<T> {
-        self.chunks
+        let value = self
+            .chunks
             .get_mut(row / PER_ROW_CHUNK)?
             .get_mut(row % PER_ROW_CHUNK)?
-            .take()
+            .take()?;
+        self.owned -= value.heap_size();
+        Some(value)
     }
 
-    /// Back to "nothing computed", keeping the room — a theme change invalidates every
-    /// span without changing a single row. The chunks go with them: what a re-highlight
-    /// wants back is the memory, not the empty slots.
-    pub fn clear(&mut self) {
-        for chunk in &mut self.chunks {
-            *chunk = Vec::new();
-        }
+    /// Heap bytes held: every allocated chunk's slots, the chunk vector itself, and what
+    /// the set values own. O(chunks) — the owned part is kept as values are written.
+    pub fn heap_bytes(&self) -> usize {
+        let slots: usize = self
+            .chunks
+            .iter()
+            .map(|c| c.capacity() * std::mem::size_of::<Option<T>>())
+            .sum();
+        self.chunks.capacity() * std::mem::size_of::<Vec<Option<T>>>() + slots + self.owned
     }
 }
 
@@ -973,6 +1009,7 @@ pub type DiffParts = (
     usize,
     bool,
     bool,
+    usize,
 );
 
 pub struct DiffData {
@@ -1024,9 +1061,47 @@ pub struct DiffData {
     /// decoded from a store written before this existed, simply pay the scan as it
     /// always did.
     pub tabless: bool,
+    /// Heap bytes the ROWS hold: each row struct plus its text allocation (the `Arc`
+    /// header included). Summed once where the rows are assembled — on the building
+    /// worker, or the store's decoding one — and carried across the display boundary,
+    /// so weighing a diff for the cache never walks its rows on the UI thread. Rows
+    /// moved by `order_files` keep their allocations; a re-lay rebuilds the row array at
+    /// exact capacity, so this may over-state by the build's spare capacity (the safe
+    /// direction).
+    pub row_bytes: usize,
+}
+
+/// What a row array holds on the heap. `text.len()` comes off the fat pointer, so this
+/// reads the row structs and never the text — one pass over memory the build just wrote.
+// capacity() is what is being measured; a slice has none
+#[allow(clippy::ptr_arg)]
+fn rows_heap_bytes(lines: &Vec<DiffLine>) -> usize {
+    const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
+    lines.capacity() * std::mem::size_of::<DiffLine>()
+        + lines
+            .iter()
+            .map(|l| ARC_HEADER + l.text.len())
+            .sum::<usize>()
 }
 
 impl DiffData {
+    /// Approximate heap bytes held: rows (measured at assembly), spans (kept by
+    /// `PerRow`), and the file list. The diff cache's weight. O(files).
+    pub fn heap_bytes(&self) -> usize {
+        let files = self.files.capacity() * std::mem::size_of::<FileEntry>()
+            + self
+                .files
+                .iter()
+                .map(|f| {
+                    f.path.capacity()
+                        + f.old_path.as_ref().map_or(0, String::capacity)
+                        + f.path_bytes.capacity()
+                        + f.old_path_bytes.as_ref().map_or(0, Vec::capacity)
+                })
+                .sum::<usize>();
+        self.row_bytes + self.spans.heap_bytes() + files
+    }
+
     /// `with_max_chars` with the widest line rescanned off the finished rows.
     ///
     /// Test-only, and that is the point of `DiffRows`: the build path accumulates the
@@ -1057,6 +1132,7 @@ impl DiffData {
     /// `cache_diff`'s guard and back into the LRU, for the one diff most likely to be
     /// revisited.
     pub fn with_max_chars(lines: Vec<DiffLine>, files: Vec<FileEntry>, max_chars: usize) -> Self {
+        let row_bytes = rows_heap_bytes(&lines);
         Self {
             // The one place a diff's span slots are allocated against its rows, which
             // is what keeps "index i means row i" true for everything downstream.
@@ -1066,6 +1142,7 @@ impl DiffData {
             max_chars,
             textconv_failed: false,
             tabless: false,
+            row_bytes,
         }
     }
 
@@ -1086,8 +1163,17 @@ impl DiffData {
             max_chars,
             textconv_failed,
             tabless,
+            row_bytes,
         } = self;
-        (lines, spans, files, max_chars, textconv_failed, tabless)
+        (
+            lines,
+            spans,
+            files,
+            max_chars,
+            textconv_failed,
+            tabless,
+            row_bytes,
+        )
     }
 
     /// Reassemble what `into_parts` split — the stash path returning the *displayed*
@@ -1095,6 +1181,8 @@ impl DiffData {
     /// build-time `max_chars` exists to avoid). Every part moves: the rows and the
     /// spans go back to the cache as they are, which is what makes a revisit restore a
     /// diff's colour instead of re-tokenizing it.
+    // the exhaustive mirror of into_parts; a struct here would be a second DiffData
+    #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         lines: Arc<Vec<DiffLine>>,
         spans: RowSpans,
@@ -1102,6 +1190,7 @@ impl DiffData {
         max_chars: usize,
         textconv_failed: bool,
         tabless: bool,
+        row_bytes: usize,
     ) -> Self {
         // The one invariant the split gave up on being structural: index `i` has to mean
         // row `i` in both, so the two lengths have to agree. Every writer goes through
@@ -1118,6 +1207,7 @@ impl DiffData {
             max_chars,
             textconv_failed,
             tabless,
+            row_bytes,
         }
     }
 
@@ -4113,9 +4203,53 @@ pub fn next_file_line(starts: &[(usize, usize)], top: usize, down: bool) -> Opti
 // different settings while looking identical.
 pub mod tests {
     use super::*;
+
     use crate::diff::convert::tests::{commit_two_zips, driven_repo};
 
     use crate::test_repo::file_entry as fe;
+
+    fn text_row(text: &str) -> DiffLine {
+        DiffLine {
+            text: Arc::from(text),
+            kind: LineKind::Context,
+            old_lineno: None,
+            new_lineno: None,
+        }
+    }
+
+    #[test]
+    fn heap_bytes_weighs_long_lines_by_their_text() {
+        let short = DiffData::with_max_chars(vec![text_row("x"); 2], vec![], 1);
+        let long_text = "y".repeat(1 << 20);
+        let long = DiffData::with_max_chars(
+            vec![text_row("x"), text_row(&long_text)],
+            vec![],
+            long_text.len(),
+        );
+        assert!(
+            long.heap_bytes() - short.heap_bytes() >= (1 << 20) - 1,
+            "a 1MB line must weigh ~1MB more than a 1-byte one: {} vs {}",
+            long.heap_bytes(),
+            short.heap_bytes()
+        );
+    }
+
+    #[test]
+    fn heap_bytes_counts_spans_once_set() {
+        let mut d = DiffData::with_max_chars(vec![text_row("abc"); 4], vec![], 3);
+        let bare = d.heap_bytes();
+        d.spans.set(0, vec![(egui::Color32::RED, 0..3); 10]);
+        assert!(d.heap_bytes() >= bare + 10 * std::mem::size_of::<highlight::Span>());
+    }
+
+    #[test]
+    fn row_bytes_survives_the_display_round_trip() {
+        let d = DiffData::with_max_chars(vec![text_row("hello"); 3], vec![], 5);
+        let before = d.heap_bytes();
+        let (lines, spans, files, max_chars, failed, tabless, row_bytes) = d.into_parts();
+        let back = DiffData::from_parts(lines, spans, files, max_chars, failed, tabless, row_bytes);
+        assert_eq!(back.heap_bytes(), before);
+    }
 
     /// The stat block this build writes is byte-for-byte what libgit2 would have
     /// written — over a commit carrying every shape the formatter branches on.
@@ -5870,6 +6004,49 @@ pub mod tests {
         assert_eq!(file_index_at_line_opt(&starts, 5), Some(1)); // src/b.rs
         assert_eq!(file_index_at_line_opt(&starts, 7), Some(2)); // Cargo.toml
         assert_eq!(file_index_at_line_opt(&starts, 1), None); // head region
+    }
+
+    #[test]
+    fn per_row_heap_bytes_tracks_chunks_and_owned_values() {
+        let slot = std::mem::size_of::<Option<Vec<u8>>>();
+        let mut p: PerRow<Vec<u8>> = PerRow::blank(super::PER_ROW_CHUNK * 3);
+        let empty = p.heap_bytes();
+
+        p.set(1, Vec::with_capacity(100));
+        assert_eq!(
+            p.heap_bytes() - empty,
+            super::PER_ROW_CHUNK * slot + 100,
+            "the first write allocates one chunk of slots and owns its value's capacity"
+        );
+
+        p.set(1, Vec::with_capacity(40));
+        assert_eq!(
+            p.heap_bytes() - empty,
+            super::PER_ROW_CHUNK * slot + 40,
+            "an overwrite replaces the old value's bytes rather than adding to them"
+        );
+
+        assert_eq!(p.take(1).map(|v| v.capacity()), Some(40));
+        assert_eq!(
+            p.heap_bytes() - empty,
+            super::PER_ROW_CHUNK * slot,
+            "a taken value's bytes leave with it; the chunk stays allocated"
+        );
+
+        p.set(super::PER_ROW_CHUNK * 2, Vec::with_capacity(8));
+        p.clear();
+        assert_eq!(
+            p.heap_bytes(),
+            empty,
+            "clear frees every chunk and every value"
+        );
+    }
+
+    /// Plain integers own nothing on the heap; lets the chunk-arithmetic test store them.
+    impl HeapSize for usize {
+        fn heap_size(&self) -> usize {
+            0
+        }
     }
 
     /// The chunk arithmetic, at the boundaries it can be wrong at — which is the whole

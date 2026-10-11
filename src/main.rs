@@ -294,7 +294,9 @@ impl DiffViewport {
 
 // ── Commit data ──────────────────────────────────────────────────────────
 
-/// Total cached diff lines before the LRU starts evicting.
+/// Line budget the diff cache's BYTE budget is derived from (`diff_cache_byte_budget`).
+/// The LRU evicts by heap bytes (`DiffData::heap_bytes`), so this is a ceiling expressed
+/// through lines at `BYTES_PER_CACHED_LINE`, not a count of cached lines.
 ///
 /// Sized so that **no diff a real repo produces gets refused a cache entry**, and so
 /// that several `warm_band`s fit beside it. Two numbers set it:
@@ -316,14 +318,18 @@ impl DiffViewport {
 /// `DiffOnly` entry pays none of them. So ~305 B/line highlighted, ~105 B/line for a
 /// `DiffOnly` warm.
 ///
-/// Both numbers came down when `DiffLine` did — 40 B off the row (spans moved out) and
-/// 24 B off the heap (`Arc<str>` for `Arc<String>`) — so **`BYTES_PER_CACHED_LINE` is
-/// now conservative**, and deliberately left that way: it over-states the per-line cost,
-/// which under-fills the cache rather than over-filling it, and re-cutting it is a
-/// measurement rather than an arithmetic exercise. At the figures above this budget is
-/// roughly **250 MB** at a realistic mix, and ~365 MB if every entry were highlighted.
-/// That is a deliberate trade of memory for never re-diffing, not an oversight — it is
-/// the one dial, and turning it down scales both prefetch bounds with it.
+/// Measured on 300 commits each of two real repos (`DiffData::heap_bytes`): a `DiffOnly`
+/// entry runs ~115-130 B/line (worst seen 2,132 B/line, a few very long lines), a
+/// highlighted one ~590-600 B/line, because the span `Vec`s carry ~2x spare capacity
+/// (6.8 spans a row against 13.8 capacity). Those figures exclude allocator overhead
+/// (~8-24 B per allocation), so for short lines they sit 10-20% under RSS.
+///
+/// The cache weighs entries by those heap bytes, so it fills to its byte budget
+/// (`BYTES_PER_CACHED_LINE` x this ceiling, ~348 MB) whatever the highlighted/`DiffOnly`
+/// mix: a mostly-`DiffOnly` cache holds far more lines than the budget names, a fully
+/// highlighted one fewer. That is a deliberate trade of memory for never re-diffing, and
+/// this is the one dial — turning it down scales the byte budget and both prefetch
+/// bounds with it.
 const DIFF_CACHE_LINE_CEILING: usize = 1_200_000;
 /// Floor on the derived cache, so a machine already short of memory still caches
 /// something. `DiffCache::insert` keeps at least one entry regardless, so this is about
@@ -336,11 +342,11 @@ const DIFF_CACHE_LINE_FLOOR: usize = 100_000;
 /// Share of the memory budget the diff cache may hold. The rest is for everything else
 /// gitkay allocates — the live diff, the pool's transient blobs, egui's own buffers.
 const CACHE_SHARE_PERCENT: u64 = 25;
-/// Bytes one cached line costs, averaged over the highlighted and `DiffOnly` mixes
-/// measured from the structs. Only used to turn a byte budget into the cache's
-/// line-shaped one, so a rough figure is the right kind of answer — and this one now
-/// sits above both (see `DIFF_CACHE_LINE_CEILING`), which spends less memory than the
-/// share allows rather than more.
+/// Bytes one cached line is assumed to cost. Converts the line budget into the cache's
+/// BYTE budget (`diff_cache_byte_budget`) — the cache itself is no longer line-shaped —
+/// and keeps the prefetch bounds, which stay line-shaped, scaling with the same dial.
+/// A rough figure between the measured `DiffOnly` and highlighted costs (see
+/// `DIFF_CACHE_LINE_CEILING`).
 const BYTES_PER_CACHED_LINE: u64 = 290;
 
 /// The diff cache's line budget, from the system's memory where it will say.
@@ -371,6 +377,15 @@ fn diff_cache_line_budget() -> usize {
         }
     );
     budget
+}
+
+/// The diff cache's budget in heap BYTES — what `DiffData::heap_bytes` weighs entries
+/// in. Derived from the line budget at `BYTES_PER_CACHED_LINE`, so there is still one
+/// dial: the prefetch bounds are fractions of the line budget, and this moves with it.
+/// What changed is only what an entry is charged — its measured bytes rather than its
+/// line count — so a diff of a few enormous lines is no longer weighed like a short one.
+fn diff_cache_byte_budget(line_budget: usize) -> usize {
+    line_budget.saturating_mul(usize::try_from(BYTES_PER_CACHED_LINE).unwrap_or(usize::MAX))
 }
 /// Real commits loaded by the startup walk. The `all_loaded` derivation compares
 /// the loaded count against this same constant (and the watcher-reload floor
@@ -3585,6 +3600,8 @@ struct GitkApp {
     /// an install does not re-read the diff's text to find out — and, like
     /// `diff_textconv_failed`, what `from_parts` needs back on the way to the cache.
     diff_tabless: bool,
+    /// `DiffData::row_bytes` of the displayed diff, carried for `from_parts`.
+    diff_row_bytes: usize,
     /// Cached per-row galleys for the (un-virtualized) file-list sidebar.
     sidebar_cache: SidebarCache,
     /// Sorted `(patch start line, file index)` for the current diff — the
@@ -4371,6 +4388,7 @@ impl GitkApp {
             diff_linenos: None, // no diff yet, and nothing to measure until one draws
             diff_textconv_failed: false,
             diff_tabless: false,
+            diff_row_bytes: 0,
             sidebar_cache: SidebarCache::default(),
             file_line_starts: Vec::new(),
             file_is_test: Vec::new(),
@@ -4384,7 +4402,7 @@ impl GitkApp {
             highlight_tx,
             highlight_rx,
             highlight_priority: None,
-            diff_cache: DiffCache::new(cache_line_budget),
+            diff_cache: DiffCache::new(diff_cache_byte_budget(cache_line_budget)),
             diff_deps: DiffDeps {
                 store: diff_store,
                 textconv: Arc::new(Textconv::new()),
@@ -4771,6 +4789,7 @@ impl GitkApp {
                 self.diff_max_chars,
                 self.diff_textconv_failed,
                 self.diff_tabless,
+                self.diff_row_bytes,
             );
             // A virtual entry is content-keyed, so each working-tree edit — or, for the
             // range row, each move of its endpoints — produces a fresh hash and the
@@ -4864,7 +4883,7 @@ impl GitkApp {
     }
 
     /// Insert a finished diff into the cache under `key` — the single place the cache's
-    /// weight unit (line count) is decided — and take the commit-list numbers off it
+    /// weight unit (heap bytes, `DiffData::heap_bytes`) is decided — and take the commit-list numbers off it
     /// while it is in hand.
     ///
     /// Harvesting the column here is what stops the same expensive work being done
@@ -4917,7 +4936,7 @@ impl GitkApp {
             );
             return;
         }
-        let weight = data.lines.len();
+        let weight = data.heap_bytes();
         self.diff_cache.insert(key, data, weight);
     }
 
@@ -5014,7 +5033,8 @@ impl GitkApp {
         // field added to `DiffData` a compile error here rather than a value silently
         // dropped at the display boundary. `max_chars` is precomputed at build time (on
         // the worker), so no per-line rescan happens here.
-        let (lines, spans, files, max_chars, textconv_failed, tabless) = data.into_parts();
+        let (lines, spans, files, max_chars, textconv_failed, tabless, row_bytes) =
+            data.into_parts();
         self.diff_max_chars = max_chars;
         // Drop the previous diff's gutter widths; the render re-measures on the
         // first frame that needs them, so a session with line numbers off never
@@ -5038,6 +5058,7 @@ impl GitkApp {
         // for the reason `diff_textconv_failed` is: the display outlives the `DiffData`
         // it was split out of, and `from_parts` needs it back.
         self.diff_tabless = tabless;
+        self.diff_row_bytes = row_bytes;
         // Emphasis is not part of a diff and is not carried across one: it is per
         // viewport, and `ensure_visible_word_emphasis` refills the window on the next
         // frame. Sized here against the incoming rows, which is the one place it can be
@@ -5302,7 +5323,7 @@ impl GitkApp {
             }
         } else {
             log::warn!("no foreground worker took the diff load; loading synchronously");
-            // scope/key were moved into the (dropped) closure; re-resolve them for the
+            // scope/key moved into the `DiffLoadJob`, which was dropped unrun; re-resolve them for the
             // synchronous fallback. Only this rare path needs a repo handle, so discover
             // it here rather than on every navigation.
             match Repository::discover(&self.repo_path) {
@@ -8602,7 +8623,7 @@ impl Drop for GitkApp {
         // flight at exit, and the duration is what would regress if someone put the
         // freeing back.
         log::debug!(
-            "shutdown: abandoned {displayed} displayed + {cached} cached diff lines \
+            "shutdown: abandoned {displayed} displayed lines + {cached} cached diff bytes \
              to the OS in {:?}",
             t.elapsed()
         );
@@ -9439,11 +9460,28 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::diff::{LineStats, RowSpans, oid_staged, oid_uncommitted};
     use crate::diff_highlight::{file_fully_highlighted, pending_files, pick_file, requeue_file};
     use crate::history::load_commits;
     use crate::test_repo::{commit_file, commit_index, commit_rename, rename_file, temp_repo};
+
+    #[test]
+    fn the_byte_budget_is_the_line_budget_at_the_documented_rate() {
+        // One dial: the byte budget moves with the line budget the pool's bounds are
+        // fractions of, so turning one down cannot leave the other where it was.
+        let rate = usize::try_from(BYTES_PER_CACHED_LINE).unwrap();
+        assert_eq!(
+            diff_cache_byte_budget(DIFF_CACHE_LINE_CEILING),
+            DIFF_CACHE_LINE_CEILING * rate
+        );
+        assert_eq!(
+            diff_cache_byte_budget(DIFF_CACHE_LINE_FLOOR),
+            DIFF_CACHE_LINE_FLOOR * rate
+        );
+        assert_eq!(diff_cache_byte_budget(usize::MAX), usize::MAX, "saturates");
+    }
 
     /// A row's `node_col` is not bounded by the width the layout reserved, so the
     /// lane mapping must saturate into it: without that, the caller's right-edge

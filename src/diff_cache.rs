@@ -1,7 +1,7 @@
-//! A small line-budget LRU cache, generic over key and value. Keeps recently
+//! A small weight-budget LRU cache, generic over key and value. Keeps recently
 //! viewed diffs (and their highlight spans) so revisiting a commit is instant.
 //! Knows nothing of git, egui, or the highlight worker: the caller supplies a
-//! per-entry `weight` (we use a diff's line count) and the cache evicts the
+//! per-entry `weight` (we use a diff's heap bytes, `DiffData::heap_bytes`) and the cache evicts the
 //! least-recently-used entries once the total weight exceeds `budget`.
 
 use std::collections::HashMap;
@@ -38,7 +38,7 @@ impl<K: Clone + Eq + Hash, V> DiffCache<K, V> {
         if let Some(entry) = self.entries.remove(key) {
             self.total -= entry.weight;
             log::debug!(
-                "diff cache: remove HIT ({} lines) → {} entries / {} lines",
+                "diff cache: remove HIT ({} bytes) → {} entries / {} bytes",
                 entry.weight,
                 self.entries.len(),
                 self.total
@@ -50,7 +50,7 @@ impl<K: Clone + Eq + Hash, V> DiffCache<K, V> {
         }
     }
 
-    /// The summed weight — lines — of everything held. For the shutdown timing log,
+    /// The summed weight — bytes — of everything held. For the shutdown timing log,
     /// where the count is what makes the duration mean something.
     pub const fn weight(&self) -> usize {
         self.total
@@ -94,7 +94,7 @@ impl<K: Clone + Eq + Hash, V> DiffCache<K, V> {
         }
         self.total += weight;
         let mut evicted_n = 0usize;
-        let mut evicted_lines = 0usize;
+        let mut evicted_bytes = 0usize;
         while self.total > self.budget && self.entries.len() > 1 {
             let lru = self
                 .entries
@@ -105,20 +105,20 @@ impl<K: Clone + Eq + Hash, V> DiffCache<K, V> {
             if let Some(evicted) = self.entries.remove(&lru) {
                 self.total -= evicted.weight;
                 evicted_n += 1;
-                evicted_lines += evicted.weight;
+                evicted_bytes += evicted.weight;
             }
         }
         if evicted_n > 0 {
             log::debug!(
-                "diff cache: insert {weight} lines, evicted {evicted_n} ({evicted_lines} lines) \
-                 → {} entries / {} lines (budget {})",
+                "diff cache: insert {weight} bytes, evicted {evicted_n} ({evicted_bytes} bytes) \
+                 → {} entries / {} bytes (budget {})",
                 self.entries.len(),
                 self.total,
                 self.budget
             );
         } else {
             log::debug!(
-                "diff cache: insert {weight} lines → {} entries / {} lines (budget {})",
+                "diff cache: insert {weight} bytes → {} entries / {} bytes (budget {})",
                 self.entries.len(),
                 self.total,
                 self.budget
