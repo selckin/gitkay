@@ -5696,13 +5696,8 @@ impl GitkApp {
             priority,
             tx: self.highlight_tx.clone(),
             ctx: ctx.clone(),
+            submitted: std::time::Instant::now(),
         };
-        // `Builder::spawn` returns Err on thread exhaustion (vs `spawn`, which
-        // panics). On failure, highlight synchronously so the diff still gets
-        // coloured rather than staying plain forever.
-        // Contain a syntect panic to this one diff (as the prefetch worker does): without
-        // this a bad grammar/line would kill the highlight thread and leave every later
-        // diff plain for the rest of the session.
         // The highlight thread when it is there; a thread of this pass's own when it is
         // not (the path that existed before the service); the frame loop last.
         let job = match &self.highlight_service {
@@ -5716,6 +5711,12 @@ impl GitkApp {
             },
             None => job,
         };
+        // `Builder::spawn` returns Err on thread exhaustion (vs `spawn`, which
+        // panics). On failure, highlight synchronously so the diff still gets
+        // coloured rather than staying plain forever.
+        // Contain a syntect panic to this one diff (as the prefetch worker does): without
+        // this a bad grammar/line would kill the highlight thread and leave every later
+        // diff plain for the rest of the session.
         if spawn_guarded(
             "gitkay-highlight-pass",
             "highlight thread panicked",
@@ -5923,11 +5924,12 @@ impl GitkApp {
             let inflight = lock_inflight(&self.inflight_diffs);
             prefetch_targets(&self.commits, sel, &view)
                 .into_iter()
-                .map(|(oid, depth)| PrefetchTarget {
+                .map(|(oid, depth, distance)| PrefetchTarget {
                     probed: None,
                     key: self.diff_cache_key(oid),
                     scope: self.row_scope(oid),
                     depth,
+                    distance,
                 })
                 .filter(|t| {
                     !self.diff_cache.contains(&t.key)

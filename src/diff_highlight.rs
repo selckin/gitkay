@@ -501,6 +501,9 @@ pub struct HighlightJob {
     pub priority: Arc<VisibleRange>,
     pub tx: mpsc::Sender<HighlightMsg>,
     pub ctx: egui::Context,
+    /// When the UI built this job, so the pass can log how long it queued behind the
+    /// service's other work.
+    pub submitted: std::time::Instant,
 }
 
 /// The most common file extensions in `paths` that `keep` accepts: distinct,
@@ -558,6 +561,7 @@ pub fn highlight_worker(job: HighlightJob) {
         priority,
         tx,
         ctx,
+        submitted,
     } = job;
 
     // This worker is superseded once a newer highlight pass has started.
@@ -579,6 +583,12 @@ pub fn highlight_worker(job: HighlightJob) {
         until_row: None,
     };
     let mut coloured = 0usize;
+    if !superseded() {
+        log::debug!(
+            "perf: worker gen {generation} started after {:?} queued",
+            submitted.elapsed()
+        );
+    }
     // `pending` holds only the files with unhighlighted code lines; a fully-cached diff
     // yields an empty list and the worker exits immediately with no work. It arrives on
     // the job because the spans it is derived from live on the UI side now.
@@ -689,9 +699,10 @@ enum ServiceJob {
 /// Why one thread rather than one per pass: syntect's regexes (fancy-regex over
 /// regex-automata) keep their match caches per THREAD-ID SLOT, for the life of the
 /// process, and a thread-per-pass reached a new slot with every diff until all eight
-/// were full. Measured: ~30 MiB of held memory per extra tokenizing thread on a
-/// multi-language mix. A fixed thread pays once. It also makes it the regexes' long-
-/// lived OWNER when it runs the prewarm, which a prewarm thread that exits never is.
+/// slots (plus the owner) were full. Measured: ~30 MiB of held memory per extra
+/// tokenizing thread on a multi-language mix. A fixed thread pays once. It also makes
+/// it the regexes' long-lived OWNER when it runs the prewarm, which a prewarm thread
+/// that exits never is.
 #[derive(Clone)]
 pub struct HighlightService {
     tx: mpsc::Sender<ServiceJob>,
@@ -738,6 +749,8 @@ impl HighlightService {
 fn service_loop(rx: &mpsc::Receiver<ServiceJob>) {
     let mut passes = std::collections::VecDeque::new();
     let mut warm = std::collections::VecDeque::new();
+    // Languages warmed since the warm queue was last empty, for the "done" line.
+    let mut warmed = 0usize;
     loop {
         let idle = passes.is_empty() && warm.is_empty();
         let next = if idle {
@@ -759,7 +772,14 @@ fn service_loop(rx: &mpsc::Receiver<ServiceJob>) {
         if let Some(job) = passes.pop_front() {
             contained("a highlight pass", || highlight_worker(job));
         } else if let Some((hl, ext)) = warm.pop_front() {
+            let t = std::time::Instant::now();
             contained("a grammar warm", || hl.warm_extension(&ext));
+            log::debug!("prewarm: warmed {ext} in {:?}", t.elapsed());
+            warmed += 1;
+            if warm.is_empty() {
+                log::debug!("prewarm: done ({warmed} languages)");
+                warmed = 0;
+            }
         }
     }
 }
@@ -881,7 +901,8 @@ pub fn spawn_prewarm(
     let (tx, rx) = mpsc::channel();
     // Catch a panic in the (detached) thread so it's logged rather than a silent
     // stderr message — e.g. if warm_extension panics after the highlighter was
-    // already sent and installed.
+    // already sent and installed (only when the service is absent; with it, the
+    // warms run, contained, on the highlight thread).
     spawn_guarded(
         "gitkay-prewarm",
         "prewarm thread panicked; highlighting falls back to the installed or synchronous highlighter",
@@ -937,6 +958,7 @@ mod tests {
             }),
             tx,
             ctx: egui::Context::default(),
+            submitted: std::time::Instant::now(),
         }
     }
 
@@ -1177,6 +1199,7 @@ mod tests {
             }),
             tx,
             ctx: egui::Context::default(),
+            submitted: std::time::Instant::now(),
         });
 
         let msgs: Vec<HighlightMsg> = rx.try_iter().collect();

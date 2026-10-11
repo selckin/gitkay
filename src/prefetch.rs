@@ -21,12 +21,13 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use git2::Repository;
 
 use crate::diff::{
-    self, BuildEnv, CommitStats, DiffData, DiffSettings, RowScope, StatsWant, commit_stats,
-    is_real_commit,
+    self, BuildEnv, CommitStats, DiffData, DiffLine, DiffSettings, FileEntry, RowScope, RowSpans,
+    StatsWant, commit_stats, is_real_commit,
 };
 use crate::diff_highlight::{ColourPass, HighlightBudget, Stopped, highlight_diff_within};
 use crate::diff_store::MAX_ENTRY_DIVISOR;
@@ -311,7 +312,7 @@ pub fn prefetch_targets(
     commits: &[CommitInfo],
     selected: usize,
     view: &std::ops::Range<usize>,
-) -> Vec<(git2::Oid, WarmDepth)> {
+) -> Vec<(git2::Oid, WarmDepth, usize)> {
     let near = PREFETCH_MARGIN;
     // An empty view has no edge to clamp to, and `warm_band` has already made the
     // band empty, so this value is never read.
@@ -334,7 +335,7 @@ pub fn prefetch_targets(
             } else {
                 WarmDepth::DiffOnly
             };
-            (commits[i].oid, depth)
+            (commits[i].oid, depth, i.abs_diff(anchor))
         })
         .collect()
 }
@@ -398,6 +399,10 @@ pub struct PrefetchTarget {
     /// value, so a worker cannot pick up one and quietly forget the other.
     pub scope: RowScope,
     pub depth: WarmDepth,
+    /// The row's distance from the band anchor, as `prefetch_targets` ordered it.
+    /// Log-only: it never influences which target is chosen, only lets a "tokenizer
+    /// busy" line say whether near or far rows were skipped.
+    pub distance: usize,
 }
 
 impl PrefetchTarget {
@@ -1396,6 +1401,7 @@ pub fn spawn_prefetch_pool(
     let (coord_tx, coord_rx) = mpsc::channel();
     let limits = budget.limits;
     let count = prefetch_worker_count();
+    let colour = spawn_colour_service();
     // Heavy ids continue straight on from the pool's, so `id >= mailboxes.len()` names
     // the lane — one comparison rather than a second collection to keep in step.
     let spawn_one = |id: usize, name: String| -> Option<mpsc::Sender<Job>> {
@@ -1408,6 +1414,8 @@ pub fn spawn_prefetch_pool(
             stats_tx: stats_tx.clone(),
             ctx: ctx.clone(),
             deps: deps.clone(),
+            colour: colour.clone(),
+            tokenizer_loss_logged: std::cell::Cell::new(false),
         };
         let repo_path = repo_path.to_owned();
         spawn_guarded(
@@ -1511,6 +1519,134 @@ fn run_caught(f: impl FnOnce() -> Outcome) -> Option<Outcome> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok()
 }
 
+/// How many long-lived threads colour speculative warms. Each one costs ~30 MiB of
+/// regex caches over a multi-language session (fancy-regex keeps them per thread-id
+/// slot), where colouring on every pool worker filled all of them; and each one is a
+/// core of colouring throughput. One until a measurement says the band needs more.
+const SPECULATIVE_TOKENIZERS: usize = 1;
+
+/// One warm's colour pass, handed from a pool worker to a tokenizer thread. The spans
+/// travel there and back by value; the rows are shared.
+struct ColourJob {
+    hl: Arc<Highlighter>,
+    lines: Arc<Vec<DiffLine>>,
+    files: Arc<Vec<FileEntry>>,
+    spans: RowSpans,
+    /// The pass's time budget, started when the TOKENIZER starts it — a warm that
+    /// waited its turn still gets its full budget rather than a lapsed one.
+    budget: Duration,
+    reply: mpsc::Sender<(RowSpans, Option<ColourPass>, Duration)>,
+}
+
+/// What a hand-off came to.
+enum Handoff {
+    /// The tokenizer ran it; `None` when the pass panicked (spans as far as it got).
+    /// The duration is the tokenizer's own pass time, queueing excluded.
+    Coloured(Option<ColourPass>, Duration),
+    /// Every tokenizer busy and the queue full — this row warms without colour.
+    Busy,
+    /// No tokenizer is left to receive jobs; the spans are restored and the caller
+    /// colours the row itself.
+    Gone,
+}
+
+/// The tokenizer threads, behind a queue as deep as there are threads: a worker can
+/// be at most one job behind each, so its wait is bounded by about two budgets.
+fn spawn_colour_service() -> Option<mpsc::SyncSender<ColourJob>> {
+    let (tx, rx) = mpsc::sync_channel::<ColourJob>(SPECULATIVE_TOKENIZERS);
+    let rx = Arc::new(Mutex::new(rx));
+    let mut spawned = 0;
+    for k in 0..SPECULATIVE_TOKENIZERS {
+        let rx = Arc::clone(&rx);
+        let ok = spawn_guarded(
+            &format!("gitkay-colour-{k}"),
+            "colour thread panicked outside a job",
+            move || {
+                loop {
+                    let job = {
+                        let Ok(rx) = rx.lock() else { return };
+                        match rx.recv() {
+                            Ok(job) => job,
+                            Err(_) => return, // the pool is gone
+                        }
+                    };
+                    let ColourJob {
+                        hl,
+                        lines,
+                        files,
+                        mut spans,
+                        budget,
+                        reply,
+                    } = job;
+                    let started = std::time::Instant::now();
+                    let mut pass = None;
+                    crate::diff_highlight::contained("a speculative colour pass", || {
+                        pass = Some(highlight_diff_within(
+                            &lines,
+                            &mut spans,
+                            &files,
+                            &hl,
+                            HighlightBudget {
+                                lines: None,
+                                deadline: Some(std::time::Instant::now() + budget),
+                                until_row: None,
+                            },
+                            0,
+                        ));
+                    });
+                    let tokenizing = started.elapsed();
+                    // Release the shared rows first, so the worker never resumes to
+                    // find the `Arc` still held here (an `Arc::make_mut` clone later).
+                    drop((hl, lines, files));
+                    let _gone = reply.send((spans, pass, tokenizing));
+                }
+            },
+        )
+        .is_ok();
+        spawned += usize::from(ok);
+    }
+    (spawned > 0).then_some(tx)
+}
+
+/// Hand `data`'s colour pass to a tokenizer thread and wait for it — or, if every
+/// tokenizer is busy, do not colour at all. Never waits for room in the queue.
+fn colour_elsewhere(
+    colour: &mpsc::SyncSender<ColourJob>,
+    hl: &Arc<Highlighter>,
+    data: &mut DiffData,
+    budget: Duration,
+) -> Handoff {
+    let (reply, back) = mpsc::channel();
+    let job = ColourJob {
+        hl: Arc::clone(hl),
+        lines: Arc::clone(&data.lines),
+        files: Arc::clone(&data.files),
+        spans: std::mem::take(&mut data.spans),
+        budget,
+        reply,
+    };
+    match colour.try_send(job) {
+        Ok(()) => {
+            if let Ok((spans, pass, tokenizing)) = back.recv() {
+                data.spans = spans;
+                Handoff::Coloured(pass, tokenizing)
+            } else {
+                // The thread died with the job: the spans went with it.
+                data.spans = RowSpans::blank(data.lines.len());
+                Handoff::Coloured(None, Duration::ZERO)
+            }
+        }
+        Err(mpsc::TrySendError::Full(job)) => {
+            data.spans = job.spans;
+            Handoff::Busy
+        }
+        Err(mpsc::TrySendError::Disconnected(job)) => {
+            data.spans = job.spans;
+            Handoff::Gone
+        }
+    }
+}
+
 /// Everything a worker holds for its whole life. All of it is either `Copy` or a
 /// channel endpoint — there is no shared mutable state left for a worker to reach.
 struct WorkerCtx {
@@ -1522,6 +1658,11 @@ struct WorkerCtx {
     ctx: egui::Context,
     /// The persistent store and the textconv drivers; see `DiffDeps`.
     deps: DiffDeps,
+    /// The tokenizer threads speculative warms hand their colour pass to; `None` colours
+    /// inline on this worker (no tokenizer could be spawned, and most tests).
+    colour: Option<mpsc::SyncSender<ColourJob>>,
+    /// Whether this worker has already said the tokenizer is gone, so it says it once.
+    tokenizer_loss_logged: std::cell::Cell<bool>,
 }
 
 /// One worker: take a job, do it, report what happened. Forever.
@@ -1555,7 +1696,7 @@ fn worker(ctx: &WorkerCtx, repo: &Repository, jobs: &mpsc::Receiver<Job>) {
                 target,
                 hl,
                 stats_epoch,
-            } => run_caught(|| warm_row(ctx, repo, target, hl.as_deref(), stats_epoch))
+            } => run_caught(|| warm_row(ctx, repo, target, hl.as_ref(), stats_epoch))
                 .unwrap_or_else(|| {
                     caught("a diff");
                     Outcome::Nothing
@@ -1837,7 +1978,7 @@ fn warm_row(
     ctx: &WorkerCtx,
     repo: &Repository,
     target: PrefetchTarget,
-    hl: Option<&Highlighter>,
+    hl: Option<&Arc<Highlighter>>,
     stats_epoch: u64,
 ) -> Outcome {
     // Probe first: a row whose blobs are huge costs seconds whatever its patch looks
@@ -1998,24 +2139,47 @@ fn warm_row(
     // `Limits::highlight_budget`. Stopping early is free — a partial `RowSpans` is a
     // legal state and `ensure_diff_highlighted` finishes the row if it is ever opened —
     // where not stopping costs the worker, its lane slot and its in-flight claim.
-    let deadline = colour_start + ctx.limits.highlight_budget;
-    let pass = if let Some(hl) = hl
-        && colour
-    {
-        Some(highlight_diff_within(
+    // Coloured on a tokenizer thread when there is one (see `SPECULATIVE_TOKENIZERS`):
+    // a pool worker that tokenizes its own warms takes a regex-cache slot of its own.
+    // A busy tokenizer means this row warms `DiffOnly` — it is coloured on open.
+    let mut busy = false;
+    // `Some((tokenizing, panicked))` when a tokenizer thread coloured this row.
+    let mut handed_off = None;
+    let inline = |data: &mut DiffData, hl: &Arc<Highlighter>| {
+        highlight_diff_within(
             &data.lines,
             &mut data.spans,
             &data.files,
             hl,
             HighlightBudget {
                 lines: None,
-                deadline: Some(deadline),
+                deadline: Some(colour_start + ctx.limits.highlight_budget),
                 until_row: None,
             },
             0,
-        ))
-    } else {
-        None
+        )
+    };
+    let pass = match (hl, colour) {
+        (Some(hl), true) => match &ctx.colour {
+            Some(c) => match colour_elsewhere(c, hl, &mut data, ctx.limits.highlight_budget) {
+                Handoff::Coloured(pass, tokenizing) => {
+                    handed_off = Some((tokenizing, pass.is_none()));
+                    pass
+                }
+                Handoff::Busy => {
+                    busy = true;
+                    None
+                }
+                Handoff::Gone => {
+                    if !ctx.tokenizer_loss_logged.replace(true) {
+                        log::warn!("prefetch: tokenizer thread gone; colouring on the worker");
+                    }
+                    Some(inline(&mut data, hl))
+                }
+            },
+            None => Some(inline(&mut data, hl)),
+        },
+        _ => None,
     };
     let coloured = colour_start.elapsed();
     // Said out loud for the reason every other cut-off here is: a row that renders
@@ -2045,7 +2209,10 @@ fn warm_row(
             // as "Highlighted", which is the exact "looks like a success" reading the
             // PlainText label exists to remove. `any` also called an empty diff
             // PlainText, though nothing had been left uncoloured.
-            Some(hl) if colour => {
+            Some(_) if matches!(handed_off, Some((_, true))) => {
+                "DiffOnly (colour pass panicked)".to_owned()
+            }
+            Some(hl) if colour && !busy => {
                 // Binary files are not part of the denominator: the highlighter skips
                 // them, so counting them as un-highlighted would report a commit that
                 // only touches a .png as "PlainText" — a coverage gap that isn't one.
@@ -2061,6 +2228,7 @@ fn warm_row(
                     (w, n) => format!("Highlighted {w}/{n}, rest PlainText"),
                 }
             }
+            _ if busy => format!("DiffOnly (tokenizer busy, distance {})", target.distance),
             _ => "DiffOnly".to_owned(),
         };
         if cut_short {
@@ -2085,9 +2253,17 @@ fn warm_row(
     // are reported separately so a slow row says WHICH half was slow — git2 walking a
     // big tree and syntect tokenizing are different problems with different fixes.
     if let Some(applied) = applied {
-        log::debug!(
-            "prefetch: done {oid} ({lines} lines, {applied}) build {built:?} + colour {coloured:?}"
-        );
+        match handed_off {
+            Some((tokenizing, _)) => {
+                let wait = coloured.saturating_sub(tokenizing);
+                log::debug!(
+                    "prefetch: done {oid} ({lines} lines, {applied}) build {built:?} + colour {tokenizing:?} + queued {wait:?}"
+                );
+            }
+            None => log::debug!(
+                "prefetch: done {oid} ({lines} lines, {applied}) build {built:?} + colour {coloured:?}"
+            ),
+        }
     }
     ctx.ctx.request_repaint();
     Outcome::Warmed { lines }
@@ -2101,6 +2277,161 @@ mod tests {
     use crate::test_repo::temp_repo;
     use crate::tests::{ci, memory_reading, oid, probe_settings};
     use crate::{highlight, textconv::Textconv};
+
+    fn rust_diff() -> DiffData {
+        let lines = vec![
+            diff::DiffLine::new("fn main() {", diff::LineKind::Context),
+            diff::DiffLine::new("    let x = 1;", diff::LineKind::Add),
+        ];
+        DiffData::new(
+            lines,
+            vec![crate::test_repo::file_entry("main.rs", Some(0))],
+        )
+    }
+
+    /// A busy tokenizer is skipped, never waited for: the row warms without colour and
+    /// keeps its (blank) spans, so a full band cannot pile its workers up behind it.
+    #[test]
+    fn a_busy_tokenizer_is_skipped_not_waited_for() {
+        let (colour, _held) = mpsc::sync_channel(1);
+        let hl = Arc::new(crate::highlight::test_highlighter());
+        let mut first = rust_diff();
+        let (reply, _keep) = mpsc::channel();
+        colour
+            .try_send(ColourJob {
+                hl: Arc::clone(&hl),
+                lines: Arc::clone(&first.lines),
+                files: Arc::clone(&first.files),
+                spans: std::mem::take(&mut first.spans),
+                budget: Duration::from_secs(1),
+                reply,
+            })
+            .expect("the queue has room for one");
+        let mut data = rust_diff();
+        data.spans.set(1, vec![(egui::Color32::RED, 0..3)]);
+        let t = std::time::Instant::now();
+        let handoff = colour_elsewhere(&colour, &hl, &mut data, Duration::from_secs(1));
+        assert!(matches!(handoff, Handoff::Busy));
+        assert!(t.elapsed() < Duration::from_millis(500), "it must not wait");
+        assert_eq!(
+            data.spans.rows(),
+            data.lines.len(),
+            "the spans come back unharmed"
+        );
+        assert_eq!(
+            data.spans.get(1),
+            Some(&vec![(egui::Color32::RED, 0..3)]),
+            "the spans that were there are the spans that come back, not blanks"
+        );
+    }
+
+    /// With no tokenizer left (the receiver is gone) the hand-off says so at once, and
+    /// the spans come back so the worker can colour the row itself.
+    #[test]
+    fn a_lost_tokenizer_is_reported_gone_with_the_spans_restored() {
+        let (colour, gone) = mpsc::sync_channel(1);
+        drop(gone);
+        let hl = Arc::new(crate::highlight::test_highlighter());
+        let mut data = rust_diff();
+        data.spans.set(1, vec![(egui::Color32::RED, 0..3)]);
+        let t = std::time::Instant::now();
+        let handoff = colour_elsewhere(&colour, &hl, &mut data, Duration::from_secs(1));
+        assert!(matches!(handoff, Handoff::Gone));
+        assert!(t.elapsed() < Duration::from_millis(500), "it must not wait");
+        assert_eq!(
+            data.spans.rows(),
+            data.lines.len(),
+            "the spans come back unharmed"
+        );
+        assert_eq!(
+            data.spans.get(1),
+            Some(&vec![(egui::Color32::RED, 0..3)]),
+            "the spans that were there are the spans that come back, not blanks"
+        );
+    }
+
+    /// A `Highlighted` warm of a small Rust commit through the whole hand-off, with the
+    /// given colour queue on the worker. Returns the outcome and how many rows came back
+    /// with spans.
+    fn warm_highlighted_via(colour: mpsc::SyncSender<ColourJob>) -> (Outcome, usize) {
+        use crate::test_repo::{commit_file, temp_repo};
+        let (_dir, repo) = temp_repo();
+        commit_file(&repo, "a.rs", "fn main() {}\n", "one");
+        let oid = commit_file(&repo, "a.rs", "fn main() {\n    todo!()\n}\n", "two");
+        let hl = Arc::new(highlight::test_highlighter());
+        let (tx, rx) = mpsc::channel();
+        let ctx = WorkerCtx {
+            id: 0,
+            limits: Limits {
+                max_blob_bytes: u64::MAX,
+                max_entry_lines: usize::MAX,
+                max_entry_bytes: usize::MAX,
+                highlight_budget: Duration::from_secs(30),
+            },
+            coord: mpsc::channel().0,
+            tx,
+            stats_tx: mpsc::channel().0,
+            ctx: egui::Context::default(),
+            deps: DiffDeps::default(),
+            colour: Some(colour),
+            tokenizer_loss_logged: std::cell::Cell::new(false),
+        };
+        let mut target = heavy_target(1);
+        target.key.oid = oid;
+        target.scope = RowScope::new(DiffSource::Commit(oid));
+        target.depth = WarmDepth::Highlighted;
+        let outcome = warm_row(&ctx, &repo, target, Some(&hl), 0);
+        let data = rx.recv().expect("the diff comes back either way").data;
+        assert!(!data.lines.is_empty(), "control: the fixture has rows");
+        let coloured = (0..data.lines.len())
+            .filter(|&i| data.spans.get(i).is_some())
+            .count();
+        (outcome, coloured)
+    }
+
+    /// End to end: every tokenizer busy means the warm still lands, uncoloured, rather
+    /// than waiting or colouring inline on the worker.
+    #[test]
+    fn a_warm_with_every_tokenizer_busy_lands_uncoloured() {
+        let (colour, _held) = mpsc::sync_channel(1);
+        let hl = Arc::new(highlight::test_highlighter());
+        let mut filler = rust_diff();
+        let (reply, _keep) = mpsc::channel();
+        colour
+            .try_send(ColourJob {
+                hl,
+                lines: Arc::clone(&filler.lines),
+                files: Arc::clone(&filler.files),
+                spans: std::mem::take(&mut filler.spans),
+                budget: Duration::from_secs(1),
+                reply,
+            })
+            .expect("the queue has room for one");
+        let (outcome, coloured) = warm_highlighted_via(colour);
+        assert!(matches!(outcome, Outcome::Warmed { .. }));
+        assert_eq!(coloured, 0, "a busy tokenizer leaves the code rows plain");
+    }
+
+    /// End to end: a tokenizer that is gone makes the worker colour the row itself.
+    #[test]
+    fn a_warm_with_the_tokenizer_gone_colours_inline() {
+        let (colour, gone) = mpsc::sync_channel(1);
+        drop(gone);
+        let (outcome, coloured) = warm_highlighted_via(colour);
+        assert!(matches!(outcome, Outcome::Warmed { .. }));
+        assert!(coloured > 0, "the inline fallback coloured the code rows");
+    }
+
+    /// Handed off, the diff comes back coloured by the tokenizer thread.
+    #[test]
+    fn a_handed_off_warm_comes_back_coloured() {
+        let colour = spawn_colour_service().expect("the tokenizer thread spawns");
+        let hl = Arc::new(crate::highlight::test_highlighter());
+        let mut data = rust_diff();
+        let handoff = colour_elsewhere(&colour, &hl, &mut data, Duration::from_secs(5));
+        assert!(matches!(handoff, Handoff::Coloured(Some(_), _)));
+        assert!(data.spans.get(1).is_some(), "the code row has spans");
+    }
 
     #[test]
     fn a_speculative_entry_is_too_big_by_lines_or_by_bytes() {
@@ -2326,6 +2657,7 @@ mod tests {
             },
             scope,
             depth: WarmDepth::DiffOnly,
+            distance: 0,
         });
         pool.submit(band, None);
 
@@ -2354,7 +2686,7 @@ mod tests {
         let (_dir, repo) = temp_repo();
         commit_file(&repo, "a.rs", "fn main() {}\n", "one");
         let oid = commit_file(&repo, "a.rs", "fn main() {\n    todo!()\n}\n", "two");
-        let hl = highlight::test_highlighter();
+        let hl = Arc::new(highlight::test_highlighter());
 
         let warm = |budget: std::time::Duration| {
             let (tx, rx) = mpsc::channel();
@@ -2371,6 +2703,8 @@ mod tests {
                 stats_tx: mpsc::channel().0,
                 ctx: egui::Context::default(),
                 deps: DiffDeps::default(),
+                colour: None,
+                tokenizer_loss_logged: std::cell::Cell::new(false),
             };
             let mut target = heavy_target(1);
             target.key.oid = oid;
@@ -2409,7 +2743,7 @@ mod tests {
         let (_dir, repo) = temp_repo();
         commit_file(&repo, "a.rs", "one\n", "one");
         let oid = commit_file(&repo, "a.rs", "one\ntwo\n", "two");
-        let hl = highlight::test_highlighter();
+        let hl = Arc::new(highlight::test_highlighter());
 
         let (tx, _rx) = mpsc::channel();
         let (stats_tx, stats_rx) = mpsc::channel();
@@ -2426,6 +2760,8 @@ mod tests {
             stats_tx,
             ctx: egui::Context::default(),
             deps: DiffDeps::default(),
+            colour: None,
+            tokenizer_loss_logged: std::cell::Cell::new(false),
         };
         let mut target = heavy_target(1);
         target.key.oid = oid;
@@ -2463,6 +2799,7 @@ mod tests {
             },
             scope: RowScope::new(DiffSource::Commit(oid(n))),
             depth: WarmDepth::DiffOnly,
+            distance: 0,
         }
     }
 
@@ -2993,7 +3330,7 @@ mod tests {
         // (larger index) first: 5,3, 6,2, 7,1, 8,0. Uncapped — the band is the bound.
         let got: Vec<git2::Oid> = prefetch_targets(&commits, 4, &(0..9))
             .into_iter()
-            .map(|(oid, _)| oid)
+            .map(|(oid, ..)| oid)
             .collect();
         assert_eq!(
             got,
@@ -3017,7 +3354,7 @@ mod tests {
         // however close to the selection they would be under the old 8-row margin.
         let got: Vec<git2::Oid> = prefetch_targets(&commits, 25, &(20..30))
             .into_iter()
-            .map(|(oid, _)| oid)
+            .map(|(oid, ..)| oid)
             .collect();
         assert_eq!(got.len(), 29, "band is 30 rows minus the selected one");
         assert!(
@@ -3038,8 +3375,8 @@ mod tests {
         let depth = |target: u32| {
             prefetch_targets(&commits, 25, &(20..30))
                 .into_iter()
-                .find(|(o, _)| *o == oid(target))
-                .map(|(_, d)| d)
+                .find(|(o, ..)| *o == oid(target))
+                .map(|(_, d, _)| d)
         };
         // near margin 8 ⇒ rows 12..38 are worth fully colouring; the rest of the
         // band is cached un-highlighted.
@@ -3067,7 +3404,7 @@ mod tests {
         let first = |sel: usize| {
             prefetch_targets(&commits, sel, &(20..30))
                 .into_iter()
-                .map(|(oid, _)| oid)
+                .map(|(oid, ..)| oid)
                 .next()
         };
         // Selection on screen: unchanged behaviour. The selected row is skipped, so
@@ -3089,7 +3426,7 @@ mod tests {
         // could not key them correctly.
         let got: Vec<git2::Oid> = prefetch_targets(&commits, 2, &(0..7))
             .into_iter()
-            .map(|(oid, _)| oid)
+            .map(|(oid, ..)| oid)
             .collect();
         assert_eq!(got, vec![oid(3), oid(4), oid(5), oid(6)]);
     }
@@ -3162,6 +3499,8 @@ mod tests {
             stats_tx,
             ctx: egui::Context::default(),
             deps: DiffDeps::default(),
+            colour: None,
+            tokenizer_loss_logged: std::cell::Cell::new(false),
         };
         let job = |textconv: bool| StatsJob {
             scope: scope.clone(),
@@ -3265,6 +3604,8 @@ mod tests {
             stats_tx,
             ctx: egui::Context::default(),
             deps,
+            colour: None,
+            tokenizer_loss_logged: std::cell::Cell::new(false),
         };
         let job = StatsJob {
             scope,
@@ -3350,6 +3691,8 @@ mod tests {
             stats_tx,
             ctx: egui::Context::default(),
             deps,
+            colour: None,
+            tokenizer_loss_logged: std::cell::Cell::new(false),
         };
         let outcome = run_stats_job(
             &worker,
@@ -3421,6 +3764,8 @@ mod tests {
             stats_tx,
             ctx: egui::Context::default(),
             deps: DiffDeps::default(),
+            colour: None,
+            tokenizer_loss_logged: std::cell::Cell::new(false),
         };
         let job = |textconv: bool| StatsJob {
             scope: scope.clone(),

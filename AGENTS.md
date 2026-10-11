@@ -354,14 +354,6 @@ either** — every pass checks its deadline between chunks of 16 or 256 lines, n
 inside one — so `highlight::MAX_TOKENIZE_CHARS` (20,000) bounds what syntect sees of a
 single line, which is what makes the clocks above mean anything: a repo of minified
 sources had a 1.5s budget overrun to 13.5s and a 20s one to 25.4s, ~750ms on ONE line.
-**Tokenizing happens on a fixed set of long-lived threads**: `gitkay-highlight`
-(`HighlightService` — every visible pass, and the startup prewarm between passes) and the
-prefetch pool's `gitkay-colour-{k}` (see `prefetch.rs`). The reason is memory, not speed:
-fancy-regex's regex-automata caches are kept per THREAD-ID SLOT (`thread_id % 8`, plus an
-owner) for the life of the process, ~30 MiB per extra tokenizing thread on a
-multi-language mix — so a thread per pass, or every pool worker colouring its own warms,
-filled all nine slots. The foreground pre-highlight (≤`PREHIGHLIGHT_CEILING`, toolbar
-rebuilds only) still tokenizes on `gitkay-fg-*`; the UI thread only as the last fallback.
 The tail past it takes a single flat span rather than none, because `append_body`'s span
 path emits only the spans and a body whose tail no span reaches is not drawn at all. The
 per-file parser state is SNAPSHOTTED across a truncated line, so what the bound costs is
@@ -376,7 +368,17 @@ measured 12.0s on the frame loop at 76.5M lines; and it REPORTS its own end
 (`HighlightMsg::Settled`, from a drop guard, so a superseded or panicking pass says so
 too), which is what the prefetch band waits on. Separate from `highlight.rs`, which knows syntect and
 nothing about diffs: this half knows `DiffLine`, `FileEntry` and the viewport, and
-is about ORDER rather than colour),
+is about ORDER rather than colour. **Tokenizing happens on a fixed set of long-lived threads**: `gitkay-highlight`
+(`HighlightService` — every visible pass, and the startup prewarm between passes) and the
+prefetch pool's `gitkay-colour-{k}` (see `prefetch.rs`). The reason is memory, not speed:
+fancy-regex's regex-automata caches are kept per THREAD-ID SLOT (`thread_id % 8`, plus an
+owner) for the life of the process, ~30 MiB per extra tokenizing thread on a
+multi-language mix — so a thread per pass, or every pool worker colouring its own warms,
+filled all eight slots (plus the owner). The foreground pre-highlight (≤`PREHIGHLIGHT_CEILING`) runs on every
+same-oid rebuild (`ScrollPlan::Anchor`) — toolbar toggles, config reloads, and the
+uncommitted/staged rows' refresh — and still tokenizes on `gitkay-fg-*`; over a session
+it can touch all four of those threads (bounded per pass by `PREHIGHLIGHT_CEILING` and
+the landing screenful). The UI thread tokenizes only as the last fallback.),
 `src/workers.rs` (the four persistent foreground workers and the three jobs they
 run — a clicked diff, a history extension, the reload's driver re-resolution. The
 distinction from `prefetch` is simply that someone is waiting; see **Startup &
@@ -384,7 +386,13 @@ timing**),
 `src/prefetch.rs` (the speculative work pool: the `Coordinator` actor, its
 `Job`/`Outcome`/`CoordMsg` protocol, the workers, and the two things they do —
 `run_stats_job` and `warm_row`. `PoolHandle` is the only way in, which the module
-boundary now enforces rather than merely asserting; see **Startup & timing**),
+boundary now enforces rather than merely asserting; see **Startup & timing**. A warm's
+colour pass runs on a `gitkay-colour-{k}` tokenizer thread (`SPECULATIVE_TOKENIZERS`),
+handed off with `try_send` on a queue as deep as there are tokenizers. A full queue warms
+the row `DiffOnly` ('tokenizer busy, distance N' in the log — N is the row's distance from the band anchor), and the pass's time budget starts when
+the tokenizer starts it; a tokenizer that is gone (not merely busy) makes the worker colour
+inline, as before the service. See the tokenizing-threads note under `diff_highlight.rs` for
+why),
 `src/history.rs` (the commit list: walking a repo's history into the `CommitInfo`
 rows the app draws, plus the ref map that labels them — `history_revwalk` and the
 loaders, the provisional walk and its `topo_window`, the resumable tail extension,
@@ -596,7 +604,7 @@ Startup work is structured so the window paints as soon as possible; the heavy/I
 parts run off the window-creation critical path. Threads: `gitkay-history` (+
 `gitkay-history-quick`, `gitkay-slow-walk`), `gitkay-probes`, `gitkay-fonts`,
 `gitkay-prewarm`, `gitkay-highlight` (one, long-lived; `gitkay-highlight-pass` only as its fallback),
-`gitkay-fg-{i}`, `gitkay-prefetch-coord` / `-{i}` / `-heavy-{k}`, `gitkay-cache-prune`.
+`gitkay-fg-{i}`, `gitkay-prefetch-coord` / `-{i}` / `-heavy-{k}`, `gitkay-colour-{k}`, `gitkay-cache-prune`.
 
 **> Most of what follows was found by MEASUREMENT, and several plausible
 "simplifications" have already been tried and were wrong. The measurements and the
