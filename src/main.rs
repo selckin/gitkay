@@ -67,8 +67,7 @@ use prefetch::{
 use textconv::Textconv;
 use workers::{
     DiffLoadJob, DiffLoadResult, ForegroundJob, HistoryJob, HistoryJobKind, HistoryLoad,
-    HistoryResult, PreHighlight, next_history_page, report_failed_diff_load, run_foreground_job,
-    spawn_foreground_workers,
+    HistoryResult, PreHighlight, next_history_page, run_foreground_job, spawn_foreground_workers,
 };
 
 /// A monotonic supersession token shared between the UI thread and a background worker.
@@ -5244,11 +5243,6 @@ impl GitkApp {
         let claim = InflightClaim::try_claim(&self.inflight_diffs, key.clone());
         // For the inflight_loads tracking below — `key` itself moves into the worker.
         let tracked_key = is_real_commit(oid).then(|| key.clone());
-        let fail = (
-            self.diff_load_tx.clone(),
-            key.clone(),
-            self.egui_ctx.clone(),
-        );
         // Colour the new content before installing it, so a same-oid rebuild
         // swaps in already highlighted instead of flashing a few plain frames.
         // The pass bounds itself by ROWS — the landing screenful — not by the
@@ -5291,14 +5285,14 @@ impl GitkApp {
         };
         // Hand it to a worker that already owns a repo handle. The claim rides
         // along and is released when the job ends, panic included.
-        let queued = self.foreground.as_ref().is_some_and(|tx| {
-            tx.send(ForegroundJob::Diff(job, claim))
-                .inspect_err(|_| {
-                    let (tx, key, ctx) = &fail;
-                    report_failed_diff_load(tx, epoch, key.clone(), ctx);
-                })
-                .is_ok()
-        });
+        // A failed send reports nothing: the synchronous fallback below either installs
+        // the diff or clears `diff_load` itself. Reporting `None` under the current epoch
+        // as well made the next drain's `None if current` arm stash and blank the pane
+        // the fallback had just filled.
+        let queued = self
+            .foreground
+            .as_ref()
+            .is_some_and(|tx| tx.send(ForegroundJob::Diff(job, claim)).is_ok());
         if queued {
             // Track the worker so a bounce-back to this commit adopts it instead of
             // stacking a duplicate; the drain removes the entry when its (always
