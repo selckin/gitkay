@@ -1138,7 +1138,82 @@ sorted drivers keep the same rows with the same rewritten parents.
 - **Color tracking**: per-pipe color index, persists through column shifts
 
 ### UI (egui immediate mode)
-- **Top panel**: search bar (SHA/author/message/ref), Enter cycles matches, any keypress focuses search, graph auto-scrolls to match. A changed keystroke selects and centers its match instantly but defers the diff load behind `DIFF_LOAD_DEBOUNCE` (120ms of input pause), so typing a word doesn't spawn a diff worker per keystroke; Enter/arrow match-cycling and clicks load immediately, and any direct `load_selected_diff` cancels the pending debounced load. That timer is **one mechanism, not the search bar's own** — the toolbar's context wheel arms it too (`defer_diff_load`), because supersession drops a stale result but never cancels a running build: with the foreground workers free, a burst starts several complete `get_diff_data` runs on the one path deliberately unguarded by `probe_row_cost`, then refuses to cache any of them
+- **Top panel**: search bar (SHA/author/message/ref), Enter cycles matches, any keypress focuses search, graph auto-scrolls to match. A changed keystroke selects and centers its match instantly but defers the diff load behind `DIFF_LOAD_DEBOUNCE` (120ms of input pause), so typing a word doesn't spawn a diff worker per keystroke; Enter/arrow match-cycling and clicks load immediately, and any direct `load_selected_diff` cancels the pending debounced load. That timer is **one mechanism, not the search bar's own** — the toolbar's context wheel arms it too (`defer_diff_load`), because supersession drops a stale result but never cancels a running build: with the foreground workers free, a burst starts several complete `get_diff_data` runs on the one path deliberately unguarded by `probe_row_cost`, then refuses to cache any of them.
+
+  **A hash reaches past the loaded rows** (`reveal_unloaded_sha`). The list loads a
+  window at a time, so a hash a few thousand commits down used to match nothing until
+  the reader had scrolled that far. Typing one now loads the rows down to it and
+  centres it. Four conditions gate it: the query is SHA-shaped (`sha_query`: 7–40 hex,
+  where seven is git's abbreviation and the floor stops a hash being typed from
+  loading per keystroke), no loaded row matched (a loaded match is always preferred),
+  the scope is plain or `--all`, and the list is the real one (not provisional, not
+  still pending). Whatever installs a new list runs the check again:
+  `install_startup_history`, and the `Rebuild` arm of `drain_history_results`, since a
+  watcher reload can retire the startup walk before it lands.
+
+  **There are two routes, because the lazy walk caches no oids.** With `history_oids`
+  present, `history_position` looks the hash up and `next_history_page` serves the
+  page. With none — every repository with a usable commit-graph, which is most of
+  them — `HistoryJobKind::Seek` resumes the walk on a worker
+  (`history::seek_commits_tail`) and scans for it. It skips and anchors through
+  `skip_to_anchor`, the one step `load_commits_tail`'s resume also takes, so the two
+  cannot count the loaded prefix differently. Either answer is an ordinary `Extend`
+  through the match **and up to `LOAD_BATCH` past it**, so `append_commits` installs
+  it and the pending reveal centres it. A load that stopped at the match would leave
+  it on the last row, where it cannot be centred. The margin's `max_new` is the whole
+  ask, so a load cut short by the true end of the history latches `all_loaded`, and
+  only that one does. The cap bounds the search, not the margin: a page cut at the cap
+  would come back short and read as the end of a history that goes on.
+
+  Both routes stop at `HISTORY_OID_CAP` and say why they missed, in the bar where the
+  match count goes: `not in this history` for a complete search, `not in the first
+  200,000 commits` for a capped one, and `searching history…` while in flight.
+  `ShaReveal` is that state, in one field. An absent prefix is remembered
+  (`absent_prefix`) until the list is replaced, so typing the rest of a missing hash
+  walks nothing; a capped one is not, since it says nothing past the cap. The prefix
+  kept is the shortest one found absent, so backspacing back to it walks nothing
+  either. A miss stays on screen until the text or the history changes: a scroll
+  extension or a failed load puts it back. A rebuild searches an absent hash again,
+  since new commits may hold it, but keeps a capped answer: it almost never changes,
+  and asking again walks up to the cap on every `.git` change. Any miss gives way to a
+  loaded match, which a rebuild jumps to.
+
+  **A reveal never supersedes another history load.** A watcher rebuild superseded by
+  it would be lost with nothing to re-arm it, so it waits (`Queued`) and looks again
+  once that load lands, and a load dispatched over a reveal sends it back to waiting.
+  A reveal whose own load is lost — the worker failed, or the walk no longer lined up
+  and a rebuild came back instead — looks again once (`Retrying`). A second loss ends
+  it, so a failing worker is not re-dispatched every frame. A path filter and the
+  reflog keep the old "no match": they have no prefix to resume, and finding the hash
+  there needs a walk. So does finding it past the cap.
+
+  **A search the reader abandons drops its own load; one still being typed keeps
+  it** (`keep_or_abandon_reveal_walk`, on every change to the search text).
+  `reveal_walk` holds the prefix the reveal's own load in flight is for, and any other
+  dispatch clears it, so `Some` means the load in flight is the reveal's. The walk is
+  kept when the new query still needs a load and it and the walk's prefix are
+  prefixes of one another — typing more of the hash, or backspacing while it is still
+  one. Such a query matches on the path the walk is taking, so the reveal goes
+  `Queued` behind it and looks in the rows it brings; restarting from the loaded tail
+  on each keystroke reached a deep hash last and, on the cached route, left a deep
+  page building per keystroke beside the reader's diff load. A miss for the walk's
+  prefix answers a query extending it (absent or capped alike) and is recorded as
+  that query's. Anything else abandons the walk: appended, a walk toward the cap for
+  a hash since cleared or typed over would grow the list for good, 200k rows and
+  ~120ms on the frame loop for nothing. Abandoning bumps `history_epoch` (its result
+  is dropped as superseded) and clears `history_inflight` (no current result is
+  coming, and the scroll extension's gate must not stay shut waiting for one). A load
+  the reveal merely waits on is never abandoned. The two deep loads also stop
+  themselves: `history_job` checks the job's own `current_epoch` per oid in a `Seek`
+  (`seek_commits_tail`'s `live`) and in a `Hydrate` page, and a superseded job sends
+  `load: None`, which the drain drops as stale. **Every history job reports exactly
+  once**, superseded or not, which is what lets a test wait for an abandoned job's
+  end rather than a clock.
+
+  **The landing is O(tail) on the frame loop**, as every append is. Measured on
+  a large data repository at 1.6ms (release) for the 2,627 rows down to row 2,827, before the
+  margin added a page to that. Extrapolated linearly, a reveal 200k rows deep costs
+  ~120ms in one frame.
 - **Central panel**: commit graph + list (`show_commit_list`), virtualized with egui `show_rows` (same mechanism as the diff pane). Lazy loading: 200 initial, +500 on scroll-near-bottom — computed on a `gitkay-history-load` worker (never the frame loop), appended incrementally via `load_commits_tail` in the common plain scope, full background rebuild otherwise. The debounced git-watcher reload takes the same worker path. `history_epoch` supersedes stale results; both land in `drain_history_results`. An append installs through `append_commits` — O(tail), not O(history): the graph layout **resumes** from the stored `GraphLayoutState` (pipes + colour counter) and the lookup maps / search matches extend in place, leaving selection and scroll untouched. The resume is unsound when a previously out-of-scope merge parent lands in the tail (its already-laid-out merge row would gain a diagonal only a relayout can add) — `deferred_parents` tracks those and forces a full `resync_commits` then; `layout_resume_matches_full_layout` pins the parity. A rebuild arrives with its `DerivedHistory` already computed on the worker (`rebuild_load`), so the frame loop only installs it and restores the selection (`install_derived` + `finish_resync`)
 - **Scope notice**: why the view holds less than the command line asked for —
   `history::scope_notice`, pure, one phrasing for both the log line and the screen
@@ -2591,7 +2666,10 @@ ones that actually fail when the write is removed.
 
 `bench_frame_after_install` (in `src/main.rs`, `#[ignore]`) times the UI frame that
 installs a big diff and the 20 after it, headless: a real `GitkApp` driven through
-`eframe::App::ui` without GL. It prints `frame: install+first`, `frame: max after` and
+`eframe::App::ui` without GL, built and pumped by `tests::HeadlessApp`, the same helper
+the hash-reveal tests drive. The two share it so they cannot drift in how the app is
+built: `HeadlessApp` drops the startup history sender before `new` runs, so the walk is
+synchronous, and it advances an input clock so egui's animations finish. It prints `frame: install+first`, `frame: max after` and
 the row count. Whole-diff scans per frame (the gutter measure, the wrap index) show up
 there. It needs `BENCH_REPO` and `BENCH_REV`, optionally `BENCH_LINENOS=1` and
 `BENCH_WRAP=1`; use fresh cache dirs so a cache hit cannot hide the build:
@@ -2602,7 +2680,13 @@ env XDG_CACHE_HOME=(mktemp -d) XDG_DATA_HOME=(mktemp -d) BENCH_REPO=… BENCH_RE
 
 ## Common Pitfalls
 
-- Both scrolled lists (commit list + diff pane) virtualize with egui `show_rows`. An early-egui bottom-gap bug once forced manual pre/post spacers on the commit list; that's fixed as of 0.34 (verified — no gap at end-of-list / few commits / on resize), so `show_rows` is used throughout. Don't reintroduce manual spacers.
+- Both scrolled lists (commit list + diff pane) virtualize with egui `show_rows`. An early-egui bottom-gap bug once forced manual pre/post spacers on the commit list; that's fixed as of 0.34 (verified — no gap at end-of-list / few commits / on resize), so `show_rows` is used throughout. Don't reintroduce manual spacers. **`show_rows`' row
+  pitch is `row_height` PLUS the item spacing**, and both lists paint at `row_height`,
+  so both zero `item_spacing.y` before calling it. The commit list didn't. Its rows then
+  sat 3pt apart from `show_rows`' pitch, and every scroll to a row landed short by 3/23
+  of its distance from the top. That was invisible near the top, a screen off at row 150,
+  and hundreds of rows off for a revealed hash. `a_search_jump_centres_its_row_on_screen`
+  pins it.
 - **Every `ScrollArea` passes `SCROLL_SOURCE`, and none takes the default.** egui
   0.36 changed `ScrollSource::default()`'s `drag` from `true` to
   `DragScroll::OnTouch`, which asks `InputState::has_touch_screen` and answers

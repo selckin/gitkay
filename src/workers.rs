@@ -24,13 +24,13 @@ use crate::diff::{BuildEnv, DiffAnchor, DiffData, DiffProgress, RowScope, anchor
 use crate::diff_highlight::{HighlightBudget, highlight_diff_within};
 use crate::highlight::Highlighter;
 use crate::history::{
-    CommitInfo, HISTORY_OID_CAP, HistoryWalk, TipPaths, build_commits_from_walk, build_ref_map,
-    load_commits_tail, load_history,
+    CommitInfo, HISTORY_OID_CAP, HistoryWalk, Seek, SeekMiss, SeekQuery, TipPaths,
+    build_commits_from_walk, build_ref_map, load_commits_tail, load_history, seek_commits_tail,
 };
 use crate::prefetch::InflightClaim;
 use crate::textconv::Textconv;
 use crate::{
-    DerivedHistory, DiffCacheKey, DiffDeps, Epoch, build_or_load, derive_from_commits,
+    DerivedHistory, DiffCacheKey, DiffDeps, Epoch, LOAD_BATCH, build_or_load, derive_from_commits,
     finalize_diff_key, store_of, textconv_for,
 };
 
@@ -260,6 +260,16 @@ pub enum HistoryJobKind {
     },
     /// Rebuild the whole list at `count` commits (the watcher reload).
     Rebuild { count: usize },
+    /// Reach the first commit past the `skip`-long loaded prefix whose hash starts
+    /// with `prefix`, for a scope with no cached walk to look it up in. Scans up to
+    /// walk position `cap`. See `seek_commits_tail`; the answer is an `Extend` through
+    /// the match and a page past it, or `Missed`.
+    Seek {
+        prefix: String,
+        skip: usize,
+        expect_last: git2::Oid,
+        cap: usize,
+    },
 }
 
 /// How to fetch the next page: from the cached walk when it holds this range, else
@@ -474,11 +484,14 @@ pub fn run_foreground_job(repo: Option<&Repository>, job: ForegroundJob) {
 }
 
 /// A finished background history load handed back to the UI, with the epoch it
-/// was dispatched under so a superseded result is dropped on arrival.
+/// was dispatched under so a superseded result is dropped on arrival. Every job
+/// reports exactly once, a superseded one included.
 pub struct HistoryResult {
     pub epoch: u64,
     /// `None` when the worker failed (repo momentarily unavailable) — still
-    /// delivered so the UI clears the in-flight state.
+    /// delivered so the UI clears the in-flight state — or when it stopped because a
+    /// newer dispatch superseded it, which the UI drops on arrival like any stale
+    /// result.
     pub load: Option<HistoryLoad>,
 }
 
@@ -504,6 +517,9 @@ pub enum HistoryLoad {
         /// scope notice's phrasing, recomputed with the rows it describes.
         tip: TipPaths,
     },
+    /// A `Seek` that found no such commit. Nothing to install, but the search bar
+    /// says which of the two ways it missed.
+    Missed(SeekMiss),
 }
 
 /// Package a rebuilt walk as a `HistoryLoad::Rebuild`, deriving the graph layout
@@ -531,10 +547,35 @@ pub fn rebuild_load(walk: HistoryWalk, count: usize) -> HistoryLoad {
     }
 }
 
+/// Build a `Hydrate` page's rows from the cached walk's `oids`, or `None` once `live`
+/// says no. A reveal's page can run to the cap, a `find_commit` a row, so it stops
+/// with the job, and a list it cut short is never handed over as a page: read as one,
+/// a short page means the history ended.
+fn hydrate_page(
+    repo: &Repository,
+    oids: &[git2::Oid],
+    max_new: usize,
+    first_parent: bool,
+    live: impl Fn() -> bool,
+) -> Option<Vec<CommitInfo>> {
+    let new = build_commits_from_walk(
+        repo,
+        oids.iter().copied().take_while(|_| live()),
+        &mut HashSet::new(),
+        &build_ref_map(repo),
+        max_new,
+        first_parent,
+    );
+    live().then_some(new)
+}
+
 /// Compute one history load off the UI thread — the walk costs a `find_commit`
 /// per commit, and per-commit tree diffs under a path filter, so on a long-loaded
-/// history it is far too slow for the frame loop. Bails without a result as soon
-/// as a newer dispatch supersedes it.
+/// history it is far too slow for the frame loop. Stops as soon as a newer dispatch
+/// supersedes it — before it starts, or part-way through the two loads that can run
+/// deep (a `Seek`, and the `Hydrate` page a cached reveal asks for) — and reports
+/// that as `load: None`, which the UI drops as superseded. Reporting it at all is
+/// what lets a test wait for an abandoned job's end rather than for a clock.
 pub fn history_job(repo: &Repository, job: HistoryJob) {
     let HistoryJob {
         scope,
@@ -544,23 +585,23 @@ pub fn history_job(repo: &Repository, job: HistoryJob) {
         tx,
         ctx,
     } = job;
-    if !current_epoch.is_current(epoch) {
+    let live = || current_epoch.is_current(epoch);
+    let superseded = || {
+        log::debug!("history-load: superseded, stopped");
+        let _gone = tx.send(HistoryResult { epoch, load: None });
+    };
+    if !live() {
+        superseded();
         return;
     }
     let t = std::time::Instant::now();
     let load = match kind {
         HistoryJobKind::Hydrate { oids, max_new } => {
             let t = std::time::Instant::now();
-            let ref_map = build_ref_map(repo);
-            let mut seen = HashSet::new();
-            let new = build_commits_from_walk(
-                repo,
-                oids.iter().copied(),
-                &mut seen,
-                &ref_map,
-                max_new,
-                scope.first_parent,
-            );
+            let Some(new) = hydrate_page(repo, &oids, max_new, scope.first_parent, live) else {
+                superseded();
+                return;
+            };
             log::debug!(
                 "history-load: hydrated {} rows from the cached walk in {:?}",
                 new.len(),
@@ -583,6 +624,39 @@ pub fn history_job(repo: &Repository, job: HistoryJob) {
         HistoryJobKind::Rebuild { count } => {
             rebuild_load(load_history(repo, count, &scope, None), count)
         }
+        HistoryJobKind::Seek {
+            prefix,
+            skip,
+            expect_last,
+            cap,
+        } => {
+            let query = SeekQuery {
+                prefix: &prefix,
+                skip,
+                expect_last,
+                margin: LOAD_BATCH,
+                cap,
+            };
+            // The walk can run to the cap, so it stops as soon as this job is
+            // superseded — a newer load, or the search box changing under it
+            // (`keep_or_abandon_reveal_walk`) — rather than only being dropped when it lands.
+            match seek_commits_tail(repo, &scope, &query, live) {
+                Some(Seek::Found { new, max_new }) => HistoryLoad::Extend { new, max_new },
+                Some(Seek::Missed(miss)) => HistoryLoad::Missed(miss),
+                // Superseded mid-walk, reported as a job superseded before it ran is.
+                Some(Seek::Abandoned) => {
+                    log::debug!("history-load: seek abandoned in {:?}", t.elapsed());
+                    superseded();
+                    return;
+                }
+                // The walk no longer lines up with the rows on screen: the same
+                // full-rebuild fallback an `Extend` takes, one page further.
+                None => {
+                    let requested = skip + LOAD_BATCH;
+                    rebuild_load(load_history(repo, requested, &scope, None), requested)
+                }
+            }
+        }
     };
     // Completion log with shape + duration, like the diff-load/prefetch/highlight
     // workers — without it a wasted walk (superseded, duplicated) is invisible in
@@ -602,6 +676,9 @@ pub fn history_job(repo: &Repository, job: HistoryJob) {
                 t.elapsed()
             );
         }
+        HistoryLoad::Missed(miss) => {
+            log::debug!("history-load: seek missed ({miss:?}) in {:?}", t.elapsed());
+        }
     }
     if tx
         .send(HistoryResult {
@@ -617,8 +694,33 @@ pub fn history_job(repo: &Repository, job: HistoryJob) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::LOAD_BATCH;
+    use crate::test_repo::{commit_file, temp_repo};
     use crate::tests::oid;
+
+    /// A page nobody wants any more stops building as soon as `live` says so, and a
+    /// list cut short is not handed over: a short page reads as the end of history.
+    #[test]
+    fn a_hydrate_page_stops_once_it_is_no_longer_live() {
+        let (_dir, repo) = temp_repo();
+        let mut oids: Vec<git2::Oid> = (0..10)
+            .map(|i| commit_file(&repo, "f.txt", &format!("{i}\n"), &format!("c{i}")))
+            .collect();
+        oids.reverse();
+        let page = hydrate_page(&repo, &oids, 10, false, || true);
+        assert_eq!(
+            page.map(|rows| rows.len()),
+            Some(10),
+            "control: a live page is built whole"
+        );
+
+        let asked = std::cell::Cell::new(0);
+        let live = || {
+            asked.set(asked.get() + 1);
+            asked.get() <= 3
+        };
+        assert!(hydrate_page(&repo, &oids, 10, false, live).is_none());
+        assert_eq!(asked.get(), 5, "it stopped where it was told to");
+    }
 
     /// The cached walk is what makes page two cost ~2ms instead of a fresh 1.6s
     /// ordering pass, but serving a page from it is only sound while it still
@@ -630,7 +732,9 @@ mod tests {
         let ids: Vec<git2::Oid> = (0..10).map(oid).collect();
         let hydrated = |k: &HistoryJobKind| match k {
             HistoryJobKind::Hydrate { oids, .. } => Some(oids.clone()),
-            HistoryJobKind::Extend { .. } | HistoryJobKind::Rebuild { .. } => None,
+            HistoryJobKind::Extend { .. }
+            | HistoryJobKind::Rebuild { .. }
+            | HistoryJobKind::Seek { .. } => None,
         };
 
         // In range and anchored on the last loaded row: serve rows 3..6 from cache.

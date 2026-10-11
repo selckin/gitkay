@@ -565,6 +565,16 @@ pub fn range_ends(repo: &Repository, scope: &cli::Scope) -> Option<(String, diff
 /// re-walking.
 pub const HISTORY_OID_CAP: usize = 200_000;
 
+/// Why a hash search past the loaded rows came back without a commit. The search bar
+/// words the two differently because only one of them is final.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeekMiss {
+    /// The whole history was searched, and no commit in it has that hash.
+    Absent,
+    /// The search stopped at its cap, so the commit may still be further down.
+    Capped,
+}
+
 /// Add what `f` costs to `acc`, returning what it returned.
 ///
 /// The walk's phases interleave — the path-filter loop does a tree diff, a commit load
@@ -664,11 +674,7 @@ fn topo_tips(repo: &Repository, scope: &cli::Scope) -> Option<Vec<git2::Oid>> {
 /// rewrites the parents of what it keeps. `lazy_filtered_walk` is that scope's entry
 /// point, and it consumes the walk itself rather than a finished list.
 fn topo_oids(repo: &Repository, scope: &cli::Scope, want: usize) -> Option<Vec<git2::Oid>> {
-    if !topo_scope(scope) || !scope.paths.is_empty() {
-        return None;
-    }
-    let graph = crate::commitgraph::CommitGraph::for_repo(repo)?;
-    let tips = topo_tips(repo, scope)?;
+    let (graph, tips) = topo_inputs(repo, scope)?;
     let t = std::time::Instant::now();
     let oids = crate::topo::TopoWalk::new(repo, &graph, &tips, scope.first_parent).take(want)?;
     log::debug!(
@@ -678,6 +684,21 @@ fn topo_oids(repo: &Repository, scope: &cli::Scope, want: usize) -> Option<Vec<g
         t.elapsed()
     );
     Some(oids)
+}
+
+/// What the lazy walk starts from, when this repository and scope can be walked that
+/// way: the commit-graph and the tips. One gate for `topo_oids` and `seek_commits_tail`,
+/// so a hash seek takes the lazy walk exactly where a page would.
+fn topo_inputs(
+    repo: &Repository,
+    scope: &cli::Scope,
+) -> Option<(crate::commitgraph::CommitGraph, Vec<git2::Oid>)> {
+    if !topo_scope(scope) || !scope.paths.is_empty() {
+        return None;
+    }
+    let graph = crate::commitgraph::CommitGraph::for_repo(repo)?;
+    let tips = topo_tips(repo, scope)?;
+    Some((graph, tips))
 }
 
 /// A walk that has stopped because it cannot answer, as opposed to having run out of
@@ -1487,6 +1508,32 @@ pub fn load_commits_tail(
     Some(commits)
 }
 
+/// Skip the `skip` distinct oids the loaded prefix holds off `walk`, and check that the
+/// last of them is `expect_last`. Returns the oids skipped, which the caller keeps
+/// deduplicating against.
+///
+/// The one place a resume skips and anchors, shared by `resume_from` (a page) and
+/// `seek_oids` (a hash seek). Both are only sound while they count the prefix exactly
+/// as the walk that produced it did, so the two cannot be allowed to drift apart.
+///
+/// `None` when the walk is shorter than the prefix, or when the anchor moved: either
+/// way the walk no longer reproduces the one the prefix came from.
+fn skip_to_anchor(
+    walk: &mut impl Iterator<Item = git2::Oid>,
+    skip: usize,
+    expect_last: git2::Oid,
+) -> Option<HashSet<git2::Oid>> {
+    let mut seen = HashSet::new();
+    let mut last = None;
+    while seen.len() < skip {
+        let oid = walk.next()?;
+        if seen.insert(oid) {
+            last = Some(oid);
+        }
+    }
+    (last == Some(expect_last)).then_some(seen)
+}
+
 /// Skip `skip` oids off `walk`, check the anchor, and build the next `max_new` rows.
 ///
 /// One function for both walks, not two copies of it: the resume is only sound while
@@ -1508,19 +1555,7 @@ fn resume_from(
     expect_last: git2::Oid,
     max_new: usize,
 ) -> Option<Vec<CommitInfo>> {
-    let mut seen = HashSet::new();
-    let mut last = None;
-    let mut skipped = 0;
-    while skipped < skip {
-        let oid = walk.next()?;
-        if seen.insert(oid) {
-            last = Some(oid);
-            skipped += 1;
-        }
-    }
-    if last != Some(expect_last) {
-        return None;
-    }
+    let mut seen = skip_to_anchor(&mut walk, skip, expect_last)?;
     let ref_map = build_ref_map(repo);
     Some(build_commits_from_walk(
         repo,
@@ -1530,6 +1565,174 @@ fn resume_from(
         max_new,
         scope.first_parent,
     ))
+}
+
+/// What a hash seek past the loaded rows found. See `seek_commits_tail`.
+pub enum Seek {
+    /// The rows after the loaded prefix, through the match, and how many were asked
+    /// for. `max_new` is what makes a short answer mean "the history ended" to the
+    /// caller, exactly as it does for a page.
+    Found {
+        new: Vec<CommitInfo>,
+        max_new: usize,
+    },
+    Missed(SeekMiss),
+    /// Stopped part-way because nobody wants the answer any more: `live` said so.
+    Abandoned,
+}
+
+/// What a seek looks for: the first commit past the `skip`-long loaded prefix, which
+/// ends at `expect_last`, whose hash starts with `prefix`, searched up to walk position
+/// `cap`, and the `margin` rows past it a match is loaded with.
+pub struct SeekQuery<'a> {
+    pub prefix: &'a str,
+    pub skip: usize,
+    pub expect_last: git2::Oid,
+    pub margin: usize,
+    pub cap: usize,
+}
+
+/// The oid half of a seek, before any row is built.
+enum OidSeek {
+    Found { oids: Vec<git2::Oid>, want: usize },
+    Missed(SeekMiss),
+    Abandoned,
+}
+
+/// Find the first commit past the loaded prefix whose hash starts with `prefix`, for a
+/// scope with no cached walk to look it up in: the lazy walk caches none.
+///
+/// It resumes the walk the way `load_commits_tail` does, skipping and anchoring on
+/// `skip`/`expect_last` and taking the lazy walk first, and scans for the prefix up to
+/// walk position `cap`. On a match it builds the rows from the prefix's end through
+/// the match and up to `margin` past it, so the match can be centred rather than sit
+/// on the last row. The answer is a page like any other, and `max_new` is the whole
+/// of that ask: a walk that ends inside the margin returns short, which is what tells
+/// the caller the history ended, and one that does not returns it in full.
+///
+/// The cap bounds the SEARCH, not the margin. A match just inside it still gets its
+/// page past it, as the cached route's does, since a page cut at the cap would come
+/// back short and read as the end of a history that goes on.
+///
+/// `live` is asked as the walk goes, and once it says no the seek stops and answers
+/// `Abandoned`: a search the reader gave up on would otherwise walk on to the cap and
+/// build every row it passed, for a result that is only dropped. It must stay false
+/// once it is false (an epoch that moved on), since a row cut short by it is only
+/// ever discarded behind that same answer.
+///
+/// `None` where `load_commits_tail` answers `None`: a scope that cannot extend
+/// incrementally, or a walk that no longer lines up with the rows on screen.
+pub fn seek_commits_tail(
+    repo: &Repository,
+    scope: &cli::Scope,
+    query: &SeekQuery,
+    live: impl Fn() -> bool,
+) -> Option<Seek> {
+    if scope.reflog || !scope.paths.is_empty() {
+        return None;
+    }
+    let t = std::time::Instant::now();
+    // A lazy walk that DECLINES part-way ends its oids early, and that must not read
+    // as "the history ended": it would answer "not in this history" for a commit the
+    // walk simply could not reach. So a decline discards the lazy answer and the
+    // sorted walk is asked instead, as `topo_oids`' all-or-nothing does for a page.
+    let lazy = topo_inputs(repo, scope).and_then(|(graph, tips)| {
+        let mut walk = crate::topo::TopoWalk::new(repo, &graph, &tips, scope.first_parent);
+        let mut declined = false;
+        let oids = std::iter::from_fn(|| {
+            let next = walk.next().map(|(oid, _)| oid);
+            declined |= next.is_none() && !walk.done();
+            next
+        });
+        let found = seek_oids(oids, query, &live);
+        if declined { None } else { Some(found) }
+    });
+    let (label, found) = if let Some(found) = lazy {
+        ("topo", found?)
+    } else {
+        let oids = history_revwalk(repo, scope)?.flatten();
+        ("sorted", seek_oids(oids, query, &live)?)
+    };
+    let seek = match found {
+        OidSeek::Found { oids, want } => {
+            // Building the rows is the costly half — a `find_commit` each, up to the
+            // cap — so it stops too, and a list it cut short never leaves as `Found`.
+            let new = build_commits_from_walk(
+                repo,
+                oids.into_iter().take_while(|_| live()),
+                &mut HashSet::new(),
+                &build_ref_map(repo),
+                want,
+                scope.first_parent,
+            );
+            if live() {
+                Seek::Found { new, max_new: want }
+            } else {
+                Seek::Abandoned
+            }
+        }
+        OidSeek::Missed(miss) => Seek::Missed(miss),
+        OidSeek::Abandoned => Seek::Abandoned,
+    };
+    log::debug!(
+        "perf: seek_commits_tail: {} past {} ({label}) {:?}",
+        match &seek {
+            Seek::Found { new, .. } => format!("+{} commits", new.len()),
+            Seek::Missed(miss) => format!("{miss:?}"),
+            Seek::Abandoned => "abandoned".to_string(),
+        },
+        query.skip,
+        t.elapsed()
+    );
+    Some(seek)
+}
+
+/// `seek_commits_tail` over one walk's oids: skip and anchor as `resume_from` does, then
+/// scan for `prefix` from walk position `skip` up to `cap`, keeping the oids it passes,
+/// since those are the rows the match needs above it, and `margin` more past it.
+/// `Abandoned` as soon as `live` says no.
+fn seek_oids(
+    mut walk: impl Iterator<Item = git2::Oid>,
+    query: &SeekQuery,
+    live: impl Fn() -> bool,
+) -> Option<OidSeek> {
+    let &SeekQuery {
+        prefix,
+        skip,
+        expect_last,
+        margin,
+        cap,
+    } = query;
+    let mut seen = skip_to_anchor(&mut walk, skip, expect_last)?;
+    let mut oids = Vec::new();
+    let mut want = None;
+    for oid in walk {
+        if !live() {
+            return Some(OidSeek::Abandoned);
+        }
+        if !seen.insert(oid) {
+            continue;
+        }
+        if want.is_none() {
+            let position = skip + oids.len();
+            if position >= cap {
+                return Some(OidSeek::Missed(SeekMiss::Capped));
+            }
+            if crate::oid_hex_starts_with(oid, prefix) {
+                want = Some(position + 1 - skip + margin);
+            }
+        }
+        oids.push(oid);
+        if want.is_some_and(|want| oids.len() >= want) {
+            break;
+        }
+    }
+    Some(
+        want.map_or(OidSeek::Missed(SeekMiss::Absent), |want| OidSeek::Found {
+            oids,
+            want,
+        }),
+    )
 }
 
 /// Pathspec to scope a commit's diff to. In --follow mode it's the file's name *at
@@ -3431,6 +3634,67 @@ mod tests {
             assert_eq!(got.summary, want.summary);
             assert_eq!(got.refs, want.refs, "ref chips for {}", want.summary);
         }
+    }
+
+    /// The skip both resumes share: it counts DISTINCT oids, as the walk that produced
+    /// the prefix did, leaves the walk just past the anchor, and refuses a walk that is
+    /// too short or no longer ends the prefix on the anchor.
+    #[test]
+    fn skip_to_anchor_counts_distinct_oids_and_checks_the_last() {
+        let ids = [oid(1), oid(2), oid(2), oid(3), oid(4)];
+        let mut walk = ids.iter().copied();
+        let seen = skip_to_anchor(&mut walk, 3, oid(3)).expect("anchored");
+        assert_eq!(seen, HashSet::from([oid(1), oid(2), oid(3)]));
+        assert_eq!(
+            walk.next(),
+            Some(oid(4)),
+            "the walk resumes past the anchor"
+        );
+
+        assert!(skip_to_anchor(&mut ids.iter().copied(), 3, oid(2)).is_none());
+        assert!(skip_to_anchor(&mut ids.iter().copied(), 9, oid(4)).is_none());
+        assert!(skip_to_anchor(&mut ids.iter().copied(), 0, oid(1)).is_none());
+    }
+
+    /// A seek nobody wants any more stops walking as soon as `live` says so, rather
+    /// than scanning on to its match or the cap, and never answers `Found` with what
+    /// it had passed by then.
+    #[test]
+    fn a_seek_stops_walking_once_it_is_no_longer_live() {
+        let ids: Vec<git2::Oid> = (1..=20).map(oid).collect();
+        let hex = oid(15).to_string();
+        let query = SeekQuery {
+            prefix: &hex,
+            skip: 2,
+            expect_last: oid(2),
+            margin: 3,
+            cap: 100,
+        };
+        let pulled = std::cell::Cell::new(0);
+        let walk = || {
+            ids.iter()
+                .copied()
+                .inspect(|_| pulled.set(pulled.get() + 1))
+        };
+
+        let found = seek_oids(walk(), &query, || true);
+        assert!(
+            matches!(found, Some(OidSeek::Found { want: 16, .. })),
+            "control: a live seek reaches the match and its margin"
+        );
+        assert_eq!(pulled.get(), 18);
+
+        pulled.set(0);
+        let asked = std::cell::Cell::new(0);
+        let live = || {
+            asked.set(asked.get() + 1);
+            asked.get() <= 5
+        };
+        assert!(matches!(
+            seek_oids(walk(), &query, live),
+            Some(OidSeek::Abandoned)
+        ));
+        assert_eq!(pulled.get(), 2 + 6, "it stopped where it was told to");
     }
 
     #[test]

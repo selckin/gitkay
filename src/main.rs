@@ -57,8 +57,9 @@ use diff_store::DiffStore;
 use graph::{GraphLayoutState, GraphRow, layout_graph_rows};
 use highlight::{DiffBg, Highlighter};
 use history::{
-    CommitInfo, HistoryWalk, PROVISIONAL_HISTORY_DELAY, RefKind, ScopeNotice, TipPaths,
-    diff_paths_for, load_history, provisional_commits, provisional_scope, scope_notice,
+    CommitInfo, HISTORY_OID_CAP, HistoryWalk, PROVISIONAL_HISTORY_DELAY, RefKind, ScopeNotice,
+    SeekMiss, TipPaths, diff_paths_for, load_history, provisional_commits, provisional_scope,
+    scope_notice,
 };
 use prefetch::{
     ClaimKind, InflightClaim, InflightKeys, PoolHandle, PrefetchBudget, PrefetchTarget, StatsJob,
@@ -583,6 +584,27 @@ fn oid_hex_starts_with(oid: git2::Oid, prefix: &str) -> bool {
         let nibble = if i % 2 == 0 { byte >> 4 } else { byte & 0x0f };
         HEX[nibble as usize] == want
     })
+}
+
+/// The query as a hash prefix worth looking up past the loaded rows: 7–40 chars, all
+/// lowercase hex. `q` is already lowercased.
+///
+/// Seven is git's default abbreviation, and the floor is what keeps a hash being typed
+/// from firing a load per keystroke: `2`, `20`, `20b` would each reach a different
+/// commit.
+fn sha_query(q: &str) -> Option<&str> {
+    ((7..=40).contains(&q.len()) && q.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        .then_some(q)
+}
+
+/// The first position at or after `from` in the walk's ordered oids whose hex starts
+/// with `prefix`.
+fn history_position(oids: &[git2::Oid], prefix: &str, from: usize) -> Option<usize> {
+    let after = oids.get(from..)?;
+    let i = after
+        .iter()
+        .position(|&oid| oid_hex_starts_with(oid, prefix))?;
+    Some(from + i)
 }
 
 /// Width in points of `s` laid out on one line in `font` — the measurement the elide
@@ -3448,6 +3470,57 @@ struct StartupHighlight {
     service: Option<HighlightService>,
 }
 
+/// A hash search that has to reach past the loaded rows: what `reveal_unloaded_sha`
+/// started, and what the search bar shows in place of the match count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShaReveal {
+    /// Another history load is in flight, and the reveal waits for it. Dispatching
+    /// would supersede it: a watcher rebuild superseded that way is simply lost, with
+    /// nothing to re-arm it. So the reveal check runs again once that load lands,
+    /// against the rows it brought. The load can also be the reveal's own walk for a
+    /// prefix of this query or one extending it, kept across the keystroke
+    /// (`keep_or_abandon_reveal_walk`): its rows are looked in the same way.
+    Queued,
+    /// The reveal's own load is in flight; its result selects the match.
+    Searching,
+    /// The reveal's own load is in flight a second time, after the first was lost:
+    /// it failed, or the walk no longer lined up and came back as a rebuild. Losing
+    /// this one too ends the reveal, so a load that keeps failing is retried once and
+    /// is not re-dispatched for ever.
+    Retrying,
+    /// The search came back without the commit.
+    Missed(SeekMiss),
+}
+
+/// How far into the history a hash search looks: `HISTORY_OID_CAP`, the most oids the
+/// startup walk caches, so the cached route and the walking route stop at the same
+/// place and say the same thing when they do.
+#[cfg(not(test))]
+const fn seek_cap() -> usize {
+    HISTORY_OID_CAP
+}
+
+/// The test build's cap: `HISTORY_OID_CAP`, unless a test has lowered it
+/// (`tests::with_seek_cap`) so that running out of it happens on a fixture of a few
+/// hundred commits. Read on the UI thread, where the reveal is dispatched.
+#[cfg(test)]
+fn seek_cap() -> usize {
+    tests::forced_seek_cap().unwrap_or(HISTORY_OID_CAP)
+}
+
+/// `n` with its thousands separated by commas: `200,000`.
+fn digits_grouped(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, d) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(d);
+    }
+    out
+}
+
 struct GitkApp {
     commits: Vec<CommitInfo>,
     graph_rows: Vec<GraphRow>,
@@ -3555,6 +3628,30 @@ struct GitkApp {
     search_text: String,
     search_matches: Vec<usize>,
     search_cursor: usize,
+    /// Where a hash search past the loaded rows stands (`reveal_unloaded_sha`), and
+    /// what the search bar says about it in place of the match count. Cleared on every
+    /// keystroke in the search box, which also keeps or abandons the reveal's own load
+    /// in flight (`keep_or_abandon_reveal_walk`), and taken by every history result
+    /// that lands.
+    /// A result ends a pending search (`finish_reveal`). A `Missed` answer is put back
+    /// while it is still true: across an extension or a failed load, which change no
+    /// history, and across a rebuild when it is `Capped`. A rebuild re-asks an
+    /// `Absent` one, since new commits may hold it, and any miss gives way to a loaded
+    /// match, which a rebuild jumps to.
+    sha_reveal: Option<ShaReveal>,
+    /// The hash prefix the reveal's own load in flight is for: set by the dispatch
+    /// `reveal_unloaded_sha` makes, and cleared by any other dispatch, by the landing
+    /// of the current result and by abandoning it. So `Some` means the load in flight
+    /// is the reveal's, whatever `sha_reveal` says — a keystroke that still wants it
+    /// leaves the reveal `Queued` behind it (`keep_or_abandon_reveal_walk`), and a
+    /// later keystroke that does not must still find it to abandon.
+    reveal_walk: Option<String>,
+    /// The last hash prefix a search found in no commit of the whole history. A query
+    /// extending it is absent too, so it is answered without walking again; typing
+    /// the rest of a missing hash would otherwise walk the history once a keystroke.
+    /// Forgotten whenever the list is replaced, since a new history may hold it.
+    /// Never set for a capped miss, which says nothing about commits past the cap.
+    absent_prefix: Option<String>,
     copied_toast: Option<std::time::Instant>,
     all_loaded: bool,
     needs_reload: Arc<AtomicBool>,
@@ -4753,6 +4850,9 @@ impl GitkApp {
             search_text: String::new(),
             search_matches: Vec::new(),
             search_cursor: 0,
+            sha_reveal: None,
+            reveal_walk: None,
+            absent_prefix: None,
             copied_toast: None,
             // True for an empty list, exactly as `real_commit_count(&[]) <
             // INITIAL_COMMITS` answered when this was computed here; the install
@@ -4876,6 +4976,197 @@ impl GitkApp {
             .collect();
         if self.search_cursor >= self.search_matches.len() {
             self.search_cursor = 0;
+        }
+    }
+
+    /// The search box's text changed: rematch the loaded rows, jump to the first match,
+    /// and for a hash that matched none of them, look past them.
+    fn on_search_changed(&mut self) {
+        self.search_cursor = 0;
+        // Whatever the previous text was waiting for is not what this one wants. Its
+        // own walk, if one is in flight, is decided on once this text has been looked
+        // for (`keep_or_abandon_reveal_walk`). Taken now, so a walk this text
+        // dispatches below is not mistaken for one it found running.
+        self.sha_reveal = None;
+        let walking = self.reveal_walk.clone();
+        self.refresh_search_matches();
+        // Jump to the first match (cursor just reset to 0) — selection and scroll
+        // now, the diff after the debounce.
+        self.jump_to_current_match_deferred();
+        self.reveal_unloaded_sha();
+        if let Some(walk) = walking {
+            self.keep_or_abandon_reveal_walk(&walk);
+        }
+    }
+
+    /// The search text changed under the reveal's own walk for `walk` (`reveal_walk`):
+    /// keep it if the new text still wants it, and abandon it otherwise. Asked after
+    /// `reveal_unloaded_sha` has looked for the new text, which cannot have dispatched
+    /// past the walk: it was in flight.
+    ///
+    /// It is still wanted when the new query needs a load (`reveal_unloaded_sha` went
+    /// `Queued` behind the walk) and it and the walk's prefix are prefixes of one
+    /// another: typing more of the hash, or backspacing while it is still a hash. Such
+    /// a query matches on the path the walk is taking — a longer one at or after the
+    /// walk's match, a shorter one at or before it — so the walk is progress, and its
+    /// rows are looked in once they land. Restarting it from the loaded tail on every
+    /// keystroke would reach a deep hash last, and on the cached route leave every
+    /// earlier page building beside the reader's diff load.
+    ///
+    /// Anything else abandons it: appended, the rows of a search nobody wants any more
+    /// would grow the list for good, up to the cap. The epoch bump drops its result and
+    /// stops the walk (`history_job`), and `history_inflight` is cleared because no
+    /// result of the current epoch is coming. Only the reveal's OWN load is ever
+    /// abandoned: any other dispatch clears `reveal_walk`, so a load the reveal merely
+    /// waits on is never lost.
+    fn keep_or_abandon_reveal_walk(&mut self, walk: &str) {
+        let q = self.search_text.to_lowercase();
+        let wanted = self.sha_reveal == Some(ShaReveal::Queued)
+            && sha_query(&q).is_some_and(|q| q.starts_with(walk) || walk.starts_with(q));
+        if wanted {
+            return;
+        }
+        self.reveal_walk = None;
+        self.history_epoch.bump();
+        self.history_inflight = false;
+        // It waited on the walk just abandoned, and nothing else is in flight now.
+        if self.sha_reveal == Some(ShaReveal::Queued) {
+            self.reveal_unloaded_sha();
+        }
+    }
+
+    /// Load the rows down to the first commit past the loaded ones whose hash starts
+    /// with the query, so the search can select it. The history only loads a window
+    /// at a time, so without this a hash a few thousand commits down matches nothing
+    /// until the reader has scrolled that far.
+    ///
+    /// A no-op unless the query is SHA-shaped, no loaded row matched it, and the list
+    /// on screen is the real one. A provisional list cannot be extended, and before
+    /// the startup list lands there is nothing to extend; `install_startup_history`
+    /// runs this again for both. Only plain scopes are searched. A path filter's
+    /// rewrite and the reflog's numbering are whole-list computations with no prefix
+    /// to resume, so they keep today's "no match".
+    ///
+    /// Two routes reach the same `Extend`. With the walk's oids cached, the position
+    /// is looked up and the page served from the cache; without them (the lazy walk
+    /// caches none), a `Seek` resumes the walk on a worker to find it.
+    fn reveal_unloaded_sha(&mut self) {
+        let q = self.search_text.to_lowercase();
+        let Some(prefix) = sha_query(&q) else { return };
+        if !self.search_matches.is_empty()
+            || self.scope.reflog
+            || !self.scope.paths.is_empty()
+            || self.pending_history.is_some()
+            || self.history_is_provisional
+        {
+            return;
+        }
+        let known_absent = self
+            .absent_prefix
+            .as_deref()
+            .is_some_and(|absent| prefix.starts_with(absent));
+        // Every commit is already a row and none matched, or a shorter prefix of this
+        // one is in no commit at all.
+        if self.all_loaded || known_absent {
+            self.record_miss(SeekMiss::Absent);
+            return;
+        }
+        if self.history_inflight {
+            self.sha_reveal = Some(ShaReveal::Queued);
+            return;
+        }
+        let Some(last_real) = self.commits.iter().rev().find(|c| is_real_commit(c.oid)) else {
+            return;
+        };
+        let skip = real_commit_count(&self.commits);
+        let cap = seek_cap();
+        let kind = if let Some(oids) = self.history_oids.as_deref() {
+            let searched = &oids[..oids.len().min(cap)];
+            let Some(position) = history_position(searched, prefix, skip) else {
+                // A cache shorter than the cap is the whole history; one that
+                // reached it stopped where the walk did.
+                let miss = if oids.len() >= cap {
+                    SeekMiss::Capped
+                } else {
+                    SeekMiss::Absent
+                };
+                self.record_miss(miss);
+                return;
+            };
+            // Through the match and a page past it, so it can be centred rather than
+            // sit on the last row. A cache that ends sooner hands over a short page,
+            // which reads as the end of the history only where the cache is complete
+            // (`next_history_page`).
+            let max_new = position + 1 - skip + LOAD_BATCH;
+            next_history_page(Some(oids), skip, last_real.oid, max_new)
+        } else {
+            HistoryJobKind::Seek {
+                prefix: prefix.to_string(),
+                skip,
+                expect_last: last_real.oid,
+                cap,
+            }
+        };
+        self.dispatch_history_load(kind);
+        self.sha_reveal = Some(ShaReveal::Searching);
+        self.reveal_walk = Some(prefix.to_string());
+    }
+
+    /// What the search bar says in place of the match count while a hash is searched
+    /// for past the loaded rows, or once that search came back without it.
+    fn reveal_status(&self) -> Option<String> {
+        self.sha_reveal.map(|reveal| match reveal {
+            ShaReveal::Queued | ShaReveal::Searching | ShaReveal::Retrying => {
+                "searching history…".to_string()
+            }
+            ShaReveal::Missed(SeekMiss::Absent) => "not in this history".to_string(),
+            ShaReveal::Missed(SeekMiss::Capped) => {
+                format!("not in the first {} commits", digits_grouped(seek_cap()))
+            }
+        })
+    }
+
+    /// The search came back without the commit: say so, and remember an absent
+    /// prefix so that typing more of it walks nothing (`absent_prefix`).
+    fn record_miss(&mut self, miss: SeekMiss) {
+        if miss == SeekMiss::Absent
+            && let Some(query) = sha_query(&self.search_text.to_lowercase())
+            // Keep the SHORTER prefix: it answers for every query the longer one
+            // does, and for the ones backspacing returns to as well.
+            && !self
+                .absent_prefix
+                .as_deref()
+                .is_some_and(|absent| query.starts_with(absent))
+        {
+            self.absent_prefix = Some(query.to_string());
+        }
+        self.sha_reveal = Some(ShaReveal::Missed(miss));
+    }
+
+    /// A history result has landed while a reveal was pending: select the match it
+    /// brought, or look again.
+    ///
+    /// A reveal looks again when it was waiting on another load (`Queued`), and when
+    /// its own load was `lost`: the worker failed, or the walk no longer lined up and
+    /// a rebuild came back in its place. The second look after a loss is `Retrying`,
+    /// and a loss there ends the reveal. Every look is one dispatch for one landed
+    /// result, and only `Queued` (another load having landed) resets the retry, so a
+    /// load that keeps failing is retried once rather than once a frame.
+    fn finish_reveal(&mut self, reveal: ShaReveal, lost: bool) {
+        if !self.search_matches.is_empty() {
+            self.search_cursor = 0;
+            self.jump_to_current_match_deferred();
+            return;
+        }
+        match reveal {
+            ShaReveal::Queued => self.reveal_unloaded_sha(),
+            ShaReveal::Searching if lost => {
+                self.reveal_unloaded_sha();
+                if self.sha_reveal == Some(ShaReveal::Searching) {
+                    self.sha_reveal = Some(ShaReveal::Retrying);
+                }
+            }
+            ShaReveal::Searching | ShaReveal::Retrying | ShaReveal::Missed(_) => {}
         }
     }
 
@@ -6516,6 +6807,16 @@ impl GitkApp {
     fn dispatch_history_load(&mut self, kind: HistoryJobKind) {
         let epoch = self.history_epoch.bump();
         self.history_inflight = true;
+        // This supersedes a reveal's load as surely as any other, so the reveal goes
+        // back to waiting, and runs again against whatever this one brings.
+        // `reveal_unloaded_sha` marks its own dispatch after this returns.
+        self.reveal_walk = None;
+        if matches!(
+            self.sha_reveal,
+            Some(ShaReveal::Searching | ShaReveal::Retrying)
+        ) {
+            self.sha_reveal = Some(ShaReveal::Queued);
+        }
         // `kind` now carries a Vec (Hydrate's page), so the job builder clones it
         // rather than copying — the sync fallback below builds a second job.
         let make_job = |kind: HistoryJobKind| HistoryJob {
@@ -6582,6 +6883,15 @@ impl GitkApp {
                 continue;
             }
             self.history_inflight = false;
+            // Every result that lands ends a pending reveal: its own result brings
+            // the match or the miss, and any other load leaves it to look again.
+            let mut reveal = self.sha_reveal.take();
+            // The prefix this result was walked for, when it is the reveal's own.
+            let walk = self.reveal_walk.take();
+            // A failed load, or a rebuild in place of the page the reveal asked for
+            // (its walk no longer lined up), brought it nothing to select.
+            let rebuilt = matches!(result.load, Some(HistoryLoad::Rebuild { .. }));
+            let lost = rebuilt || result.load.is_none();
             // A failed worker (logged there) leaves the commit list alone — a
             // scroll re-triggers the extension — but the diff refresh below still
             // has to run. The reload `drain_apply_results` armed is the ONLY
@@ -6592,6 +6902,25 @@ impl GitkApp {
             // matches that commit".
             match result.load {
                 None => {}
+                Some(HistoryLoad::Missed(miss)) => {
+                    // Only the reveal that is still waiting on it gets to say so; a
+                    // miss for text since retyped is nobody's answer. Unless the text
+                    // only grew: a walk kept across the keystrokes that typed more of
+                    // its hash found no commit with the shorter prefix, so none has
+                    // the longer one either, absent or within the cap alike.
+                    let answers = match reveal {
+                        Some(ShaReveal::Searching | ShaReveal::Retrying) => true,
+                        Some(ShaReveal::Queued) => walk.as_deref().is_some_and(|w| {
+                            sha_query(&self.search_text.to_lowercase())
+                                .is_some_and(|q| q.starts_with(w))
+                        }),
+                        Some(ShaReveal::Missed(_)) | None => false,
+                    };
+                    if answers {
+                        self.record_miss(miss);
+                        reveal = self.sha_reveal;
+                    }
+                }
                 Some(HistoryLoad::Extend { new, max_new }) => {
                     let requested = real_commit_count(&self.commits) + max_new;
                     self.append_commits(new, requested);
@@ -6615,6 +6944,8 @@ impl GitkApp {
                     self.pending_history = None;
                     self.pending_provisional = None;
                     self.history_is_provisional = false;
+                    // A new history may hold what the old one lacked.
+                    self.absent_prefix = None;
                     let previous_oid = self.selected_oid();
                     let previous_index = self.selected;
                     self.commits = commits;
@@ -6633,6 +6964,41 @@ impl GitkApp {
             // mean something else (rewritten history, changed virtual rows); after
             // a pure append the current-key check makes this a no-op.
             self.load_selected_diff();
+            // After the refresh, so a revealed match's diff waits out the search
+            // debounce like any other keystroke's.
+            match reveal {
+                Some(reveal @ (ShaReveal::Queued | ShaReveal::Searching | ShaReveal::Retrying)) => {
+                    self.finish_reveal(reveal, lost);
+                }
+                Some(missed @ ShaReveal::Missed(miss)) => {
+                    if !self.search_matches.is_empty() {
+                        // The query matches a loaded row now, so the miss is no longer
+                        // true. A rebuild that loaded the commit gets the reveal's
+                        // jump; an extension only adds rows below, and does not move
+                        // the reader.
+                        if rebuilt {
+                            self.search_cursor = 0;
+                            self.jump_to_current_match_deferred();
+                        }
+                    } else if rebuilt && miss == SeekMiss::Absent {
+                        // An absent hash may be among the new commits.
+                        self.reveal_unloaded_sha();
+                    } else {
+                        // Still the answer. An extension or a failed load changes no
+                        // history; a capped answer survives a rebuild because new
+                        // commits almost never move it, and asking again would walk
+                        // up to the cap on every `.git` change.
+                        self.sha_reveal = Some(missed);
+                    }
+                }
+                // Nothing was pending, but a rebuild installs a new history, as
+                // `install_startup_history` does. A hash typed before the real list
+                // arrived was not looked for yet: a watcher rebuild can retire the
+                // startup walk, so `install_startup_history` never runs to look for
+                // it.
+                None if rebuilt => self.reveal_unloaded_sha(),
+                None => {}
+            }
         }
     }
 
@@ -7728,6 +8094,12 @@ impl GitkApp {
                 };
 
                 let graph_scroll_to = self.graph_scroll_to.take();
+                // The rows are painted, and the scroll target below computed, at a pitch
+                // of exactly `row_height`. `show_rows` adds the item spacing to it, so with
+                // the default spacing its rows sat 3pt apart from ours. Every scroll to a
+                // row then landed short by 3/23 of its distance from the top, which is
+                // hundreds of rows for a hash revealed thousands down.
+                ui.spacing_mut().item_spacing.y = 0.0;
                 // Virtualize with egui show_rows (same as the diff pane): it reserves the
                 // full virtual height and hands back the visible row range. An early-egui
                 // bottom-gap bug once forced manual pre/post spacers here; that's fixed as
@@ -8408,8 +8780,13 @@ impl GitkApp {
         // replaces it brings the oids with it.
         self.history_oids = oids;
         // A query typed while the list was empty matched nothing; re-run it now
-        // that there are rows to match.
+        // that there are rows to match — and, for a hash none of them holds, look
+        // past them, which `reveal_unloaded_sha` declined to do before the real list
+        // was here. Any reveal state was about the list this one replaces.
         self.refresh_search_matches();
+        self.sha_reveal = None;
+        self.absent_prefix = None;
+        self.reveal_unloaded_sha();
         // The selection, and with it the branch highlight, which holds row INDICES.
         // This list is a different list: the real one prepends the working-tree rows
         // the provisional one has none of, so an index computed against that one
@@ -9399,8 +9776,13 @@ impl eframe::App for GitkApp {
             .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.label(egui::RichText::new("🔍").size(14.0));
-                    let avail = ui.available_width() - 120.0; // leave space for match count
                     let ui_font = self.fonts.font_id(Role::Ui);
+                    // Leave space for the match count, or for the reveal's status, which
+                    // can be wider than it.
+                    let reserve = self.reveal_status().map_or(120.0, |status| {
+                        f32::max(120.0, text_width(ui.painter(), &status, &ui_font) + 16.0)
+                    });
+                    let avail = ui.available_width() - reserve;
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.search_text)
                             .id(search_id)
@@ -9409,11 +9791,7 @@ impl eframe::App for GitkApp {
                             .font(ui_font.clone()),
                     );
                     if resp.changed() {
-                        self.search_cursor = 0;
-                        self.refresh_search_matches();
-                        // Jump to the first match (cursor just reset to 0) —
-                        // selection and scroll now, the diff after the debounce.
-                        self.jump_to_current_match_deferred();
+                        self.on_search_changed();
                     }
                     // Enter cycles through matches
                     if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -9424,15 +9802,20 @@ impl eframe::App for GitkApp {
                         }
                         resp.request_focus();
                     }
-                    if !self.search_matches.is_empty() {
+                    let count = if self.search_matches.is_empty() {
+                        self.reveal_status()
+                    } else {
+                        Some(format!(
+                            "{}/{}",
+                            self.search_cursor + 1,
+                            self.search_matches.len()
+                        ))
+                    };
+                    if let Some(count) = count {
                         ui.label(
-                            egui::RichText::new(format!(
-                                "{}/{}",
-                                self.search_cursor + 1,
-                                self.search_matches.len()
-                            ))
-                            .color(SUBTEXT)
-                            .font(ui_font.clone()),
+                            egui::RichText::new(count)
+                                .color(SUBTEXT)
+                                .font(ui_font.clone()),
                         );
                     }
                     // Copied toast
@@ -10118,7 +10501,9 @@ mod tests {
     use crate::diff::{DiffLine, LineStats, RowSpans, oid_staged, oid_uncommitted};
     use crate::diff_highlight::{file_fully_highlighted, pending_files, pick_file, requeue_file};
     use crate::history::load_commits;
-    use crate::test_repo::{commit_file, commit_index, commit_rename, rename_file, temp_repo};
+    use crate::test_repo::{
+        commit_file, commit_index, commit_rename, rename_file, temp_repo, write_commit_graph,
+    };
 
     #[test]
     fn the_byte_budget_is_the_line_budget_at_the_documented_rate() {
@@ -12749,6 +13134,98 @@ mod tests {
         }
     }
 
+    /// A real [`GitkApp`] driven headlessly through `eframe::App::ui` on a bare
+    /// `egui::Context`. There is no GL and no window, but the `ui` body is the one the
+    /// app runs. Shared by the frame bench and the tests that need the whole app, so
+    /// the two cannot drift in how they build it.
+    ///
+    /// The startup history sender is dropped, so `new` walks synchronously and the
+    /// list is installed before the first frame. That is the same fallback `main()`
+    /// takes when its prefetch thread cannot start.
+    pub struct HeadlessApp {
+        pub app: GitkApp,
+        ctx: egui::Context,
+        frame: eframe::Frame,
+        /// The input clock, advanced a 60 Hz frame at a time. egui animates against
+        /// it — a centred scroll is one — and with no time at all an animation never
+        /// finishes.
+        time: f64,
+    }
+
+    impl HeadlessApp {
+        pub fn new(repo_path: &str, scope: cli::Scope) -> Self {
+            let ctx = egui::Context::default();
+            let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+            let service = HighlightService::spawn();
+            let prewarm_rx =
+                crate::diff_highlight::spawn_prewarm(repo_path.to_string(), service.clone());
+            // Each in its own statement, so the sender is gone before `new` asks: as a
+            // temporary inside the call it would live until `new` returns, and the
+            // history would read as "still walking" for a walk that never comes.
+            let history_rx = mpsc::channel().1;
+            let font_rx = mpsc::channel().1;
+            let app = GitkApp::new(
+                &cc,
+                repo_path.to_string(),
+                scope,
+                history_rx,
+                None,
+                font_rx,
+                StartupHighlight {
+                    prewarm_rx,
+                    service,
+                },
+            )
+            .expect("the app opens the repository");
+            Self {
+                app,
+                ctx,
+                frame: eframe::Frame::_new_kittest(),
+                time: 0.0,
+            }
+        }
+
+        /// One frame on a 900 × 1150 viewport, 1/60 s after the last, its texture
+        /// deltas consumed (see `run_headless`).
+        pub fn frame(&mut self) {
+            self.time += 1.0 / 60.0;
+            let input = egui::RawInput {
+                time: Some(self.time),
+                ..headless_screen(900.0, 1150.0)
+            };
+            let out = self.ctx.run_ui(input, |ui| {
+                eframe::App::ui(&mut self.app, ui, &mut self.frame);
+            });
+            out.drop_without_applying_deltas();
+        }
+    }
+
+    thread_local! {
+        /// Set by `with_seek_cap` while a test wants a hash search to stop early.
+        /// Read by `seek_cap` on the UI thread, which in a headless test is the
+        /// test's own.
+        static FORCE_SEEK_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// The forced hash-search cap, if a test is asking for one.
+    pub fn forced_seek_cap() -> Option<usize> {
+        FORCE_SEEK_CAP.with(std::cell::Cell::get)
+    }
+
+    /// Run `f` with every hash search it starts stopping at `cap` oids. Restores the
+    /// previous setting on the way out, panic included, as `with_build_limits` does.
+    fn with_seek_cap<T>(cap: usize, f: impl FnOnce() -> T) -> T {
+        struct Restore(Option<usize>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FORCE_SEEK_CAP.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(FORCE_SEEK_CAP.with(std::cell::Cell::get));
+        FORCE_SEEK_CAP.with(|c| c.set(Some(cap)));
+        f()
+    }
+
     #[test]
     fn default_fonts_fit_the_row_height_floors() {
         // The commit list floors its row height at 20px and the file list at
@@ -14831,6 +15308,860 @@ mod tests {
         assert!(!data.lines.is_empty());
     }
 
+    #[test]
+    fn a_sha_query_is_seven_to_forty_hex_characters() {
+        assert_eq!(
+            sha_query("20b175"),
+            None,
+            "six is short of git's abbreviation"
+        );
+        assert_eq!(sha_query("20b1752"), Some("20b1752"));
+        assert_eq!(sha_query(&"a".repeat(40)), Some("a".repeat(40).as_str()));
+        assert_eq!(sha_query(&"a".repeat(41)), None, "longer than any oid");
+        assert_eq!(sha_query("20b175g"), None, "not hex");
+        assert_eq!(sha_query("20b1752 "), None, "a space is not hex either");
+    }
+
+    #[test]
+    fn a_history_position_is_the_first_match_at_or_after_from() {
+        let oids: Vec<git2::Oid> = [
+            "aaaa000000000000000000000000000000000000",
+            "bbbb000000000000000000000000000000000000",
+            "aaaa111111111111111111111111111111111111",
+            "cccc000000000000000000000000000000000000",
+        ]
+        .iter()
+        .map(|h| git2::Oid::from_str(h).unwrap())
+        .collect();
+        assert_eq!(history_position(&oids, "aaaa", 0), Some(0));
+        assert_eq!(
+            history_position(&oids, "aaaa", 1),
+            Some(2),
+            "a match before `from` is already loaded and not the one wanted"
+        );
+        assert_eq!(history_position(&oids, "cccc", 3), Some(3));
+        assert_eq!(history_position(&oids, "dddd", 0), None);
+        assert_eq!(history_position(&oids, "aaaa", 9), None, "past the end");
+    }
+
+    #[test]
+    fn digits_are_grouped_in_thousands() {
+        assert_eq!(digits_grouped(0), "0");
+        assert_eq!(digits_grouped(210), "210");
+        assert_eq!(digits_grouped(1_000), "1,000");
+        assert_eq!(digits_grouped(HISTORY_OID_CAP), "200,000");
+        assert_eq!(digits_grouped(1_234_567), "1,234,567");
+    }
+
+    /// Where a reveal fixture's target sits in the walk: past the startup window and
+    /// inside the history, so it is reachable but not loaded.
+    const REVEAL_TARGET_POSITION: usize = INITIAL_COMMITS + 40;
+
+    /// The reveal fixtures' usual length: the history ends 19 rows past the target,
+    /// well inside the page a reveal loads past it.
+    const REVEAL_HISTORY: usize = INITIAL_COMMITS + 60;
+
+    /// Every row a reveal of a target at walk position `target` loads, when the
+    /// history is long enough to hold them: through the target and a page past it.
+    const fn reveal_loads(target: usize) -> usize {
+        target + 1 + LOAD_BATCH
+    }
+
+    /// A one-branch history `len` commits long, every commit touching `f.txt`, newest
+    /// first. `graph` writes a commit-graph over it. That moves the walk onto the lazy
+    /// path, which caches no oids, so it decides which of the reveal's two routes the
+    /// app takes.
+    fn reveal_fixture_of(len: usize, graph: bool) -> (tempfile::TempDir, Vec<git2::Oid>) {
+        let (dir, repo) = temp_repo();
+        let mut walk: Vec<git2::Oid> = (0..len)
+            .map(|i| commit_file(&repo, "f.txt", &format!("{i}\n"), &format!("c{i}")))
+            .collect();
+        walk.reverse();
+        if graph {
+            write_commit_graph(&repo, &walk[..1]);
+        }
+        (dir, walk)
+    }
+
+    /// `reveal_fixture_of` at the usual length.
+    fn reveal_fixture(graph: bool) -> (tempfile::TempDir, Vec<git2::Oid>) {
+        reveal_fixture_of(REVEAL_HISTORY, graph)
+    }
+
+    /// Open a reveal fixture headlessly, run frames until the layout has settled, and
+    /// check the route. The panels take a few frames to reach their sizes, and a
+    /// scroll centred against the first frame's would be centred in a viewport that is
+    /// about to shrink.
+    fn open_fixture(dir: &tempfile::TempDir, scope: cli::Scope, cached: bool) -> HeadlessApp {
+        let mut h = HeadlessApp::new(dir.path().to_str().unwrap(), scope);
+        for _ in 0..5 {
+            h.frame();
+        }
+        assert_eq!(
+            h.app.history_oids.is_some(),
+            cached,
+            "the route under test: a plain walk caches its oids, the lazy one does not"
+        );
+        h
+    }
+
+    /// Type `q` into the search box.
+    fn search(h: &mut HeadlessApp, q: &str) {
+        h.app.search_text = q.to_string();
+        h.app.on_search_changed();
+    }
+
+    /// How long `poll_history` waits before giving up. Generous, because the reveal
+    /// tests run in the debug profile beside the whole suite: a two-second budget once
+    /// timed out on a walk of a few hundred commits.
+    const HISTORY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Drain history results every few ms until `done`, and say how many polls that
+    /// took. It drains directly rather than pumping whole frames: the frame's render
+    /// consumes `graph_scroll_to`, which is half of what a reveal has to set.
+    fn poll_history(h: &mut HeadlessApp, done: impl Fn(&GitkApp) -> bool) -> Option<usize> {
+        let deadline = std::time::Instant::now() + HISTORY_DEADLINE;
+        let mut polls = 0;
+        while std::time::Instant::now() < deadline {
+            if done(&h.app) {
+                return Some(polls);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            h.app.drain_history_results();
+            polls += 1;
+        }
+        done(&h.app).then_some(polls)
+    }
+
+    /// Wait for the history job dispatched under `epoch` to report, and hand back its
+    /// result — undrained, so the caller decides what the app sees. A superseded job
+    /// reports too (`history_job`), so this is how a test knows an abandoned walk has
+    /// ENDED, rather than guessing from a clock. Anything else that lands meanwhile is
+    /// put back on the channel.
+    fn wait_for_report(h: &HeadlessApp, epoch: u64) -> HistoryResult {
+        let deadline = std::time::Instant::now() + HISTORY_DEADLINE;
+        let mut others = Vec::new();
+        let result = loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let result = h
+                .app
+                .history_load_rx
+                .recv_timeout(left)
+                .expect("the history job never reported");
+            if result.epoch == epoch {
+                break result;
+            }
+            others.push(result);
+        };
+        for other in others {
+            h.app.history_load_tx.send(other).unwrap();
+        }
+        result
+    }
+
+    /// The target is loaded, selected and centred, the pending reveal is gone, and a
+    /// few frames later the list is actually showing it.
+    fn assert_revealed(h: &mut HeadlessApp, target: git2::Oid) {
+        let idx = *h
+            .app
+            .commit_index_by_oid
+            .get(&target)
+            .expect("the target row is loaded");
+        assert_eq!(h.app.commits[idx].oid, target);
+        assert_eq!(h.app.selected_oid(), Some(target));
+        assert_eq!(
+            h.app.graph_scroll_to,
+            Some((idx, Some(egui::Align::Center))),
+            "the list is told to centre the match"
+        );
+        assert_eq!(h.app.sha_reveal, None, "the pending reveal is cleared");
+        assert_eq!(h.app.search_matches.get(h.app.search_cursor), Some(&idx));
+        assert_centred_on_screen(h, idx);
+    }
+
+    /// Run frames until a centred scroll has finished animating (at most 0.3s), and
+    /// check that row `idx` is in the middle of what the commit list shows.
+    fn assert_centred_on_screen(h: &mut HeadlessApp, idx: usize) {
+        for _ in 0..30 {
+            h.frame();
+        }
+        let view = h.app.commit_view_range.clone();
+        let middle = usize::midpoint(view.start, view.end);
+        assert!(
+            view.contains(&idx) && middle.abs_diff(idx) <= 1,
+            "row {idx} is centred on screen ({view:?})"
+        );
+    }
+
+    /// A search jump centres its row whatever its distance from the top. The scroll
+    /// target is computed from the row pitch, and a pitch that disagreed with the
+    /// list's lands short by a share of the distance: invisible at row 30, a whole
+    /// screen off at row 150, and hundreds of rows off for a revealed hash.
+    #[test]
+    fn a_search_jump_centres_its_row_on_screen() {
+        let (dir, walk) = reveal_fixture(false);
+        for idx in [30, 150, 199] {
+            let mut h = open_fixture(&dir, cli::Scope::default(), true);
+            search(&mut h, &walk[idx].to_string()[..8]);
+            assert_eq!(h.app.selected_oid(), Some(walk[idx]));
+            assert_centred_on_screen(&mut h, idx);
+        }
+    }
+
+    /// The whole feature, end to end through a real app on both routes. The plain repo
+    /// takes the cached route (`history_position` + `next_history_page`), and the one
+    /// with a commit-graph takes the walking one (`HistoryJobKind::Seek`). The route
+    /// is asserted, so neither run can pass by taking the other.
+    ///
+    /// Each route runs over three histories:
+    /// - one that ends inside the page loaded past the match, so the load comes up
+    ///   short and the list must read as complete;
+    /// - one that runs on past that page, so the load is full and the list must not;
+    /// - one whose match is more than a page past the loaded rows, where a load that
+    ///   stopped at the match would leave it on the last row, where it cannot be
+    ///   centred.
+    #[test]
+    fn a_hash_past_the_loaded_history_is_loaded_and_selected() {
+        let near = REVEAL_TARGET_POSITION;
+        for graph in [false, true] {
+            for (len, position) in [
+                (REVEAL_HISTORY, near),
+                (reveal_loads(near) + 20, near),
+                (
+                    reveal_loads(REVEAL_DEEP_POSITION) + 20,
+                    REVEAL_DEEP_POSITION,
+                ),
+            ] {
+                reveal_and_check(graph, len, position);
+            }
+        }
+    }
+
+    /// One run of `a_hash_past_the_loaded_history_is_loaded_and_selected`: reveal the
+    /// commit at walk `position` in a `len`-commit fixture.
+    fn reveal_and_check(graph: bool, len: usize, position: usize) {
+        let (dir, walk) = reveal_fixture_of(len, graph);
+        let target = walk[position];
+        let mut h = open_fixture(&dir, cli::Scope::default(), !graph);
+        assert!(
+            !h.app.commit_index_by_oid.contains_key(&target),
+            "control: the target starts out unloaded"
+        );
+
+        search(&mut h, &target.to_string()[..8]);
+        assert_eq!(h.app.sha_reveal, Some(ShaReveal::Searching));
+        assert_eq!(h.app.reveal_status().as_deref(), Some("searching history…"));
+        let polls = poll_history(&mut h, |a| a.selected_oid() == Some(target));
+        assert!(
+            polls.is_some(),
+            "graph={graph} len={len}: the target was never selected"
+        );
+        assert_eq!(
+            real_commit_count(&h.app.commits),
+            len.min(reveal_loads(position)),
+            "graph={graph} len={len}: loaded through the match and a page past it"
+        );
+        assert_eq!(
+            h.app.all_loaded,
+            len <= reveal_loads(position),
+            "graph={graph} len={len}: the list is complete only if the history ended"
+        );
+        assert_ne!(
+            h.app.commits.last().map(|c| c.oid),
+            Some(target),
+            "the match is not the last loaded row"
+        );
+        assert_revealed(&mut h, target);
+    }
+
+    /// A hash no commit has is answered from the cache with no load at all, because a
+    /// complete cache is the whole history.
+    #[test]
+    fn a_hash_in_no_commit_is_answered_from_the_cache_without_a_load() {
+        let (dir, walk) = reveal_fixture(false);
+        let mut h = open_fixture(&dir, cli::Scope::default(), true);
+        let rows = h.app.commits.len();
+        let absent = "deadbeefdeadbeef";
+        assert!(
+            !walk.iter().any(|&o| oid_hex_starts_with(o, absent)),
+            "control: no commit has the hash"
+        );
+
+        search(&mut h, absent);
+        assert!(!h.app.history_inflight, "no load was dispatched");
+        assert_eq!(h.app.sha_reveal, Some(ShaReveal::Missed(SeekMiss::Absent)));
+        assert_eq!(
+            h.app.reveal_status().as_deref(),
+            Some("not in this history")
+        );
+        for _ in 0..3 {
+            h.frame();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!h.app.history_inflight);
+        assert_eq!(h.app.commits.len(), rows, "nothing was appended");
+    }
+
+    /// With no cache, the same answer takes a walk to the end of the history, and
+    /// appends nothing.
+    #[test]
+    fn a_hash_in_no_commit_is_walked_for_without_a_cache() {
+        let (dir, _walk) = reveal_fixture(true);
+        let mut h = open_fixture(&dir, cli::Scope::default(), false);
+        let rows = h.app.commits.len();
+
+        search(&mut h, "deadbeefdeadbeef");
+        assert_eq!(h.app.sha_reveal, Some(ShaReveal::Searching));
+        assert!(
+            poll_history(&mut h, |a| a.sha_reveal != Some(ShaReveal::Searching)).is_some(),
+            "the walk never answered"
+        );
+        assert_eq!(h.app.sha_reveal, Some(ShaReveal::Missed(SeekMiss::Absent)));
+        assert_eq!(
+            h.app.reveal_status().as_deref(),
+            Some("not in this history")
+        );
+        assert_eq!(h.app.commits.len(), rows, "nothing was appended");
+    }
+
+    /// A commit past the cap is not claimed to be absent. The search names how far it
+    /// looked, on both routes.
+    #[test]
+    fn a_hash_past_the_cap_says_how_far_the_search_looked() {
+        for graph in [false, true] {
+            with_seek_cap(INITIAL_COMMITS + 10, || {
+                let (dir, walk) = reveal_fixture(graph);
+                let mut h = open_fixture(&dir, cli::Scope::default(), !graph);
+                let rows = h.app.commits.len();
+
+                search(&mut h, &walk[REVEAL_TARGET_POSITION].to_string()[..8]);
+                assert!(
+                    poll_history(&mut h, |a| !matches!(
+                        a.sha_reveal,
+                        Some(ShaReveal::Searching | ShaReveal::Queued)
+                    ))
+                    .is_some(),
+                    "graph={graph}: the search never answered"
+                );
+                assert_eq!(h.app.sha_reveal, Some(ShaReveal::Missed(SeekMiss::Capped)));
+                assert_eq!(
+                    h.app.reveal_status().as_deref(),
+                    Some("not in the first 210 commits")
+                );
+                assert_eq!(h.app.commits.len(), rows, "graph={graph}: nothing appended");
+            });
+        }
+    }
+
+    /// A hash already on screen is today's search: found among the loaded rows, with
+    /// no load and no reveal.
+    #[test]
+    fn a_hash_of_a_loaded_row_needs_no_load() {
+        let (dir, walk) = reveal_fixture(false);
+        let mut h = open_fixture(&dir, cli::Scope::default(), true);
+        let loaded = walk[10];
+
+        search(&mut h, &loaded.to_string()[..8]);
+        assert_eq!(h.app.selected_oid(), Some(loaded));
+        assert!(!h.app.history_inflight, "no load was dispatched");
+        assert_eq!(h.app.sha_reveal, None);
+        assert_eq!(h.app.reveal_status(), None);
+    }
+
+    /// A path-filtered scope has no cache and no walk to resume, so a hash past its
+    /// loaded rows stays today's "no match".
+    #[test]
+    fn a_path_filtered_scope_does_not_reveal() {
+        let (dir, walk) = reveal_fixture(false);
+        let scope = cli::Scope {
+            paths: vec!["f.txt".to_string()],
+            ..Default::default()
+        };
+        let mut h = open_fixture(&dir, scope, false);
+        let rows = h.app.commits.len();
+        let target = walk[REVEAL_TARGET_POSITION];
+        assert!(!h.app.commit_index_by_oid.contains_key(&target));
+
+        search(&mut h, &target.to_string()[..8]);
+        assert_eq!(h.app.sha_reveal, None);
+        assert!(!h.app.history_inflight, "no load was dispatched");
+        for _ in 0..3 {
+            h.frame();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(h.app.commits.len(), rows, "nothing was appended");
+        assert!(h.app.search_matches.is_empty());
+    }
+
+    /// A commit at walk position `REVEAL_DEEP_POSITION` is more than a page past the
+    /// loaded rows, so a load of `skip + LOAD_BATCH` rows does not reach it.
+    const REVEAL_DEEP_POSITION: usize = INITIAL_COMMITS + LOAD_BATCH + 40;
+
+    /// A reveal whose own walk no longer lines up comes back as a full rebuild of a
+    /// page past the loaded rows. Here that rebuild does not reach the target: a new
+    /// commit on the branch shifts the walk by one, so the anchor no longer matches.
+    /// The reveal must look again against the rebuilt list rather than end without
+    /// a word.
+    #[test]
+    fn a_reveal_whose_walk_moved_looks_again_on_the_rebuilt_list() {
+        let (dir, walk) = reveal_fixture_of(reveal_loads(REVEAL_DEEP_POSITION) + 20, true);
+        let target = walk[REVEAL_DEEP_POSITION];
+        let mut h = open_fixture(&dir, cli::Scope::default(), false);
+        let repo = crate::test_repo::open_repo(dir.path());
+        commit_file(&repo, "f.txt", "moved\n", "moved");
+
+        search(&mut h, &target.to_string()[..8]);
+        assert_eq!(h.app.sha_reveal, Some(ShaReveal::Searching));
+        assert!(
+            poll_history(&mut h, |a| a.selected_oid() == Some(target)).is_some(),
+            "the target was never selected after the rebuild"
+        );
+        assert_eq!(h.app.sha_reveal, None);
+    }
+
+    /// A hash search the reader abandons — the box cleared, or a word typed over the
+    /// hash, including after more of the hash was typed and the walk kept — drops what
+    /// its walk brings back, on both routes. Appended, a search nobody wants any more
+    /// would grow the list for good, up to the cap: ~120ms on the frame loop and ~200k
+    /// rows. Dropping it must not strand the history either: the scroll extension's
+    /// gate is open again at once, and the next extension lands.
+    #[test]
+    fn an_abandoned_hash_search_drops_its_walks_result() {
+        for graph in [false, true] {
+            for kept_first in [false, true] {
+                for typed_over in ["", "nothing matches this"] {
+                    abandon_and_check(graph, kept_first, typed_over);
+                }
+            }
+        }
+    }
+
+    /// One run of `an_abandoned_hash_search_drops_its_walks_result`.
+    fn abandon_and_check(graph: bool, kept_first: bool, typed_over: &str) {
+        let case = format!("graph={graph} kept_first={kept_first} {typed_over:?}");
+        let (dir, walk) = reveal_fixture(graph);
+        let target = walk[REVEAL_TARGET_POSITION];
+        let hex = target.to_string();
+        let mut h = open_fixture(&dir, cli::Scope::default(), !graph);
+        let rows = h.app.commits.len();
+
+        search(&mut h, &hex[..8]);
+        assert_eq!(h.app.sha_reveal, Some(ShaReveal::Searching));
+        let walking = h.app.history_epoch.current();
+        if kept_first {
+            search(&mut h, &hex[..9]);
+            assert_eq!(h.app.history_epoch.current(), walking, "{case}: control");
+        }
+        search(&mut h, typed_over);
+        assert_eq!(h.app.sha_reveal, None, "{case}");
+        assert_eq!(h.app.reveal_status(), None, "{case}");
+        assert!(
+            !h.app.history_inflight,
+            "{case}: the extension's gate is open"
+        );
+
+        // The abandoned job's own report, whenever it comes, changes nothing.
+        let abandoned = wait_for_report(&h, walking);
+        h.app.history_load_tx.send(abandoned).unwrap();
+        h.app.drain_history_results();
+        assert_eq!(
+            h.app.commits.len(),
+            rows,
+            "{case}: the abandoned search appended nothing"
+        );
+        assert!(!h.app.commit_index_by_oid.contains_key(&target), "{case}");
+
+        // The scroll extension, as the list dispatches it near its bottom.
+        let last = h
+            .app
+            .commits
+            .iter()
+            .rev()
+            .find(|c| is_real_commit(c.oid))
+            .unwrap()
+            .oid;
+        h.app.dispatch_history_load(next_history_page(
+            h.app.history_oids.as_deref(),
+            real_commit_count(&h.app.commits),
+            last,
+            LOAD_BATCH,
+        ));
+        assert!(
+            poll_history(&mut h, |a| !a.history_inflight).is_some(),
+            "{case}: the extension never landed"
+        );
+        assert_eq!(
+            real_commit_count(&h.app.commits),
+            REVEAL_HISTORY,
+            "{case}: the extension loaded the rest"
+        );
+        assert!(h.app.all_loaded, "{case}");
+    }
+
+    /// Typing more of a hash, or backspacing while it is still one, keeps the walk
+    /// already in flight: the new prefix matches on the path it is taking. Restarted
+    /// from the loaded tail on every keystroke, a deep hash would be reached last, and
+    /// the cached route would leave a deep page building per keystroke. The reveal
+    /// waits behind the walk and finds the match among the rows it brings.
+    #[test]
+    fn typing_more_of_a_hash_keeps_its_walk() {
+        for graph in [false, true] {
+            for len in [9, 7] {
+                let (dir, walk) = reveal_fixture(graph);
+                let target = walk[REVEAL_TARGET_POSITION];
+                let hex = target.to_string();
+                let mut h = open_fixture(&dir, cli::Scope::default(), !graph);
+
+                search(&mut h, &hex[..8]);
+                let walking = h.app.history_epoch.current();
+                search(&mut h, &hex[..len]);
+                assert!(
+                    h.app.search_matches.is_empty(),
+                    "control: no loaded row has the prefix"
+                );
+                assert_eq!(
+                    h.app.history_epoch.current(),
+                    walking,
+                    "graph={graph} len={len}: the walk was kept, not restarted"
+                );
+                assert_eq!(h.app.sha_reveal, Some(ShaReveal::Queued));
+                assert!(h.app.history_inflight);
+                assert!(
+                    poll_history(&mut h, |a| a.selected_oid() == Some(target)).is_some(),
+                    "graph={graph} len={len}: the target was never selected"
+                );
+                assert_eq!(
+                    h.app.history_epoch.current(),
+                    walking,
+                    "graph={graph} len={len}: from the kept walk's rows alone"
+                );
+                assert_revealed(&mut h, target);
+            }
+        }
+    }
+
+    /// A kept walk that finds no commit with its prefix has found none with the
+    /// longer one typed since, so that answer is shown, and remembered, without a
+    /// second walk.
+    #[test]
+    fn typing_more_of_an_absent_hash_takes_its_walks_answer() {
+        let (dir, _walk) = reveal_fixture(true);
+        let mut h = open_fixture(&dir, cli::Scope::default(), false);
+        search(&mut h, "deadbeefdead");
+        let walking = h.app.history_epoch.current();
+        search(&mut h, "deadbeefdeadb");
+        assert_eq!(h.app.sha_reveal, Some(ShaReveal::Queued));
+        assert!(poll_history(&mut h, |a| !a.history_inflight).is_some());
+        assert_eq!(h.app.sha_reveal, Some(ShaReveal::Missed(SeekMiss::Absent)));
+        assert_eq!(h.app.history_epoch.current(), walking, "no second walk");
+        assert_eq!(h.app.absent_prefix.as_deref(), Some("deadbeefdeadb"));
+    }
+
+    /// Land a failed history load (a worker that reported no result) on a reveal in
+    /// the given state, as the result of the load it is waiting on.
+    fn land_failed_load(h: &mut HeadlessApp, reveal: ShaReveal) {
+        let epoch = h.app.history_epoch.bump();
+        h.app.history_inflight = true;
+        h.app.sha_reveal = Some(reveal);
+        h.app
+            .history_load_tx
+            .send(HistoryResult { epoch, load: None })
+            .unwrap();
+        h.app.drain_history_results();
+    }
+
+    /// A reveal whose load fails is retried, once: the retry reaches the target, and
+    /// a retry that fails too ends the reveal with no further load. A failure that
+    /// re-dispatched every time would re-walk on every frame for as long as the
+    /// worker kept failing.
+    #[test]
+    fn a_failed_reveal_load_is_retried_once() {
+        let (dir, walk) = reveal_fixture(true);
+        let target = walk[REVEAL_TARGET_POSITION];
+        let mut h = open_fixture(&dir, cli::Scope::default(), false);
+        h.app.search_text = target.to_string()[..8].to_string();
+
+        land_failed_load(&mut h, ShaReveal::Searching);
+        assert_eq!(h.app.sha_reveal, Some(ShaReveal::Retrying));
+        assert!(h.app.history_inflight, "the retry dispatched a real load");
+        assert!(
+            poll_history(&mut h, |a| a.selected_oid() == Some(target)).is_some(),
+            "the retry never selected the target"
+        );
+
+        let mut h = open_fixture(&dir, cli::Scope::default(), false);
+        h.app.search_text = target.to_string()[..8].to_string();
+        land_failed_load(&mut h, ShaReveal::Retrying);
+        assert_eq!(h.app.sha_reveal, None, "a second loss ends the reveal");
+        assert!(!h.app.history_inflight, "and dispatches nothing");
+    }
+
+    /// A hash typed while the startup walk is still pending is not looked for yet.
+    /// When that walk is then replaced by a rebuild (a watcher reload retires it),
+    /// `install_startup_history` never runs, so the rebuild has to look instead.
+    #[test]
+    fn a_hash_typed_before_the_list_is_revealed_by_the_rebuild_that_replaces_it() {
+        let (dir, walk) = reveal_fixture(true);
+        let target = walk[REVEAL_TARGET_POSITION];
+        let mut h = open_fixture(&dir, cli::Scope::default(), false);
+        let (_walking, pending) = mpsc::channel();
+        h.app.pending_history = Some(pending);
+
+        search(&mut h, &target.to_string()[..8]);
+        assert_eq!(h.app.sha_reveal, None, "control: not before the real list");
+        h.app.dispatch_history_load(HistoryJobKind::Rebuild {
+            count: INITIAL_COMMITS,
+        });
+        assert!(
+            poll_history(&mut h, |a| a.selected_oid() == Some(target)).is_some(),
+            "the rebuild never revealed the target"
+        );
+    }
+
+    /// Wait for a walking reveal to answer.
+    fn poll_until_answered(h: &mut HeadlessApp) {
+        assert!(
+            poll_history(h, |a| !matches!(
+                a.sha_reveal,
+                Some(ShaReveal::Searching | ShaReveal::Retrying | ShaReveal::Queued)
+            ))
+            .is_some(),
+            "the search never answered"
+        );
+    }
+
+    /// A hash that extends one the whole history lacks is lacking too, so it is
+    /// answered without walking the history again: typing the rest of a missing hash
+    /// would otherwise walk it once a keystroke. A capped miss proves nothing about a
+    /// longer prefix past the cap, and a rebuilt history may hold what the old one
+    /// did not, so neither is remembered.
+    #[test]
+    fn an_absent_prefix_answers_its_extensions_without_a_walk() {
+        let (dir, _walk) = reveal_fixture(true);
+        let mut h = open_fixture(&dir, cli::Scope::default(), false);
+
+        search(&mut h, "deadbeefdead");
+        poll_until_answered(&mut h);
+        assert_eq!(h.app.sha_reveal, Some(ShaReveal::Missed(SeekMiss::Absent)));
+
+        search(&mut h, "deadbeefdeadb");
+        assert_eq!(h.app.sha_reveal, Some(ShaReveal::Missed(SeekMiss::Absent)));
+        assert!(!h.app.history_inflight, "an extension walks nothing");
+
+        search(&mut h, "deadbeefdeac");
+        assert_eq!(
+            h.app.sha_reveal,
+            Some(ShaReveal::Searching),
+            "control: a different prefix still walks"
+        );
+        poll_until_answered(&mut h);
+
+        // A rebuild replaces the history the answer was about.
+        search(&mut h, "");
+        h.app.dispatch_history_load(HistoryJobKind::Rebuild {
+            count: INITIAL_COMMITS,
+        });
+        assert!(poll_history(&mut h, |a| !a.history_inflight).is_some());
+        search(&mut h, "deadbeefdeac0");
+        assert_eq!(
+            h.app.sha_reveal,
+            Some(ShaReveal::Searching),
+            "the rebuild forgot the absent prefix"
+        );
+    }
+
+    /// Dispatch a rebuild, as a watcher reload does, and drain until it has landed
+    /// over the miss `shown`: the shown answer changed, or no load is in flight.
+    fn land_rebuild_over(h: &mut HeadlessApp, shown: SeekMiss) {
+        h.app.dispatch_history_load(HistoryJobKind::Rebuild {
+            count: INITIAL_COMMITS,
+        });
+        assert!(
+            poll_history(h, |a| a.sha_reveal != Some(ShaReveal::Missed(shown))
+                || !a.history_inflight)
+            .is_some(),
+            "the rebuild never landed"
+        );
+    }
+
+    /// A rebuild is a new history. A commit absent from the old one may be in it, so
+    /// an absent hash is searched for again. A capped answer almost never changes,
+    /// and searching again is a walk of up to the cap per `.git` change, so it stays
+    /// on screen with no walk.
+    #[test]
+    fn a_rebuild_searches_an_absent_hash_again_but_keeps_a_capped_answer() {
+        let (dir, walk) = reveal_fixture(true);
+        let mut h = open_fixture(&dir, cli::Scope::default(), false);
+        search(&mut h, "deadbeefdead");
+        poll_until_answered(&mut h);
+        assert_eq!(h.app.sha_reveal, Some(ShaReveal::Missed(SeekMiss::Absent)));
+        land_rebuild_over(&mut h, SeekMiss::Absent);
+        assert_eq!(
+            h.app.sha_reveal,
+            Some(ShaReveal::Searching),
+            "an absent hash is searched for in the rebuilt history"
+        );
+        poll_until_answered(&mut h);
+        assert_eq!(h.app.sha_reveal, Some(ShaReveal::Missed(SeekMiss::Absent)));
+
+        with_seek_cap(INITIAL_COMMITS + 10, || {
+            let mut h = open_fixture(&dir, cli::Scope::default(), false);
+            search(&mut h, &walk[REVEAL_TARGET_POSITION].to_string()[..8]);
+            poll_until_answered(&mut h);
+            assert_eq!(h.app.sha_reveal, Some(ShaReveal::Missed(SeekMiss::Capped)));
+            land_rebuild_over(&mut h, SeekMiss::Capped);
+            assert_eq!(
+                h.app.sha_reveal,
+                Some(ShaReveal::Missed(SeekMiss::Capped)),
+                "a capped answer stays on screen"
+            );
+            assert!(!h.app.history_inflight, "and is not walked for again");
+            search(&mut h, "");
+            assert_eq!(h.app.sha_reveal, None, "a text change still clears it");
+        });
+    }
+
+    /// The remembered absent prefix is the SHORTEST one found absent: extending it
+    /// answers without a walk, and backspacing back to it must too, which it would not
+    /// if each extension had replaced it with the longer query.
+    #[test]
+    fn backspacing_to_an_absent_prefix_walks_nothing() {
+        let (dir, _walk) = reveal_fixture(true);
+        let mut h = open_fixture(&dir, cli::Scope::default(), false);
+        search(&mut h, "deadbeefdead");
+        poll_until_answered(&mut h);
+        assert_eq!(h.app.sha_reveal, Some(ShaReveal::Missed(SeekMiss::Absent)));
+        search(&mut h, "deadbeefdeadbe");
+        assert!(
+            !h.app.history_inflight,
+            "control: an extension walks nothing"
+        );
+        search(&mut h, "deadbeefdead");
+        assert_eq!(h.app.sha_reveal, Some(ShaReveal::Missed(SeekMiss::Absent)));
+        assert!(!h.app.history_inflight, "backspacing walks nothing either");
+    }
+
+    /// A miss is an answer about the query and the history, so a load that changes
+    /// neither — a scroll extension, or a worker that failed — leaves it on screen.
+    #[test]
+    fn a_miss_survives_a_scroll_extension_and_a_failed_load() {
+        let (dir, _walk) = reveal_fixture(false);
+        let mut h = open_fixture(&dir, cli::Scope::default(), true);
+        search(&mut h, "deadbeefdead");
+        assert_eq!(h.app.sha_reveal, Some(ShaReveal::Missed(SeekMiss::Absent)));
+        let rows = h.app.commits.len();
+        let last = h
+            .app
+            .commits
+            .iter()
+            .rev()
+            .find(|c| is_real_commit(c.oid))
+            .unwrap()
+            .oid;
+        h.app.dispatch_history_load(HistoryJobKind::Extend {
+            skip: real_commit_count(&h.app.commits),
+            expect_last: last,
+            max_new: LOAD_BATCH,
+        });
+        assert!(poll_history(&mut h, |a| !a.history_inflight).is_some());
+        assert!(
+            h.app.commits.len() > rows,
+            "control: the extension appended rows"
+        );
+        assert_eq!(
+            h.app.reveal_status().as_deref(),
+            Some("not in this history")
+        );
+
+        let epoch = h.app.history_epoch.bump();
+        h.app.history_inflight = true;
+        h.app
+            .history_load_tx
+            .send(HistoryResult { epoch, load: None })
+            .unwrap();
+        h.app.drain_history_results();
+        assert_eq!(
+            h.app.reveal_status().as_deref(),
+            Some("not in this history")
+        );
+    }
+
+    /// A capped answer is kept across a rebuild only while it is still true of the
+    /// list: a rebuild that loads the commit replaces it with the match, selected and
+    /// centred as a reveal would.
+    #[test]
+    fn a_rebuild_that_loads_a_capped_hash_jumps_to_it() {
+        with_seek_cap(INITIAL_COMMITS + 10, || {
+            let (dir, walk) = reveal_fixture(true);
+            let target = walk[REVEAL_TARGET_POSITION];
+            let mut h = open_fixture(&dir, cli::Scope::default(), false);
+            search(&mut h, &target.to_string()[..8]);
+            poll_until_answered(&mut h);
+            assert_eq!(h.app.sha_reveal, Some(ShaReveal::Missed(SeekMiss::Capped)));
+
+            h.app.dispatch_history_load(HistoryJobKind::Rebuild {
+                count: REVEAL_HISTORY,
+            });
+            assert!(
+                poll_history(&mut h, |a| a.selected_oid() == Some(target)).is_some(),
+                "the rebuilt list's match was never selected"
+            );
+            let idx = h.app.commit_index_by_oid[&target];
+            assert_eq!(
+                h.app.graph_scroll_to,
+                Some((idx, Some(egui::Align::Center)))
+            );
+            assert_eq!(h.app.sha_reveal, None, "the capped answer is gone");
+        });
+    }
+
+    /// The cap is not remembered: a longer prefix of a capped miss is searched again.
+    #[test]
+    fn a_capped_prefix_is_not_remembered() {
+        with_seek_cap(INITIAL_COMMITS + 10, || {
+            let (dir, walk) = reveal_fixture(true);
+            let mut h = open_fixture(&dir, cli::Scope::default(), false);
+            let hex = walk[REVEAL_TARGET_POSITION].to_string();
+
+            search(&mut h, &hex[..8]);
+            poll_until_answered(&mut h);
+            assert_eq!(h.app.sha_reveal, Some(ShaReveal::Missed(SeekMiss::Capped)));
+            search(&mut h, &hex[..9]);
+            assert_eq!(h.app.sha_reveal, Some(ShaReveal::Searching));
+        });
+    }
+
+    /// A reveal never supersedes another history load. A watcher rebuild superseded
+    /// that way would be lost, with nothing left to re-arm it. So a reveal typed while
+    /// a load is in flight waits for it, and a load dispatched over a reveal sends the
+    /// reveal back to waiting. Either way the target is reached once the other load
+    /// has landed.
+    #[test]
+    fn a_reveal_waits_for_a_history_load_already_in_flight() {
+        for reveal_first in [false, true] {
+            let (dir, walk) = reveal_fixture(true);
+            let target = walk[REVEAL_TARGET_POSITION];
+            let mut h = open_fixture(&dir, cli::Scope::default(), false);
+            let rebuild = HistoryJobKind::Rebuild {
+                count: INITIAL_COMMITS,
+            };
+            if reveal_first {
+                search(&mut h, &target.to_string()[..8]);
+                h.app.dispatch_history_load(rebuild);
+            } else {
+                h.app.dispatch_history_load(rebuild);
+                search(&mut h, &target.to_string()[..8]);
+            }
+            assert_eq!(h.app.sha_reveal, Some(ShaReveal::Queued));
+            assert_eq!(h.app.reveal_status().as_deref(), Some("searching history…"));
+            assert!(
+                poll_history(&mut h, |a| a.selected_oid() == Some(target)).is_some(),
+                "reveal_first={reveal_first}: the target was never selected"
+            );
+            assert_revealed(&mut h, target);
+        }
+    }
+
     /// Times the UI frame that installs a big diff, and the frames right after it.
     ///
     /// The install frame is where whole-diff scans (the line-number gutter measure, the
@@ -14860,47 +16191,23 @@ mod tests {
             .and_then(|r| Ok(r.revparse_single(&rev)?.peel_to_commit()?.id()))
             .expect("BENCH_REV resolves to a commit in BENCH_REPO");
         let scope = cli::Scope {
-            all: false,
             revs: vec![rev],
-            paths: vec![],
-            reflog: false,
-            follow: false,
-            combined: false,
-            first_parent: false,
+            ..Default::default()
         };
-        let ctx = egui::Context::default();
-        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
-        let service = HighlightService::spawn();
-        let prewarm_rx = crate::diff_highlight::spawn_prewarm(repo.clone(), service.clone());
-        let history_rx = mpsc::channel().1;
-        let font_rx = mpsc::channel().1;
-        let mut app = GitkApp::new(
-            &cc,
-            repo,
-            scope,
-            history_rx,
-            None,
-            font_rx,
-            StartupHighlight {
-                prewarm_rx,
-                service,
-            },
-        )
-        .unwrap();
-        app.line_numbers = std::env::var("BENCH_LINENOS").is_ok_and(|v| v == "1");
-        app.wrap = std::env::var("BENCH_WRAP").is_ok_and(|v| v == "1");
-        let mut frame = eframe::Frame::_new_kittest();
+        let mut h = HeadlessApp::new(&repo, scope);
+        h.app.line_numbers = std::env::var("BENCH_LINENOS").is_ok_and(|v| v == "1");
+        h.app.wrap = std::env::var("BENCH_WRAP").is_ok_and(|v| v == "1");
         let mut installed_at = None;
         let mut max_after = std::time::Duration::ZERO;
         for n in 0..MAX_FRAMES {
             let started = std::time::Instant::now();
-            let out = ctx.run_ui(headless_screen(900.0, 1150.0), |ui| {
-                eframe::App::ui(&mut app, ui, &mut frame);
-            });
-            out.drop_without_applying_deltas();
+            h.frame();
             let took = started.elapsed();
-            let installed = app.diff_load.is_none()
-                && app.current_diff_key.as_ref().is_some_and(|k| k.oid == oid);
+            let installed = h.app.diff_load.is_none()
+                && h.app
+                    .current_diff_key
+                    .as_ref()
+                    .is_some_and(|k| k.oid == oid);
             match installed_at {
                 None if installed => {
                     installed_at = Some(n);
@@ -14921,6 +16228,6 @@ mod tests {
             "the diff for {oid} was not installed within {MAX_FRAMES} frames"
         );
         eprintln!("frame: max after {max_after:?}");
-        eprintln!("rows {}", app.diff_lines.len());
+        eprintln!("rows {}", h.app.diff_lines.len());
     }
 }
