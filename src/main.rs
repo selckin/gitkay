@@ -50,8 +50,8 @@ use diff::{
 };
 use diff_cache::DiffCache;
 use diff_highlight::{
-    HighlightJob, HighlightMsg, HighlightService, band_warmable, highlight_diff, highlight_worker,
-    pending_files, spawn_prewarm,
+    HighlightJob, HighlightMsg, HighlightService, band_warmable, highlight_on_frame_loop,
+    highlight_worker, pending_files, spawn_prewarm,
 };
 use diff_store::DiffStore;
 use graph::{GraphLayoutState, GraphRow, layout_graph_rows};
@@ -3508,6 +3508,20 @@ fn seek_cap() -> usize {
     tests::forced_seek_cap().unwrap_or(HISTORY_OID_CAP)
 }
 
+/// Whether a highlight pass is refused a thread of its own before the spawn is tried:
+/// never, in the app — only thread exhaustion refuses one there.
+#[cfg(not(test))]
+const fn pass_thread_refused() -> bool {
+    false
+}
+
+/// The test build's answer: never, unless a test is standing in for thread exhaustion
+/// (`tests::with_pass_thread_refused`) to drive the UI-thread fallback.
+#[cfg(test)]
+fn pass_thread_refused() -> bool {
+    tests::forced_pass_thread_refusal()
+}
+
 /// `n` with its thousands separated by commas: `200,000`.
 fn digits_grouped(n: usize) -> String {
     let digits = n.to_string();
@@ -3731,7 +3745,7 @@ struct GitkApp {
     /// `set_span_settings`, which is the sole later writer.
     languages_fingerprint: u64,
     diff_palette: highlight::DiffPalette, // theme-derived diff colours (both modes)
-    diff_needs_highlight: bool,           // diff_lines changed; re-run highlight_diff
+    diff_needs_highlight: bool,           // diff_lines changed; ensure_diff_highlighted re-runs
     diff_generation: Epoch, // bumped each highlight pass; lets stale workers bail + results drop
     highlight_tx: mpsc::Sender<HighlightMsg>, // worker → UI: span batches, then the pass's end
     highlight_rx: mpsc::Receiver<HighlightMsg>,
@@ -6526,7 +6540,10 @@ impl GitkApp {
             page_lo: AtomicUsize::new(0),
             page_hi: AtomicUsize::new(0),
         });
-        priority.store(VisibleRange::window(&self.file_line_starts, rows));
+        let window = VisibleRange::window(&self.file_line_starts, rows);
+        // Where the UI-thread fallback starts, should it come to that.
+        let first_file = window.lo;
+        priority.store(window);
         self.highlight_priority = Some(Arc::clone(&priority));
         // The hand-off: two refcount bumps and the pending list, whatever the diff's
         // size. The worker reads the rows while the UI writes spans, and those spans
@@ -6559,25 +6576,39 @@ impl GitkApp {
             None => job,
         };
         // `Builder::spawn` returns Err on thread exhaustion (vs `spawn`, which
-        // panics). On failure, highlight synchronously so the diff still gets
-        // coloured rather than staying plain forever.
+        // panics). On failure, colour what a frame loop's budget reaches, synchronously,
+        // so the view in front of the reader is not left plain.
         // Contain a syntect panic to this one diff (as the prefetch worker does): without
         // this a bad grammar/line would kill the highlight thread and leave every later
         // diff plain for the rest of the session.
-        if spawn_guarded(
-            "gitkay-highlight-pass",
-            "highlight thread panicked",
-            move || {
-                highlight_worker(job);
-            },
-        )
-        .is_err()
+        if pass_thread_refused()
+            || spawn_guarded(
+                "gitkay-highlight-pass",
+                "highlight thread panicked",
+                move || {
+                    highlight_worker(job);
+                },
+            )
+            .is_err()
         {
             log::warn!("highlight thread spawn failed; highlighting on the UI thread");
             self.highlight_priority = None;
-            highlight_diff(&self.diff_lines, &mut self.diff_spans, &self.diff_files, hl);
-            // Done, synchronously and unbudgeted — nothing will report for this pass, so
-            // say so here or the band waits on a worker that was never created.
+            // Bounded to a frame loop's budget, from the file in view; what it does not
+            // reach is left pending for a later pass — see `highlight_on_frame_loop`.
+            let pass = highlight_on_frame_loop(
+                &self.diff_lines,
+                &mut self.diff_spans,
+                &self.diff_files,
+                hl,
+                first_file,
+            );
+            log::debug!(
+                "highlight: UI-thread pass from file {first_file}: {} lines, {:?}",
+                pass.coloured,
+                pass.stopped
+            );
+            // Done, synchronously — nothing will report for this pass, so say so here or
+            // the band waits on a worker that was never created.
             self.highlight_settled = true;
         }
     }
@@ -13249,6 +13280,33 @@ mod tests {
         FORCE_SEEK_CAP.with(std::cell::Cell::get)
     }
 
+    thread_local! {
+        /// Set by `with_pass_thread_refused` while a test wants a highlight pass to find
+        /// no thread of its own. Read by `pass_thread_refused` on the UI thread, which in
+        /// a headless test is the test's own.
+        static FORCE_PASS_THREAD_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Whether a test is refusing a highlight pass its own thread.
+    pub fn forced_pass_thread_refusal() -> bool {
+        FORCE_PASS_THREAD_REFUSED.with(std::cell::Cell::get)
+    }
+
+    /// Run `f` with every highlight pass it starts failing to spawn a thread of its own,
+    /// as thread exhaustion would. Restores the previous setting on the way out, panic
+    /// included, as `with_build_limits` does.
+    fn with_pass_thread_refused<T>(f: impl FnOnce() -> T) -> T {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FORCE_PASS_THREAD_REFUSED.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(FORCE_PASS_THREAD_REFUSED.with(std::cell::Cell::get));
+        FORCE_PASS_THREAD_REFUSED.with(|c| c.set(true));
+        f()
+    }
+
     /// Run `f` with every hash search it starts stopping at `cap` oids. Restores the
     /// previous setting on the way out, panic included, as `with_build_limits` does.
     fn with_seek_cap<T>(cap: usize, f: impl FnOnce() -> T) -> T {
@@ -14819,6 +14877,59 @@ mod tests {
             app.diff_settings,
             BuildEnv::NONE,
         )
+    }
+
+    /// With the highlight thread gone and no thread of its own to be had, a pass runs on
+    /// the frame loop — and must stop at a frame loop's budget like every other pass,
+    /// rather than tokenize the whole diff while the window is frozen. What it did not
+    /// reach stays pending, for the next pass to offer a thread again, and colouring
+    /// reads as settled, so the band is not held shut waiting on a worker that was never
+    /// created.
+    #[test]
+    fn the_ui_thread_fallback_pass_stops_at_a_frame_loops_budget() {
+        let (dir, repo) = temp_repo();
+        // Far more than the budget can tokenize, in either profile: ~1.2ms a line in a
+        // debug build (12s for the file, which is what the unbounded pass took on the
+        // frame loop) and tens of µs in release — still several budgets' worth.
+        let mut body = String::new();
+        for i in 0..10_000 {
+            use std::fmt::Write as _;
+            writeln!(body, "let x{i}: &str = \"{i}\"; // line {i}").unwrap();
+        }
+        let tip = commit_file(&repo, "big.rs", &body, "add a big file");
+        let mut h = idle_app(&dir);
+        let app = &mut h.app;
+        app.highlight_service = None;
+        app.highlighter = Some(Arc::new(highlight::test_highlighter()));
+        let data = built_diff(&repo, app, tip);
+        let key = app.diff_cache_key(tip);
+        app.set_diff_content(Some(key), data);
+        assert!(
+            app.diff_needs_highlight,
+            "control: the install asks for a pass"
+        );
+
+        let ctx = egui::Context::default();
+        let t = std::time::Instant::now();
+        with_pass_thread_refused(|| app.ensure_diff_highlighted(&ctx));
+        let took = t.elapsed();
+
+        assert!(
+            took < crate::diff_highlight::FRAME_LOOP_HIGHLIGHT_BUDGET * 10,
+            "the frame loop must not colour past its budget: took {took:?}"
+        );
+        assert!(
+            (0..app.diff_lines.len()).any(|i| app.diff_spans.is_set(i)),
+            "it still colours what it can reach"
+        );
+        assert!(
+            !pending_files(&app.diff_lines, &app.diff_spans, &app.diff_files).is_empty(),
+            "the rest is left pending for a later pass, not tokenized on this frame"
+        );
+        assert!(
+            app.highlight_settled && !app.diff_needs_highlight,
+            "no worker will report this pass's end, so it is settled here"
+        );
     }
 
     /// The reader adopted the warm building a row, and a span-settings reload then moved

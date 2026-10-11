@@ -88,6 +88,17 @@ const HIGHLIGHT_LINE_BUDGET: usize = 2_000_000;
 /// 300k-line one is under a second of plain text, and a few seconds of real grammar)
 /// and short enough that neither the core nor the band is held for minutes.
 const HIGHLIGHT_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+/// The longest the UI thread will spend colouring, when neither the highlight thread nor
+/// a thread of the pass's own can be had (`highlight_on_frame_loop`).
+///
+/// `HIGHLIGHT_TIME_BUDGET` is a background thread's appetite, and on the frame loop it
+/// is twenty seconds of a frozen window. This is a frame loop's: a one-off stall of a
+/// few frames, the same 50ms the app already reports an install as slow past
+/// (`DIFF_INSTALL_SLOW`), and enough at ~0.3ms a line to colour the landing screenful
+/// of an ordinary file from its start. Taken once per pass, never per frame — see
+/// `highlight_on_frame_loop` for why the rest is left for a later pass rather than
+/// sliced across frames.
+pub const FRAME_LOOP_HIGHLIGHT_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
 
 // Asserted at compile time rather than in a test, so a bad edit fails the build instead
 // of one suite nobody may run. Beside the constants it checks, which is the only place
@@ -220,7 +231,10 @@ pub fn highlight_ranges(files: &[FileEntry], total_lines: usize) -> Vec<(usize, 
 /// sets is its own business, but they are named together here so a fourth pass has to
 /// answer for each rather than inventing its own vocabulary — which is what the three
 /// existing ones did, one of them in a hand-rolled loop reading two globals.
-#[derive(Clone, Copy, Default)]
+///
+/// No `Default`: all three `None` is a pass with no bound at all, and a budget should
+/// not be unbounded by omission. The tests' `UNBOUNDED` is the one spelling of it.
+#[derive(Clone, Copy)]
 pub struct HighlightBudget {
     /// Code lines this pass may colour before it stops where it is. Bounds the memory
     /// it commits.
@@ -261,9 +275,14 @@ pub struct ColourPass {
 }
 
 impl HighlightBudget {
-    /// Everything, for a pass with nothing to answer to: the UI-thread fallback and the
-    /// prefetch worker's whole-diff pass, both of which run where stopping early would
-    /// leave the only colour the row is going to get.
+    /// No bound at all — tests only, as the baseline a bounded pass is compared against
+    /// or the fill for the fields a test does not exercise.
+    ///
+    /// No pass in the app may run without both a line and a time bound (see the type's
+    /// own doc), so this has no production caller and must not gain one. Its last two —
+    /// the prefetch worker's whole-diff pass and the UI-thread fallback, through a
+    /// `highlight_diff` wrapper since removed — both answer to a clock now.
+    #[cfg(test)]
     pub const UNBOUNDED: Self = Self {
         lines: None,
         deadline: None,
@@ -358,16 +377,41 @@ pub fn highlight_diff_within(
     }
 }
 
-/// Attach syntax-highlighted spans to every code line, synchronously and
-/// unbounded — the prefetch worker's whole-diff pass, and the UI-thread fallback
-/// when the highlight thread cannot be spawned.
-pub fn highlight_diff(
+/// The colour pass the UI thread runs itself, the last fallback — the highlight thread
+/// is gone and a thread of the pass's own could not be spawned.
+///
+/// Bounded like every other pass, by `HIGHLIGHT_LINE_BUDGET` and by a clock, but the
+/// clock is a frame loop's (`FRAME_LOOP_HIGHLIGHT_BUDGET`), since everything this pass
+/// spends is a frozen window. It starts at `first_file` — the file in view — so what
+/// the budget buys is the colour the reader is looking at.
+///
+/// **What it does not reach is left uncoloured, not sliced across later frames.** That
+/// is what a background pass stopping at its budget already does, and a later pass —
+/// the next install, a revisit, a theme or grammar change — finds the rest through
+/// `pending_files` and asks for a thread again first. Resuming every frame cannot work
+/// here: a file is re-tokenized from its START on resume (a multi-line construct opened
+/// before the cut would otherwise mis-colour the remainder), so a file longer than one
+/// frame's budget would restart on every frame and never finish, holding the band shut
+/// for as long as it was displayed.
+pub fn highlight_on_frame_loop(
     lines: &DiffLines,
     spans: &mut RowSpans,
     files: &[FileEntry],
     hl: &Highlighter,
-) {
-    highlight_diff_within(lines, spans, files, hl, HighlightBudget::UNBOUNDED, 0);
+    first_file: usize,
+) -> ColourPass {
+    highlight_diff_within(
+        lines,
+        spans,
+        files,
+        hl,
+        HighlightBudget {
+            lines: Some(HIGHLIGHT_LINE_BUDGET),
+            deadline: Some(std::time::Instant::now() + FRAME_LOOP_HIGHLIGHT_BUDGET),
+            until_row: None,
+        },
+        first_file,
+    )
 }
 
 /// Index into `pending` of the file to tokenize next, given the visible file
@@ -1092,7 +1136,14 @@ mod tests {
         let hl = highlight::test_highlighter();
         let lines = &data.lines;
         let mut spans = RowSpans::blank(lines.len());
-        highlight_diff(lines, &mut spans, &data.files, &hl);
+        highlight_diff_within(
+            lines,
+            &mut spans,
+            &data.files,
+            &hl,
+            HighlightBudget::UNBOUNDED,
+            0,
+        );
         let start = entry.diff_line_idx.expect("binary file has a patch header");
         assert!(
             (start..lines.len()).all(|i| !spans.is_set(i)),
@@ -1112,7 +1163,7 @@ mod tests {
     }
 
     #[test]
-    fn highlight_diff_colors_code_and_skips_structure() {
+    fn a_colour_pass_colours_code_and_skips_structure() {
         let hl = highlight::test_highlighter();
         let lines = DiffLines::from(vec![
             DiffLine::new("commit abc123", LineKind::Meta),
@@ -1126,7 +1177,14 @@ mod tests {
         let files = vec![fe("x.rs", Some(1))];
         let mut spans = RowSpans::blank(lines.len());
 
-        highlight_diff(&lines, &mut spans, &files, &hl);
+        highlight_diff_within(
+            &lines,
+            &mut spans,
+            &files,
+            &hl,
+            HighlightBudget::UNBOUNDED,
+            0,
+        );
 
         assert!(!spans.is_set(0), "meta header is outside any file range");
         assert!(!spans.is_set(1), "file-meta line is not code");
@@ -1160,7 +1218,7 @@ mod tests {
     }
 
     #[test]
-    fn highlight_diff_skips_no_patch_file() {
+    fn a_colour_pass_skips_a_file_with_no_patch_body() {
         // A FileEntry with no patch body has diff_line_idx == None. It must NOT
         // cause the commit header at index 0 to be tokenized as code. (In practice
         // git2 positions every delta, so None is a defensive case.)
@@ -1175,7 +1233,14 @@ mod tests {
         ];
         let mut spans = RowSpans::blank(lines.len());
 
-        highlight_diff(&lines, &mut spans, &files, &hl);
+        highlight_diff_within(
+            &lines,
+            &mut spans,
+            &files,
+            &hl,
+            HighlightBudget::UNBOUNDED,
+            0,
+        );
 
         assert!(
             !spans.is_set(0),
@@ -1340,8 +1405,8 @@ mod tests {
         );
     }
 
-    /// No deadline ⇒ the whole diff, which is what the prefetch path relies on
-    /// through `highlight_diff`'s delegation.
+    /// No bound ⇒ the whole diff: the baseline every bounded pass stops short of, and
+    /// what the tests that use `UNBOUNDED` as a fill rely on.
     #[test]
     fn a_colour_pass_colours_everything_without_a_budget() {
         let hl = highlight::test_highlighter();

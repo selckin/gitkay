@@ -454,7 +454,10 @@ rate is a property of the grammar, not of the repo, so no line count can stand i
 clock: see `Limits::highlight_budget`. The three bounds are one type, `HighlightBudget`
 — lines, deadline, `until_row` — tested at one place, `exhausted`, at every pass's chunk
 boundary, so a fourth pass answers for each of them instead of inventing its own
-arithmetic; and a pass REPORTS what it did (`ColourPass`: how much it coloured and which
+arithmetic. **No unbounded budget exists outside the tests**: `HighlightBudget::UNBOUNDED`
+is `#[cfg(test)]` and the type has no `Default` (all-`None` would be one by omission) —
+its last production callers, the prefetch worker's whole-diff pass and the UI-thread
+fallback, both through a since-deleted `highlight_diff`, answer to a clock now. And a pass REPORTS what it did (`ColourPass`: how much it coloured and which
 bound stopped it) rather than leaving a caller to compare elapsed time against its own
 deadline or rescan the finished diff to count spans, which is what two of the three used
 to do. **A budget over LINES cannot bound one line
@@ -486,7 +489,17 @@ filled all eight slots (plus the owner). The foreground pre-highlight (≤`PREHI
 same-oid rebuild (`ScrollPlan::Anchor`) — toolbar toggles, config reloads, and the
 uncommitted/staged rows' refresh — and still tokenizes on `gitkay-fg-*`; over a session
 it can touch all four of those threads (bounded per pass by `PREHIGHLIGHT_CEILING` and
-the landing screenful). The UI thread tokenizes only as the last fallback.),
+the landing screenful). The UI thread tokenizes only as the last fallback — the
+highlight thread gone AND a thread of the pass's own refused — and answers to both bounds
+like any other pass: `highlight_on_frame_loop`, the line budget plus a frame loop's clock
+(`FRAME_LOOP_HIGHLIGHT_BUDGET`, 50ms), from the file in view. It was the one pass left
+unbounded, so a large diff froze the window for as long as the whole diff took to colour
+(12s for a 10k-line file in a debug build). What it does not reach is left PENDING, not
+sliced across later frames: a resumed file is re-tokenized from its first line, so one
+longer than a frame's budget would restart every frame and never finish. A later pass —
+the next install, a revisit, a span-settings reload — finds the rest through
+`pending_files` and asks for a thread again first. It reports settled itself, nothing
+else being left to.),
 `src/workers.rs` (the four persistent foreground workers and the three jobs they
 run — a clicked diff, a history extension, the reload's driver re-resolution. The
 distinction from `prefetch` is simply that someone is waiting; see **Startup &
