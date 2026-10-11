@@ -1084,7 +1084,14 @@ sorted drivers keep the same rows with the same rewritten parents.
   (`drain_stats_results`): a job still running across an invalidation keeps its oid in
   `busy_stats`, so the coordinator refuses the row's fresh job, and once the stale result
   is dropped an unchanged target list would never offer the row again until the view
-  moved.
+  moved. **So does a current result that leaves its row still owed** (`stats_satisfy`,
+  shared with `stats_targets`): switching `line_count` on while a FilesOnly job runs for
+  the only owed row had its FilesAndLines job refused as busy, and the FilesOnly answer
+  then landed in the current epoch with the target list unchanged. A costly row's
+  deliberate FilesOnly answer costs one extra submission, which `measured` refuses. It
+  is judged on the landed ANSWER, not the entry: a failed FilesAndLines job leaves an
+  older FilesOnly entry standing, and re-opening on that rebuilt the failing diff (a
+  missing blob in a partial clone) on every frame.
   That comparison is the gate precisely because it **cannot go stale**: it is recomputed
   every frame from the same state it gates on. A cheaper *precondition* in front of it —
   "skip unless the view moved or the map changed" — has to enumerate every way the list
@@ -1172,10 +1179,10 @@ sorted drivers keep the same rows with the same rewritten parents.
   nothing can currently produce. A commit whose diff fails is recorded as
   failed, not left unknown —
   otherwise the dispatcher re-queues it every frame. `invalidate_commit_stats`
-  clears the map, **the in-flight set**, and bumps the epoch: a batch running
-  across an invalidation has its results discarded, so nothing else would release
-  those claims and dispatch (gated on the set being empty) would stop for the
-  session. Invalidation is keyed on `stats_relevant` — `ignore_ws` /
+  clears the map and `stats_submitted`, bumps the epoch, and empties the pool's stats
+  queue; a job running across it keeps its own claim (`busy_stats`, released when it
+  reports) and its result is discarded as stale — which clears `stats_submitted` again
+  so the row is re-offered (see above). Invalidation is keyed on `stats_relevant` — `ignore_ws` /
   `ignore_blank_lines` / `detect_renames` / `detect_copies` / `textconv` — not the
   whole `DiffSettings`, so bumping the toolbar's context doesn't blank the column. The oid key is wrong for the two
   **virtual rows**, which keep one sentinel oid forever: a worktree-only edit

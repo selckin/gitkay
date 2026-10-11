@@ -1011,6 +1011,21 @@ const fn stats_relevant(s: DiffSettings) -> (bool, bool, bool, bool, bool) {
     )
 }
 
+/// Whether a row's recorded stats answer what the column asks for — the one rule both
+/// `stats_targets` (which rows are owed) and `drain_stats_results` (did a landed answer
+/// leave its row owed) apply, so the two cannot disagree.
+fn stats_satisfy(entry: Option<&Option<CommitStats>>, want: StatsWant) -> bool {
+    match entry {
+        // Never computed — it needs computing.
+        None => false,
+        // Recorded as failed: re-queueing it every frame is exactly what that
+        // record exists to prevent. `handle_git_reload` is what retries it.
+        Some(None) => true,
+        // Computed: enough only if it holds what is being asked for.
+        Some(Some(s)) => want == StatsWant::FilesOnly || s.lines.answered(),
+    }
+}
+
 /// Which visible rows still need their stats computed, for the `want` the
 /// column is currently asking for.
 ///
@@ -1056,15 +1071,7 @@ fn stats_targets(
     want: StatsWant,
     supplied_by_pane: Option<git2::Oid>,
 ) -> Vec<git2::Oid> {
-    let satisfied = |oid: &git2::Oid| match known.get(oid) {
-        // Never computed — it needs computing.
-        None => false,
-        // Recorded as failed: re-queueing it every frame is exactly what that
-        // record exists to prevent. `handle_git_reload` is what retries it.
-        Some(None) => true,
-        // Computed: enough only if it holds what is being asked for.
-        Some(Some(s)) => want == StatsWant::FilesOnly || s.lines.answered(),
-    };
+    let satisfied = |oid: &git2::Oid| stats_satisfy(known.get(oid), want);
     let mut seen = HashSet::new();
     commits
         .get(view.start.min(commits.len())..view.end.min(commits.len()))
@@ -1100,6 +1107,7 @@ fn drain_stats_results(
     known: &mut HashMap<git2::Oid, Option<CommitStats>>,
     submitted: &mut Vec<git2::Oid>,
     epoch: &Epoch,
+    want: StatsWant,
     landed: impl IntoIterator<Item = StatsResult>,
 ) {
     for StatsResult {
@@ -1108,9 +1116,18 @@ fn drain_stats_results(
         stats,
     } in landed
     {
-        if epoch.is_current(at) {
-            install_stats_result(known, oid, stats);
-        } else {
+        if !epoch.is_current(at) {
+            submitted.clear();
+            continue;
+        }
+        // Answered less than is now asked (a FilesOnly job outran a switch to
+        // `line_count`): the row is still owed, and its fresh job was refused while the
+        // old one held the oid — so the unchanged target list must not hide it. Judged
+        // on the ANSWER, not the entry: a failure leaves an older FilesOnly entry
+        // standing, and re-opening on that would rebuild a failing diff every frame.
+        let short = stats.is_some_and(|s| !stats_satisfy(Some(&Some(s)), want));
+        install_stats_result(known, oid, stats);
+        if short {
             submitted.clear();
         }
     }
@@ -6123,10 +6140,16 @@ impl GitkApp {
     /// results in flight for it.
     fn drain_commit_stats(&mut self) {
         let landed: Vec<StatsResult> = self.stats_rx.try_iter().collect();
+        let want = if self.commit_list_cfg.line_count {
+            StatsWant::FilesAndLines
+        } else {
+            StatsWant::FilesOnly
+        };
         drain_stats_results(
             &mut self.commit_stats,
             &mut self.stats_submitted,
             &self.stats_epoch,
+            want,
             landed,
         );
     }
@@ -13431,6 +13454,7 @@ mod tests {
             &mut known,
             &mut submitted,
             &epoch,
+            StatsWant::FilesOnly,
             [StatsResult {
                 epoch: stale,
                 oid: oid(1),
@@ -13444,6 +13468,7 @@ mod tests {
             &mut known,
             &mut submitted,
             &epoch,
+            StatsWant::FilesOnly,
             [StatsResult {
                 epoch: epoch.current(),
                 oid: oid(1),
@@ -13455,6 +13480,74 @@ mod tests {
             vec![oid(1)],
             "a current result leaves the gate alone"
         );
+    }
+
+    /// A result that answers less than the column now asks for leaves its row owed —
+    /// and must make the next dispatch re-submit. The case: `line_count` switched on
+    /// while a `FilesOnly` job ran for the only owed row. The `FilesAndLines` job submitted
+    /// meanwhile was refused (the oid was busy), the `FilesOnly` answer then landed in the
+    /// current epoch, and with targets == submitted nothing ever offered the row again.
+    #[test]
+    fn a_result_that_leaves_its_row_owed_forces_a_resubmit() {
+        let epoch = Epoch::default();
+        let files_only = CommitStats {
+            files: 2,
+            lines: LineStats::NotAsked,
+        };
+        let counted = CommitStats {
+            files: 2,
+            lines: LineStats::Counted(3, 1),
+        };
+        let mut known = HashMap::new();
+        let mut submitted = vec![oid(1)];
+        drain_stats_results(
+            &mut known,
+            &mut submitted,
+            &epoch,
+            StatsWant::FilesAndLines,
+            [StatsResult {
+                epoch: epoch.current(),
+                oid: oid(1),
+                stats: Some(files_only),
+            }],
+        );
+        assert!(known.contains_key(&oid(1)), "the file count still installs");
+        assert!(
+            submitted.is_empty(),
+            "but the row is still owed, so offer it again"
+        );
+        let mut submitted = vec![oid(2)];
+        drain_stats_results(
+            &mut known,
+            &mut submitted,
+            &epoch,
+            StatsWant::FilesAndLines,
+            [StatsResult {
+                epoch: epoch.current(),
+                oid: oid(2),
+                stats: Some(counted),
+            }],
+        );
+        assert_eq!(
+            submitted,
+            vec![oid(2)],
+            "an answer that satisfies leaves the gate alone"
+        );
+        // A failure over a standing FilesOnly entry leaves the row owed, but must NOT
+        // re-open the gate: the retry would fail the same way, every frame.
+        let mut submitted = vec![oid(1)];
+        drain_stats_results(
+            &mut known,
+            &mut submitted,
+            &epoch,
+            StatsWant::FilesAndLines,
+            [StatsResult {
+                epoch: epoch.current(),
+                oid: oid(1),
+                stats: None,
+            }],
+        );
+        assert_eq!(submitted, vec![oid(1)], "a failure does not loop");
     }
 
     /// A diff's span fields follow a reload; what it was BUILT under does not. The
