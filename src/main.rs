@@ -318,19 +318,23 @@ impl DiffViewport {
 /// this comment had wrong and priced ~3× too high). Spans are not part of the row: they
 /// live in `PerRow` beside it, so a `DiffOnly` entry pays none of them.
 ///
-/// The figures below were measured while every row was its own allocation (a 32 B row
-/// plus an `Arc<str>` of ~72 B), and the two constants were sized from them. Rows now
-/// weigh ~40% less, so at an unchanged `BYTES_PER_CACHED_LINE` the same byte budget
-/// holds more lines than this ceiling names — the cache itself is byte-weighed and
-/// still fills to its budget.
+/// **The two constants were sized under the old row representation**, where every row
+/// was its own allocation, and the figures below were measured then. A row now costs
+/// 20 B plus its text, well under what those figures carry per row, so at an unchanged
+/// `BYTES_PER_CACHED_LINE` the same byte budget holds more lines than this ceiling
+/// names — the cache itself is byte-weighed and still fills to its budget, so the
+/// sizing rationale (a band several times over, and the largest observed diff
+/// admitted) still holds, with headroom.
 ///
 /// Measured on 300 commits each of two real repos (`DiffData::heap_bytes`): a `DiffOnly`
 /// entry runs ~115-130 B/line (worst seen 2,132 B/line, a few very long lines), a
 /// highlighted one ~400-450 B/line — ~5-8 spans a row at 24 B, held at near-exact
 /// capacity since `tokenize_line` sizes its `Vec` up front (an in-place `collect` had
-/// left ~2x the slots, and highlighted entries at ~590-600 B/line). Those figures
-/// exclude allocator overhead (~8-24 B per allocation), so for short lines they sit
-/// 10-20% under RSS.
+/// left ~2x the slots, and highlighted entries at ~590-600 B/line). These figures were
+/// measured before the text arena, when every row also owned its text: they
+/// exclude allocator overhead (~8-24 B per allocation), which today applies only to the
+/// span `Vec`s (the arena's chunks are few and large), so the 10-20% gap under RSS for
+/// short lines no longer holds.
 ///
 /// The cache weighs entries by those heap bytes, so it fills to its byte budget
 /// (`BYTES_PER_CACHED_LINE` x this ceiling, ~348 MB) whatever the highlighted/`DiffOnly`
@@ -2804,9 +2808,9 @@ fn body_sections(
 /// worst case — every visible row that long — of roughly 40MB of vertices instead of an
 /// unbounded one.
 ///
-/// **A RENDER cap and nothing else.** The row's text is untouched, so search, word
-/// diff, the scroll anchor, the persistent store, the diffstat and every write action
-/// still see the whole line; only the glyphs stop. And it is never silent — see
+/// **A RENDER cap and nothing else.** The row's text is untouched, so word diff, the
+/// scroll anchor, the persistent store, the diffstat and every write action still see
+/// the whole line; only the glyphs stop. And it is never silent — see
 /// `clip_row_text`.
 const MAX_ROW_RENDER_CHARS: usize = 10_000;
 
@@ -3663,8 +3667,6 @@ struct GitkApp {
     /// an install does not re-read the diff's text to find out — and, like
     /// `diff_textconv_failed`, what `from_parts` needs back on the way to the cache.
     diff_tabless: bool,
-    /// `DiffData::row_bytes` of the displayed diff, carried for `from_parts`.
-    diff_row_bytes: usize,
     /// Cached per-row galleys for the (un-virtualized) file-list sidebar.
     sidebar_cache: SidebarCache,
     /// Sorted `(patch start line, file index)` for the current diff — the
@@ -4810,7 +4812,6 @@ impl GitkApp {
             diff_linenos: None, // no diff yet, and nothing to measure until one draws
             diff_textconv_failed: false,
             diff_tabless: false,
-            diff_row_bytes: 0,
             sidebar_cache: SidebarCache::default(),
             file_line_starts: Vec::new(),
             file_is_test: Vec::new(),
@@ -5229,7 +5230,6 @@ impl GitkApp {
                 self.diff_max_chars,
                 self.diff_textconv_failed,
                 self.diff_tabless,
-                self.diff_row_bytes,
             );
             // A virtual entry is content-keyed, so each working-tree edit — or, for the
             // range row, each move of its endpoints — produces a fresh hash and the
@@ -5526,8 +5526,7 @@ impl GitkApp {
         // field added to `DiffData` a compile error here rather than a value silently
         // dropped at the display boundary. `max_chars` is precomputed at build time (on
         // the worker), so no per-line rescan happens here.
-        let (lines, spans, files, max_chars, textconv_failed, tabless, row_bytes) =
-            data.into_parts();
+        let (lines, spans, files, max_chars, textconv_failed, tabless) = data.into_parts();
         self.diff_max_chars = max_chars;
         // Drop the previous diff's gutter widths; the render re-measures on the
         // first frame that needs them, so a session with line numbers off never
@@ -5551,17 +5550,18 @@ impl GitkApp {
         // for the reason `diff_textconv_failed` is: the display outlives the `DiffData`
         // it was split out of, and `from_parts` needs it back.
         self.diff_tabless = tabless;
-        self.diff_row_bytes = row_bytes;
         // Emphasis is not part of a diff and is not carried across one: it is per
         // viewport, and `ensure_visible_word_emphasis` refills the window on the next
         // frame. Sized here against the incoming rows, which is the one place it can be
         // — every other writer indexes it.
         let t_swap = std::time::Instant::now();
         let rows = lines.len();
-        // The outgoing diff is freed on the drop thread, never here: on a large diff
-        // that free is a pass over every row (3.24s at 76.5M lines). Usually the rows
-        // are already gone — `stash_current_diff` moved them into the cache — but a
-        // caller that clears without stashing would otherwise free them on this frame.
+        // The outgoing diff is freed on the drop thread, never here. Its rows free in
+        // O(chunks) now, but a coloured diff's spans are still a free per coloured row
+        // (the whole diff measured 3.24s at 76.5M lines with per-row `Arc<str>`s).
+        // Usually they are already gone — `stash_current_diff` moved them into the
+        // cache — but a caller that clears without stashing would otherwise free them
+        // on this frame.
         reaper::dispose((
             std::mem::replace(&mut self.diff_lines, lines),
             std::mem::replace(&mut self.diff_spans, spans),
@@ -9193,13 +9193,18 @@ impl Drop for GitkApp {
     /// line.
     ///
     /// Freeing them is real work and buys nothing: a coloured diff holds a span `Vec`
-    /// per row, and the allocator walks every one of them to hand the memory back to a
-    /// process that is about to stop existing. Measured when each row also owned its
-    /// text (an `Arc` per row), on a 76.5M-line diff: **3.24s of a 3.44s exit**, with
-    /// the window already gone — the reader sees gitkay linger after they closed it,
-    /// and eframe drops the app inside its event loop after the last frame, so nothing
-    /// even logged it. The kernel reclaims the whole address space in one operation
-    /// moments later regardless.
+    /// per coloured row, and the allocator walks every one of them to hand the memory back to a
+    /// process that is about to stop existing. Measured with per-row `Arc<str>`s, on a
+    /// 76.5M-line diff: **3.24s of a 3.44s exit**, with the window already gone — the
+    /// reader sees gitkay linger after they closed it, and eframe drops the app inside
+    /// its event loop after the last frame, so nothing even logged it. The kernel
+    /// reclaims the whole address space in one operation moments later regardless.
+    ///
+    /// The rows themselves now free in O(chunks) — a few `munmap`s of their text
+    /// arena — so what the `forget` still saves is the spans (a `Vec` per coloured
+    /// row) and the cache's entries with theirs. The rows' `forget` is kept anyway: it
+    /// costs nothing, and it keeps the exit path one rule, since a live highlight
+    /// worker may hold the other `Arc`.
     ///
     /// Nothing is skipped but the deallocation: these hold plain memory — `Arc`s,
     /// `Vec`s, `String`s — and no destructor with an effect anyone could observe. The

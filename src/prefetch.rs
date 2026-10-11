@@ -151,8 +151,8 @@ pub enum WarmDepth {
     /// cache already supports — a superseded highlight worker's diff is stashed
     /// exactly this way, `RowSpans` holds an `Option` per row, and
     /// `ensure_diff_highlighted` colours it on install. Far cheaper per row in CPU
-    /// and meaningfully cheaper in memory (measured ~115-130 B/line against
-    /// ~400-450 B — see `DIFF_CACHE_LINE_CEILING`; a `highlight::Span` is `(Color32, Range<usize>)`,
+    /// and meaningfully cheaper in memory (measured BEFORE the text arena, when each
+    /// row owned its text: ~115-130 B/line against ~400-450 B — see `DIFF_CACHE_LINE_CEILING`; a `highlight::Span` is `(Color32, Range<usize>)`,
     /// byte offsets into the line's text in the diff's shared arena, NOT an owned
     /// string per token, and none of them is allocated at all for a `DiffOnly` entry),
     /// which is what makes a full-window band reachable at all.

@@ -368,14 +368,18 @@ write layer: `ApplyAction`/`ApplyRequest`/`ApplyError`, the
 role→FontId map), `src/highlight.rs` (syntect highlighter, theme/palette
 resolution, grammar selection, per-line tokenization — no diff knowledge; the
 diff-side orchestration is `src/diff_highlight.rs`), `src/diff_cache.rs` (weight-budget LRU cache; the app weighs a diff by `DiffData::heap_bytes`
-— rows measured where they are assembled, spans kept by `PerRow` as they are written — under
+— the rows read off their arena in O(chunks) (`DiffLines::heap_bytes`, so no weight is
+carried beside them across `into_parts`/`from_parts`), spans kept by `PerRow` as they are
+written — under
 `diff_cache_byte_budget`, which is the line budget at `BYTES_PER_CACHED_LINE`, so the prefetch
 bounds and the cache still turn on one dial. **The UI thread never frees a diff**: freeing
 one was a pass over every row's allocation, measured at **3.24s** on the frame loop for a
-76.5M-line diff and a dropped frame at a few hundred thousand lines. Since the rows moved
-into the text arena, freeing the rows is O(chunks) — a few `munmap`s — but the spans of a
-coloured diff are still a free per coloured row, and a send costs ~100ns, so the rule
-stays. So `insert` and
+76.5M-line diff (with per-row `Arc<str>`s) and a dropped frame at a few hundred thousand
+lines. Since the rows moved into the text arena, freeing the rows is O(chunks) — a few
+`munmap`s — but the spans of a coloured diff are still a free per coloured row, and a send
+costs ~100ns, so the rule stays. The exit-time `forget` in `GitkApp`'s `Drop` stays for the
+same reason: what it still saves is the spans and the cache's entries with theirs, and the
+rows' `forget` is kept because it costs nothing and keeps the exit path one rule. So `insert` and
 `retain_keys` hand back what they evict, overwrite or purge instead of dropping it, and
 every place the app lets a diff go — those values, a dropped or refused arrival, the copy
 `install_preferring_cache` declines, the outgoing content `set_diff_content` replaces, the
@@ -2268,8 +2272,13 @@ half-applied, the re-lay sharing the very same text arena chunk for chunk (it mo
 rows, never text), and a held copy — the highlight worker's `Arc` — keeping its old
 order across the re-lay; and the row container itself: `heap_bytes` held to exactly
 the row buffer at 20 B a slot plus the chunks' bytes over a real build (no dead
-text), rows of no text needing no chunk, and a build that runs out of `u16` chunk
-indices failing rather than wrapping; and `LineNoGutter`: the widths taken over a whole diff, the side no
+text), rows of no text needing no chunk, a build that runs out of `u16` chunk
+indices failing rather than wrapping — at `DiffRows`, and through a real build under
+shrunk limits (`tests::with_build_limits`, a thread-local override `build_limits` reads
+on the building thread): `build_diff_data` returning the failed diff on both patch
+passes, and a split worker abandoning the split — and the split pass's merge measuring
+exactly what pushing the same rows does, both with the parts' text copied and with their
+chunks adopted; and `LineNoGutter`: the widths taken over a whole diff, the side no
 row carries being dropped whole, and every patch row filling exactly the width
 `chars()` promises — the two halves the pane reserves and draws with, which is
 what stops them drifting; and `wrap`, whose two mappings are checked against a
@@ -2567,8 +2576,9 @@ ones that actually fail when the write is removed.
   caps what `diff_row_job` lays out, and `window_spans`/`window_ranges` cut the spans and
   emphasis with it, since both index into the body. A straddling span is TRUNCATED, not
   dropped: `append_body`'s span path emits only the spans, so dropping one takes visible
-  text with it. **Render-only** — the row's text is untouched, so search, word diff,
-  the anchor, the store and the write layer still see the whole line — and never silent
+  text with it. **Render-only** — the row's text is untouched, so word diff, the
+  anchor, the store and the write layer still see the whole line (nothing searches diff
+  text: `commit_matches` is over `CommitInfo`) — and never silent
   (`append_clip_marker`). `content_chars` is capped to match, or the horizontal scroll
   runs tens of millions of pixels into blank. This is the backstop for the toolbar's
   soft wrap being OFF; with it on the row never gets long enough to reach the cap (see

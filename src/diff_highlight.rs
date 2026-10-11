@@ -11,7 +11,7 @@
 //!
 //! Those spans sit BESIDE the rows rather than inside them, which is what lets the
 //! worker share the row array with the UI instead of being handed a copy of it (see
-//! `PerRow`). Nothing here writes to a `DiffLine`.
+//! `PerRow`). Nothing here writes to a row.
 //!
 //! `pending_files` is easier to get wrong than it looks: a file with no grammar still
 //! gets a span on every line from syntect's plain text fallback, so "highlighted" never

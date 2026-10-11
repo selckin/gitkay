@@ -1,8 +1,8 @@
 //! The diff data layer: building `DiffData` (lines + files) from git2 diffs —
 //! commit, working-tree, and staged — plus the diff-shaping options, the
 //! word-diff emphasis driver, and the pure line/file lookup helpers the render
-//! reads. git2-facing and egui-free (except the `Span` type carried in
-//! `DiffLine`); the cache keying (`DiffCacheKey`) and all rendering stay in
+//! reads. git2-facing and egui-free (except the `Span` type the rows'
+//! colour spans use); the cache keying (`DiffCacheKey`) and all rendering stay in
 //! `main.rs`, highlight orchestration in `diff_highlight.rs`.
 
 use git2::{DiffOptions, Repository};
@@ -958,8 +958,8 @@ pub struct FileEntry {
 }
 
 /// What `DiffData::into_parts` splits into: the rows, their spans, the files, the
-/// precomputed width and the textconv flag. Named because a five-value tuple in a
-/// signature says nothing about which value is which.
+/// precomputed width, the textconv flag and the tab census. Named because a six-value
+/// tuple in a signature says nothing about which value is which.
 pub type DiffParts = (
     Arc<DiffLines>,
     RowSpans,
@@ -967,7 +967,6 @@ pub type DiffParts = (
     usize,
     bool,
     bool,
-    usize,
 );
 
 pub struct DiffData {
@@ -1020,18 +1019,13 @@ pub struct DiffData {
     /// decoded from a store written before this existed, simply pay the scan as it
     /// always did.
     pub tabless: bool,
-    /// Heap bytes the ROWS hold: the 20 B rows plus the text arena's chunks
-    /// (`DiffLines::heap_bytes`, exact and O(chunks)). Taken once where the rows are
-    /// assembled — on the building worker, or the store's decoding one — and carried
-    /// across the display boundary, so weighing a diff never touches its rows on the UI
-    /// thread. A re-lay by `order_files` builds a row array of the same length at exact
-    /// capacity over the same arena, so the figure still holds.
-    pub row_bytes: usize,
 }
 
 impl DiffData {
-    /// Approximate heap bytes held: rows (measured at assembly), spans (kept by
-    /// `PerRow`), and the file list. The diff cache's weight. O(files).
+    /// Approximate heap bytes held: the rows and their text arena (exact, O(chunks) —
+    /// see `DiffLines::heap_bytes`), the spans (kept by `PerRow`), and the file list.
+    /// The diff cache's weight. O(chunks + files), so weighing a diff never touches its
+    /// rows on the UI thread.
     pub fn heap_bytes(&self) -> usize {
         let files = self.files.capacity() * std::mem::size_of::<FileEntry>()
             + self
@@ -1044,7 +1038,7 @@ impl DiffData {
                         + f.old_path_bytes.as_ref().map_or(0, Vec::capacity)
                 })
                 .sum::<usize>();
-        self.row_bytes + self.spans.heap_bytes() + files
+        self.lines.heap_bytes() + self.spans.heap_bytes() + files
     }
 
     /// `with_max_chars` with the widest line rescanned off the finished rows.
@@ -1077,7 +1071,6 @@ impl DiffData {
     /// `cache_diff`'s guard and back into the LRU, for the one diff most likely to be
     /// revisited.
     pub fn with_max_chars(lines: DiffLines, files: Vec<FileEntry>, max_chars: usize) -> Self {
-        let row_bytes = lines.heap_bytes();
         Self {
             // The one place a diff's span slots are allocated against its rows, which
             // is what keeps "index i means row i" true for everything downstream.
@@ -1087,7 +1080,6 @@ impl DiffData {
             max_chars,
             textconv_failed: false,
             tabless: false,
-            row_bytes,
         }
     }
 
@@ -1108,17 +1100,8 @@ impl DiffData {
             max_chars,
             textconv_failed,
             tabless,
-            row_bytes,
         } = self;
-        (
-            lines,
-            spans,
-            files,
-            max_chars,
-            textconv_failed,
-            tabless,
-            row_bytes,
-        )
+        (lines, spans, files, max_chars, textconv_failed, tabless)
     }
 
     /// Reassemble what `into_parts` split — the stash path returning the *displayed*
@@ -1126,8 +1109,6 @@ impl DiffData {
     /// build-time `max_chars` exists to avoid). Every part moves: the rows and the
     /// spans go back to the cache as they are, which is what makes a revisit restore a
     /// diff's colour instead of re-tokenizing it.
-    // the exhaustive mirror of into_parts; a struct here would be a second DiffData
-    #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         lines: Arc<DiffLines>,
         spans: RowSpans,
@@ -1135,7 +1116,6 @@ impl DiffData {
         max_chars: usize,
         textconv_failed: bool,
         tabless: bool,
-        row_bytes: usize,
     ) -> Self {
         // The one invariant the split gave up on being structural: index `i` has to mean
         // row `i` in both, so the two lengths have to agree. Every writer goes through
@@ -1152,7 +1132,6 @@ impl DiffData {
             max_chars,
             textconv_failed,
             tabless,
-            row_bytes,
         }
     }
 
@@ -1286,11 +1265,27 @@ struct RowMark {
     tabless: bool,
 }
 
+/// The limits a build's arena is cut under: `ArenaLimits::DEFAULT` in the app. Read on
+/// the thread that starts the build, so a split pass reads it once and hands it to its
+/// workers.
+#[cfg(not(test))]
+const fn build_limits() -> ArenaLimits {
+    ArenaLimits::DEFAULT
+}
+
+/// The test build's limits: the default, unless a test has shrunk them
+/// (`tests::with_build_limits`) so that running out of chunk indices — 65,536 chunks of
+/// 64 MiB in the app — happens on a fixture of tens of thousands of rows.
+#[cfg(test)]
+fn build_limits() -> ArenaLimits {
+    tests::forced_build_limits().unwrap_or(ArenaLimits::DEFAULT)
+}
+
 impl DiffRows {
     /// Start from rows the caller assembled itself — a diff's header block — measuring
     /// them: a commit message line is routinely the widest row in a small diff.
     fn new(lines: Vec<DiffLine>) -> Self {
-        Self::start(ArenaLimits::DEFAULT, lines)
+        Self::start(build_limits(), lines)
     }
 
     /// An empty `DiffRows` cutting its text under `limits` — a test's small chunk cap.
@@ -1940,7 +1935,7 @@ fn push_patch_line(
     // would also make distinct working-tree states hash identically).
     let content = String::from_utf8_lossy(line.content());
     // git2 delivers a multi-line file header (origin FILE_HDR) as ONE line
-    // with embedded newlines; split it so every DiffLine is exactly one
+    // with embedded newlines; split it so every row is exactly one
     // visual line — the row-virtualized render allocates a fixed row height
     // per line, so a multi-line entry would draw over the lines below it.
     for piece in content.trim_end_matches('\n').split('\n') {
@@ -2106,8 +2101,8 @@ fn append_diff_body(
 
     // **The pass across threads, where that is both safe and worth it.** Every
     // condition is in `parallel_patch_workers`, and the attempt is allowed to fail: a
-    // worker that cannot reproduce the delta list this build is rendering returns
-    // nothing and the sequential pass below runs instead, which is the only answer that
+    // worker that cannot reproduce the delta list this build is rendering (or runs out
+    // of chunk indices) returns nothing and the sequential pass below runs instead, which is the only answer that
     // cannot render the wrong file's rows. See `performance.md` §1.
     if let Some(patches) = parallel_patch_workers(
         repo,
@@ -2127,7 +2122,7 @@ fn append_diff_body(
             // took the sequential time, with nothing to connect them.
             log::debug!(
                 "perf: abandoned the split over {} deltas — a worker could not reproduce \
-                 this diff; building it sequentially",
+                 this diff or ran out of chunk indices; building it sequentially",
                 diff.deltas().len()
             );
         }
@@ -2549,6 +2544,9 @@ fn parallel_delta_patches(
         .collect();
     let git_dir = repo.path().to_path_buf();
     let expected = &expected;
+    // Read here, on the thread the build runs on, and handed to the workers: the
+    // workers' parts are cut under the same limits the merge appends them into.
+    let limits = build_limits();
 
     // **Workers CLAIM their next delta rather than being handed a share up front.**
     // Deltas differ enormously in cost — on the commit this was measured against, one
@@ -2601,7 +2599,7 @@ fn parallel_delta_patches(
                         if i >= expected.len() {
                             break;
                         }
-                        let mut rows = DiffRows::new(Vec::new());
+                        let mut rows = DiffRows::start(limits, Vec::new());
                         let mut entry = blank_entry();
                         env.enter_file(delta_path_bytes(&diff.get_delta(i)?));
                         if let Some(mut patch) = git2::Patch::from_diff(&diff, i).ok()? {
@@ -4114,7 +4112,7 @@ pub fn file_index_at_line(starts: &[(usize, usize)], line: usize) -> usize {
 }
 
 /// One hunk's two line ranges, as spelled in its `@@ -old_start,old_lines
-/// +new_start,new_lines @@` header. Copied out of the display's `DiffLine`s so an
+/// +new_start,new_lines @@` header. Copied out of the display's rows so an
 /// action can be matched against a freshly generated diff's hunks later, when the
 /// original `git2::DiffHunk` is long gone.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -4256,12 +4254,14 @@ pub mod tests {
         assert!(d.heap_bytes() >= bare + 10 * std::mem::size_of::<highlight::Span>());
     }
 
+    /// A diff's weight survives the display round trip — the cache charges what it was
+    /// charged, now read off the arena in O(chunks) rather than carried beside it.
     #[test]
-    fn row_bytes_survives_the_display_round_trip() {
+    fn heap_bytes_survives_the_display_round_trip() {
         let d = DiffData::with_max_chars(vec![text_row("hello"); 3].into(), vec![], 5);
         let before = d.heap_bytes();
-        let (lines, spans, files, max_chars, failed, tabless, row_bytes) = d.into_parts();
-        let back = DiffData::from_parts(lines, spans, files, max_chars, failed, tabless, row_bytes);
+        let (lines, spans, files, max_chars, failed, tabless) = d.into_parts();
+        let back = DiffData::from_parts(lines, spans, files, max_chars, failed, tabless);
         assert_eq!(back.heap_bytes(), before);
     }
 
@@ -4299,8 +4299,10 @@ pub mod tests {
         assert_eq!(DiffLines::default().iter().count(), 0);
     }
 
-    /// Running out of chunk indices fails the BUILD (`build_diff_data` reports it as
-    /// failed) rather than wrapping an index onto another file's text.
+    /// Running out of chunk indices fails `DiffRows::finish` rather than wrapping an
+    /// index onto another file's text. Its two consumers are pinned through real
+    /// builds: `a_diff_that_runs_out_of_chunks_builds_as_failed` and
+    /// `a_split_worker_that_runs_out_of_chunks_abandons_the_split`.
     #[test]
     fn a_build_that_runs_out_of_chunks_fails() {
         let mut rows = DiffRows::with_limits(ArenaLimits {
@@ -4645,6 +4647,107 @@ pub mod tests {
         let _restore = Restore(FORCE_PARALLEL.with(std::cell::Cell::get));
         FORCE_PARALLEL.with(|c| c.set(Some(workers)));
         f()
+    }
+
+    thread_local! {
+        /// Set by `with_build_limits` while a test wants a build's arena cut under
+        /// small limits. Read by `build_limits` on the thread that starts the build.
+        static FORCE_LIMITS: std::cell::Cell<Option<ArenaLimits>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// The forced build limits, if a test is asking for them.
+    pub(super) fn forced_build_limits() -> Option<ArenaLimits> {
+        FORCE_LIMITS.with(std::cell::Cell::get)
+    }
+
+    /// Run `f` with every build it starts cutting its text under `limits`. Restores the
+    /// previous setting on the way out, panic included, as `with_parallel_patch_pass`
+    /// does.
+    pub fn with_build_limits<T>(limits: ArenaLimits, f: impl FnOnce() -> T) -> T {
+        struct Restore(Option<ArenaLimits>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FORCE_LIMITS.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(FORCE_LIMITS.with(std::cell::Cell::get));
+        FORCE_LIMITS.with(|c| c.set(Some(limits)));
+        f()
+    }
+
+    /// Limits a build runs out of chunk indices under within 65,537 non-empty rows:
+    /// every row needs its own chunk.
+    const ONE_BYTE_CHUNKS: ArenaLimits = ArenaLimits {
+        chunk_cap: 1,
+        adopt_min: 1,
+        max_row: u32::MAX as usize,
+    };
+
+    /// A commit adding two files, one of more rows than a `u16` can name chunks for
+    /// under `ONE_BYTE_CHUNKS` — so a build of it runs out, and only under those
+    /// limits. Two deltas because the split gate takes `forced.min(deltas)`: with one
+    /// the "split" would quietly be the sequential pass.
+    fn too_many_chunks_repo() -> (tempfile::TempDir, Repository, git2::Oid) {
+        let (d, repo) = crate::test_repo::temp_repo();
+        crate::test_repo::commit_file(&repo, "seed.txt", "seed\n", "base");
+        let body = "x\n".repeat(usize::from(u16::MAX) + 2);
+        crate::test_repo::write_file(&repo, "big.txt", &body);
+        crate::test_repo::write_file(&repo, "small.txt", "small\n");
+        let mut index = repo.index().unwrap();
+        for path in ["big.txt", "small.txt"] {
+            index.add_path(std::path::Path::new(path)).unwrap();
+        }
+        let oid = crate::test_repo::commit_index(&repo, &mut index, "many rows");
+        (d, repo, oid)
+    }
+
+    /// The build's own consumer of an exhausted arena: `build_diff_data` logs it and
+    /// returns `DiffData::empty()`, which every cache refuses (`build_failed`). Through
+    /// both patch passes — the split one abandons and falls back to the sequential one,
+    /// which then fails the same way — against a control showing the same commit builds
+    /// whole under the app's limits.
+    #[test]
+    fn a_diff_that_runs_out_of_chunks_builds_as_failed() {
+        let (_d, repo, oid) = too_many_chunks_repo();
+        let scope = RowScope::new(DiffSource::Commit(oid));
+        let s = base_settings();
+        let whole = get_diff_data(&repo, &scope, s, BuildEnv::NONE);
+        assert!(!whole.build_failed(), "control: the default limits fit it");
+        assert!(whole.lines.len() > usize::from(u16::MAX) + 1);
+
+        let sequential = with_build_limits(ONE_BYTE_CHUNKS, || {
+            with_parallel_patch_pass(0, || get_diff_data(&repo, &scope, s, BuildEnv::NONE))
+        });
+        assert!(sequential.build_failed(), "sequential pass");
+        let progress = DiffProgress::default();
+        let split = with_build_limits(ONE_BYTE_CHUNKS, || {
+            with_parallel_patch_pass(2, || {
+                get_diff_data(&repo, &scope, s, BuildEnv::tracked(None, &progress))
+            })
+        });
+        assert!(split.build_failed(), "split pass");
+    }
+
+    /// The split pass's consumer: a worker whose part runs out of chunk indices
+    /// abandons the whole split (`parallel_delta_patches` answers `None`), and the build
+    /// takes the sequential pass, as for any worker failure — never a merge missing a
+    /// delta's rows.
+    #[test]
+    fn a_split_worker_that_runs_out_of_chunks_abandons_the_split() {
+        let (_d, repo, oid) = too_many_chunks_repo();
+        let scope = RowScope::new(DiffSource::Commit(oid));
+        let s = base_settings();
+        let split = || {
+            let mut opts = scoped_diff_opts(s, &scope.paths);
+            let mut diff = source_diff(&repo, &scope, s, &mut opts).expect("diff");
+            detect_similar(&mut diff, s);
+            parallel_delta_patches(&repo, &scope, s, BuildEnv::NONE, &diff, 2).is_some()
+        };
+        assert!(
+            split(),
+            "control: under the app's limits the split completes"
+        );
+        assert!(!with_build_limits(ONE_BYTE_CHUNKS, split));
     }
 
     /// A build that failed returns `DiffData::empty()` — no rows at all, where any real
@@ -5045,8 +5148,23 @@ pub mod tests {
     /// a row wider than anything in the host, one holding a tab — has to come out as if
     /// the same rows had been pushed into it one by one: same rows, same widest row,
     /// same tab census.
+    ///
+    /// Under both ways a part's text can enter the host: COPIED (the app's limits, where
+    /// no chunk this small reaches `ADOPT_MIN`) and ADOPTED (8-byte chunks adopted from
+    /// 4 bytes up, so the parts' chunks are moved in whole and their rows rebased onto
+    /// them) — each asserted by whether the parts' chunk allocations survive the merge.
     #[test]
     fn merging_parts_measures_what_pushing_the_same_rows_does() {
+        let small = ArenaLimits {
+            chunk_cap: 8,
+            adopt_min: 4,
+            max_row: u32::MAX as usize,
+        };
+        merge_matches_pushing(ArenaLimits::DEFAULT, false);
+        merge_matches_pushing(small, true);
+    }
+
+    fn merge_matches_pushing(limits: ArenaLimits, adopts: bool) {
         type Row = (
             LineKind,
             Option<NonZeroU32>,
@@ -5092,20 +5210,24 @@ pub mod tests {
         };
         let header = || vec![DiffLine::new("head", LineKind::Meta)];
 
-        let mut sequential = DiffRows::new(header());
+        let mut sequential = DiffRows::start(limits, header());
         for block in [&host[..], &wide, &tabbed] {
             push_all(&mut sequential, block);
         }
 
-        let mut merged = DiffRows::new(header());
+        let mut merged = DiffRows::start(limits, header());
         push_all(&mut merged, &host);
         assert!(merged.tabless, "control: the host holds no tab");
         let mut parts = Vec::new();
         for block in [&wide[..], &tabbed] {
-            let mut part = DiffRows::new(Vec::new());
+            let mut part = DiffRows::start(limits, Vec::new());
             push_all(&mut part, block);
             parts.push(part.finish_part().expect("fits"));
         }
+        let part_chunks: Vec<(*const u8, usize)> = parts
+            .iter()
+            .flat_map(|p| p.text.chunk_ptrs().into_iter().zip(p.text.chunk_lens()))
+            .collect();
         assert!(
             parts[0].tabless && !parts[1].tabless,
             "control: only the second holds a tab"
@@ -5120,6 +5242,37 @@ pub mod tests {
 
         let (want, want_chars, want_tabless) = sequential.finish().expect("fits");
         let (got, got_chars, got_tabless) = merged.finish().expect("fits");
+        if adopts {
+            // A pointer survives only a MOVE; a copied chunk is freed by the merge. EVERY
+            // part chunk the limits adopt must be present (one surviving by allocator
+            // reuse of a freed copy cannot satisfy all of them), and the arena holds
+            // exactly 6 chunks (counted from the fixture: the host's, those adopted
+            // and the copied remainder).
+            let kept = got.text_arena().chunk_ptrs();
+            let adopted: Vec<_> = part_chunks
+                .iter()
+                .filter(|(_, len)| *len >= limits.adopt_min)
+                .collect();
+            assert!(!adopted.is_empty(), "control: some part chunk is adoptable");
+            for (ptr, len) in &adopted {
+                assert!(
+                    kept.contains(ptr),
+                    "{limits:?}: the {len}-byte part chunk is adopted"
+                );
+            }
+            assert_eq!(
+                got.text_arena().chunk_count(),
+                6,
+                "{limits:?}: the merged arena's chunk count"
+            );
+        } else {
+            // Not by pointer: a freed part chunk's address may be reused by the host.
+            assert_eq!(
+                got.text_arena().chunk_count(),
+                1,
+                "{limits:?}: the parts' text is copied into the host's one chunk"
+            );
+        }
         assert_eq!(
             got.iter().collect::<Vec<_>>(),
             want.iter().collect::<Vec<_>>()

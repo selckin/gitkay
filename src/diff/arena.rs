@@ -95,6 +95,10 @@ impl TextArena {
     pub fn chunk_ptrs(&self) -> Vec<*const u8> {
         self.chunks.iter().map(|c| c.as_ptr()).collect()
     }
+    #[cfg(test)]
+    pub fn chunk_lens(&self) -> Vec<usize> {
+        self.chunks.iter().map(|c| c.len()).collect()
+    }
 }
 
 /// How the arena cuts its text. The app uses `DEFAULT`; tests shrink every bound so the
