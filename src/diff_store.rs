@@ -31,10 +31,12 @@ const MAGIC: &[u8; 8] = b"gitkayD\x00";
 /// joined the header beside `max_chars`, so a store hit does not pay the frame-loop tab
 /// census the build path stopped paying. 6: `FileEntry::new_blob` joined the file
 /// record — the displayed new side's blob id, which a hunk click on an untracked file
-/// is checked against. Note this guards
-/// the LAYOUT only — a change to what the diff BUILDER emits is invisible here,
+/// is checked against. 7: rows became fixed 13 B records — kind, `u32` length, the two
+/// `u32` line numbers — and the text one block after them in row order, so decode
+/// validates UTF-8 once over the block and reads no per-row length prefix. Note this
+/// guards the LAYOUT only — a change to what the diff BUILDER emits is invisible here,
 /// which is why `StoreContext` mixes in the crate version.
-const VERSION: u16 = 6;
+const VERSION: u16 = 7;
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
@@ -90,10 +92,6 @@ impl<'a> Reader<'a> {
         self.take(1).map(|b| b[0])
     }
 
-    fn u32(&mut self) -> Option<u32> {
-        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
-    }
-
     fn u64(&mut self) -> Option<u64> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
@@ -107,14 +105,6 @@ impl<'a> Reader<'a> {
 
     fn string(&mut self) -> Option<String> {
         String::from_utf8(self.bytes()?.to_vec()).ok()
-    }
-
-    /// The same run BORROWED out of the mapped entry, for a caller that is going to
-    /// copy it into its own allocation anyway. `string` would allocate a `String` for
-    /// that caller to copy out of and drop — two allocations and two copies where one
-    /// of each will do, on the per-line path the store exists to make fast.
-    fn str(&mut self) -> Option<&'a str> {
-        std::str::from_utf8(self.bytes()?).ok()
     }
 
     /// The two `Option` levels mean different things and collapsing them would
@@ -156,12 +146,12 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// The smallest a line can encode to: kind tag, an empty length-prefixed text,
-/// and the two line numbers. Only used to bound `count`'s reserve, so it must be
+/// The smallest a line can encode to: its fixed record — kind tag, `u32` text length
+/// and the two line numbers — with no text in the block. Only used to bound `count`'s reserve, so it must be
 /// a floor the encoder can never go under, which
 /// `the_minimum_element_sizes_match_the_encoder` measures against the real
 /// encoder rather than restating by hand.
-const LINE_MIN_BYTES: usize = 1 + 8 + 4 + 4;
+const LINE_MIN_BYTES: usize = 1 + 4 + 4 + 4;
 /// The same for a file: two empty length-prefixed paths, the two optional-path
 /// tags, the status tag, the binary and converted flags, the optional-blob tag, and
 /// three `u64`s.
@@ -282,42 +272,115 @@ fn encode(data: &DiffData) -> Vec<u8> {
         put_u64(&mut out, f.diff_line_idx.map_or(0, |i| i as u64 + 1));
     }
 
+    // Rows in ROW order, not arena order: `order_files` permutes rows over an
+    // unpermuted arena, and decode recovers each row's offset as the running sum of the
+    // lengths before it.
     put_u64(&mut out, data.lines.len() as u64);
+    // `text_len` is patched in once the records have summed it: a summing pass of its
+    // own over every row cost ~6 ms of ~53 on `bench_store_codec`'s 1.6M rows.
+    let text_len_at = out.len();
+    put_u64(&mut out, 0);
+    let mut text_len = 0u64;
     for l in data.lines.iter() {
+        text_len += l.text.len() as u64;
         out.push(kind_tag(l.kind));
-        put_str(&mut out, l.text);
+        put_u32(&mut out, l.text.len() as u32); // ≤ u32::MAX: the arena cuts longer rows
         // 0 stands for `None`: git's line numbers are 1-based, which is why the
         // field is a `NonZeroU32` in the first place.
         put_u32(&mut out, l.old_lineno.map_or(0, NonZeroU32::get));
         put_u32(&mut out, l.new_lineno.map_or(0, NonZeroU32::get));
     }
+    out[text_len_at..text_len_at + 8].copy_from_slice(&text_len.to_le_bytes());
+    for l in data.lines.iter() {
+        out.extend_from_slice(l.text.as_bytes());
+    }
     out
 }
+
+/// How a decoded diff's text is cut into chunks — and so, through its `chunk_cap`, the
+/// largest text block `decode` accepts. One value for both, so the bound and the
+/// writer it protects cannot drift apart.
+const LIMITS: ArenaLimits = ArenaLimits::DEFAULT;
 
 /// `None` for anything that is not a valid current-version entry. The caller
 /// deletes the file and treats it as a miss — the fallback is "build it", which
 /// always works.
+///
+/// The entry is untrusted input: `load` reads any file in the store directory, and
+/// `MAX_ENTRY_BYTES` is enforced only on save.
 fn decode(bytes: &[u8]) -> Option<DiffData> {
+    decode_with(bytes, LIMITS.chunk_cap)
+}
+
+/// `decode` with the text-block bound stated. The app always passes one chunk's worth
+/// (`decode`); `bench_store_codec` passes more, so its 900,000-line baseline — whose
+/// block is past one chunk — still decodes. A block over one chunk is correct, only
+/// not what `save` writes: the writer seals the first chunk full and copies the rest
+/// into a second one.
+fn decode_with(bytes: &[u8], block_cap: usize) -> Option<DiffData> {
     let mut r = Reader::new(bytes);
     let (max_chars, tabless, files) = decode_head(&mut r)?;
 
-    let n_lines = r.count(LINE_MIN_BYTES)?;
-    // Straight into the arena, not through `DiffRows`: the entry carries `max_chars` and
-    // `tabless` already, so nothing is re-measured.
-    let mut w = ArenaWriter::with_capacity(ArenaLimits::DEFAULT, n_lines, 0);
-    for _ in 0..n_lines {
-        let kind = kind_from_tag(r.u8()?)?;
-        let text = r.str()?; // borrowed out of the entry; copied once, into the arena tail
-        let old_lineno = NonZeroU32::new(r.u32()?);
-        let new_lineno = NonZeroU32::new(r.u32()?);
-        w.push_parts(kind, old_lineno, new_lineno, &[text]);
+    let n_rows = r.count(LINE_MIN_BYTES)?;
+    // A file's patch starts at a row this entry holds: the pane indexes rows by it.
+    if files
+        .iter()
+        .any(|f| f.diff_line_idx.is_some_and(|i| i >= n_rows))
+    {
+        return None;
     }
-    let (rows, text) = w.finish().ok()?;
-
+    let text_len = usize::try_from(r.u64()?).ok()?;
+    // Bound the claim before anything is sized by it.
+    if text_len > block_cap || text_len > u32::MAX as usize {
+        return None;
+    }
+    let (table, _) = r
+        .take(n_rows.checked_mul(LINE_MIN_BYTES)?)?
+        .as_chunks::<LINE_MIN_BYTES>();
+    // One UTF-8 pass over the whole block, borrowed out of the entry.
+    let text = std::str::from_utf8(r.take(text_len)?).ok()?;
     // Trailing bytes mean the file is not what this version writes.
-    (r.pos == bytes.len()).then(|| DiffData {
+    if r.pos != bytes.len() {
+        return None;
+    }
+
+    let row = |&[k, l0, l1, l2, l3, o0, o1, o2, o3, n0, n1, n2, n3]: &[u8; LINE_MIN_BYTES]| {
+        Some((
+            kind_from_tag(k)?,
+            u32::from_le_bytes([l0, l1, l2, l3]) as usize,
+            NonZeroU32::new(u32::from_le_bytes([o0, o1, o2, o3])),
+            NonZeroU32::new(u32::from_le_bytes([n0, n1, n2, n3])),
+        ))
+    };
+    // The lengths must account for the block exactly.
+    let mut sum = 0usize;
+    for rec in table {
+        sum = sum.checked_add(row(rec)?.1)?;
+    }
+    if sum != text_len {
+        return None;
+    }
+
+    // Straight into the arena, not through `DiffRows`: the entry carries `max_chars` and
+    // `tabless` already, so nothing is re-measured. `str::get` refuses a split inside a
+    // code point — the block being valid UTF-8 does not make the row SPLITS boundaries,
+    // and a bad one would panic later in `text(i)`, on the frame loop. The same goes for
+    // an Add/Del row with no one-byte marker to strip: `LineRef::body` slices `[1..]`.
+    let mut w = ArenaWriter::with_capacity(LIMITS, n_rows, text_len);
+    let mut off = 0;
+    for rec in table {
+        let (kind, len, old_lineno, new_lineno) = row(rec)?;
+        let t = text.get(off..off + len)?;
+        if matches!(kind, LineKind::Add | LineKind::Del) && !t.is_char_boundary(1) {
+            return None;
+        }
+        w.push_parts(kind, old_lineno, new_lineno, &[t]);
+        off += len;
+    }
+    let (rows, arena) = w.finish().ok()?;
+    Some(DiffData {
         tabless,
-        ..DiffData::with_max_chars(DiffLines::from_arena(rows, text), files, max_chars)
+        ..DiffData::with_max_chars(DiffLines::from_arena(rows, arena), files, max_chars)
     })
 }
 
@@ -1016,6 +1079,9 @@ pub const MAX_ENTRY_DIVISOR: usize = 8;
 /// right trade at this size — a diff this large has no fast path anyway (its INSTALL
 /// alone takes seconds), and the alternative spends the whole store on it.
 pub const MAX_ENTRY_BYTES: u64 = DEFAULT_BUDGET_BYTES / MAX_ENTRY_DIVISOR as u64;
+// An entry holds its text block, so every entry `save` writes fits the block `decode`
+// accepts.
+const _: () = assert!(MAX_ENTRY_BYTES <= LIMITS.chunk_cap as u64);
 
 /// A floor on what `encode` will produce for a diff of this shape: the fixed
 /// per-line and per-file fields, before a byte of text. Pure and count-based so the
@@ -1260,6 +1326,251 @@ mod tests {
         let mut wrong_version = good;
         wrong_version[MAGIC.len()] = wrong_version[MAGIC.len()].wrapping_add(1);
         assert!(decode(&wrong_version).is_none(), "wrong version");
+    }
+
+    /// A VERSION 7 entry with no files, built by hand so a test can state what the
+    /// encoder never would.
+    fn v7_entry(rows: &[(LineKind, u32)], text: &[u8], text_len: u64) -> Vec<u8> {
+        let mut out = MAGIC.to_vec();
+        out.extend_from_slice(&VERSION.to_le_bytes());
+        put_u64(&mut out, 0); // max_chars
+        out.push(0); // tabless
+        put_u64(&mut out, 0); // n_files
+        put_u64(&mut out, rows.len() as u64);
+        put_u64(&mut out, text_len);
+        for &(kind, len) in rows {
+            out.push(kind_tag(kind));
+            put_u32(&mut out, len);
+            put_u32(&mut out, 0);
+            put_u32(&mut out, 0);
+        }
+        out.extend_from_slice(text);
+        out
+    }
+
+    /// A claimed text block over one chunk is refused before anything is sized by it.
+    /// `load` reads any file in the store directory; the 32 MiB cap is enforced only on
+    /// save, so a crafted or corrupt entry can claim anything.
+    #[test]
+    fn a_claimed_text_block_past_the_chunk_cap_is_refused_before_it_is_allocated() {
+        assert!(
+            decode(&v7_entry(&[(LineKind::Context, 2)], b"ok", 2)).is_some(),
+            "control"
+        );
+        for claim in [
+            LIMITS.chunk_cap as u64 + 1,
+            u64::from(u32::MAX) + 1,
+            u64::MAX,
+        ] {
+            assert!(
+                decode(&v7_entry(&[(LineKind::Context, 2)], b"ok", claim)).is_none(),
+                "{claim}"
+            );
+        }
+        // A block that really is that long, so running out of bytes cannot be what
+        // refuses it: every byte is there and the lengths sum to the block.
+        let past = LIMITS.chunk_cap + 1;
+        let len = u32::try_from(past).expect("the cap fits a u32");
+        let entry = v7_entry(&[(LineKind::Context, len)], &vec![b'a'; past], past as u64);
+        assert!(decode(&entry).is_none(), "a real block past the cap");
+    }
+
+    /// An Add/Del row's text starts with its one-byte marker, which `LineRef::body`
+    /// strips by slicing `[1..]` — on the frame loop. A row with no text, or whose first
+    /// character is wider than a byte, would panic there, so decode refuses it.
+    #[test]
+    fn an_add_or_del_row_with_no_one_byte_marker_is_refused() {
+        for kind in [LineKind::Add, LineKind::Del] {
+            assert!(
+                decode(&v7_entry(&[(kind, 2)], b"+x", 2)).is_some(),
+                "control: {kind:?}"
+            );
+            assert!(
+                decode(&v7_entry(&[(kind, 1)], b"+", 1)).is_some(),
+                "control: a marker alone is an empty body, {kind:?}"
+            );
+            assert!(
+                decode(&v7_entry(&[(kind, 0)], b"", 0)).is_none(),
+                "empty {kind:?}"
+            );
+            assert!(
+                decode(&v7_entry(&[(kind, 3)], "éx".as_bytes(), 3)).is_none(),
+                "multi-byte first char, {kind:?}"
+            );
+        }
+        // Only the marker kinds: an empty context or blank row is ordinary.
+        for kind in [LineKind::Context, LineKind::Blank] {
+            assert!(
+                decode(&v7_entry(&[(kind, 0)], b"", 0)).is_some(),
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// A file's `diff_line_idx` names the row its patch starts at, and the pane indexes
+    /// rows by it; one past the rows this entry holds is refused.
+    #[test]
+    fn a_file_pointing_past_the_rows_is_refused() {
+        let entry = |idx| {
+            let file = FileEntry {
+                path: "x.rs".to_string(),
+                old_path: None,
+                path_bytes: b"x.rs".to_vec(),
+                old_path_bytes: None,
+                status: git2::Delta::Modified,
+                is_binary: false,
+                is_converted: false,
+                new_blob: None,
+                additions: 0,
+                deletions: 0,
+                diff_line_idx: idx,
+            };
+            let rows = vec![
+                line("diff --git a/x.rs b/x.rs", LineKind::FileMeta, 0, 0),
+                line(" ctx", LineKind::Context, 1, 1),
+            ];
+            encode(&DiffData::with_max_chars(rows.into(), vec![file], 0))
+        };
+        assert!(decode(&entry(None)).is_some(), "control: no body");
+        assert!(decode(&entry(Some(1))).is_some(), "control: the last row");
+        assert!(decode(&entry(Some(2))).is_none(), "one past the rows");
+        assert!(decode(&entry(Some(usize::MAX - 1))).is_none(), "far past");
+    }
+
+    /// `order_files` permutes the rows over an unpermuted arena, so their text no longer
+    /// sits in arena order; encode writes it in ROW order and decode recovers each
+    /// row's offset from the lengths before it. A re-laid diff must come back row for
+    /// row, with its entries' moved `diff_line_idx`s.
+    #[test]
+    fn a_diff_relaid_by_order_files_round_trips() {
+        let entry = |path: &str, idx| FileEntry {
+            path: path.to_string(),
+            old_path: None,
+            path_bytes: path.as_bytes().to_vec(),
+            old_path_bytes: None,
+            status: git2::Delta::Modified,
+            is_binary: false,
+            is_converted: false,
+            new_blob: None,
+            additions: 1,
+            deletions: 1,
+            diff_line_idx: Some(idx),
+        };
+        let mut data = DiffData::with_max_chars(
+            vec![
+                line("commit abc", LineKind::Meta, 0, 0),
+                line("diff --git a/b.rs b/b.rs", LineKind::FileMeta, 0, 0),
+                line("@@ -1,2 +1,2 @@", LineKind::Hunk, 0, 0),
+                line("-bé", LineKind::Del, 1, 0),
+                line("+b2", LineKind::Add, 0, 1),
+                line(" b ctx", LineKind::Context, 2, 2),
+                line("diff --git a/a.rs b/a.rs", LineKind::FileMeta, 0, 0),
+                line("@@ -7 +7 @@", LineKind::Hunk, 0, 0),
+                line("-a😀", LineKind::Del, 7, 0),
+                line("+a", LineKind::Add, 0, 7),
+            ]
+            .into(),
+            vec![entry("b.rs", 1), entry("a.rs", 6)],
+            24,
+        );
+        assert!(
+            crate::diff::order_files(&mut data.lines, &mut data.spans, &mut data.files, &[1, 0]),
+            "a non-identity re-lay"
+        );
+        assert_eq!(data.lines.text(1), "diff --git a/a.rs b/a.rs", "control");
+
+        let back = decode(&encode(&data)).expect("decodes");
+
+        assert_eq!(back.lines.len(), data.lines.len());
+        for (i, (a, b)) in back.lines.iter().zip(data.lines.iter()).enumerate() {
+            assert_eq!(a.text, b.text, "row {i}");
+            assert_eq!(a.kind, b.kind, "row {i}");
+            assert_eq!(a.old_lineno, b.old_lineno, "row {i}");
+            assert_eq!(a.new_lineno, b.new_lineno, "row {i}");
+        }
+        let laid = |d: &DiffData| {
+            d.files
+                .iter()
+                .map(|f| (f.path.clone(), f.diff_line_idx))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(laid(&back), laid(&data));
+        assert_eq!(
+            laid(&back),
+            [("a.rs".to_string(), Some(1)), ("b.rs".to_string(), Some(5))]
+        );
+    }
+
+    /// The block is valid UTF-8 but the split is not: "é" cut into 1 + 1 bytes.
+    #[test]
+    fn a_row_split_inside_a_code_point_is_refused() {
+        let two = [(LineKind::Context, 1), (LineKind::Context, 1)];
+        assert!(decode(&v7_entry(&two, "é".as_bytes(), 2)).is_none());
+        assert!(
+            decode(&v7_entry(&[(LineKind::Context, 2)], "é".as_bytes(), 2)).is_some(),
+            "control"
+        );
+    }
+
+    #[test]
+    fn row_lengths_that_do_not_sum_to_the_block_are_refused() {
+        assert!(decode(&v7_entry(&[(LineKind::Context, 1)], b"ab", 2)).is_none());
+        assert!(decode(&v7_entry(&[(LineKind::Context, 3)], b"ab", 2)).is_none());
+    }
+
+    #[test]
+    fn trailing_bytes_after_the_text_block_are_refused() {
+        let mut e = v7_entry(&[(LineKind::Context, 2)], b"ok", 2);
+        e.push(0);
+        assert!(decode(&e).is_none());
+    }
+
+    /// Multibyte rows of every kind come back exactly, an empty one included.
+    #[test]
+    fn multibyte_rows_round_trip() {
+        let data = DiffData::with_max_chars(
+            vec![
+                line("+héllo", LineKind::Add, 0, 1),
+                line("", LineKind::Blank, 0, 0),
+                line(" 😀 €", LineKind::Context, 2, 2),
+            ]
+            .into(),
+            vec![],
+            6,
+        );
+        let back = decode(&encode(&data)).expect("round trip");
+        assert_eq!(
+            back.lines.iter().collect::<Vec<_>>(),
+            data.lines.iter().collect::<Vec<_>>()
+        );
+    }
+
+    /// An entry written by the previous layout misses and is deleted, through either
+    /// reader — the same as every earlier bump, so no migration code.
+    #[test]
+    fn a_version_6_entry_misses_and_is_removed_through_either_load() {
+        for stats in [false, true] {
+            let (_d, repo) = temp_repo();
+            let oid = commit_file(&repo, "a.txt", "one\n", "c");
+            let (_t, store) = temp_store(&repo);
+            let built =
+                crate::diff::get_diff_data(&repo, &scope_of(oid), settings(), BuildEnv::NONE);
+            assert!(
+                store.save(&scope_of(oid), settings(), &built),
+                "control: written"
+            );
+            let entry = only_entry(&store);
+            let mut bytes = std::fs::read(&entry).unwrap();
+            bytes[MAGIC.len()..MAGIC.len() + 2].copy_from_slice(&6u16.to_le_bytes());
+            std::fs::write(&entry, &bytes).unwrap();
+            let hit = if stats {
+                store.load_stats(&scope_of(oid), settings()).is_some()
+            } else {
+                store.load(&scope_of(oid), settings()).is_some()
+            };
+            assert!(!hit, "a VERSION 6 entry is a miss (load_stats: {stats})");
+            assert!(!entry.exists(), "and is deleted (load_stats: {stats})");
+        }
     }
 
     /// A corrupt COUNT must be refused against what the remaining bytes could
@@ -2030,7 +2341,8 @@ mod tests {
 
     /// CODEC BENCH: `encode` and `decode` over the row-memory bench's diff
     /// (`diff::tests::synthetic_rewrite_repo`, `BENCH_LINES` lines rewritten, default
-    /// 900,000), each the median of `BENCH_REPS` (default 3), and the encoded size.
+    /// 900,000 — the row-memory bench's size, and the baseline's), each the median of
+    /// `BENCH_REPS` (default 3), and the encoded size.
     ///
     /// ```text
     /// cargo test --release bench_store_codec -- --ignored --nocapture
@@ -2038,6 +2350,11 @@ mod tests {
     ///
     /// The codec functions are called directly rather than through `save`/`load`, so
     /// `MAX_ENTRY_BYTES` does not refuse an entry this size and no disk is involved.
+    /// Decode goes through `decode_with` with no block cap of its own (the `u32` bound
+    /// still holds): past ~880,000 lines the text block exceeds one chunk, which
+    /// `decode` refuses, so `decode` itself could not be timed at the baseline size.
+    /// The cost of that is one extra chunk per decode — the first sealed full, the rest
+    /// copied into a second, reserved whole — which an entry `save` writes never has.
     #[test]
     #[ignore = "a benchmark; see the doc comment for how to run it"]
     fn bench_store_codec() {
@@ -2073,7 +2390,7 @@ mod tests {
         let mut decodes = Vec::with_capacity(reps);
         for _ in 0..reps {
             let t = Instant::now();
-            let back = decode(&bytes).expect("decodes");
+            let back = decode_with(&bytes, u32::MAX as usize).expect("decodes");
             decodes.push(t.elapsed());
             assert_eq!(back.lines.len(), rows, "the round trip keeps every row");
         }

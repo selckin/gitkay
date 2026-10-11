@@ -398,7 +398,12 @@ build already has — a port of libgit2's own formatter, which exists so `Diff::
 (a whole second pass over every blob, 38% of a build) never runs; see **Diffstat
 block**),
 `src/diff_store.rs` (the persistent layer below that cache: a hand-rolled binary
-codec for a diff's structure, key derivation, atomic load/save under its own
+codec for a diff's structure — store `VERSION` 7: header, file table, then fixed 13 B
+row records and the rows' text as one block in row order, which decode validates with
+a single UTF-8 pass and copies into one arena chunk, treating the entry as untrusted
+(refusing too what would only panic later, on the frame loop: a row split inside a code
+point, an Add/Del row with no one-byte marker, a file pointing past the rows) —
+key derivation, atomic load/save under its own
 `MAX_ENTRY_BYTES` — an entry the budget could never keep is refused before it is
 even encoded — and the budget-and-temp-sweep pruner),
 `src/diff/arena.rs` (the chunked text arena a diff's rows point into —
@@ -2306,10 +2311,18 @@ there ends at the same chunk count), and an over-long row cut on a char boundary
 overwritten value, the LRU victims in order, the purged values), `reaper` (a disposed
 value is dropped on `gitkay-drop`, not the caller's thread; with no thread, or one that
 is gone, it is dropped inline), `diff_store`
-(codec round trips including a non-UTF-8 path and every tag, key derivation, load/save
-over real temp repos, the entry cap from both sides — the measured 76.5M-line shape
+(codec round trips including a non-UTF-8 path, every tag and a diff `order_files`
+re-laid into a non-identity order, key derivation, load/save
+over real temp repos, the entry cap from both sides (the measured 76.5M-line shape
 refused from its line count alone, and a few enormous lines refused only after
-encoding — and the pruner's eviction + temp sweep), `word_diff` (LCS word
+encoding), the VERSION 7 decode's refusals (a text block claimed past one chunk,
+refused before anything is sized by it; a row split inside a code point; lengths that
+do not sum to the block; trailing bytes; and the two that would panic on render rather
+than in decode — an Add/Del row with no one-byte marker for `LineRef::body`'s `[1..]`
+(empty, or a first character wider than a byte), and a file whose `diff_line_idx` is
+past the rows), a VERSION 6 entry missing and being deleted
+through both `load` and `load_stats`, and the pruner's eviction + temp sweep),
+`word_diff` (LCS word
 alignment), `testcode` (test-path classification per convention, including the
 negatives a looser rule would catch — a test-SUPPORT package under `src/main/`, a
 directory merely containing `test`, an API `spec/` — and the Maven directory parse),
