@@ -31,6 +31,7 @@ mod highlight;
 mod history;
 mod mem;
 mod prefetch;
+mod reaper;
 #[cfg(test)]
 mod test_repo;
 mod testcode;
@@ -5234,8 +5235,10 @@ impl GitkApp {
             // still reachable by flipping the toolbar back, and a stale-content one
             // is never served anyway (the fresh content hash just misses).
             if !is_real_commit(key.oid) {
-                self.diff_cache
-                    .retain_keys(|k| !k.same_modulo_content(&key));
+                reaper::dispose_all(
+                    self.diff_cache
+                        .retain_keys(|k| !k.same_modulo_content(&key)),
+                );
             }
             self.cache_diff(key, data);
         }
@@ -5368,16 +5371,18 @@ impl GitkApp {
                  fell back to raw content",
                 key.oid
             );
+            reaper::dispose(data);
             return;
         }
         if data.build_failed() {
             // Kept out for the reason `worth_persisting` refuses it: an error is not
             // an answer, and a revisit should retry rather than serve the blank.
             log_failed_build_not_cached(key.oid);
+            reaper::dispose(data);
             return;
         }
         let weight = data.heap_bytes();
-        self.diff_cache.insert(key, data, weight);
+        reaper::dispose_all(self.diff_cache.insert(key, data, weight));
     }
 
     /// Is `key`'s diff both the one on screen AND still a valid answer for it?
@@ -5479,7 +5484,7 @@ impl GitkApp {
     /// installed under the fresh key's — wrong colours that `pending_files` would then find
     /// nothing to re-do for, and that would get cached under the new key. Blank them
     /// exactly like `handle_config_reload`'s own re-highlight reset does for the live
-    /// diff (`self.diff_spans.clear()`) so the post-install pass recolours from
+    /// diff (`self.diff_spans.take_all()`) so the post-install pass recolours from
     /// scratch — same mechanism, applied to the arriving result instead of the field.
     fn rekey_for_install(&self, key: &DiffCacheKey, data: &mut DiffData) -> DiffCacheKey {
         // Span fields from now, everything else from what the result was built under
@@ -5490,7 +5495,7 @@ impl GitkApp {
             data,
         );
         if spans_outlived(key, &fresh) {
-            data.spans.clear();
+            reaper::dispose(data.spans.take_all());
         }
         fresh
     }
@@ -5547,11 +5552,17 @@ impl GitkApp {
         // frame. Sized here against the incoming rows, which is the one place it can be
         // — every other writer indexes it.
         let t_swap = std::time::Instant::now();
-        self.diff_emphasis = diff::RowEmphasis::blank(lines.len());
         let rows = lines.len();
-        self.diff_lines = lines;
-        self.diff_spans = spans;
-        self.diff_files = files;
+        // The outgoing diff is freed on the drop thread, never here: on a large diff
+        // that free is a pass over every row (3.24s at 76.5M lines). Usually the rows
+        // are already gone — `stash_current_diff` moved them into the cache — but a
+        // caller that clears without stashing would otherwise free them on this frame.
+        reaper::dispose((
+            std::mem::replace(&mut self.diff_lines, lines),
+            std::mem::replace(&mut self.diff_spans, spans),
+            std::mem::replace(&mut self.diff_files, files),
+            std::mem::replace(&mut self.diff_emphasis, diff::RowEmphasis::blank(rows)),
+        ));
         self.current_diff_key = key;
         self.diff_content_stale = false;
         self.diff_viewport.reset_top();
@@ -5561,9 +5572,9 @@ impl GitkApp {
         let layout = t_layout.elapsed();
         self.invalidate_diff_highlight();
         // Attributed, because this is the frame the reader feels on a large diff and
-        // its two halves fail differently: the swap is per-ROW work (dropping the
-        // outgoing diff, sizing the new one's slots) and the layout is the re-lay,
-        // which is O(lines) only when the file order actually moves.
+        // its two halves fail differently: the swap is per-CHUNK work (sizing the new
+        // diff's slots — the outgoing one is freed off this thread) and the layout is
+        // the re-lay, which is O(lines) only when the file order actually moves.
         if swap + layout > DIFF_INSTALL_SLOW {
             log::debug!("perf: diff install {rows} lines: swap {swap:?}, layout {layout:?}");
         }
@@ -5725,9 +5736,16 @@ impl GitkApp {
         if self.shows_current(&key) {
             self.diff_load = None;
             self.pending_anchor = None;
+            reaper::dispose(data);
             return;
         }
-        let data = self.diff_cache.remove(&key).unwrap_or(data);
+        let data = match self.diff_cache.remove(&key) {
+            Some(cached) => {
+                reaper::dispose(data);
+                cached
+            }
+            None => data,
+        };
         self.apply_loaded_diff(key, data);
     }
 
@@ -6874,7 +6892,10 @@ impl GitkApp {
             // The emphasis is dropped rather than moved, being the cheap half: it
             // covers one viewport and `ensure_visible_word_emphasis` refills it on the
             // next frame, where the spans it sits beside cost seconds to recompute.
-            self.diff_emphasis = diff::RowEmphasis::blank(self.diff_lines.len());
+            reaper::dispose(std::mem::replace(
+                &mut self.diff_emphasis,
+                diff::RowEmphasis::blank(self.diff_lines.len()),
+            ));
             // And the wrap index, which names lines by INDEX: the permutation moves a
             // 5,000-byte line to where a 40-byte one was, so every visual row past
             // the first moved file would draw the wrong slice of the wrong line.
@@ -8495,7 +8516,7 @@ impl GitkApp {
             // memory rather than deciding anything — including for a warm still running
             // under the pre-edit map, whose result now fails `key_is_current` and is
             // dropped instead of landing back in the cache this just emptied.
-            self.diff_cache.retain_keys(|_| false);
+            reaper::dispose_all(self.diff_cache.retain_keys(|_| false));
             // The commit-list column is the third cache holding the old driver's
             // answers, and `CommitStats` records nothing about which driver produced
             // them: `cache_diff` harvests a driven row's `+`/`-` off its diff, so
@@ -8759,7 +8780,7 @@ impl GitkApp {
                     // One vector, not a write through every row: the rows are
                     // shared with a worker that may still be reading them, and
                     // none of them says anything about colour any more.
-                    self.diff_spans.clear();
+                    reaper::dispose(self.diff_spans.take_all());
                     // Re-key the live diff so its eventual stash lands under the
                     // new span settings — and ONLY those (`respan`): the displayed
                     // diff keeps the settings it was built with, which are not
@@ -8879,20 +8900,28 @@ impl GitkApp {
                 // the previous commit's diff would misattribute it to the now-selected
                 // commit. Stashed first so a revisit is instant; re-selecting this
                 // commit retries.
-                (Arrival::ClearPane, _) => self.clear_failed_load(),
+                (Arrival::ClearPane, data) => {
+                    reaper::dispose(data);
+                    self.clear_failed_load();
+                }
                 // The adopted worker turned out to have bailed pre-compute (it was
                 // superseded before it started, then the user bounced back). Nothing
                 // else will deliver this diff — dispatch a fresh load. No retry loop:
                 // that fresh load runs under the current epoch, so its failure clears.
-                (Arrival::Redispatch, _) => self.load_selected_diff(),
+                (Arrival::Redispatch, data) => {
+                    reaper::dispose(data);
+                    self.load_selected_diff();
+                }
                 // A superseded failure or pre-compute bail: nothing to install,
                 // but log it — during the dedupe diagnosis the open question was
                 // "did that worker ever report?", and this line is the answer.
-                (Arrival::Drop(DropReason::Bailed), _) => {
+                (Arrival::Drop(DropReason::Bailed), data) => {
+                    reaper::dispose(data);
                     log::debug!("diff-load: superseded bail/failure for {}", key.oid);
                 }
                 (Arrival::Drop(reason), Some(data)) => {
                     log_superseded_result(&key, &data);
+                    reaper::dispose(data);
                     // `cache_diff` used to be the one refusing this, and said so.
                     if reason == DropReason::BuildFailed {
                         log_failed_build_not_cached(key.oid);
@@ -9245,24 +9274,36 @@ impl WarmDrain for GitkApp {
             // blanked.
             Arrival::Install => self.install(&key, data),
             Arrival::Cache => self.cache_diff(key, data),
-            Arrival::ClearPane => self.clear_failed_load(),
+            Arrival::ClearPane => {
+                reaper::dispose(data);
+                self.clear_failed_load();
+            }
             // Only an adopted warm is sent uncacheable, and only the reader moving away
             // between adopting it — or the diff-shaping settings moving under it — and
             // its delivery lands it here: it was never meant for the cache, so it is
             // freed rather than kept.
-            Arrival::Drop(DropReason::Uncacheable) => log::debug!(
-                "prefetch: drop uncacheable adopted result for {} — no longer awaited",
-                key.oid
-            ),
+            Arrival::Drop(DropReason::Uncacheable) => {
+                log::debug!(
+                    "prefetch: drop uncacheable adopted result for {} — no longer awaited",
+                    key.oid
+                );
+                reaper::dispose(data);
+            }
             // Logged: this completed prefetch was wasted work.
             Arrival::Drop(DropReason::StaleKey) => {
                 log::debug!("prefetch: drop stale-keyed result for {}", key.oid);
+                reaper::dispose(data);
             }
-            Arrival::Drop(DropReason::BuildFailed) => log_failed_build_not_cached(key.oid),
+            Arrival::Drop(DropReason::BuildFailed) => {
+                log_failed_build_not_cached(key.oid);
+                reaper::dispose(data);
+            }
             // Only a foreground bail redispatches; a warm always carries rows. The key
             // on screen is `load_selected_diff`'s, and needs no word.
             Arrival::Redispatch
-            | Arrival::Drop(DropReason::Shown | DropReason::Superseded | DropReason::Bailed) => {}
+            | Arrival::Drop(DropReason::Shown | DropReason::Superseded | DropReason::Bailed) => {
+                reaper::dispose(data);
+            }
         }
     }
 
@@ -11498,7 +11539,7 @@ mod tests {
         };
         let dark = T::CatppuccinMocha;
         let mut c: DiffCache<DiffCacheKey, u32> = DiffCache::new(100);
-        c.insert(key(dark, true, true, 0), 1, 1);
+        assert!(c.insert(key(dark, true, true, 0), 1, 1).is_empty());
         assert_eq!(
             c.remove(&key(T::CatppuccinLatte, true, true, 0)),
             None,
@@ -11556,7 +11597,7 @@ mod tests {
             languages,
         };
         let mut c: DiffCache<DiffCacheKey, u32> = DiffCache::new(100);
-        c.insert(key(0), 1, 1);
+        assert!(c.insert(key(0), 1, 1).is_empty());
         assert_eq!(c.remove(&key(7)), None, "different language map ⇒ miss");
         assert_eq!(c.remove(&key(0)), Some(1), "same key ⇒ hit");
         assert!(
@@ -11612,7 +11653,7 @@ mod tests {
             languages: 0,
         };
         let mut c: DiffCache<DiffCacheKey, u32> = DiffCache::new(100);
-        c.insert(key(0), 1, 1);
+        assert!(c.insert(key(0), 1, 1).is_empty());
         assert_eq!(c.remove(&key(7)), None, "different drivers ⇒ miss");
         assert_eq!(c.remove(&key(0)), Some(1), "same key ⇒ hit");
         assert!(
@@ -11699,7 +11740,7 @@ mod tests {
             languages: 0,
         };
         let mut c: DiffCache<DiffCacheKey, u32> = DiffCache::new(100);
-        c.insert(key(false, false), 1, 1);
+        assert!(c.insert(key(false, false), 1, 1).is_empty());
         assert_eq!(
             c.remove(&key(true, false)),
             None,

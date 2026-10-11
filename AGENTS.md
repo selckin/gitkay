@@ -319,7 +319,26 @@ resolution, grammar selection, per-line tokenization — no diff knowledge; the
 diff-side orchestration is `src/diff_highlight.rs`), `src/diff_cache.rs` (weight-budget LRU cache; the app weighs a diff by `DiffData::heap_bytes`
 — rows measured where they are assembled, spans kept by `PerRow` as they are written — under
 `diff_cache_byte_budget`, which is the line budget at `BYTES_PER_CACHED_LINE`, so the prefetch
-bounds and the cache still turn on one dial),
+bounds and the cache still turn on one dial. **The UI thread never frees a diff**: freeing
+one is a pass over every row's allocation, measured at **3.24s** on the frame loop for a
+76.5M-line diff and a dropped frame at a few hundred thousand lines. So `insert` and
+`retain_keys` hand back what they evict, overwrite or purge instead of dropping it, and
+every place the app lets a diff go — those values, a dropped or refused arrival, the copy
+`install_preferring_cache` declines, the outgoing content `set_diff_content` replaces, the
+spans a re-key or theme change blanks (`PerRow::take_all`) — passes it to
+`reaper::dispose`, unconditionally rather than above a size: a send is ~100ns, and a
+threshold would be one more rule to keep right. What the cache hands back goes through
+`reaper::dispose_all`, which skips an empty list: that is most inserts, and the only
+case not worth a box and a send. `order_files` disposes its emptied source
+buffer the same way: every row was moved out, but the buffer is still N × 32 B. The cost
+is a brief overshoot: a bulk purge (a driver change's `retain_keys`, or evicting one giant
+entry) empties the cache's books at once, so the band can re-warm while the old bytes are
+still being freed — bounded by about one cache budget, and the heavy lane's live reading
+sees it),
+`src/reaper.rs` (the `gitkay-drop` thread: `dispose` boxes any `Send` value onto an
+unbounded channel to one long-lived thread that drops it, spawned on first use and never
+joined — process exit frees everything, and waiting would slow shutdown; a failed spawn or
+a thread that is gone means dropping inline, never a panic),
 `src/diffstat.rs` (the `--stat` block above a patch, formatted from the counts the
 build already has — a port of libgit2's own formatter, which exists so `Diff::stats`
 (a whole second pass over every blob, 38% of a build) never runs; see **Diffstat
@@ -715,7 +734,8 @@ Startup work is structured so the window paints as soon as possible; the heavy/I
 parts run off the window-creation critical path. Threads: `gitkay-history` (+
 `gitkay-history-quick`, `gitkay-slow-walk`), `gitkay-probes`, `gitkay-fonts`,
 `gitkay-prewarm`, `gitkay-highlight` (one, long-lived; `gitkay-highlight-pass` only as its fallback),
-`gitkay-fg-{i}`, `gitkay-prefetch-coord` / `-{i}` / `-heavy-{k}`, `gitkay-colour-{k}`, `gitkay-cache-prune`.
+`gitkay-fg-{i}`, `gitkay-prefetch-coord` / `-{i}` / `-heavy-{k}`, `gitkay-colour-{k}`, `gitkay-cache-prune`,
+`gitkay-drop` (one, long-lived, spawned on first use; see `src/reaper.rs`).
 
 **> Most of what follows was found by MEASUREMENT, and several plausible
 "simplifications" have already been tried and were wrong. The measurements and the
@@ -2197,7 +2217,10 @@ invariant both binary searches rest on), a run at the very start and a diff hidd
 entirely, `lines_of_rows` spanning the hidden lines it covers, an over-cap build
 falling back to the identity, and the composition with a real `WrapIndex` where the
 hidden run wraps too, so what it removes is its ROWS and not its lines),
-`diff_cache` (LRU eviction), `diff_store`
+`diff_cache` (LRU eviction, and what `insert`/`retain_keys` hand back: the
+overwritten value, the LRU victims in order, the purged values), `reaper` (a disposed
+value is dropped on `gitkay-drop`, not the caller's thread; with no thread, or one that
+is gone, it is dropped inline), `diff_store`
 (codec round trips including a non-UTF-8 path and every tag, key derivation, load/save
 over real temp repos, the entry cap from both sides — the measured 76.5M-line shape
 refused from its line count alone, and a few enormous lines refused only after

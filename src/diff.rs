@@ -289,7 +289,7 @@ pub struct PerRow<T> {
     /// One entry per chunk; an EMPTY inner vector means nothing in that chunk has been
     /// written, and allocates nothing.
     chunks: Vec<Vec<Option<T>>>,
-    /// Heap bytes owned by the values currently set, kept exact by `set`/`take`/`clear`
+    /// Heap bytes owned by the values currently set, kept exact by `set`/`take`/`take_all`
     /// so `heap_bytes` never walks the rows.
     owned: usize,
 }
@@ -360,13 +360,12 @@ impl<T> PerRow<T> {
     }
 
     /// Back to "nothing computed", keeping the room — a theme change invalidates every
-    /// span without changing a single row. The chunks go with them: what a re-highlight
-    /// wants back is the memory, not the empty slots.
-    pub fn clear(&mut self) {
-        for chunk in &mut self.chunks {
-            *chunk = Vec::new();
-        }
-        self.owned = 0;
+    /// span without changing a single row — and hand back what was computed, chunks
+    /// and all, for the caller to free off the frame loop (`reaper::dispose`): what a
+    /// re-highlight wants back is the memory, not the empty slots.
+    #[must_use = "the computed values are the caller's to free"]
+    pub fn take_all(&mut self) -> Self {
+        std::mem::replace(self, Self::blank(self.rows))
     }
 }
 
@@ -4046,7 +4045,7 @@ pub fn order_files(
 
     // Past every refusal, so take the write handles only now: an identity re-lay — every
     // cache hit, every flat layout — must not clone a row array the highlight worker is
-    // reading. When it does clone, the rows are 24 B apiece and their text is shared.
+    // reading. When it does clone, the rows are 32 B apiece and their text is shared.
     let lines = Arc::make_mut(lines);
     let files = Arc::make_mut(files);
 
@@ -4085,6 +4084,9 @@ pub fn order_files(
         }
     }
     *lines = out;
+    // Every row has been moved out, but the buffer itself is one per-row-sized free
+    // (2.4GB at 76.5M rows), which the UI thread does not do.
+    crate::reaper::dispose((src, src_spans));
 
     // The entries take the same walk the rows just did — `for &i in order` — and are
     // moved out of a source buffer the same way, for the same reason. Tagging each with
@@ -6074,11 +6076,16 @@ pub mod tests {
         );
 
         p.set(super::PER_ROW_CHUNK * 2, Vec::with_capacity(8));
-        p.clear();
+        let taken = p.take_all();
         assert_eq!(
             p.heap_bytes(),
             empty,
-            "clear frees every chunk and every value"
+            "take_all leaves no chunk and no value behind"
+        );
+        assert_eq!(
+            taken.heap_bytes() - empty,
+            2 * super::PER_ROW_CHUNK * slot + 8,
+            "every chunk and value goes with what take_all hands back"
         );
     }
 
@@ -6130,10 +6137,14 @@ pub mod tests {
         assert_eq!(p.take(PER_ROW_CHUNK), Some(PER_ROW_CHUNK));
         assert!(!p.is_set(PER_ROW_CHUNK));
 
-        // And `clear` unsets everything while keeping the room.
-        p.clear();
+        // And `take_all` unsets everything while keeping the room, handing back what
+        // was set.
+        let taken = p.take_all();
         assert!(probes.iter().all(|&row| !p.is_set(row)));
         assert_eq!(p.rows(), rows);
+        for row in probes.into_iter().filter(|&row| row != PER_ROW_CHUNK) {
+            assert_eq!(taken.get(row), Some(&row), "row {row} handed back");
+        }
     }
 
     /// A row's spans move with the row. This used to be structural — the spans were a
