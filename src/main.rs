@@ -49,8 +49,8 @@ use diff::{
 };
 use diff_cache::DiffCache;
 use diff_highlight::{
-    HighlightJob, HighlightMsg, band_warmable, highlight_diff, highlight_worker, pending_files,
-    spawn_prewarm,
+    HighlightJob, HighlightMsg, HighlightService, band_warmable, highlight_diff, highlight_worker,
+    pending_files, spawn_prewarm,
 };
 use diff_store::DiffStore;
 use graph::{GraphLayoutState, GraphRow, layout_graph_rows};
@@ -3389,6 +3389,15 @@ impl DiffScrollTo {
     }
 }
 
+/// What `main()` starts for syntax highlighting before the window exists, handed to
+/// `GitkApp::new` together.
+struct StartupHighlight {
+    /// The startup-prewarmed highlighter, until installed.
+    prewarm_rx: Option<mpsc::Receiver<Arc<Highlighter>>>,
+    /// The long-lived highlight thread, when it spawned.
+    service: Option<HighlightService>,
+}
+
 struct GitkApp {
     commits: Vec<CommitInfo>,
     graph_rows: Vec<GraphRow>,
@@ -3667,6 +3676,9 @@ struct GitkApp {
     /// Cleared by `set_diff_content`, which is where content and key are set together.
     diff_content_stale: bool,
     prewarm_rx: Option<mpsc::Receiver<Arc<Highlighter>>>, // startup-prewarmed highlighter, until installed
+    /// The long-lived `gitkay-highlight` thread (see `HighlightService`); `None` when it
+    /// could not be spawned or has gone, and a pass then gets a thread of its own.
+    highlight_service: Option<HighlightService>,
     prefetch_tx: mpsc::Sender<WarmResult>,
     prefetch_rx: mpsc::Receiver<WarmResult>,
     /// The persistent worker pool, started on first dispatch. A dispatch replaces its
@@ -4068,7 +4080,7 @@ impl GitkApp {
         history_rx: mpsc::Receiver<HistoryWalk>,
         provisional_rx: Option<mpsc::Receiver<Vec<CommitInfo>>>,
         font_rx: mpsc::Receiver<(egui::FontDefinitions, Vec<String>)>,
-        prewarm_rx: Option<mpsc::Receiver<Arc<Highlighter>>>,
+        startup_highlight: StartupHighlight,
     ) -> Result<Self, String> {
         let startup_t0 = std::time::Instant::now();
         // eframe has already restored egui's memory blob — before the window was
@@ -4304,6 +4316,10 @@ impl GitkApp {
         // like the history/font prefetches). With syntax off, drop the receiver —
         // the thread bailed without building anyway — so the disabled mode stays
         // cost-free and a mid-session enable takes the synchronous build path.
+        let StartupHighlight {
+            prewarm_rx,
+            service: highlight_service,
+        } = startup_highlight;
         let prewarm_rx = if syntax_enabled { prewarm_rx } else { None };
         // Built before the literal so the fingerprint below is derived from the very
         // map that is stored, rather than from `cfg` a second time — the same one-source
@@ -4415,6 +4431,7 @@ impl GitkApp {
             current_diff_key,
             diff_content_stale: false,
             prewarm_rx,
+            highlight_service,
             prefetch_tx,
             prefetch_rx,
             prefetch_pool: None,
@@ -5686,9 +5703,26 @@ impl GitkApp {
         // Contain a syntect panic to this one diff (as the prefetch worker does): without
         // this a bad grammar/line would kill the highlight thread and leave every later
         // diff plain for the rest of the session.
-        if spawn_guarded("gitkay-highlight", "highlight thread panicked", move || {
-            highlight_worker(job);
-        })
+        // The highlight thread when it is there; a thread of this pass's own when it is
+        // not (the path that existed before the service); the frame loop last.
+        let job = match &self.highlight_service {
+            Some(service) => match service.submit_pass(job) {
+                Ok(()) => return,
+                Err(job) => {
+                    log::warn!("highlight thread gone; this pass gets a thread of its own");
+                    self.highlight_service = None;
+                    *job
+                }
+            },
+            None => job,
+        };
+        if spawn_guarded(
+            "gitkay-highlight-pass",
+            "highlight thread panicked",
+            move || {
+                highlight_worker(job);
+            },
+        )
         .is_err()
         {
             log::warn!("highlight thread spawn failed; highlighting on the UI thread");
@@ -9438,7 +9472,10 @@ fn main() -> eframe::Result {
     // And the syntax highlighter: the multi-MB syntect SyntaxSet deserialize also
     // overlaps window/GL init, so the deferred first diff usually finds it already
     // built and installs coloured — no plain → highlighted flash.
-    let prewarm_rx = spawn_prewarm(repo_path.clone());
+    // The one thread every visible diff is coloured on — spawned before the prewarm so
+    // the prewarm can hand it the grammar warm-up (see `HighlightService`).
+    let highlight_service = HighlightService::spawn();
+    let prewarm_rx = spawn_prewarm(repo_path.clone(), highlight_service.clone());
 
     // Stable app id "gitkay" (not the per-repo title) so Wayland compositors can
     // match window rules on app_id, and so eframe uses a stable storage dir for
@@ -9462,7 +9499,10 @@ fn main() -> eframe::Result {
                 history_rx,
                 provisional_rx,
                 font_rx,
-                prewarm_rx,
+                StartupHighlight {
+                    prewarm_rx,
+                    service: highlight_service,
+                },
             )?;
             log::debug!(
                 "perf: startup: ready (process start -> app built) {:?}",

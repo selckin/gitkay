@@ -354,6 +354,14 @@ either** — every pass checks its deadline between chunks of 16 or 256 lines, n
 inside one — so `highlight::MAX_TOKENIZE_CHARS` (20,000) bounds what syntect sees of a
 single line, which is what makes the clocks above mean anything: a repo of minified
 sources had a 1.5s budget overrun to 13.5s and a 20s one to 25.4s, ~750ms on ONE line.
+**Tokenizing happens on a fixed set of long-lived threads**: `gitkay-highlight`
+(`HighlightService` — every visible pass, and the startup prewarm between passes) and the
+prefetch pool's `gitkay-colour-{k}` (see `prefetch.rs`). The reason is memory, not speed:
+fancy-regex's regex-automata caches are kept per THREAD-ID SLOT (`thread_id % 8`, plus an
+owner) for the life of the process, ~30 MiB per extra tokenizing thread on a
+multi-language mix — so a thread per pass, or every pool worker colouring its own warms,
+filled all nine slots. The foreground pre-highlight (≤`PREHIGHLIGHT_CEILING`, toolbar
+rebuilds only) still tokenizes on `gitkay-fg-*`; the UI thread only as the last fallback.
 The tail past it takes a single flat span rather than none, because `append_body`'s span
 path emits only the spans and a body whose tail no span reaches is not drawn at all. The
 per-file parser state is SNAPSHOTTED across a truncated line, so what the bound costs is
@@ -587,7 +595,7 @@ The big picture, ahead of the detail sections below:
 Startup work is structured so the window paints as soon as possible; the heavy/IO-bound
 parts run off the window-creation critical path. Threads: `gitkay-history` (+
 `gitkay-history-quick`, `gitkay-slow-walk`), `gitkay-probes`, `gitkay-fonts`,
-`gitkay-prewarm`,
+`gitkay-prewarm`, `gitkay-highlight` (one, long-lived; `gitkay-highlight-pass` only as its fallback),
 `gitkay-fg-{i}`, `gitkay-prefetch-coord` / `-{i}` / `-heavy-{k}`, `gitkay-cache-prune`.
 
 **> Most of what follows was found by MEASUREMENT, and several plausible

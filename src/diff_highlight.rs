@@ -662,6 +662,108 @@ pub fn highlight_worker(job: HighlightJob) {
     );
 }
 
+/// Run `f`, containing a panic to it: logged, and reported as `false`, so a long-lived
+/// thread survives a bad grammar or line and goes on to its next job. A pass that
+/// panics still reports its end — `highlight_worker`'s `SettleOnExit` runs on unwind.
+pub fn contained(what: &str, f: impl FnOnce()) -> bool {
+    let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_ok();
+    if !ok {
+        log::warn!("{what} panicked; the thread carries on with its next job");
+    }
+    ok
+}
+
+/// What the highlight thread is asked to do.
+enum ServiceJob {
+    /// One visible-diff colour pass.
+    Pass(HighlightJob),
+    /// Compile these languages' grammars ahead of the first diff that needs them.
+    Warm {
+        hl: Arc<Highlighter>,
+        exts: Vec<String>,
+    },
+}
+
+/// The one long-lived `gitkay-highlight` thread.
+///
+/// Why one thread rather than one per pass: syntect's regexes (fancy-regex over
+/// regex-automata) keep their match caches per THREAD-ID SLOT, for the life of the
+/// process, and a thread-per-pass reached a new slot with every diff until all eight
+/// were full. Measured: ~30 MiB of held memory per extra tokenizing thread on a
+/// multi-language mix. A fixed thread pays once. It also makes it the regexes' long-
+/// lived OWNER when it runs the prewarm, which a prewarm thread that exits never is.
+#[derive(Clone)]
+pub struct HighlightService {
+    tx: mpsc::Sender<ServiceJob>,
+}
+
+impl HighlightService {
+    /// `None` when the thread cannot be spawned; every caller then falls back to the
+    /// path that existed before the service (a thread per pass, then the UI thread).
+    pub fn spawn() -> Option<Self> {
+        let (tx, rx) = mpsc::channel();
+        spawn_guarded(
+            "gitkay-highlight",
+            "highlight thread panicked outside a job",
+            move || service_loop(&rx),
+        )
+        .map_err(|e| {
+            log::warn!(
+                "highlight thread spawn failed: {e}; colouring falls back to a thread per pass"
+            );
+        })
+        .ok()
+        .map(|_| Self { tx })
+    }
+
+    /// Queue a visible pass. `Err` hands the job back when the thread is gone, so the
+    /// caller can run it another way rather than lose it (and its `Settled`).
+    pub fn submit_pass(&self, job: HighlightJob) -> Result<(), Box<HighlightJob>> {
+        self.tx.send(ServiceJob::Pass(job)).map_err(|e| match e.0 {
+            ServiceJob::Pass(job) => Box::new(job),
+            ServiceJob::Warm { .. } => unreachable!("a Pass was sent"),
+        })
+    }
+
+    /// Queue a prewarm. `false` when the thread is gone.
+    pub fn submit_warm(&self, hl: Arc<Highlighter>, exts: Vec<String>) -> bool {
+        self.tx.send(ServiceJob::Warm { hl, exts }).is_ok()
+    }
+}
+
+/// The highlight thread: passes first, in submission order; the prewarm one language
+/// at a time in between, so the first diff's colour never waits behind more than one
+/// grammar's compile. A superseded pass is run, not skipped: it bails at its first
+/// check and reports `Settled`, which is what "every exit reports" rests on.
+fn service_loop(rx: &mpsc::Receiver<ServiceJob>) {
+    let mut passes = std::collections::VecDeque::new();
+    let mut warm = std::collections::VecDeque::new();
+    loop {
+        let idle = passes.is_empty() && warm.is_empty();
+        let next = if idle {
+            match rx.recv() {
+                Ok(job) => Some(job),
+                Err(_) => return, // the app is gone
+            }
+        } else {
+            None
+        };
+        for job in next.into_iter().chain(rx.try_iter()) {
+            match job {
+                ServiceJob::Pass(job) => passes.push_back(job),
+                ServiceJob::Warm { hl, exts } => {
+                    warm.extend(exts.into_iter().map(|ext| (Arc::clone(&hl), ext)));
+                }
+            }
+        }
+        if let Some(job) = passes.pop_front() {
+            contained("a highlight pass", || highlight_worker(job));
+        } else if let Some((hl, ext)) = warm.pop_front() {
+            contained("a grammar warm", || hl.warm_extension(&ext));
+        }
+    }
+}
+
 /// Collect blob (file) names from `tree`, descending into subtrees, until `out`
 /// reaches `max` entries or `MAX_TREE_DEPTH`. Names only — no blob reads.
 /// Best-effort: unreadable names are skipped.
@@ -723,6 +825,7 @@ pub fn prewarm_highlighter(
     diff_bg: DiffBg,
     languages: &highlight::LanguageMap,
     tx: &mpsc::Sender<Arc<Highlighter>>,
+    service: Option<&HighlightService>,
 ) {
     let t = std::time::Instant::now();
     let hl = Arc::new(Highlighter::new(theme, diff_bg, languages));
@@ -744,14 +847,20 @@ pub fn prewarm_highlighter(
         log::debug!("prewarm: no recognised file extensions in HEAD tree; warmed 0 languages");
         return;
     }
+    // On the highlight thread when there is one, so the thread that will tokenize
+    // every visible diff is the regexes' first user — their pool's long-lived owner —
+    // rather than this thread, which exits.
+    let n = exts.len();
+    if service.is_some_and(|s| s.submit_warm(Arc::clone(&hl), exts.clone())) {
+        log::debug!("prewarm: queued {n} languages {exts:?} on the highlight thread");
+        return;
+    }
     let t = std::time::Instant::now();
     for ext in &exts {
         hl.warm_extension(ext);
     }
     log::debug!(
-        "prewarm: warmed {} languages {:?} in {:?}",
-        exts.len(),
-        exts,
+        "prewarm: warmed {n} languages {exts:?} in {:?}",
         t.elapsed()
     );
 }
@@ -765,7 +874,10 @@ pub fn prewarm_highlighter(
 /// The thread resolves theme/bands silently — warning is `GitkApp::new`'s job, and
 /// the install re-themes via `reconfigured` anyway. Returns `None` on spawn failure
 /// (the first diff then builds the highlighter synchronously).
-pub fn spawn_prewarm(repo_path: String) -> Option<mpsc::Receiver<Arc<Highlighter>>> {
+pub fn spawn_prewarm(
+    repo_path: String,
+    service: Option<HighlightService>,
+) -> Option<mpsc::Receiver<Arc<Highlighter>>> {
     let (tx, rx) = mpsc::channel();
     // Catch a panic in the (detached) thread so it's logged rather than a silent
     // stderr message — e.g. if warm_extension panics after the highlighter was
@@ -783,7 +895,7 @@ pub fn spawn_prewarm(repo_path: String) -> Option<mpsc::Receiver<Arc<Highlighter
             // The language map matters here too, not just at the install: it decides
             // which extensions `top_extensions` counts as warmable and which grammar
             // each warms. The UI re-asserts its own copy through `reconfigured`.
-            prewarm_highlighter(&repo_path, theme, diff_bg, &cfg.diff.languages, &tx);
+            prewarm_highlighter(&repo_path, theme, diff_bg, &cfg.diff.languages, &tx, service.as_ref());
         },
     )
     .map_err(|e| {
@@ -802,6 +914,83 @@ mod tests {
     use crate::test_repo::file_entry as fe;
     use crate::test_repo::temp_repo;
     use crate::tests::probe_settings;
+
+    fn job(
+        lines: Vec<DiffLine>,
+        generation: u64,
+        current_gen: Epoch,
+        tx: mpsc::Sender<HighlightMsg>,
+    ) -> HighlightJob {
+        let files = vec![fe("x.rs", Some(0))];
+        HighlightJob {
+            hl: Arc::new(highlight::test_highlighter()),
+            pending: pending_files(&lines, &RowSpans::blank(lines.len()), &files),
+            lines: Arc::new(lines),
+            files: Arc::new(files),
+            generation,
+            current_gen,
+            priority: Arc::new(VisibleRange {
+                lo: std::sync::atomic::AtomicUsize::new(0),
+                hi: std::sync::atomic::AtomicUsize::new(0),
+                page_lo: std::sync::atomic::AtomicUsize::new(0),
+                page_hi: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            tx,
+            ctx: egui::Context::default(),
+        }
+    }
+
+    /// The service runs every pass it is given, in order, on one thread: a superseded
+    /// pass still reports that it ended (the band waits on that), and the current one
+    /// colours. Nothing is dropped for being stale — `highlight_worker` bails on its
+    /// own.
+    #[test]
+    fn the_highlight_service_runs_every_pass_and_each_reports_its_end() {
+        let service = HighlightService::spawn().expect("the service thread spawns");
+        let (tx, rx) = mpsc::channel();
+        let current_gen = Epoch::default();
+        let stale = current_gen.bump();
+        let current = current_gen.bump();
+        let line = || vec![DiffLine::new("let x = 1;", LineKind::Context)];
+        assert!(
+            service
+                .submit_pass(job(line(), stale, current_gen.clone(), tx.clone()))
+                .is_ok()
+        );
+        assert!(
+            service
+                .submit_pass(job(line(), current, current_gen, tx))
+                .is_ok()
+        );
+
+        let mut settled = Vec::new();
+        let mut coloured_current = false;
+        while settled.len() < 2 {
+            match rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("both passes report")
+            {
+                HighlightMsg::Settled { generation } => settled.push(generation),
+                HighlightMsg::Batch { generation, lines } => {
+                    coloured_current |= generation == current && !lines.is_empty();
+                }
+            }
+        }
+        assert_eq!(
+            settled,
+            vec![stale, current],
+            "in submission order, each exactly once"
+        );
+        assert!(coloured_current, "the current pass colours its diff");
+    }
+
+    /// A panicking job costs that job, not the thread that ran it.
+    #[test]
+    fn contained_reports_a_panic_and_lets_the_caller_go_on() {
+        assert!(contained("a fine job", || {}));
+        assert!(!contained("a bad job", || panic!("boom")));
+        assert!(contained("the next job", || {}));
+    }
 
     /// A binary file must not be reported as a missing grammar. `.png`/`.jar` have
     /// no source to highlight, so telling the reader to map them under
