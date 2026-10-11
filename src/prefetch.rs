@@ -487,8 +487,8 @@ pub struct Limits {
     /// 10,000-line cap — measured `build 418ms + colour 29.6s`, i.e. **5.6ms a line,
     /// 43× the assumed rate**. Nobody is waiting on a speculative warm, so the row was
     /// simply absent from the band, and the worker was gone with it: its
-    /// `heavy_outstanding` share, its lane slot and its `warming` claim are all held
-    /// until it reports.
+    /// `heavy_outstanding` share and its lane slot are held until it reports, and the
+    /// row's in-flight claim, which travels with the job, until the warm ends.
     ///
     /// This is the same lesson the UI's own pass already carries — it takes a line
     /// budget AND a time budget precisely because "a line costs 3µs or 70µs depending
@@ -640,6 +640,13 @@ enum Job {
         /// read from shared state, so a config reload swapping the highlighter cannot
         /// race a worker mid-row: the job holds the one it was dispatched under.
         hl: Option<Arc<Highlighter>>,
+        /// This row's in-flight claim. It travels with the work rather than living in
+        /// the coordinator, so it is released wherever the warm actually ends — on the
+        /// worker today, on the tokenizer when the colour pass is handed off — and a
+        /// row waiting for colour is never handed out a second time. A warm that ends
+        /// in bookkeeping instead (`TooBig`, `Oversized`, `Unconverted`) hands it back
+        /// inside its `Outcome`, so `finish` releases it only once the row is recorded.
+        claim: InflightClaim,
     },
 }
 
@@ -648,6 +655,11 @@ enum Job {
 /// Every job produces exactly one of these — including a panicked one — which is what
 /// lets the coordinator own all the bookkeeping: it handed the work out, so it knows
 /// what came back, and nothing has to be reconstructed from shared state.
+///
+/// The three outcomes the coordinator must RECORD carry the warm's `claim` back to it,
+/// and `finish` drops it only after the record is made. Released on the worker, the key
+/// would be free while the report is still queued, and a band re-submitted in that
+/// window would find the row neither claimed nor recorded and hand it out again.
 enum Outcome {
     /// The row's blobs are too large to build inline. Carries the target back so the
     /// coordinator can queue it on the heavy lane without rebuilding it, and the
@@ -655,15 +667,24 @@ enum Outcome {
     TooBig {
         target: Box<PrefetchTarget>,
         cost: RowCost,
+        claim: InflightClaim,
     },
     /// Built and handed to the UI. `lines` feeds the dispatch budget.
     Warmed { lines: usize },
     /// Built, over the speculative cap (`Limits::entry_too_big`: lines or heap bytes),
     /// dropped uncached.
-    Oversized { key: DiffCacheKey, lines: usize },
+    Oversized {
+        key: DiffCacheKey,
+        lines: usize,
+        claim: InflightClaim,
+    },
     /// Built, a textconv driver failed, dropped uncached. See
     /// `Coordinator::unconverted`.
-    Unconverted { key: DiffCacheKey, lines: usize },
+    Unconverted {
+        key: DiffCacheKey,
+        lines: usize,
+        claim: InflightClaim,
+    },
     /// A stats row finished — result already sent. `costly` carries the probe's
     /// measurement when the row was too expensive for its line counts, in which case
     /// only the file count was sent.
@@ -763,14 +784,17 @@ impl PoolHandle {
 /// The single owner of every scheduling decision.
 ///
 /// It runs on its own thread and **nothing else touches its fields**, so the queues,
-/// the memos and the in-flight sets need no mutexes, no RAII guards and no ordering
-/// discipline. Workers are pure: they receive a job, do it, and report what happened.
+/// the memos and the stats in-flight set need no mutexes and no ordering discipline.
+/// Workers are pure: they receive a job, do it, and report what happened. The one
+/// shared thing is the warm key set it shares with the foreground diff-load
+/// (`inflight`); a warm's RAII claim on it travels in the job, and comes back to
+/// `finish` in any outcome the coordinator must record before the key may be reused.
 ///
 /// This replaced a design where each of eight workers made these decisions itself
-/// against six shared mutexes. Everything that had to be locked, claimed or released
-/// is now a plain field — and the class of bug that shape produced went with it: a
-/// dedup that read "measured" as "queued" silently dropped every heavy row the stats
-/// path had already probed, i.e. every heavy row on screen.
+/// against six shared mutexes. Everything else that had to be locked, claimed or
+/// released is now a plain field — and the class of bug that shape produced went with
+/// it: a dedup that read "measured" as "queued" silently dropped every heavy row the
+/// stats path had already probed, i.e. every heavy row on screen.
 struct Coordinator {
     /// On-screen work: the commit-list numbers the user is looking at right now.
     /// Always handed out first — a blank cell is visible, a cold cache entry is not.
@@ -859,13 +883,6 @@ struct Coordinator {
     /// `commit_stats` still reads as unknown, so without this the same row would be
     /// handed to a second worker.
     busy_stats: HashSet<git2::Oid>,
-    /// Claims on the keys being warmed, released when the worker reports back.
-    ///
-    /// Held here rather than by the worker because the coordinator is what knows the
-    /// job ended. The set itself is shared with the foreground diff-load path, which is
-    /// the point: a prefetch skips a key that load is already computing, and that load
-    /// skips one the pool has.
-    warming: HashMap<usize, InflightClaim>,
     /// Lines built since the last `Submit`, across every worker.
     warmed: usize,
     /// Lines one dispatch may build before it stops — a fraction of the resolved cache
@@ -1040,10 +1057,12 @@ impl Coordinator {
 
     /// Record what a worker did and free it.
     fn finish(&mut self, id: usize, outcome: Outcome) {
-        // Releases the shared claim for a warm job (nothing for a stats job).
-        drop(self.warming.remove(&id));
         match outcome {
-            Outcome::TooBig { target, cost } => {
+            Outcome::TooBig {
+                target,
+                cost,
+                claim,
+            } => {
                 // The one outcome that puts a target back on a queue, and the probe it
                 // came from started under whatever band was current THEN. Everything
                 // else the band owns was replaced wholesale by `take_band`, so this is
@@ -1059,7 +1078,10 @@ impl Coordinator {
                 // dropped in that case: the cache is sized to hold it and revisiting it
                 // should be instant. It simply must not stand in front of fifty cheap
                 // rows. No dedup needed — the coordinator handed this row out exactly
-                // once, so it can come back exactly once.
+                // once, so it can come back exactly once. That holds only because the
+                // claim returns WITH the outcome and is dropped below the record: freed
+                // on the worker, a band re-submitted while this report was queued would
+                // have re-claimed the unrecorded row and handed it out a second time.
                 if self.band_settings.as_ref() == Some(&target.key.settings) {
                     self.measured.insert(target.key.oid, cost);
                     self.deferred.push_back(target.measured(cost));
@@ -1069,17 +1091,20 @@ impl Coordinator {
                         target.key.oid
                     );
                 }
+                drop(claim);
             }
             Outcome::Warmed { lines } => self.warmed += lines,
-            Outcome::Oversized { key, lines } => {
+            Outcome::Oversized { key, lines, claim } => {
                 // Counted before being remembered: a row built and discarded still cost
                 // this dispatch a worker's time, which is what the budget rations.
                 self.warmed += lines;
                 self.oversized.insert(key);
+                drop(claim); // after the record, for the reason `TooBig` gives
             }
-            Outcome::Unconverted { key, lines } => {
+            Outcome::Unconverted { key, lines, claim } => {
                 self.warmed += lines;
                 self.unconverted.insert(key);
+                drop(claim); // after the record, for the reason `TooBig` gives
             }
             Outcome::Stats { oid, costly } => {
                 self.busy_stats.remove(&oid);
@@ -1121,7 +1146,7 @@ impl Coordinator {
         // it is the bound that stops a stampede.
         let usable = std::cell::OnceCell::new();
         while let Some(&id) = self.heavy_idle.last() {
-            let Some((job, need)) = self.next_heavy(id, &usable) else {
+            let Some((job, need)) = self.next_heavy(&usable) else {
                 break;
             };
             self.heavy_idle.pop();
@@ -1191,16 +1216,10 @@ impl Coordinator {
     /// requeue-and-park loop with a retry interval; there is nothing to park on when
     /// the queue is the coordinator's own field.
     ///
-    /// `id` is the idle heavy worker this row would go to. Taken as a parameter because
-    /// the caller has already read it off `heavy_idle` to drive its loop and does not
-    /// pop until this returns — read back here, it was the same lookup twice with an
-    /// unreachable `None` branch behind it, and "only called for an idle heavy worker"
-    /// was a property of the loop's shape rather than of the signature.
-    fn next_heavy(
-        &mut self,
-        id: usize,
-        usable: &std::cell::OnceCell<Option<u64>>,
-    ) -> Option<(Job, u64)> {
+    /// Only called for an idle heavy worker: the caller reads one off `heavy_idle` to
+    /// drive its loop and pops it once this returns a job. The warm's claim travels in
+    /// the job, so nothing here needs to know which worker it is for.
+    fn next_heavy(&mut self, usable: &std::cell::OnceCell<Option<u64>>) -> Option<(Job, u64)> {
         loop {
             let front = self.deferred.front()?;
             let (need, oid) = (Self::heavy_need(front), front.key.oid);
@@ -1227,7 +1246,7 @@ impl Coordinator {
             }
             self.reported_heavy_full = None;
             let target = self.deferred.pop_front()?;
-            if let Some(job) = self.claim_warm(id, target) {
+            if let Some(job) = self.claim_warm(target) {
                 return Some((job, need));
             }
             // Dropped, not requeued — the foreground diff-load holds this key and its
@@ -1315,25 +1334,28 @@ impl Coordinator {
                 return Some(Job::Stats(job));
             }
         }
-        let id = *self.idle.last()?;
+        // Stats are served without an idle worker; a warm is not, as it pins a key claim.
+        if self.idle.is_empty() {
+            return None;
+        }
         while let Some(target) = self.ready.pop_front() {
-            if let Some(job) = self.claim_warm(id, target) {
+            if let Some(job) = self.claim_warm(target) {
                 return Some(job);
             }
         }
         None
     }
 
-    /// Claim a row's key for `id`, or `None` when the foreground diff-load already
+    /// Claim a row's key, or `None` when the foreground diff-load already
     /// holds it — that result will be cached when it lands, so recomputing it here
     /// would be pure duplicate work.
-    fn claim_warm(&mut self, id: usize, target: PrefetchTarget) -> Option<Job> {
+    fn claim_warm(&self, target: PrefetchTarget) -> Option<Job> {
         let claim = InflightClaim::try_claim(&self.inflight, target.key.clone())?;
-        self.warming.insert(id, claim);
         Some(Job::Warm {
             target,
             stats_epoch: self.band_stats_epoch,
             hl: self.hl.clone(),
+            claim,
         })
     }
 
@@ -1342,10 +1364,11 @@ impl Coordinator {
     /// never used again.
     ///
     /// A failed post must undo BOTH kinds of claim, which is why the job is taken back
-    /// out of the `SendError` rather than dropped. The warm key is the obvious one; the
-    /// stats oid is the one that silently kills a cell for the session — `next_pool_job`
-    /// put it in `busy_stats`, and nothing else would ever take it out, so the
-    /// coordinator would refuse to hand that row out again while `stats_targets`
+    /// out of the `SendError` rather than left to drop inside it. The warm key needs
+    /// nothing more: the job carries its claim, so dropping the returned job releases
+    /// it. The stats oid is the one that silently kills a cell for the session —
+    /// `next_pool_job` put it in `busy_stats`, and nothing else would ever take it out,
+    /// so the coordinator would refuse to hand that row out again while `stats_targets`
     /// re-offered it forever. Reachable without any thread dying mid-run: a worker whose
     /// `Repository::discover` failed exits immediately, and every send to it fails.
     fn send(&mut self, id: usize, job: Job) -> bool {
@@ -1377,7 +1400,6 @@ impl Coordinator {
         if let Job::Stats(job) = unsent {
             self.busy_stats.remove(&job.scope.source.oid());
         }
-        drop(self.warming.remove(&id));
         false
     }
 }
@@ -1434,9 +1456,9 @@ pub fn spawn_prefetch_pool(
     // failed spawn is skipped, so a counter-derived id would name a different slot than
     // the worker ends up occupying. The coordinator addresses a worker by index
     // (`mailboxes[id]`) while the worker reports as `ctx.id`, so a one-off mismatch
-    // leaks the key claim of every job it runs, pushes a phantom id onto `idle`, and —
-    // once an id passes `mailboxes.len()` — has `is_heavy` route pool work to the heavy
-    // lane.
+    // credits every report to the wrong worker — a busy one is pushed onto `idle` and a
+    // phantom id with it, the real one is never freed, and once an id passes
+    // `mailboxes.len()` `is_heavy` routes pool work to the heavy lane.
     let mut mailboxes: Vec<mpsc::Sender<Job>> = Vec::with_capacity(count);
     for _ in 0..count {
         let id = mailboxes.len();
@@ -1477,7 +1499,6 @@ pub fn spawn_prefetch_pool(
         heavy_outstanding: HashMap::new(),
         heavy_budget,
         busy_stats: HashSet::new(),
-        warming: HashMap::new(),
         warmed: 0,
         line_budget: budget.line_budget,
         hl: None,
@@ -1689,14 +1710,16 @@ fn worker(ctx: &WorkerCtx, repo: &Repository, jobs: &mpsc::Receiver<Job>) {
                     costly: None,
                 }
             }),
-            // Nothing to report for a warm: the coordinator releases the key claim
-            // when the worker reports back, and the row is simply re-offered by the
-            // next dispatch.
+            // Nothing to report for a panicked warm: its claim was in the closure and
+            // is released by the unwind, and the row is simply re-offered by the next
+            // dispatch. A warm that ends normally releases its claim as it ends if the
+            // row was Warmed, and hands it back to `finish` inside a bookkeeping outcome.
             Job::Warm {
                 target,
                 hl,
                 stats_epoch,
-            } => run_caught(|| warm_row(ctx, repo, target, hl.as_ref(), stats_epoch))
+                claim,
+            } => run_caught(|| warm_row(ctx, repo, target, hl.as_ref(), stats_epoch, claim))
                 .unwrap_or_else(|| {
                     caught("a diff");
                     Outcome::Nothing
@@ -1973,13 +1996,16 @@ pub const fn warm_disposition(f: WarmFacts) -> WarmDisposition {
 /// Warm one row into the cache: probe, build, cap, colour, send.
 ///
 /// Pure in the sense that matters: everything it learns comes back as the return value,
-/// so the coordinator — not this thread — decides what any of it means.
+/// so the coordinator — not this thread — decides what any of it means. That includes
+/// `claim`: an outcome the coordinator must record carries it back, and only a row that
+/// ends here (sent to the UI, or lost with it) releases it on this thread, after the send.
 fn warm_row(
     ctx: &WorkerCtx,
     repo: &Repository,
     target: PrefetchTarget,
     hl: Option<&Arc<Highlighter>>,
     stats_epoch: u64,
+    claim: InflightClaim,
 ) -> Outcome {
     // Probe first: a row whose blobs are huge costs seconds whatever its patch looks
     // like, and must not hold up the rest of the band. An already-measured row skips it
@@ -1998,6 +2024,7 @@ fn warm_row(
         return Outcome::TooBig {
             cost: RowCost::of(&cost),
             target: Box::new(target),
+            claim,
         };
     }
     // At `trace`, not `debug`: several workers logging twice a row is a lot of output,
@@ -2066,6 +2093,7 @@ fn warm_row(
         return Outcome::Oversized {
             key: target.key,
             lines,
+            claim,
         };
     }
     // A driver that failed makes this diff uncacheable — `cache_diff` refuses it for
@@ -2107,6 +2135,7 @@ fn warm_row(
         return Outcome::Unconverted {
             key: target.key,
             lines,
+            claim,
         };
     }
     // A row is coloured only if it is BOTH near enough to be worth colouring and small
@@ -2380,7 +2409,8 @@ mod tests {
         target.key.oid = oid;
         target.scope = RowScope::new(DiffSource::Commit(oid));
         target.depth = WarmDepth::Highlighted;
-        let outcome = warm_row(&ctx, &repo, target, Some(&hl), 0);
+        let claim = InflightClaim::try_claim(&InflightKeys::default(), target.key.clone()).unwrap();
+        let outcome = warm_row(&ctx, &repo, target, Some(&hl), 0, claim);
         let data = rx.recv().expect("the diff comes back either way").data;
         assert!(!data.lines.is_empty(), "control: the fixture has rows");
         let coloured = (0..data.lines.len())
@@ -2499,16 +2529,6 @@ mod tests {
         test_coord_n(workers, 1)
     }
 
-    /// The heavy worker `dispatch` would hand the next row to. `next_heavy` is called
-    /// only for an idle one, and its loop reads that id before popping; a test driving
-    /// it directly states the same precondition through here.
-    fn idle_heavy(coord: &Coordinator) -> usize {
-        *coord
-            .heavy_idle
-            .last()
-            .expect("the heavy lane has an idle worker")
-    }
-
     /// As `test_coord`, with an explicit heavy-lane width.
     fn test_coord_n(workers: usize, heavy_count: usize) -> (Coordinator, Vec<mpsc::Receiver<Job>>) {
         let (mut mailboxes, rxs): (Vec<_>, Vec<_>) = (0..workers + heavy_count)
@@ -2533,7 +2553,6 @@ mod tests {
                 heavy_outstanding: HashMap::new(),
                 heavy_budget: None,
                 busy_stats: HashSet::new(),
-                warming: HashMap::new(),
                 warmed: 0,
                 line_budget: 1_000,
                 hl: None,
@@ -2710,7 +2729,9 @@ mod tests {
             target.key.oid = oid;
             target.scope = RowScope::new(DiffSource::Commit(oid));
             target.depth = WarmDepth::Highlighted;
-            let outcome = warm_row(&ctx, &repo, target, Some(&hl), 0);
+            let claim =
+                InflightClaim::try_claim(&InflightKeys::default(), target.key.clone()).unwrap();
+            let outcome = warm_row(&ctx, &repo, target, Some(&hl), 0, claim);
             let data = rx.recv().expect("the diff comes back either way").data;
             let coloured = (0..data.lines.len())
                 .filter(|&i| data.spans.get(i).is_some())
@@ -2767,7 +2788,8 @@ mod tests {
         target.key.oid = oid;
         target.scope = RowScope::new(DiffSource::Commit(oid));
         target.depth = WarmDepth::Highlighted;
-        warm_row(&ctx, &repo, target, Some(&hl), 7);
+        let claim = InflightClaim::try_claim(&InflightKeys::default(), target.key.clone()).unwrap();
+        warm_row(&ctx, &repo, target, Some(&hl), 7, claim);
 
         let sent = stats_rx
             .try_recv()
@@ -2781,6 +2803,153 @@ mod tests {
             sent.stats.expect("counted").lines,
             LineStats::Counted(1, 0),
             "the diff's own counts, which are what `cache_diff` would harvest later"
+        );
+    }
+
+    /// Whether `key` is claimed in the set the coordinator shares with the foreground
+    /// diff-load — i.e. whether either side may start building it right now.
+    fn held(coord: &Coordinator, key: &DiffCacheKey) -> bool {
+        lock_inflight(&coord.inflight).contains(key)
+    }
+
+    /// A claim on `key` in a set of its own, for a test that hands `finish` an outcome
+    /// without dispatching the row first.
+    fn loose_claim(key: &DiffCacheKey) -> InflightClaim {
+        InflightClaim::try_claim(&InflightKeys::default(), key.clone()).expect("a fresh set")
+    }
+
+    /// A one-row band, dispatched and taken out of whichever mailbox it landed in, as
+    /// that worker would: its id, the target and the claim the job carried.
+    fn dispatch_one(
+        coord: &mut Coordinator,
+        rxs: &[mpsc::Receiver<Job>],
+    ) -> (usize, PrefetchTarget, InflightClaim) {
+        coord.run_msg(CoordMsg::Submit {
+            targets: std::iter::once(heavy_target(1)).collect(),
+            hl: None,
+        });
+        let (id, job) = rxs
+            .iter()
+            .enumerate()
+            .find_map(|(id, rx)| rx.try_recv().ok().map(|job| (id, job)))
+            .expect("a worker was handed the row");
+        match job {
+            Job::Warm { target, claim, .. } => (id, target, claim),
+            Job::Stats(_) => panic!("a band row is a warm"),
+        }
+    }
+
+    /// A warm's claim lives in its job, not in the coordinator: handing the row out
+    /// claims the key, a `Warmed` report does not release it while the job is still
+    /// alive somewhere (the colour pass is about to outlive the worker's report), and
+    /// dropping the job is what frees it.
+    #[test]
+    fn a_dispatched_warm_holds_its_key_until_its_job_is_dropped() {
+        let (mut coord, rxs) = test_coord(1);
+        let key = heavy_target(1).key;
+        coord.run_msg(CoordMsg::Submit {
+            targets: std::iter::once(heavy_target(1)).collect(),
+            hl: None,
+        });
+        assert!(
+            held(&coord, &key),
+            "claimed while the job sits in the mailbox"
+        );
+        let job = rxs[0].try_recv().expect("worker 0 was handed the row");
+        coord.run_msg(CoordMsg::Done(0, Outcome::Warmed { lines: 1 }));
+        assert!(
+            held(&coord, &key),
+            "a report is not the end of the warm while its job is still alive"
+        );
+        drop(job);
+        assert!(!held(&coord, &key), "released with the job");
+    }
+
+    /// A bookkeeping outcome hands its claim BACK, so the key is released in the same
+    /// coordinator step that records the row — never free while unrecorded.
+    ///
+    /// Released on the worker instead, a band re-submitted between the worker's report
+    /// and the coordinator reading it (scrolling re-submits constantly) finds the key
+    /// free and the row in none of `measured`/`oversized`/`unconverted`, so `take_band`
+    /// re-offers it and a second worker probes or builds it again — and a `TooBig` row
+    /// handed out twice comes back twice, onto `deferred` with no dedup.
+    #[test]
+    fn a_bookkeeping_outcome_frees_its_key_only_once_the_row_is_recorded() {
+        type Report = fn(PrefetchTarget, InflightClaim) -> Outcome;
+        type Recorded = fn(&Coordinator, &DiffCacheKey) -> bool;
+        let reports: [(&str, Report, Recorded); 3] = [
+            (
+                "too big",
+                |target, claim| Outcome::TooBig {
+                    target: Box::new(target),
+                    cost: cost(999),
+                    claim,
+                },
+                |coord, key| coord.measured.contains_key(&key.oid) && coord.deferred.len() == 1,
+            ),
+            (
+                "oversized",
+                |target, claim| Outcome::Oversized {
+                    key: target.key,
+                    lines: 10,
+                    claim,
+                },
+                |coord, key| coord.oversized.contains(key),
+            ),
+            (
+                "unconverted",
+                |target, claim| Outcome::Unconverted {
+                    key: target.key,
+                    lines: 10,
+                    claim,
+                },
+                |coord, key| coord.unconverted.contains(key),
+            ),
+        ];
+        for (what, report, recorded) in reports {
+            let (mut coord, rxs) = test_coord(2);
+            let key = heavy_target(1).key;
+            let (id, target, claim) = dispatch_one(&mut coord, &rxs);
+            // The worker has finished and its report is on the way: the claim is in the
+            // outcome now, not in a job.
+            let outcome = report(target, claim);
+            assert!(
+                held(&coord, &key),
+                "{what}: still held in flight to the coordinator"
+            );
+            coord.run_msg(CoordMsg::Submit {
+                targets: std::iter::once(heavy_target(1)).collect(),
+                hl: None,
+            });
+            assert!(
+                rxs.iter().all(|rx| rx.try_recv().is_err()),
+                "{what}: a re-submitted band must not hand the row out a second time"
+            );
+            coord.finish(id, outcome);
+            assert!(!held(&coord, &key), "{what}: released by `finish`");
+            assert!(
+                recorded(&coord, &key),
+                "{what}: and recorded in the same step"
+            );
+        }
+    }
+
+    /// A warm posted to a worker whose thread is gone is dropped with the failed send,
+    /// and its claim with it — otherwise the key stays claimed for the session and
+    /// neither the pool nor the foreground diff-load would ever build that row.
+    #[test]
+    fn a_failed_send_frees_the_warms_key() {
+        let (mut coord, mut rxs) = test_coord(1);
+        drop(rxs.remove(0)); // worker 0's thread is gone
+        let key = heavy_target(1).key;
+        coord.run_msg(CoordMsg::Submit {
+            targets: std::iter::once(heavy_target(1)).collect(),
+            hl: None,
+        });
+        assert!(coord.ready.is_empty(), "control: the row was handed out");
+        assert!(
+            !held(&coord, &key),
+            "released with the job the send gave back"
         );
     }
 
@@ -2852,6 +3021,7 @@ mod tests {
             Outcome::TooBig {
                 target: Box::new(heavy_target(1)),
                 cost: cost(999),
+                claim: loose_claim(&heavy_target(1).key),
             },
         );
         assert_eq!(coord.deferred.len(), 1, "postponed, not dropped");
@@ -2887,6 +3057,7 @@ mod tests {
             Outcome::TooBig {
                 target: Box::new(heavy_target(1)),
                 cost: cost(999),
+                claim: loose_claim(&heavy_target(1).key),
             },
         );
         assert!(
@@ -3106,11 +3277,7 @@ mod tests {
         let (mut coord, _rxs) = test_coord_n(1, 2);
         let untouched = std::cell::OnceCell::new();
         coord.deferred.push_back(measured_target(1, 1_000));
-        let id = idle_heavy(&coord);
-        assert!(
-            coord.next_heavy(id, &untouched).is_some(),
-            "idle lane admits"
-        );
+        assert!(coord.next_heavy(&untouched).is_some(), "idle lane admits");
         assert!(
             untouched.get().is_none(),
             "and did so without reading anything"
@@ -3123,9 +3290,8 @@ mod tests {
         coord.heavy_outstanding.insert(1, 1_000);
         coord.deferred.push_back(measured_target(2, 1_000)); // need = 2_000
         let seeded = std::cell::OnceCell::from(Some(500));
-        let id = idle_heavy(&coord);
         assert!(
-            coord.next_heavy(id, &seeded).is_none(),
+            coord.next_heavy(&seeded).is_none(),
             "declined against the reading it was given"
         );
     }
@@ -3152,8 +3318,7 @@ mod tests {
     fn an_idle_heavy_lane_admits_a_row_of_any_size() {
         let (mut coord, _rxs) = test_coord(1);
         coord.deferred.push_back(measured_target(1, u64::MAX / 2));
-        let id = idle_heavy(&coord);
-        assert!(coord.next_heavy(id, &memory_reading()).is_some());
+        assert!(coord.next_heavy(&memory_reading()).is_some());
     }
 
     /// A row that will not fit stays exactly where it is rather than being popped and
@@ -3165,11 +3330,7 @@ mod tests {
         let (mut coord, _rxs) = test_coord_n(1, 2);
         coord.heavy_outstanding.insert(1, 1_000); // the lane is loaded
         coord.deferred.push_back(measured_target(1, u64::MAX / 2));
-        let id = idle_heavy(&coord);
-        assert!(
-            coord.next_heavy(id, &memory_reading()).is_none(),
-            "declined"
-        );
+        assert!(coord.next_heavy(&memory_reading()).is_none(), "declined");
         assert_eq!(coord.deferred.len(), 1, "and kept, not dropped");
     }
 
@@ -3839,9 +4000,8 @@ mod tests {
             "a heavy row must wait for its own lane, not occupy a worker the next \
              band needs"
         );
-        let id = idle_heavy(&coord);
         assert!(
-            coord.next_heavy(id, &memory_reading()).is_some(),
+            coord.next_heavy(&memory_reading()).is_some(),
             "and the heavy lane does take it"
         );
     }
@@ -3859,6 +4019,7 @@ mod tests {
         coord.finish(
             0,
             Outcome::Unconverted {
+                claim: loose_claim(&target.key),
                 key: target.key,
                 lines: 10,
             },

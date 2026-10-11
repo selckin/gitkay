@@ -387,10 +387,15 @@ timing**),
 `Job`/`Outcome`/`CoordMsg` protocol, the workers, and the two things they do —
 `run_stats_job` and `warm_row`. `PoolHandle` is the only way in, which the module
 boundary now enforces rather than merely asserting; see **Startup & timing**. A warm's
-colour pass runs on a `gitkay-colour-{k}` tokenizer thread (`SPECULATIVE_TOKENIZERS`),
-handed off with `try_send` on a queue as deep as there are tokenizers. A full queue warms
-the row `DiffOnly` ('tokenizer busy, distance N' in the log — N is the row's distance from the band anchor), and the pass's time budget starts when
-the tokenizer starts it; a tokenizer that is gone (not merely busy) makes the worker colour
+`InflightClaim` travels in its `Job::Warm` and is released when the warm ends, on whichever
+thread ends it — except that an outcome the coordinator must RECORD (`TooBig`, `Oversized`,
+`Unconverted`) carries the claim back, and `finish` drops it only after the record, so a
+band re-submitted while the report is queued can never find the row free and unrecorded and
+hand it out twice. A warm's colour pass runs on a `gitkay-colour-{k}` tokenizer thread
+(`SPECULATIVE_TOKENIZERS`), handed off with `try_send` on a queue as deep as there are
+tokenizers. A full queue warms the row `DiffOnly` ('tokenizer busy, distance N' in the log —
+N is the row's distance from the band anchor), and the pass's time budget starts when the
+tokenizer starts it; a tokenizer that is gone (not merely busy) makes the worker colour
 inline, as before the service. See the tokenizing-threads note under `diff_highlight.rs` for
 why),
 `src/history.rs` (the commit list: walking a repo's history into the `CommitInfo`
@@ -2085,7 +2090,9 @@ protocol rather than by reaching into its fields: the heavy lane's two admission
 bounds and the stampede a whole dispatch would otherwise commit, the deferral round
 trip — and the band boundary it must not cross, the one way a superseded target can
 reach the live band — the conversion charge that keeps a driven row from being admitted
-as free, stats claiming, and `warm_disposition`'s precedence),
+as free, stats claiming, a warm claim's lifetime (held by its job, handed back to `finish`
+by a bookkeeping outcome and released only after the record, freed by a failed send), and
+`warm_disposition`'s precedence),
 `commitgraph` (the file format, over fixtures this suite writes itself so it depends
 on no `git` binary: both on-disk shapes, a zeroed generation refused as the
 pre-2.19 marker it is, a chunk whose claimed end is past the real end of the file,
