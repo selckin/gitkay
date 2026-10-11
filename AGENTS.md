@@ -391,13 +391,24 @@ boundary now enforces rather than merely asserting; see **Startup & timing**. A 
 thread ends it — except that an outcome the coordinator must RECORD (`TooBig`, `Oversized`,
 `Unconverted`) carries the claim back, and `finish` drops it only after the record, so a
 band re-submitted while the report is queued can never find the row free and unrecorded and
-hand it out twice. A warm's colour pass runs on a `gitkay-colour-{k}` tokenizer thread
-(`SPECULATIVE_TOKENIZERS`), handed off with `try_send` on a queue as deep as there are
-tokenizers. A full queue warms the row `DiffOnly` ('tokenizer busy, distance N' in the log —
-N is the row's distance from the band anchor), and the pass's time budget starts when the
-tokenizer starts it; a tokenizer that is gone (not merely busy) makes the worker colour
-inline, as before the service. See the tokenizing-threads note under `diff_highlight.rs` for
-why),
+hand it out twice. A warm's colour pass is handed to the `gitkay-colour-{k}` tokenizer
+(`SPECULATIVE_TOKENIZERS`) together with the built diff and the row's in-flight claim, and
+the worker returns at once. The tokenizer keeps up to `TOKENIZER_QUEUE_CAP` warms ordered
+nearest to where the reader is NOW (`PrefetchTarget::row` against the anchor — `prefetch_anchor`,
+where the reader is now, published by the UI every frame with `PoolHandle::aim` through an
+atomic the tokenizer reads at each decision; arrow-keying inside a warm band submits
+nothing, so a value sent with a band would go stale), so a warm already
+queued stays near as the reader moves; ranked when queued instead, each arrow-key band's
+far-edge rows would outrank the previous band's near ones. It colours the nearest, and
+DELIVERS each warm itself — `WarmResult` first, claim released after — so a row waiting for
+colour is never built twice. Past the cap the warm farthest from the anchor is delivered
+uncoloured ('tokenizer queue full, distance N' in the log). A tokenizer thread that exits
+delivers what it still holds uncoloured too, but that drain is best-effort: a warm handed
+off in the instant before an abnormal exit (a panic outside a pass) can be dropped with its
+claim released and no result, and the next band re-offers the row. The pass's time budget
+starts when the tokenizer starts it. A tokenizer
+that is gone means colouring inline on the worker, as with none. See the tokenizing-threads
+note under `diff_highlight.rs` for why),
 `src/history.rs` (the commit list: walking a repo's history into the `CommitInfo`
 rows the app draws, plus the ref map that labels them — `history_revwalk` and the
 loaders, the provisional walk and its `topo_window`, the resumable tail extension,
@@ -2091,8 +2102,13 @@ bounds and the stampede a whole dispatch would otherwise commit, the deferral ro
 trip — and the band boundary it must not cross, the one way a superseded target can
 reach the live band — the conversion charge that keeps a driven row from being admitted
 as free, stats claiming, a warm claim's lifetime (held by its job, handed back to `finish`
-by a bookkeeping outcome and released only after the record, freed by a failed send), and
-`warm_disposition`'s precedence),
+by a bookkeeping outcome and released only after the record, freed by a failed send), the
+`aim` the tokenizer ranks against, the tokenizer's queue (nearest the CURRENT anchor
+first, re-ranked when it moves, evicting the farthest) and every way a handed-off warm is
+delivered — coloured by the tokenizer (on its own channel, so an inline send cannot pass
+for it), evicted through `accept`, left in the queue or the channel by an exiting
+tokenizer, or coloured inline when it is gone — each releasing the claim only after its
+send, and `warm_disposition`'s precedence),
 `commitgraph` (the file format, over fixtures this suite writes itself so it depends
 on no `git` binary: both on-disk shapes, a zeroed generation refused as the
 pre-2.19 marker it is, a chunk whose claimed end is past the real end of the file,

@@ -20,14 +20,15 @@
 //! several designs this one replaced.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use git2::Repository;
 
 use crate::diff::{
-    self, BuildEnv, CommitStats, DiffData, DiffLine, DiffSettings, FileEntry, RowScope, RowSpans,
-    StatsWant, commit_stats, is_real_commit,
+    self, BuildEnv, CommitStats, DiffData, DiffSettings, FileEntry, RowScope, StatsWant,
+    commit_stats, is_real_commit,
 };
 use crate::diff_highlight::{ColourPass, HighlightBudget, Stopped, highlight_diff_within};
 use crate::diff_store::MAX_ENTRY_DIVISOR;
@@ -296,16 +297,20 @@ fn prefetch_heavy_workers(budget: Option<u64>) -> usize {
 /// content-hashed only after its diff exists, so a prefetch cannot key one.
 ///
 /// Ordered by distance from an anchor that is **the selection clamped into the
-/// view**. While the selection is on screen that anchor *is* the selection, exactly
-/// as before, so the next arrow-key target warms first. Once the user has scrolled
-/// away from it the anchor becomes the visible edge they scrolled toward, so the
-/// pool warms what is on screen instead of racing off to rows nobody is looking at.
+/// view** (`prefetch_anchor`). While the selection is on screen that anchor *is* the
+/// selection, exactly as before, so the next arrow-key target warms first. Once the
+/// user has scrolled away from it the anchor becomes the visible edge they scrolled
+/// toward, so the pool warms what is on screen instead of racing off to rows nobody is
+/// looking at.
 /// On a tie the row *below* (larger index, i.e. scrolling down) wins.
 ///
 /// Deliberately **uncapped**: the work is bounded by `Coordinator::line_budget` (a
 /// `PREFETCH_LINE_BUDGET_DIVISOR` share of the cache), which is the bound that matches
 /// the actual cost. A count cap here would silently truncate the band and make the
 /// widened window a no-op.
+///
+/// Each target comes with its row in `commits`, which is what the tokenizer ranks it
+/// by against the anchor of whichever band is current by then.
 ///
 /// Pure — fed the loaded commit list.
 pub fn prefetch_targets(
@@ -314,13 +319,7 @@ pub fn prefetch_targets(
     view: &std::ops::Range<usize>,
 ) -> Vec<(git2::Oid, WarmDepth, usize)> {
     let near = PREFETCH_MARGIN;
-    // An empty view has no edge to clamp to, and `warm_band` has already made the
-    // band empty, so this value is never read.
-    let anchor = if view.is_empty() {
-        selected
-    } else {
-        selected.clamp(view.start, view.end - 1)
-    };
+    let anchor = prefetch_anchor(selected, view);
     let near_band = view.start.saturating_sub(near)..view.end.saturating_add(near);
     let mut idxs: Vec<usize> = warm_band(view)
         .filter(|&i| i != selected)
@@ -335,9 +334,20 @@ pub fn prefetch_targets(
             } else {
                 WarmDepth::DiffOnly
             };
-            (commits[i].oid, depth, i.abs_diff(anchor))
+            (commits[i].oid, depth, i)
         })
         .collect()
+}
+
+/// Where the reader is, for ordering speculative work: the selection clamped into the
+/// view (see `prefetch_targets`). An empty view has no edge to clamp to; it also has
+/// an empty band, so nothing is ordered by the selection it falls back to.
+pub fn prefetch_anchor(selected: usize, view: &std::ops::Range<usize>) -> usize {
+    if view.is_empty() {
+        selected
+    } else {
+        selected.clamp(view.start, view.end - 1)
+    }
 }
 
 /// Cache keys currently being computed by some worker (prefetch or diff-load),
@@ -399,10 +409,10 @@ pub struct PrefetchTarget {
     /// value, so a worker cannot pick up one and quietly forget the other.
     pub scope: RowScope,
     pub depth: WarmDepth,
-    /// The row's distance from the band anchor, as `prefetch_targets` ordered it.
-    /// Log-only: it never influences which target is chosen, only lets a "tokenizer
-    /// busy" line say whether near or far rows were skipped.
-    pub distance: usize,
+    /// The commit-list row it was built from, as `prefetch_targets` returned it. It
+    /// never influences which target the coordinator hands out; the tokenizer ranks a
+    /// queued warm by its distance from where the reader is now (see `Ranked`).
+    pub row: usize,
 }
 
 impl PrefetchTarget {
@@ -742,9 +752,20 @@ enum CoordMsg {
 /// cache entry, so nothing has to be detected or discarded.
 pub struct PoolHandle {
     tx: mpsc::Sender<CoordMsg>,
+    /// Where the reader is, shared with the tokenizers, which rank their queue by it.
+    /// The UI is its only writer (`aim`).
+    anchor: Arc<AtomicUsize>,
 }
 
 impl PoolHandle {
+    /// Publish where the reader is NOW (`prefetch_anchor`), for the tokenizers to rank
+    /// their queued warms by. Called by the UI every frame: arrow-keying inside a warm
+    /// band submits nothing, so a value sent with a band would go stale exactly while
+    /// the reader moves.
+    pub fn aim(&self, anchor: usize) {
+        self.anchor.store(anchor, Ordering::Relaxed);
+    }
+
     /// Hand the pool a new band. The line budget restarts with it.
     ///
     /// A send failure means the coordinator thread is gone, which only happens if it
@@ -1423,7 +1444,8 @@ pub fn spawn_prefetch_pool(
     let (coord_tx, coord_rx) = mpsc::channel();
     let limits = budget.limits;
     let count = prefetch_worker_count();
-    let colour = spawn_colour_service();
+    let anchor = Arc::new(AtomicUsize::new(0));
+    let colour = spawn_colour_service(tx, ctx, &anchor);
     // Heavy ids continue straight on from the pool's, so `id >= mailboxes.len()` names
     // the lane — one comparison rather than a second collection to keep in step.
     let spawn_one = |id: usize, name: String| -> Option<mpsc::Sender<Job>> {
@@ -1527,7 +1549,10 @@ pub fn spawn_prefetch_pool(
             |b| format!("{}MB", b / 1024 / 1024)
         )
     );
-    PoolHandle { tx: coord_tx }
+    PoolHandle {
+        tx: coord_tx,
+        anchor,
+    }
 }
 
 /// Run `f`, turning a panic into `None` instead of unwinding the worker.
@@ -1546,126 +1571,363 @@ fn run_caught(f: impl FnOnce() -> Outcome) -> Option<Outcome> {
 /// core of colouring throughput. One until a measurement says the band needs more.
 const SPECULATIVE_TOKENIZERS: usize = 1;
 
-/// One warm's colour pass, handed from a pool worker to a tokenizer thread. The spans
-/// travel there and back by value; the rows are shared.
+/// How many handed-off warms the tokenizer holds. Bounded because each one keeps its
+/// whole built diff alive while it waits (at most `PREFETCH_MAX_HIGHLIGHT_LINES` rows,
+/// since only rows that small are coloured); past it, the one farthest from the reader
+/// is delivered uncoloured, as a busy tokenizer's rows used to be.
+const TOKENIZER_QUEUE_CAP: usize = 16;
+
+/// What the tokenizer orders its queue by: distance from where the reader is NOW —
+/// the anchor the UI publishes every frame (`PoolHandle::aim`) — with the row
+/// below winning a tie, the rule `prefetch_targets` orders a band by. Ranked at every
+/// decision rather than when queued, because a queued warm stays claimed and is never
+/// offered again: under arrow-key reading each new band holds only the rows entering
+/// its far edge, and a rank fixed at queueing would put those ahead of the previous
+/// band's near rows, the ones the reader reaches next. Smaller is wanted sooner.
+trait Ranked {
+    /// The commit-list row the item was built for.
+    fn row(&self) -> usize;
+
+    fn rank(&self, anchor: usize) -> (usize, bool) {
+        let row = self.row();
+        (row.abs_diff(anchor), row < anchor)
+    }
+}
+
+/// The tokenizer's pending warms. A `Vec` scanned for the best or worst entry: it
+/// never holds more than `TOKENIZER_QUEUE_CAP` + 1 items, where a heap would need a
+/// second one to evict from the far end — and would have to be rebuilt whenever the
+/// anchor it was ordered by moved.
+struct ColourQueue<T: Ranked> {
+    items: Vec<T>,
+}
+
+impl<T: Ranked> Default for ColourQueue<T> {
+    fn default() -> Self {
+        Self { items: Vec::new() }
+    }
+}
+
+impl<T: Ranked> ColourQueue<T> {
+    /// Queue `item`; past the cap, hand back the item farthest from `anchor` (possibly
+    /// `item`).
+    fn push(&mut self, item: T, anchor: usize) -> Option<T> {
+        self.items.push(item);
+        if self.items.len() <= TOKENIZER_QUEUE_CAP {
+            return None;
+        }
+        let worst = (0..self.items.len()).max_by_key(|&i| self.items[i].rank(anchor))?;
+        Some(self.items.swap_remove(worst))
+    }
+
+    /// The item nearest `anchor`.
+    fn pop(&mut self, anchor: usize) -> Option<T> {
+        let best = (0..self.items.len()).min_by_key(|&i| self.items[i].rank(anchor))?;
+        Some(self.items.swap_remove(best))
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+/// A built warm handed to the tokenizer to colour and deliver. It owns the warm's
+/// result and its claim: the tokenizer sends the `WarmResult` (coloured, or not if it
+/// is evicted or its pass panics) and only then lets the claim go — so a row waiting
+/// for colour is never found unclaimed and built a second time.
 struct ColourJob {
+    key: DiffCacheKey,
+    data: DiffData,
     hl: Arc<Highlighter>,
-    lines: Arc<Vec<DiffLine>>,
-    files: Arc<Vec<FileEntry>>,
-    spans: RowSpans,
     /// The pass's time budget, started when the TOKENIZER starts it — a warm that
     /// waited its turn still gets its full budget rather than a lapsed one.
     budget: Duration,
-    reply: mpsc::Sender<(RowSpans, Option<ColourPass>, Duration)>,
+    /// The commit-list row it was built for (`PrefetchTarget::row`), what it is
+    /// ranked by.
+    row: usize,
+    /// How long the worker took to build it — for the `done` line the tokenizer logs.
+    built: Duration,
+    handed_at: std::time::Instant,
+    claim: InflightClaim,
 }
 
-/// What a hand-off came to.
-enum Handoff {
-    /// The tokenizer ran it; `None` when the pass panicked (spans as far as it got).
-    /// The duration is the tokenizer's own pass time, queueing excluded.
-    Coloured(Option<ColourPass>, Duration),
-    /// Every tokenizer busy and the queue full — this row warms without colour.
-    Busy,
-    /// No tokenizer is left to receive jobs; the spans are restored and the caller
-    /// colours the row itself.
-    Gone,
+impl Ranked for ColourJob {
+    fn row(&self) -> usize {
+        self.row
+    }
 }
 
-/// The tokenizer threads, behind a queue as deep as there are threads: a worker can
-/// be at most one job behind each, so its wait is bounded by about two budgets.
-fn spawn_colour_service() -> Option<mpsc::SyncSender<ColourJob>> {
-    let (tx, rx) = mpsc::sync_channel::<ColourJob>(SPECULATIVE_TOKENIZERS);
+/// What became of a warm's colour, for its `done` line.
+#[derive(Clone, Copy)]
+enum Delivered {
+    /// No pass was wanted: the row is too far, too big, or syntax is off.
+    Uncoloured,
+    /// A pass ran, and took this long (queueing excluded). The tokenizer also notes how
+    /// far the row was from the reader when it was picked.
+    Coloured(ColourPass, Duration, Option<usize>),
+    /// Pushed out of a full tokenizer queue as the warm farthest from the reader's
+    /// anchor, this far from it.
+    Evicted(usize),
+    /// The pass panicked; the spans are as far as it got.
+    Panicked,
+}
+
+/// What a warm's `done` line says was applied — not what was asked for, and THREE
+/// outcomes, not two. A depth downgrade the log hid would read as syntect being
+/// mysteriously fast on an enormous row; the plain-text fallback reads the same way and
+/// is worse, because it looks like a success. Nothing else can tell them apart: the
+/// fallback still sets a span on every line, so `pending_files` comes back empty, the
+/// diff is never re-tokenized, and it renders in one flat colour for the rest of the
+/// session. `PlainText` here is the only place that shows up. (Measured: a whole band
+/// of `.oml` rows logged `Highlighted` at ~3µs/line against ~60µs/line for the rows
+/// that really tokenized — the ratio was the only clue.)
+///
+/// `None` unless the line will actually be printed: `has_grammar` lower-cases the
+/// extension into a fresh `String` and then scans the whole syntax set, so on a
+/// 1317-delta commit this is ~1300 allocations and ~1300 linear scans, discarded at the
+/// default level.
+fn applied_label(
+    hl: Option<&Arc<Highlighter>>,
+    files: &[FileEntry],
+    how: &Delivered,
+) -> Option<String> {
+    if !log::log_enabled!(log::Level::Debug) {
+        return None;
+    }
+    let applied = match (hl, how) {
+        (Some(_), Delivered::Panicked) => "DiffOnly (colour pass panicked)".to_owned(),
+        (Some(_), Delivered::Evicted(distance)) => {
+            format!("DiffOnly (tokenizer queue full, distance {distance})")
+        }
+        // A COUNT, not `any`: one .rs beside 500 .oml files would otherwise read as
+        // "Highlighted", which is the exact "looks like a success" reading the
+        // PlainText label exists to remove. `any` also called an empty diff PlainText,
+        // though nothing had been left uncoloured.
+        (Some(hl), Delivered::Coloured(..)) => {
+            // Binary files are not part of the denominator: the highlighter skips
+            // them, so counting them as un-highlighted would report a commit that only
+            // touches a .png as "PlainText" — a coverage gap that isn't one.
+            let (mut with, mut candidates) = (0usize, 0usize);
+            for f in files.iter().filter(|f| !f.is_binary) {
+                candidates += 1;
+                with += usize::from(hl.has_grammar(&f.path));
+            }
+            match (with, candidates) {
+                (_, 0) => "Highlighted (no files)".to_owned(),
+                (w, n) if w == n => "Highlighted".to_owned(),
+                (0, _) => "PlainText".to_owned(),
+                (w, n) => format!("Highlighted {w}/{n}, rest PlainText"),
+            }
+        }
+        _ => "DiffOnly".to_owned(),
+    };
+    // Said out loud for the reason every other cut-off here is: a row that renders
+    // half-plain otherwise looks like the highlighter simply failing on it. The pass
+    // reports which bound stopped it, so nothing here compares clocks and guesses.
+    Some(match how {
+        Delivered::Coloured(pass, ..) if pass.stopped == Stopped::Deadline => {
+            format!("{applied}, cut short at the time budget")
+        }
+        _ => applied,
+    })
+}
+
+/// Send a handed-off warm to the UI, then let its claim go — in that order, so the row
+/// is never free to be dispatched again before its result is on its way to the cache.
+/// Every warm the tokenizer accepts leaves through here exactly once — or, on exit,
+/// through `Drop`.
+fn deliver(tx: &mpsc::Sender<WarmResult>, ctx: &egui::Context, job: ColourJob, how: Delivered) {
+    let ColourJob {
+        key,
+        data,
+        hl,
+        built,
+        handed_at,
+        claim,
+        ..
+    } = job;
+    // Read before the label, whose grammar scan (debug only) is not time spent with
+    // the tokenizer.
+    let with_tokenizer = handed_at.elapsed();
+    let (oid, lines) = (key.oid, data.lines.len());
+    let label = applied_label(Some(&hl), &data.files, &how);
+    if tx.send(WarmResult { key, data }).is_err() {
+        return; // the UI is gone, and the claim with this frame
+    }
+    drop(claim); // only now: the result is on its way to the cache
+    if let Some(label) = label {
+        if let Delivered::Coloured(_, tokenizing, distance) = how {
+            let queued = with_tokenizer.saturating_sub(tokenizing);
+            let distance = distance.map_or_else(String::new, |d| format!(", distance {d}"));
+            log::debug!(
+                "prefetch: done {oid} ({lines} lines, {label}) build {built:?} + colour \
+                 {tokenizing:?} after {queued:?} queued{distance}"
+            );
+        } else {
+            log::debug!(
+                "prefetch: done {oid} ({lines} lines, {label}) build {built:?}, \
+                 {with_tokenizer:?} with the tokenizer"
+            );
+        }
+    }
+    ctx.request_repaint();
+}
+
+/// Hand a built warm to the tokenizer. Never waits: the channel is unbounded and the
+/// bound is the tokenizer's own queue. The job comes back only if no tokenizer is left
+/// to receive it, for the worker to colour and deliver itself.
+fn hand_off(colour: &mpsc::Sender<ColourJob>, job: ColourJob) -> Result<(), Box<ColourJob>> {
+    colour.send(job).map_err(|e| Box::new(e.0))
+}
+
+/// One tokenizer thread: the warms it has accepted, and where they go when done.
+///
+/// Dropping it — the pool gone, or a panic outside a pass unwinding the thread — sends
+/// every warm still waiting to the UI uncoloured, so none the thread accepted is lost
+/// with it. That path does no logging per warm and no label work: during an unwind a
+/// second panic would abort the process.
+struct Tokenizer {
+    rx: Arc<Mutex<mpsc::Receiver<ColourJob>>>,
+    queue: ColourQueue<ColourJob>,
+    /// Where the reader is, as the UI last published it (see `Ranked`).
+    anchor: Arc<AtomicUsize>,
+    tx: mpsc::Sender<WarmResult>,
+    ctx: egui::Context,
+}
+
+impl Tokenizer {
+    /// The reader's anchor, read once per queue decision. `Relaxed`: it is a ranking
+    /// hint, and a stale read costs one warm coloured a little out of order.
+    fn anchor(&self) -> usize {
+        self.anchor.load(Ordering::Relaxed)
+    }
+
+    fn run(&mut self) {
+        loop {
+            // Block only when there is nothing to do; otherwise take whatever has
+            // arrived, so a nearer row handed off mid-pass is served ahead of farther
+            // ones queued before it.
+            if self.queue.is_empty() {
+                let Some(job) = self.recv() else {
+                    return; // the pool is gone, and nothing is waiting
+                };
+                self.accept(job);
+            }
+            while let Some(job) = self.try_recv() {
+                self.accept(job);
+            }
+            let anchor = self.anchor();
+            if let Some(job) = self.queue.pop(anchor) {
+                let distance = job.row.abs_diff(anchor);
+                self.colour(job, distance);
+            }
+        }
+    }
+
+    fn accept(&mut self, job: ColourJob) {
+        let anchor = self.anchor();
+        if let Some(evicted) = self.queue.push(job, anchor) {
+            let distance = evicted.row.abs_diff(anchor);
+            deliver(&self.tx, &self.ctx, evicted, Delivered::Evicted(distance));
+        }
+    }
+
+    fn colour(&self, mut job: ColourJob, distance: usize) {
+        let started = std::time::Instant::now();
+        let mut pass = None;
+        let data = &mut job.data;
+        let hl = &job.hl;
+        let deadline = started + job.budget;
+        crate::diff_highlight::contained("a speculative colour pass", || {
+            pass = Some(highlight_diff_within(
+                &data.lines,
+                &mut data.spans,
+                &data.files,
+                hl,
+                HighlightBudget {
+                    lines: None,
+                    deadline: Some(deadline),
+                    until_row: None,
+                },
+                0,
+            ));
+        });
+        // `None` only if the pass panicked before it could report.
+        let how = pass.map_or(Delivered::Panicked, |pass| {
+            Delivered::Coloured(pass, started.elapsed(), Some(distance))
+        });
+        deliver(&self.tx, &self.ctx, job, how);
+    }
+
+    /// The next hand-off, waiting for it; `None` once every worker is gone.
+    fn recv(&self) -> Option<ColourJob> {
+        self.rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recv()
+            .ok()
+    }
+
+    /// A hand-off that has already arrived, if any. `try_lock`, because with more than
+    /// one tokenizer the lock can be held by one blocked in `recv` — one with nothing
+    /// to do, which takes the next job, and is the right place for it.
+    fn try_recv(&self) -> Option<ColourJob> {
+        match self.rx.try_lock() {
+            Ok(rx) => rx.try_recv().ok(),
+            Err(std::sync::TryLockError::Poisoned(rx)) => rx.into_inner().try_recv().ok(),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+}
+
+impl Drop for Tokenizer {
+    fn drop(&mut self) {
+        let mut abandoned = 0usize;
+        let anchor = self.anchor();
+        while let Some(job) = self.queue.pop(anchor).or_else(|| self.try_recv()) {
+            let ColourJob {
+                key, data, claim, ..
+            } = job;
+            abandoned += 1;
+            let _gone = self.tx.send(WarmResult { key, data });
+            drop(claim); // after the send, as in `deliver`
+        }
+        if abandoned > 0 {
+            log::warn!("prefetch: tokenizer exited; delivered {abandoned} warms uncoloured");
+            self.ctx.request_repaint();
+        }
+    }
+}
+
+/// The tokenizer threads, fed through one unbounded channel: a worker hands its built
+/// warm over and moves on, and the tokenizer delivers it on `tx`. `anchor` is where the
+/// reader is, which the coordinator keeps current. `None` when not one could be
+/// spawned, which makes every worker colour inline.
+fn spawn_colour_service(
+    tx: &mpsc::Sender<WarmResult>,
+    ctx: &egui::Context,
+    anchor: &Arc<AtomicUsize>,
+) -> Option<mpsc::Sender<ColourJob>> {
+    let (colour, rx) = mpsc::channel::<ColourJob>();
     let rx = Arc::new(Mutex::new(rx));
     let mut spawned = 0;
     for k in 0..SPECULATIVE_TOKENIZERS {
-        let rx = Arc::clone(&rx);
+        let mut tokenizer = Tokenizer {
+            rx: Arc::clone(&rx),
+            queue: ColourQueue::default(),
+            anchor: Arc::clone(anchor),
+            tx: tx.clone(),
+            ctx: ctx.clone(),
+        };
         let ok = spawn_guarded(
             &format!("gitkay-colour-{k}"),
-            "colour thread panicked outside a job",
-            move || {
-                loop {
-                    let job = {
-                        let Ok(rx) = rx.lock() else { return };
-                        match rx.recv() {
-                            Ok(job) => job,
-                            Err(_) => return, // the pool is gone
-                        }
-                    };
-                    let ColourJob {
-                        hl,
-                        lines,
-                        files,
-                        mut spans,
-                        budget,
-                        reply,
-                    } = job;
-                    let started = std::time::Instant::now();
-                    let mut pass = None;
-                    crate::diff_highlight::contained("a speculative colour pass", || {
-                        pass = Some(highlight_diff_within(
-                            &lines,
-                            &mut spans,
-                            &files,
-                            &hl,
-                            HighlightBudget {
-                                lines: None,
-                                deadline: Some(std::time::Instant::now() + budget),
-                                until_row: None,
-                            },
-                            0,
-                        ));
-                    });
-                    let tokenizing = started.elapsed();
-                    // Release the shared rows first, so the worker never resumes to
-                    // find the `Arc` still held here (an `Arc::make_mut` clone later).
-                    drop((hl, lines, files));
-                    let _gone = reply.send((spans, pass, tokenizing));
-                }
-            },
+            "colour thread panicked outside a pass; its waiting warms went uncoloured",
+            move || tokenizer.run(),
         )
         .is_ok();
         spawned += usize::from(ok);
     }
-    (spawned > 0).then_some(tx)
-}
-
-/// Hand `data`'s colour pass to a tokenizer thread and wait for it — or, if every
-/// tokenizer is busy, do not colour at all. Never waits for room in the queue.
-fn colour_elsewhere(
-    colour: &mpsc::SyncSender<ColourJob>,
-    hl: &Arc<Highlighter>,
-    data: &mut DiffData,
-    budget: Duration,
-) -> Handoff {
-    let (reply, back) = mpsc::channel();
-    let job = ColourJob {
-        hl: Arc::clone(hl),
-        lines: Arc::clone(&data.lines),
-        files: Arc::clone(&data.files),
-        spans: std::mem::take(&mut data.spans),
-        budget,
-        reply,
-    };
-    match colour.try_send(job) {
-        Ok(()) => {
-            if let Ok((spans, pass, tokenizing)) = back.recv() {
-                data.spans = spans;
-                Handoff::Coloured(pass, tokenizing)
-            } else {
-                // The thread died with the job: the spans went with it.
-                data.spans = RowSpans::blank(data.lines.len());
-                Handoff::Coloured(None, Duration::ZERO)
-            }
-        }
-        Err(mpsc::TrySendError::Full(job)) => {
-            data.spans = job.spans;
-            Handoff::Busy
-        }
-        Err(mpsc::TrySendError::Disconnected(job)) => {
-            data.spans = job.spans;
-            Handoff::Gone
-        }
-    }
+    (spawned > 0).then_some(colour)
 }
 
 /// Everything a worker holds for its whole life. All of it is either `Copy` or a
@@ -1679,9 +1941,10 @@ struct WorkerCtx {
     ctx: egui::Context,
     /// The persistent store and the textconv drivers; see `DiffDeps`.
     deps: DiffDeps,
-    /// The tokenizer threads speculative warms hand their colour pass to; `None` colours
-    /// inline on this worker (no tokenizer could be spawned, and most tests).
-    colour: Option<mpsc::SyncSender<ColourJob>>,
+    /// The tokenizer threads speculative warms are handed to, to colour and deliver;
+    /// `None` colours inline on this worker (no tokenizer could be spawned, and most
+    /// tests).
+    colour: Option<mpsc::Sender<ColourJob>>,
     /// Whether this worker has already said the tokenizer is gone, so it says it once.
     tokenizer_loss_logged: std::cell::Cell<bool>,
 }
@@ -1993,11 +2256,13 @@ pub const fn warm_disposition(f: WarmFacts) -> WarmDisposition {
     }
 }
 
-/// Warm one row into the cache: probe, build, cap, colour, send.
+/// Warm one row into the cache: probe, build, cap, then colour and send — or hand
+/// both to the tokenizer.
 ///
 /// Pure in the sense that matters: everything it learns comes back as the return value,
 /// so the coordinator — not this thread — decides what any of it means. That includes
-/// `claim`: an outcome the coordinator must record carries it back, and only a row that
+/// `claim`: an outcome the coordinator must record carries it back; a row handed to the
+/// tokenizer takes it along, released there after the tokenizer's send; and a row that
 /// ends here (sent to the UI, or lost with it) releases it on this thread, after the send.
 fn warm_row(
     ctx: &WorkerCtx,
@@ -2059,7 +2324,7 @@ fn warm_row(
     // `Coordinator::take_band` routes by its own `measured` map before this
     // function runs. Surgery on a delicate function for a millisecond, buying
     // none of the thing it looks like it buys.
-    let mut data = build_or_load(
+    let data = build_or_load(
         store_of(&ctx.deps.store),
         repo,
         &target.scope,
@@ -2161,137 +2426,84 @@ fn warm_row(
     // identical, so the later one is a no-op, and it is what covers the foreground.
     send_row_stats(ctx, stats_epoch, oid, &data);
     let colour = target.depth == WarmDepth::Highlighted && lines <= PREFETCH_MAX_HIGHLIGHT_LINES;
-    let colour_start = std::time::Instant::now();
     // Bounded in TIME as well as in lines, because the two measure different things and
     // the line cap's rate assumption is a property of the grammar rather than of the
     // repo: a 5,310-line row under the 10,000-line cap coloured for 29.6s. See
     // `Limits::highlight_budget`. Stopping early is free — a partial `RowSpans` is a
     // legal state and `ensure_diff_highlighted` finishes the row if it is ever opened —
-    // where not stopping costs the worker, its lane slot and its in-flight claim.
+    // where not stopping costs the tokenizer (or the worker) and the in-flight claim.
+    //
     // Coloured on a tokenizer thread when there is one (see `SPECULATIVE_TOKENIZERS`):
     // a pool worker that tokenizes its own warms takes a regex-cache slot of its own.
-    // A busy tokenizer means this row warms `DiffOnly` — it is coloured on open.
-    let mut busy = false;
-    // `Some((tokenizing, panicked))` when a tokenizer thread coloured this row.
-    let mut handed_off = None;
-    let inline = |data: &mut DiffData, hl: &Arc<Highlighter>| {
-        highlight_diff_within(
-            &data.lines,
-            &mut data.spans,
-            &data.files,
-            hl,
-            HighlightBudget {
-                lines: None,
-                deadline: Some(colour_start + ctx.limits.highlight_budget),
-                until_row: None,
-            },
-            0,
-        )
-    };
-    let pass = match (hl, colour) {
-        (Some(hl), true) => match &ctx.colour {
-            Some(c) => match colour_elsewhere(c, hl, &mut data, ctx.limits.highlight_budget) {
-                Handoff::Coloured(pass, tokenizing) => {
-                    handed_off = Some((tokenizing, pass.is_none()));
-                    pass
-                }
-                Handoff::Busy => {
-                    busy = true;
-                    None
-                }
-                Handoff::Gone => {
+    // The warm is HANDED OFF — the built diff and the claim with it — and this worker
+    // moves straight on: the tokenizer colours the warms nearest the reader first and
+    // delivers each one itself (see `deliver`).
+    let PrefetchTarget { key, row, .. } = target;
+    let (key, mut data, claim) = match (hl, &ctx.colour) {
+        (Some(hl), Some(tokenizer)) if colour => {
+            let job = ColourJob {
+                key,
+                data,
+                hl: Arc::clone(hl),
+                budget: ctx.limits.highlight_budget,
+                row,
+                built,
+                handed_at: std::time::Instant::now(),
+                claim,
+            };
+            match hand_off(tokenizer, job) {
+                Ok(()) => return Outcome::Warmed { lines },
+                Err(job) => {
                     if !ctx.tokenizer_loss_logged.replace(true) {
                         log::warn!("prefetch: tokenizer thread gone; colouring on the worker");
                     }
-                    Some(inline(&mut data, hl))
-                }
-            },
-            None => Some(inline(&mut data, hl)),
-        },
-        _ => None,
-    };
-    let coloured = colour_start.elapsed();
-    // Said out loud for the reason every other cut-off here is: a row that renders
-    // half-plain otherwise looks like the highlighter simply failing on it. The pass
-    // reports which bound stopped it; this used to compare its own elapsed time against
-    // its own deadline and guess, which is the same answer arrived at less exactly and
-    // by a caller that does not own the bound.
-    let cut_short = pass.is_some_and(|p: ColourPass| p.stopped == Stopped::Deadline);
-    // What was actually applied, not what was asked for — and THREE outcomes, not two.
-    // A depth downgrade the log hid would read as syntect being mysteriously fast on an
-    // enormous row; the plain-text fallback reads the same way and is worse, because it
-    // looks like a success. Nothing else can tell them apart: the fallback still sets a
-    // span on every line, so `pending_files` comes back empty, the diff is never
-    // re-tokenized, and it renders in one flat colour for the rest of the session.
-    // `PlainText` here is the only place that shows up. (Measured: a whole band of
-    // `.oml` rows logged `Highlighted` at ~3µs/line against ~60µs/line for the rows that
-    // really tokenized — the ratio was the only clue.)
-    //
-    // Derived here because `data` is moved into the send below, but only when the line
-    // it feeds will actually be printed: `has_grammar` lower-cases the extension into a
-    // fresh `String` and then scans the whole syntax set, so on a 1317-delta commit this
-    // is ~1300 allocations and ~1300 linear scans on a pool thread, discarded at the
-    // default level.
-    let applied = log::log_enabled!(log::Level::Debug).then(|| {
-        let applied = match hl {
-            // A COUNT, not `any`: one .rs beside 500 .oml files would otherwise read
-            // as "Highlighted", which is the exact "looks like a success" reading the
-            // PlainText label exists to remove. `any` also called an empty diff
-            // PlainText, though nothing had been left uncoloured.
-            Some(_) if matches!(handed_off, Some((_, true))) => {
-                "DiffOnly (colour pass panicked)".to_owned()
-            }
-            Some(hl) if colour && !busy => {
-                // Binary files are not part of the denominator: the highlighter skips
-                // them, so counting them as un-highlighted would report a commit that
-                // only touches a .png as "PlainText" — a coverage gap that isn't one.
-                let (mut with, mut candidates) = (0usize, 0usize);
-                for f in data.files.iter().filter(|f| !f.is_binary) {
-                    candidates += 1;
-                    with += usize::from(hl.has_grammar(&f.path));
-                }
-                match (with, candidates) {
-                    (_, 0) => "Highlighted (no files)".to_owned(),
-                    (w, n) if w == n => "Highlighted".to_owned(),
-                    (0, _) => "PlainText".to_owned(),
-                    (w, n) => format!("Highlighted {w}/{n}, rest PlainText"),
+                    let ColourJob {
+                        key, data, claim, ..
+                    } = *job;
+                    (key, data, claim)
                 }
             }
-            _ if busy => format!("DiffOnly (tokenizer busy, distance {})", target.distance),
-            _ => "DiffOnly".to_owned(),
-        };
-        if cut_short {
-            format!("{applied}, cut short at the time budget")
-        } else {
-            applied
         }
-    });
+        _ => (key, data, claim),
+    };
+    // Inline from here: no tokenizer, a tokenizer gone, or no colour wanted.
+    let colour_start = std::time::Instant::now();
+    let how = match hl {
+        Some(hl) if colour => {
+            let pass = highlight_diff_within(
+                &data.lines,
+                &mut data.spans,
+                &data.files,
+                hl,
+                HighlightBudget {
+                    lines: None,
+                    deadline: Some(colour_start + ctx.limits.highlight_budget),
+                    until_row: None,
+                },
+                0,
+            );
+            Delivered::Coloured(pass, colour_start.elapsed(), None)
+        }
+        _ => Delivered::Uncoloured,
+    };
+    // Derived here because `data` is moved into the send below.
+    let applied = applied_label(hl, &data.files, &how);
     // A send failure means the UI is gone, i.e. the process is on its way out; there is
     // nothing useful left to do, but nothing to clean up either.
-    if ctx
-        .tx
-        .send(WarmResult {
-            key: target.key,
-            data,
-        })
-        .is_err()
-    {
+    if ctx.tx.send(WarmResult { key, data }).is_err() {
         return Outcome::Nothing;
     }
+    drop(claim); // only now: the result is on its way to the cache
     // Logged only after the result actually reached the UI for caching. Build and colour
     // are reported separately so a slow row says WHICH half was slow — git2 walking a
     // big tree and syntect tokenizing are different problems with different fixes.
     if let Some(applied) = applied {
-        match handed_off {
-            Some((tokenizing, _)) => {
-                let wait = coloured.saturating_sub(tokenizing);
-                log::debug!(
-                    "prefetch: done {oid} ({lines} lines, {applied}) build {built:?} + colour {tokenizing:?} + queued {wait:?}"
-                );
-            }
-            None => log::debug!(
+        if let Delivered::Coloured(_, coloured, _) = how {
+            log::debug!(
                 "prefetch: done {oid} ({lines} lines, {applied}) build {built:?} + colour {coloured:?}"
-            ),
+            );
+        } else {
+            log::debug!("prefetch: done {oid} ({lines} lines, {applied}) build {built:?}");
         }
     }
     ctx.ctx.request_repaint();
@@ -2318,73 +2530,96 @@ mod tests {
         )
     }
 
-    /// A busy tokenizer is skipped, never waited for: the row warms without colour and
-    /// keeps its (blank) spans, so a full band cannot pile its workers up behind it.
+    /// A queued item that is only a commit-list row.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Probe(usize);
+    impl Ranked for Probe {
+        fn row(&self) -> usize {
+            self.0
+        }
+    }
+
+    /// Every item `q` holds, popped in the order an unmoving reader at `anchor` gets.
+    fn drain_at(q: &mut ColourQueue<Probe>, anchor: usize) -> Vec<usize> {
+        std::iter::from_fn(|| q.pop(anchor)).map(|p| p.0).collect()
+    }
+
+    /// Nearest the reader's anchor first; on a tie the row below wins, the rule
+    /// `prefetch_targets` orders a band by.
     #[test]
-    fn a_busy_tokenizer_is_skipped_not_waited_for() {
-        let (colour, _held) = mpsc::sync_channel(1);
-        let hl = Arc::new(crate::highlight::test_highlighter());
-        let mut first = rust_diff();
-        let (reply, _keep) = mpsc::channel();
-        colour
-            .try_send(ColourJob {
-                hl: Arc::clone(&hl),
-                lines: Arc::clone(&first.lines),
-                files: Arc::clone(&first.files),
-                spans: std::mem::take(&mut first.spans),
-                budget: Duration::from_secs(1),
-                reply,
-            })
-            .expect("the queue has room for one");
-        let mut data = rust_diff();
-        data.spans.set(1, vec![(egui::Color32::RED, 0..3)]);
-        let t = std::time::Instant::now();
-        let handoff = colour_elsewhere(&colour, &hl, &mut data, Duration::from_secs(1));
-        assert!(matches!(handoff, Handoff::Busy));
-        assert!(t.elapsed() < Duration::from_millis(500), "it must not wait");
+    fn the_colour_queue_serves_the_row_nearest_the_anchor_first() {
+        let mut q = ColourQueue::default();
+        for row in [0, 8, 3, 6, 4, 1, 7, 2, 5] {
+            assert!(q.push(Probe(row), 4).is_none());
+        }
+        assert_eq!(drain_at(&mut q, 4), vec![4, 5, 3, 6, 2, 7, 1, 8, 0]);
+    }
+
+    /// A queued item is ranked against where the reader is NOW, not where they were
+    /// when it was queued: arrow-keying on keeps the next rows nearest, where a rank
+    /// fixed at queueing would serve the far edge of the newest band ahead of them.
+    #[test]
+    fn the_colour_queue_re_ranks_when_the_anchor_moves() {
+        let mut q = ColourQueue::default();
+        for row in 0..10 {
+            assert!(q.push(Probe(row), 2).is_none());
+        }
+        assert_eq!(q.pop(2), Some(Probe(2)), "served from where the reader was");
         assert_eq!(
-            data.spans.rows(),
-            data.lines.len(),
-            "the spans come back unharmed"
-        );
-        assert_eq!(
-            data.spans.get(1),
-            Some(&vec![(egui::Color32::RED, 0..3)]),
-            "the spans that were there are the spans that come back, not blanks"
+            drain_at(&mut q, 8),
+            vec![8, 9, 7, 6, 5, 4, 3, 1, 0],
+            "then from where the reader moved to"
         );
     }
 
-    /// With no tokenizer left (the receiver is gone) the hand-off says so at once, and
-    /// the spans come back so the worker can colour the row itself.
+    /// Past the cap the item FARTHEST from the current anchor leaves — handed back so
+    /// the caller can deliver it uncoloured — which may be the one just pushed.
     #[test]
-    fn a_lost_tokenizer_is_reported_gone_with_the_spans_restored() {
-        let (colour, gone) = mpsc::sync_channel(1);
-        drop(gone);
-        let hl = Arc::new(crate::highlight::test_highlighter());
-        let mut data = rust_diff();
-        data.spans.set(1, vec![(egui::Color32::RED, 0..3)]);
-        let t = std::time::Instant::now();
-        let handoff = colour_elsewhere(&colour, &hl, &mut data, Duration::from_secs(1));
-        assert!(matches!(handoff, Handoff::Gone));
-        assert!(t.elapsed() < Duration::from_millis(500), "it must not wait");
+    fn a_full_colour_queue_evicts_the_item_farthest_from_the_current_anchor() {
+        let mut q = ColourQueue::default();
+        for row in 0..TOKENIZER_QUEUE_CAP {
+            assert!(q.push(Probe(row), 0).is_none());
+        }
         assert_eq!(
-            data.spans.rows(),
-            data.lines.len(),
-            "the spans come back unharmed"
+            q.push(Probe(100), 0),
+            Some(Probe(100)),
+            "the newcomer is the farthest"
         );
         assert_eq!(
-            data.spans.get(1),
-            Some(&vec![(egui::Color32::RED, 0..3)]),
-            "the spans that were there are the spans that come back, not blanks"
+            q.push(Probe(100), 100),
+            Some(Probe(0)),
+            "the reader moved: what was nearest is now farthest"
         );
+        assert_eq!(q.pop(100), Some(Probe(100)), "the near row stays");
+        // Equally far either side, the row ABOVE is the one evicted: the mirror of
+        // the below-wins tie at the front.
+        let mut q = ColourQueue::default();
+        for row in 51..=50 + TOKENIZER_QUEUE_CAP {
+            assert!(q.push(Probe(row), 50).is_none());
+        }
+        let above = 50 - TOKENIZER_QUEUE_CAP;
+        assert_eq!(q.push(Probe(above), 50), Some(Probe(above)));
     }
 
-    /// A `Highlighted` warm of a small Rust commit through the whole hand-off, with the
-    /// given colour queue on the worker. Returns the outcome and how many rows came back
-    /// with spans.
-    fn warm_highlighted_via(colour: mpsc::SyncSender<ColourJob>) -> (Outcome, usize) {
-        use crate::test_repo::{commit_file, temp_repo};
-        let (_dir, repo) = temp_repo();
+    /// A `Highlighted` warm of a small Rust commit, started with the given colour
+    /// hand-off on the worker. Nothing here waits for the result: each test receives it
+    /// as its subject needs.
+    struct StartedWarm {
+        outcome: Outcome,
+        /// Where the result arrives — from the worker or from the tokenizer.
+        rx: mpsc::Receiver<WarmResult>,
+        /// The sender the worker had, for a tokenizer a test builds by hand.
+        tx: mpsc::Sender<WarmResult>,
+        inflight: InflightKeys,
+        key: DiffCacheKey,
+        _dir: tempfile::TempDir,
+    }
+
+    fn start_highlighted_warm(
+        colour: impl FnOnce(&mpsc::Sender<WarmResult>) -> mpsc::Sender<ColourJob>,
+    ) -> StartedWarm {
+        use crate::test_repo::commit_file;
+        let (dir, repo) = temp_repo();
         commit_file(&repo, "a.rs", "fn main() {}\n", "one");
         let oid = commit_file(&repo, "a.rs", "fn main() {\n    todo!()\n}\n", "two");
         let hl = Arc::new(highlight::test_highlighter());
@@ -2398,69 +2633,245 @@ mod tests {
                 highlight_budget: Duration::from_secs(30),
             },
             coord: mpsc::channel().0,
-            tx,
+            tx: tx.clone(),
             stats_tx: mpsc::channel().0,
             ctx: egui::Context::default(),
             deps: DiffDeps::default(),
-            colour: Some(colour),
+            colour: Some(colour(&tx)),
             tokenizer_loss_logged: std::cell::Cell::new(false),
         };
         let mut target = heavy_target(1);
         target.key.oid = oid;
         target.scope = RowScope::new(DiffSource::Commit(oid));
         target.depth = WarmDepth::Highlighted;
-        let claim = InflightClaim::try_claim(&InflightKeys::default(), target.key.clone()).unwrap();
+        let key = target.key.clone();
+        let inflight = InflightKeys::default();
+        let claim = InflightClaim::try_claim(&inflight, key.clone()).unwrap();
         let outcome = warm_row(&ctx, &repo, target, Some(&hl), 0, claim);
-        let data = rx.recv().expect("the diff comes back either way").data;
-        assert!(!data.lines.is_empty(), "control: the fixture has rows");
-        let coloured = (0..data.lines.len())
+        StartedWarm {
+            outcome,
+            rx,
+            tx,
+            inflight,
+            key,
+            _dir: dir,
+        }
+    }
+
+    /// How many rows of `data` carry spans.
+    fn coloured_rows(data: &DiffData) -> usize {
+        (0..data.lines.len())
             .filter(|&i| data.spans.get(i).is_some())
-            .count();
-        (outcome, coloured)
+            .count()
     }
 
-    /// End to end: every tokenizer busy means the warm still lands, uncoloured, rather
-    /// than waiting or colouring inline on the worker.
-    #[test]
-    fn a_warm_with_every_tokenizer_busy_lands_uncoloured() {
-        let (colour, _held) = mpsc::sync_channel(1);
-        let hl = Arc::new(highlight::test_highlighter());
-        let mut filler = rust_diff();
-        let (reply, _keep) = mpsc::channel();
-        colour
-            .try_send(ColourJob {
-                hl,
-                lines: Arc::clone(&filler.lines),
-                files: Arc::clone(&filler.files),
-                spans: std::mem::take(&mut filler.spans),
-                budget: Duration::from_secs(1),
-                reply,
-            })
-            .expect("the queue has room for one");
-        let (outcome, coloured) = warm_highlighted_via(colour);
-        assert!(matches!(outcome, Outcome::Warmed { .. }));
-        assert_eq!(coloured, 0, "a busy tokenizer leaves the code rows plain");
+    /// Whether `key`'s claim is let go within `limit`. Polled, because the claim drops
+    /// just AFTER the send the caller has seen arrive.
+    fn released_within(inflight: &InflightKeys, key: &DiffCacheKey, limit: Duration) -> bool {
+        let t = std::time::Instant::now();
+        while lock_inflight(inflight).contains(key) {
+            if t.elapsed() > limit {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
     }
 
-    /// End to end: a tokenizer that is gone makes the worker colour the row itself.
+    /// Handed off, the warm comes back from the TOKENIZER — coloured — and its claim is
+    /// free only once it has. The tokenizer delivers on a channel of its own here, so a
+    /// result the worker coloured and sent inline cannot pass for one it handed off.
     #[test]
-    fn a_warm_with_the_tokenizer_gone_colours_inline() {
-        let (colour, gone) = mpsc::sync_channel(1);
-        drop(gone);
-        let (outcome, coloured) = warm_highlighted_via(colour);
-        assert!(matches!(outcome, Outcome::Warmed { .. }));
-        assert!(coloured > 0, "the inline fallback coloured the code rows");
+    fn a_handed_off_warm_is_delivered_coloured_by_the_tokenizer_then_unclaimed() {
+        let (tokenizer_tx, tokenizer_rx) = mpsc::channel();
+        let warm = start_highlighted_warm(|_| {
+            spawn_colour_service(&tokenizer_tx, &egui::Context::default(), &Arc::default())
+                .expect("the tokenizer spawns")
+        });
+        assert!(matches!(warm.outcome, Outcome::Warmed { .. }));
+        let data = tokenizer_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the tokenizer delivers the warm")
+            .data;
+        assert!(
+            warm.rx.try_recv().is_err(),
+            "the worker sent nothing itself: it handed the warm off"
+        );
+        assert!(!data.lines.is_empty(), "control: the fixture has rows");
+        assert!(
+            coloured_rows(&data) > 0,
+            "the tokenizer coloured the code rows"
+        );
+        assert!(
+            released_within(&warm.inflight, &warm.key, Duration::from_secs(1)),
+            "the claim goes once the result is sent"
+        );
     }
 
-    /// Handed off, the diff comes back coloured by the tokenizer thread.
+    /// A tokenizer that has gone means colouring inline on the worker, as with no
+    /// tokenizer at all.
     #[test]
-    fn a_handed_off_warm_comes_back_coloured() {
-        let colour = spawn_colour_service().expect("the tokenizer thread spawns");
-        let hl = Arc::new(crate::highlight::test_highlighter());
-        let mut data = rust_diff();
-        let handoff = colour_elsewhere(&colour, &hl, &mut data, Duration::from_secs(5));
-        assert!(matches!(handoff, Handoff::Coloured(Some(_), _)));
-        assert!(data.spans.get(1).is_some(), "the code row has spans");
+    fn a_lost_tokenizer_means_colouring_inline() {
+        let warm = start_highlighted_warm(|_| {
+            let (colour, gone) = mpsc::channel();
+            drop(gone);
+            colour
+        });
+        assert!(matches!(warm.outcome, Outcome::Warmed { .. }));
+        let data = warm
+            .rx
+            .try_recv()
+            .expect("sent by the worker itself, before warm_row returned")
+            .data;
+        assert!(
+            coloured_rows(&data) > 0,
+            "the inline fallback coloured the code rows"
+        );
+        assert!(
+            !lock_inflight(&warm.inflight).contains(&warm.key),
+            "released by the worker, after its send"
+        );
+    }
+
+    /// A handed-off warm still waiting for the tokenizer stays CLAIMED — so no dispatch
+    /// can build it twice — and a tokenizer that exits with it still queued delivers it
+    /// uncoloured rather than losing it.
+    #[test]
+    fn a_waiting_warm_stays_claimed_and_an_exiting_tokenizer_still_delivers_it() {
+        let (colour, waiting) = mpsc::channel();
+        let warm = start_highlighted_warm(|_| colour);
+        assert!(matches!(warm.outcome, Outcome::Warmed { .. }));
+        assert!(warm.rx.try_recv().is_err(), "the worker did not deliver it");
+        assert!(
+            lock_inflight(&warm.inflight).contains(&warm.key),
+            "held while it waits"
+        );
+        drop(Tokenizer {
+            rx: Arc::new(Mutex::new(waiting)),
+            queue: ColourQueue::default(),
+            anchor: Arc::default(),
+            tx: warm.tx.clone(),
+            ctx: egui::Context::default(),
+        });
+        let data = warm
+            .rx
+            .try_recv()
+            .expect("delivered as the tokenizer went")
+            .data;
+        assert_eq!(coloured_rows(&data), 0, "uncoloured");
+        assert!(!lock_inflight(&warm.inflight).contains(&warm.key));
+    }
+
+    /// A built warm of commit-list row `row`, as a worker hands it off, holding a claim
+    /// on `key` in `inflight`.
+    fn colour_job(inflight: &InflightKeys, key: &DiffCacheKey, row: usize) -> ColourJob {
+        ColourJob {
+            key: key.clone(),
+            data: rust_diff(),
+            hl: Arc::new(highlight::test_highlighter()),
+            budget: Duration::from_secs(5),
+            row,
+            built: Duration::ZERO,
+            handed_at: std::time::Instant::now(),
+            claim: InflightClaim::try_claim(inflight, key.clone()).unwrap(),
+        }
+    }
+
+    /// An evicted warm is delivered, uncoloured, and then unclaimed; with the UI gone
+    /// there is nowhere to deliver it, and the claim still goes.
+    #[test]
+    fn an_evicted_warm_is_delivered_uncoloured_and_its_claim_released() {
+        let inflight = InflightKeys::default();
+        let key = heavy_target(1).key;
+        let (tx, rx) = mpsc::channel();
+        let ctx = egui::Context::default();
+        deliver(
+            &tx,
+            &ctx,
+            colour_job(&inflight, &key, 9),
+            Delivered::Evicted(9),
+        );
+        let got = rx.try_recv().expect("an evicted warm is still delivered");
+        assert!(got.key == key, "the warm handed off is the one delivered");
+        assert_eq!(coloured_rows(&got.data), 0, "uncoloured");
+        assert!(!lock_inflight(&inflight).contains(&key), "released after");
+
+        drop(rx);
+        deliver(
+            &tx,
+            &ctx,
+            colour_job(&inflight, &key, 9),
+            Delivered::Evicted(9),
+        );
+        assert!(
+            !lock_inflight(&inflight).contains(&key),
+            "the UI gone, the claim is not leaked"
+        );
+    }
+
+    /// A tokenizer that delivers on `tx`, ranks against `anchor`, and has no worker
+    /// left to hand it anything.
+    fn idle_tokenizer(tx: &mpsc::Sender<WarmResult>, anchor: usize) -> Tokenizer {
+        Tokenizer {
+            rx: Arc::new(Mutex::new(mpsc::channel().1)),
+            queue: ColourQueue::default(),
+            anchor: Arc::new(AtomicUsize::new(anchor)),
+            tx: tx.clone(),
+            ctx: egui::Context::default(),
+        }
+    }
+
+    /// A handed-off warm the tokenizer's full queue pushes out is DELIVERED, uncoloured,
+    /// and unclaimed — the eviction is a delivery path, not a drop — while the warms it
+    /// kept stay claimed.
+    #[test]
+    fn a_warm_evicted_from_the_tokenizers_queue_arrives_uncoloured_and_unclaimed() {
+        let inflight = InflightKeys::default();
+        let (tx, rx) = mpsc::channel();
+        let mut tokenizer = idle_tokenizer(&tx, 0);
+        let kept: Vec<DiffCacheKey> = (0..TOKENIZER_QUEUE_CAP)
+            .map(|row| heavy_target(u32::try_from(row).unwrap()).key)
+            .collect();
+        for (row, key) in kept.iter().enumerate() {
+            tokenizer.accept(colour_job(&inflight, key, row));
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "control: nothing evicted under the cap"
+        );
+        let far = heavy_target(1000).key;
+        tokenizer.accept(colour_job(&inflight, &far, 1000));
+        let got = rx.try_recv().expect("the evicted warm is delivered");
+        assert!(got.key == far, "the farthest warm is the one evicted");
+        assert_eq!(coloured_rows(&got.data), 0, "uncoloured");
+        assert!(!lock_inflight(&inflight).contains(&far), "and unclaimed");
+        assert!(rx.try_recv().is_err(), "exactly one delivered");
+        assert!(
+            kept.iter().all(|k| lock_inflight(&inflight).contains(k)),
+            "the queued warms stay claimed"
+        );
+    }
+
+    /// A tokenizer dropped with warms in its QUEUE — accepted, not yet coloured —
+    /// delivers each of them, uncoloured, and lets each claim go.
+    #[test]
+    fn an_exiting_tokenizer_delivers_the_warms_in_its_queue() {
+        let inflight = InflightKeys::default();
+        let (tx, rx) = mpsc::channel();
+        let mut tokenizer = idle_tokenizer(&tx, 0);
+        let keys: Vec<DiffCacheKey> = (1..=3).map(|n| heavy_target(n).key).collect();
+        for (row, key) in keys.iter().enumerate() {
+            tokenizer.accept(colour_job(&inflight, key, row));
+        }
+        assert!(rx.try_recv().is_err(), "control: all three are queued");
+        drop(tokenizer);
+        let got: Vec<WarmResult> = rx.try_iter().collect();
+        assert_eq!(got.len(), keys.len(), "each queued warm delivered once");
+        for key in &keys {
+            let result = got.iter().find(|r| r.key == *key).expect("delivered");
+            assert_eq!(coloured_rows(&result.data), 0, "uncoloured");
+            assert!(!lock_inflight(&inflight).contains(key), "and unclaimed");
+        }
     }
 
     #[test]
@@ -2676,7 +3087,7 @@ mod tests {
             },
             scope,
             depth: WarmDepth::DiffOnly,
-            distance: 0,
+            row: 0,
         });
         pool.submit(band, None);
 
@@ -2839,6 +3250,36 @@ mod tests {
         }
     }
 
+    /// `aim` is what the tokenizer ranks against: whatever the UI published last is the
+    /// anchor the next pop is ordered by, with no band submitted in between.
+    #[test]
+    fn aim_is_what_the_tokenizer_ranks_its_queue_against() {
+        let (coord_tx, _coord_rx) = mpsc::channel();
+        let pool = PoolHandle {
+            tx: coord_tx,
+            anchor: Arc::default(),
+        };
+        let inflight = InflightKeys::default();
+        let (tx, _rx) = mpsc::channel();
+        let mut tokenizer = idle_tokenizer(&tx, 0);
+        tokenizer.anchor = Arc::clone(&pool.anchor);
+        let keys: Vec<DiffCacheKey> = (1..=3).map(|n| heavy_target(n).key).collect();
+        for (row, key) in [2, 20, 40].into_iter().zip(&keys) {
+            tokenizer.accept(colour_job(&inflight, key, row));
+        }
+        let mut popped = Vec::new();
+        for aim in [41, 1] {
+            pool.aim(aim);
+            let anchor = tokenizer.anchor();
+            popped.push(tokenizer.queue.pop(anchor).map(|job| job.row));
+        }
+        assert_eq!(
+            popped,
+            vec![Some(40), Some(2)],
+            "each pop follows the latest aim"
+        );
+    }
+
     /// A warm's claim lives in its job, not in the coordinator: handing the row out
     /// claims the key, a `Warmed` report does not release it while the job is still
     /// alive somewhere (the colour pass is about to outlive the worker's report), and
@@ -2968,7 +3409,7 @@ mod tests {
             },
             scope: RowScope::new(DiffSource::Commit(oid(n))),
             depth: WarmDepth::DiffOnly,
-            distance: 0,
+            row: 0,
         }
     }
 

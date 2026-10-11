@@ -61,8 +61,8 @@ use history::{
 };
 use prefetch::{
     InflightClaim, InflightKeys, PoolHandle, PrefetchBudget, PrefetchTarget, StatsJob, StatsResult,
-    WarmDisposition, WarmFacts, WarmResult, lock_inflight, prefetch_targets, spawn_prefetch_pool,
-    view_moved_enough, warm_band, warm_disposition,
+    WarmDisposition, WarmFacts, WarmResult, lock_inflight, prefetch_anchor, prefetch_targets,
+    spawn_prefetch_pool, view_moved_enough, warm_band, warm_disposition,
 };
 use textconv::Textconv;
 use workers::{
@@ -5924,12 +5924,12 @@ impl GitkApp {
             let inflight = lock_inflight(&self.inflight_diffs);
             prefetch_targets(&self.commits, sel, &view)
                 .into_iter()
-                .map(|(oid, depth, distance)| PrefetchTarget {
+                .map(|(oid, depth, row)| PrefetchTarget {
                     probed: None,
                     key: self.diff_cache_key(oid),
                     scope: self.row_scope(oid),
                     depth,
-                    distance,
+                    row,
                 })
                 .filter(|t| {
                     !self.diff_cache.contains(&t.key)
@@ -8460,6 +8460,12 @@ impl GitkApp {
         let current_gen = self.diff_generation.current();
         let settled_diff_unwarmed = self.prefetched_gen != current_gen;
         let scrolled_off_band = view_moved_enough(&self.prefetched_view, &self.commit_view_range);
+        // Where the reader is NOW, every frame: the tokenizer ranks its queue against it,
+        // and a dispatch only runs when the band needs re-aiming — arrow-keying within an
+        // already-warm band submits nothing.
+        if let (Some(pool), Some(sel)) = (&self.prefetch_pool, self.selected) {
+            pool.aim(prefetch_anchor(sel, &self.commit_view_range));
+        }
         if settled_diff_unwarmed || scrolled_off_band {
             // Still never compete with the foreground diff's own colouring: the reader
             // is looking at that, not at a row they might scroll to. With syntax OFF
