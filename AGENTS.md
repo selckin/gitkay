@@ -811,7 +811,7 @@ The invariants:
 - **The heavy lane is separate threads, admitted against memory**, with two bounds that
   fail differently: our own commitments against a budget fixed at startup (stops a
   stampede), and one row's need against a live reading (notices a busy machine). Do not
-  swap those pairings — each has already been a bug. **A row that does not RUN must
+  swap those pairings — each has already been a bug. The budget fixed at startup is `HEAVY_SHARE_PERCENT` (25%) of `mem::usable_bytes`, not all of it — measured: with all of it, eight single-blob warms on a 23 GB-spare machine peaked the process at 9.1 GB — and the thread count follows it (`prefetch_heavy_workers`). **A row that does not RUN must
   still log**: everything that runs logs twice and everything that waited logged
   nothing, so a commit left cold — and its stats cell left blank — was indistinguishable
   from one never queued. `report_outstanding` (queue depth, on change) plus a line for

@@ -238,6 +238,18 @@ fn prefetch_worker_count() -> usize {
 /// genuinely short of memory.
 const HEAVY_ROW_NOMINAL_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Share of the memory the machine can spare (`mem::usable_bytes`, which already holds
+/// back 10% of total) that speculative heavy warms may commit at once.
+const HEAVY_SHARE_PERCENT: u64 = 25;
+
+/// The heavy lane's startup budget: a share of `usable`, `None` when there is no reading.
+fn heavy_budget(usable: Option<u64>) -> Option<u64> {
+    let usable = usable?;
+    // Widened so the share is exact (dividing first loses up to 24 bytes) and cannot overflow.
+    let share = u128::from(usable) * u128::from(HEAVY_SHARE_PERCENT) / 100;
+    Some(u64::try_from(share).unwrap_or(u64::MAX))
+}
+
 /// What `heavy_fits` charges a driven row ON TOP of its blob bytes.
 ///
 /// Two sides at `textconv::TEXTCONV_MAX_OUTPUT` — what one conversion can hold live —
@@ -1584,10 +1596,12 @@ pub fn spawn_prefetch_pool(
     // which is what a count chosen up front cannot do.
     // Resolved once, and once only: a budget that moved as the lane's own blobs landed
     // could not be compared against the lane's own commitments without double counting.
-    // `usable_bytes` already holds back 10% of total for the machine.
-    let heavy_budget = mem::usable_bytes();
+    // The lane is budgeted a share (`HEAVY_SHARE_PERCENT`) of what the machine can spare,
+    // fixed at startup: speculative work that may commit all spare memory took a session
+    // to 9.1 GB. `usable_bytes` already holds back 10% of total for the machine.
+    let lane_budget = heavy_budget(mem::usable_bytes());
     let mut heavy: Vec<mpsc::Sender<Job>> = Vec::new();
-    for _ in 0..prefetch_heavy_workers(heavy_budget) {
+    for _ in 0..prefetch_heavy_workers(lane_budget) {
         // Same rule as the pool: the id is where this worker will actually sit, so a
         // skipped spawn cannot shift every later id off its mailbox.
         let k = heavy.len();
@@ -1608,7 +1622,7 @@ pub fn spawn_prefetch_pool(
         reported_outstanding: (0, 0),
         reported_heavy_full: None,
         heavy_outstanding: HashMap::new(),
-        heavy_budget,
+        heavy_budget: lane_budget,
         busy_stats: HashSet::new(),
         warmed: 0,
         line_budget: budget.line_budget,
@@ -1633,7 +1647,7 @@ pub fn spawn_prefetch_pool(
     log::debug!(
         "prefetch: pool started with {started} workers + {heavy_started} on the heavy lane \
          (budget {})",
-        heavy_budget.map_or_else(
+        lane_budget.map_or_else(
             || "unknown".to_owned(),
             |b| format!("{}MB", b / 1024 / 1024)
         )
@@ -4328,6 +4342,31 @@ mod tests {
             assert!(heavy >= 1, "the lane must be able to drain, at {budget:?}");
             assert!(heavy <= pool, "{heavy} heavy of {pool} pool, at {budget:?}");
         }
+    }
+
+    /// Speculative heavy warms get a share of the spare memory, not all of it: on a
+    /// machine with 23 GB to spare, eight 556 MB-a-side warms were admitted at once and
+    /// the process peaked at 9.1 GB.
+    #[test]
+    fn the_heavy_lane_is_budgeted_a_share_of_spare_memory() {
+        const GB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(heavy_budget(Some(24 * GB)), Some(6 * GB));
+        assert_eq!(
+            heavy_budget(None),
+            None,
+            "no reading stays unbounded, as before"
+        );
+        assert_eq!(
+            heavy_budget(Some(u64::MAX)),
+            Some(u64::MAX / 4),
+            "no overflow"
+        );
+        // The thread count follows the budget, never below one.
+        assert_eq!(
+            prefetch_heavy_workers(heavy_budget(Some(24 * GB))),
+            6.min(prefetch_worker_count())
+        );
+        assert_eq!(prefetch_heavy_workers(heavy_budget(Some(GB))), 1);
     }
 
     /// A machine short of memory gets fewer threads, not eight it can never keep busy.
