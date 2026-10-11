@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 mod anchor;
 mod convert;
+mod lines;
 mod side;
 mod wrap;
 
@@ -20,6 +21,9 @@ use convert::{
     ConvertCtx, DEFAULT_PREFIXES, DeltaDrivers, DeltaModes, HeaderOf, Substitution, delta_modes,
     delta_path, emit_converted, header_prefixes, modes_from_header, move_to_end, side_path_bytes,
 };
+#[cfg(test)]
+pub use lines::views;
+pub use lines::{DiffLines, LineRef};
 pub use side::{DiffSide, RowMap, SideIndex};
 pub use wrap::{RowSlice, WrapIndex, WrapKey};
 
@@ -316,7 +320,7 @@ const PER_ROW_CHUNK: usize = 4096;
 /// colour across a revisit.
 pub type RowSpans = PerRow<Vec<highlight::Span>>;
 
-/// Per-row word-diff emphasis: changed byte ranges within `DiffLine::body()`. Unset ⇒
+/// Per-row word-diff emphasis: changed byte ranges within `LineRef::body()`. Unset ⇒
 /// the lazy per-viewport pass has not reached this row — and, for the first row of a
 /// change block, that its block has not been decided either: `emphasize_rows` writes a
 /// whole-block alignment into every row of the block at once, so that one slot is what
@@ -428,6 +432,11 @@ impl<T> PerRow<Vec<T>> {
     }
 }
 
+/// One row as a build PUSHES it — the input type. A built diff's rows are read
+/// through `DiffLines` (`line(i)` gives a `LineRef`, `kind(i)`/`text(i)` a field), and
+/// the fields here are private to `diff` so nothing outside it reads a stored row any
+/// other way: that is what lets the representation behind `DiffLines` change without
+/// a reader noticing.
 #[derive(Clone)]
 pub struct DiffLine {
     /// The line text, shared (`Arc`) so handing the diff to the highlight worker
@@ -439,8 +448,8 @@ pub struct DiffLine {
     /// of behind a second pointer, which is ONE allocation per row rather than two on
     /// the hottest path in the build, and ~24 B less heap per row (1.8GB on a
     /// 76.5M-line diff) against 8 B more in the row itself.
-    pub text: Arc<str>,
-    pub kind: LineKind,
+    text: Arc<str>,
+    kind: LineKind,
     /// This row's line numbers in the pre- and post-image, straight from git2's
     /// own `DiffLine` — the stable identity a scroll anchor re-finds a line by
     /// after a settings change reshapes the diff. `NonZeroU32` because git's
@@ -451,8 +460,8 @@ pub struct DiffLine {
     /// Structural rows carry `None` on both — and so do git's EOF/binary marker
     /// rows, which are `LineKind::Context` but are filtered out by origin in
     /// `append_diff_body`.
-    pub old_lineno: Option<NonZeroU32>,
-    pub new_lineno: Option<NonZeroU32>,
+    old_lineno: Option<NonZeroU32>,
+    new_lineno: Option<NonZeroU32>,
 }
 
 impl DiffLine {
@@ -469,8 +478,8 @@ impl DiffLine {
         }
     }
 
-    /// `new` plus git's line numbers for a patch row. Only `append_diff_body`
-    /// calls it — every structural construction site (the header builders, the
+    /// `new` plus git's line numbers for a patch row. Only `append_diff_body` and the
+    /// store's decode call it — every structural construction site (the header builders, the
     /// stat block, the blanks, the test fixtures) keeps `new` and its
     /// `None`/`None`, which is what keeps a two-field addition from becoming a
     /// sweep of the whole module.
@@ -484,55 +493,6 @@ impl DiffLine {
             old_lineno,
             new_lineno,
             ..Self::new(text, kind)
-        }
-    }
-
-    /// The line text without its leading `+`/`-` diff marker. Only Add/Del lines
-    /// carry a marker (git's origin char is excluded from context-line content),
-    /// so this strips exactly one byte for those and returns the full text
-    /// otherwise. The single authoritative place that knows the marker shape.
-    pub fn body(&self) -> &str {
-        match self.kind {
-            LineKind::Add | LineKind::Del => &self.text[1..],
-            _ => &self.text,
-        }
-    }
-
-    /// The text a row actually DRAWS, after the line-number gutter and the `+`/`-`
-    /// marker column that `diff_row_job` synthesizes in front of it: a code row's
-    /// body, and the whole line for every structural row (which has no marker
-    /// column).
-    ///
-    /// The one place that rule lives. `diff_row_job` appends this and `wrap`
-    /// measures and slices it, so a line can never be wrapped at a width it is not
-    /// drawn at — a mismatch there would put a row's tail in the row below it.
-    pub fn rendered(&self) -> &str {
-        if self.kind.is_code() {
-            self.body()
-        } else {
-            &self.text
-        }
-    }
-
-    /// This row's number on `side`, or `None` when it has none there.
-    pub const fn lineno_on(&self, side: AnchorSide) -> Option<NonZeroU32> {
-        match side {
-            AnchorSide::Old => self.old_lineno,
-            AnchorSide::New => self.new_lineno,
-        }
-    }
-
-    /// The row's preferred anchor identity: its post-image number when it has
-    /// one (context and additions), else its pre-image one (deletions). `None`
-    /// for every row that carries no number — the structural rows and git's
-    /// EOF/binary markers — which is exactly the set anchoring must skip, stated
-    /// once as a property of the data rather than as a second classification
-    /// that could drift from it.
-    pub const fn anchor_point(&self) -> Option<(AnchorSide, NonZeroU32)> {
-        match (self.new_lineno, self.old_lineno) {
-            (Some(n), _) => Some((AnchorSide::New, n)),
-            (None, Some(o)) => Some((AnchorSide::Old, o)),
-            (None, None) => None,
         }
     }
 }
@@ -550,9 +510,9 @@ impl DiffLine {
 /// is-it-on test beside the one that picks the value.
 ///
 /// Nothing here is a diff SETTING: the numbers come from data every built diff
-/// already carries (`DiffLine::old_lineno`/`new_lineno`, recorded for the scroll
-/// anchor and encoded in the persistent store), so turning the gutter on changes
-/// no diff, no cache key and no stored entry.
+/// already carries (`DiffLines::linenos`, recorded for the scroll anchor and
+/// encoded in the persistent store), so turning the gutter on changes no diff, no
+/// cache key and no stored entry.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LineNoGutter {
     old: usize,
@@ -566,13 +526,14 @@ impl LineNoGutter {
     ///
     /// ONE pass for both sides: this runs on the UI thread at every install,
     /// including the cache hits and store loads that had no build to hide behind.
-    pub fn measure(lines: &[DiffLine]) -> Self {
+    pub fn measure(lines: &DiffLines) -> Self {
         let (mut old, mut new) = (0, 0);
-        for l in lines {
-            if let Some(n) = l.old_lineno {
+        for i in 0..lines.len() {
+            let (o, n) = lines.linenos(i);
+            if let Some(n) = o {
                 old = old.max(n.get());
             }
-            if let Some(n) = l.new_lineno {
+            if let Some(n) = n {
                 new = new.max(n.get());
             }
         }
@@ -608,7 +569,7 @@ impl LineNoGutter {
     /// columns, blank where the row has none (an addition has no pre-image
     /// number, a hunk header has neither). Emits either nothing — for a row above
     /// the first file — or exactly `chars()` characters.
-    pub fn write(self, line: &DiffLine, out: &mut String) {
+    pub fn write(self, line: LineRef<'_>, out: &mut String) {
         if !line.kind.in_patch() {
             return;
         }
@@ -624,7 +585,7 @@ impl LineNoGutter {
     /// the first file, `chars()` characters inside a patch — because both ask
     /// `in_patch` and both size from `chars`. A blank of the wrong width would
     /// step the wrapped body out of the column its first row set.
-    pub fn blank(self, line: &DiffLine, out: &mut String) {
+    pub fn blank(self, line: LineRef<'_>, out: &mut String) {
         if !line.kind.in_patch() {
             return;
         }
@@ -695,7 +656,7 @@ const STAT_WIDTH: usize = 80;
 /// removes the case that does not need the walk at all.
 ///
 /// `lines` is read, never written: emphasis lands in `emph`, indexed by row.
-pub fn emphasize_rows(lines: &[DiffLine], emph: &mut RowEmphasis, rows: std::ops::Range<usize>) {
+pub fn emphasize_rows(lines: &DiffLines, emph: &mut RowEmphasis, rows: std::ops::Range<usize>) {
     let (lo, hi) = (rows.start.min(lines.len()), rows.end.min(lines.len()));
     if lo >= hi {
         return;
@@ -711,33 +672,30 @@ pub fn emphasize_rows(lines: &[DiffLine], emph: &mut RowEmphasis, rows: std::ops
     // whole-block path writes emphasis into EVERY row of a block it decides, including
     // rows far outside the window, so "a pair is only written when one of its two rows is
     // in the window" stopped being the reason this is safe.
-    if !lines[lo..hi]
-        .iter()
-        .any(|l| matches!(l.kind, LineKind::Del | LineKind::Add))
-    {
+    if !(lo..hi).any(|i| matches!(lines.kind(i), LineKind::Del | LineKind::Add)) {
         return;
     }
     let mut i = lo;
-    while i > 0 && matches!(lines[i - 1].kind, LineKind::Del | LineKind::Add) {
+    while i > 0 && matches!(lines.kind(i - 1), LineKind::Del | LineKind::Add) {
         i -= 1;
     }
     let mut end = hi;
-    while end < lines.len() && matches!(lines[end].kind, LineKind::Del | LineKind::Add) {
+    while end < lines.len() && matches!(lines.kind(end), LineKind::Del | LineKind::Add) {
         end += 1;
     }
     // Cells this pass has already committed to. See `MAX_PASS_CELLS`.
     let mut spent = 0usize;
     while i < end {
-        if lines[i].kind != LineKind::Del {
+        if lines.kind(i) != LineKind::Del {
             i += 1;
             continue;
         }
         let del_start = i;
-        while i < end && lines[i].kind == LineKind::Del {
+        while i < end && lines.kind(i) == LineKind::Del {
             i += 1;
         }
         let add_start = i;
-        while i < end && lines[i].kind == LineKind::Add {
+        while i < end && lines.kind(i) == LineKind::Add {
             i += 1;
         }
         // A block always opens with a Del run (the walk above skips anything else), so
@@ -824,7 +782,7 @@ pub fn emphasize_rows(lines: &[DiffLine], emph: &mut RowEmphasis, rows: std::ops
             // left unset, so the window does not re-consider it every frame.
             let (de, ae) = match align_cells(lines, d..d + 1, a..a + 1) {
                 Some(cells) if spend(&mut spent, cells) => {
-                    word_diff::line_emphasis(lines[d].body(), lines[a].body())
+                    word_diff::line_emphasis(lines.line(d).body(), lines.line(a).body())
                 }
                 // Over the pass budget rather than unaffordable in itself: leave it
                 // unset so a later frame computes it, instead of deciding it empty.
@@ -865,7 +823,7 @@ const fn spend(spent: &mut usize, cells: usize) -> bool {
 }
 
 /// The table `word_diff` would fill for these two runs, or `None` where it refuses them —
-/// `word_diff`'s whole question, asked over `DiffLine`s. One predicate and one call, so
+/// `word_diff`'s whole question, asked over a diff's rows. One predicate and one call, so
 /// the block path and the 1:1 pair path cannot come to different answers about the same
 /// rows, and so the ORDER stays right: weighing short-circuits on the first row that
 /// busts the budget, where a per-row scan would walk a million-row block to the end
@@ -880,7 +838,7 @@ const fn spend(spent: &mut usize, cells: usize) -> bool {
 /// is refused whatever its bodies hold, in O(1), before a body is read at all; asked
 /// outside, a later caller gets the expensive form and silently loses it.
 fn align_cells(
-    lines: &[DiffLine],
+    lines: &DiffLines,
     del: std::ops::Range<usize>,
     add: std::ops::Range<usize>,
 ) -> Option<usize> {
@@ -891,16 +849,17 @@ fn align_cells(
         return None;
     }
     let weigh = |rows: std::ops::Range<usize>| {
-        word_diff::SideWeight::of(lines[rows].iter().map(|l| l.body().len()))
+        // A block's rows are all Add or Del, whose rendered text IS their body.
+        word_diff::SideWeight::of(rows.map(|i| lines.rendered_len(i)))
     };
     let (d, a) = (weigh(del), weigh(add));
     word_diff::alignment_fits(d, a).then(|| word_diff::alignment_cells(d, a))
 }
 
 /// The bodies of `rows`, for handing a block to `word_diff` — which knows `&str` and
-/// deliberately nothing about `DiffLine`.
-fn bodies(lines: &[DiffLine], rows: std::ops::Range<usize>) -> Vec<&str> {
-    lines[rows].iter().map(DiffLine::body).collect()
+/// deliberately nothing about `DiffLines`.
+fn bodies(lines: &DiffLines, rows: std::ops::Range<usize>) -> Vec<&str> {
+    lines.range(rows).map(LineRef::body).collect()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1002,7 +961,7 @@ pub struct FileEntry {
 /// precomputed width and the textconv flag. Named because a five-value tuple in a
 /// signature says nothing about which value is which.
 pub type DiffParts = (
-    Arc<Vec<DiffLine>>,
+    Arc<DiffLines>,
     RowSpans,
     Arc<Vec<FileEntry>>,
     usize,
@@ -1016,7 +975,7 @@ pub struct DiffData {
     /// so the pane, the cache and the highlight worker all hold the same allocation and
     /// every hand-off between them is a refcount bump. `order_files` is the one thing
     /// that writes them afterwards, through `Arc::make_mut`.
-    pub lines: Arc<Vec<DiffLine>>,
+    pub lines: Arc<DiffLines>,
     /// The rows' syntax spans, indexed alongside `lines`. Part of the diff because the
     /// LRU deliberately hands a revisited commit its colour back (see
     /// `install_preferring_cache`); deliberately NOT part of the persistent store,
@@ -1070,19 +1029,6 @@ pub struct DiffData {
     pub row_bytes: usize,
 }
 
-/// What a row array holds on the heap. `text.len()` comes off the fat pointer, so this
-/// reads the row structs and never the text — one pass over memory the build just wrote.
-// capacity() is what is being measured; a slice has none
-#[allow(clippy::ptr_arg)]
-fn rows_heap_bytes(lines: &Vec<DiffLine>) -> usize {
-    const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
-    lines.capacity() * std::mem::size_of::<DiffLine>()
-        + lines
-            .iter()
-            .map(|l| ARC_HEADER + l.text.len())
-            .sum::<usize>()
-}
-
 impl DiffData {
     /// Approximate heap bytes held: rows (measured at assembly), spans (kept by
     /// `PerRow`), and the file list. The diff cache's weight. O(files).
@@ -1109,8 +1055,8 @@ impl DiffData {
     /// over.
     #[cfg(test)]
     pub fn new(lines: Vec<DiffLine>, files: Vec<FileEntry>) -> Self {
-        let max_chars = lines.iter().map(row_chars).max().unwrap_or(0);
-        Self::with_max_chars(lines, files, max_chars)
+        let max_chars = lines.iter().map(|l| row_chars(&l.text)).max().unwrap_or(0);
+        Self::with_max_chars(lines.into(), files, max_chars)
     }
 
     /// Finalize a diff whose widest line is already known: the build path, where
@@ -1130,8 +1076,8 @@ impl DiffData {
     /// stating `false` here laundered a transient textconv failure straight past
     /// `cache_diff`'s guard and back into the LRU, for the one diff most likely to be
     /// revisited.
-    pub fn with_max_chars(lines: Vec<DiffLine>, files: Vec<FileEntry>, max_chars: usize) -> Self {
-        let row_bytes = rows_heap_bytes(&lines);
+    pub fn with_max_chars(lines: DiffLines, files: Vec<FileEntry>, max_chars: usize) -> Self {
+        let row_bytes = lines.heap_bytes();
         Self {
             // The one place a diff's span slots are allocated against its rows, which
             // is what keeps "index i means row i" true for everything downstream.
@@ -1183,7 +1129,7 @@ impl DiffData {
     // the exhaustive mirror of into_parts; a struct here would be a second DiffData
     #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
-        lines: Arc<Vec<DiffLine>>,
+        lines: Arc<DiffLines>,
         spans: RowSpans,
         files: Arc<Vec<FileEntry>>,
         max_chars: usize,
@@ -1213,7 +1159,7 @@ impl DiffData {
     /// An empty diff — returned when a git2 operation fails (the error is logged
     /// at the call site before returning this).
     pub fn empty() -> Self {
-        Self::with_max_chars(Vec::new(), Vec::new(), 0)
+        Self::with_max_chars(DiffLines::default(), Vec::new(), 0)
     }
 
     /// Did the build that produced this fail? A real build always has rows — at least
@@ -1254,8 +1200,8 @@ pub const fn common_dir_prefix_len(a: &str, b: &str) -> usize {
 
 /// One row's width in characters. NOT `text.len()`: that is exact for ASCII and three
 /// times too wide for CJK, and this value sizes the horizontal scroll range.
-fn row_chars(line: &DiffLine) -> usize {
-    line.text.chars().count()
+fn row_chars(text: &str) -> usize {
+    text.chars().count()
 }
 
 /// Fold one row into a running widest-row maximum.
@@ -1268,7 +1214,7 @@ fn row_chars(line: &DiffLine) -> usize {
 /// used to decode every character of every row pushed.
 fn widen(max: &mut usize, line: &DiffLine) {
     if line.text.len() > *max {
-        *max = (*max).max(row_chars(line));
+        *max = (*max).max(row_chars(&line.text));
     }
 }
 
@@ -2883,7 +2829,7 @@ pub fn build_diff_data<'r>(
     DiffData {
         textconv_failed: failed,
         tabless,
-        ..DiffData::with_max_chars(lines, files, max_chars)
+        ..DiffData::with_max_chars(DiffLines::from(lines), files, max_chars)
     }
 }
 
@@ -4013,7 +3959,7 @@ pub fn file_line_starts(files: &[FileEntry]) -> Vec<(usize, usize)> {
 /// order) and the two flat layouts (whose order is the identity by construction) both
 /// pay an O(files) scan and nothing more.
 pub fn order_files(
-    lines: &mut Arc<Vec<DiffLine>>,
+    lines: &mut Arc<DiffLines>,
     spans: &mut RowSpans,
     files: &mut Arc<Vec<FileEntry>>,
     order: &[usize],
@@ -4050,7 +3996,7 @@ pub fn order_files(
     // Past every refusal, so take the write handles only now: an identity re-lay — every
     // cache hit, every flat layout — must not clone a row array the highlight worker is
     // reading. When it does clone, the rows are 32 B apiece and their text is shared.
-    let lines = Arc::make_mut(lines);
+    let lines = Arc::make_mut(lines).rows_mut();
     let files = Arc::make_mut(files);
 
     // Rows are MOVED, never cloned: wrapping in `Option` (free — `Arc<str>`'s niche
@@ -4182,11 +4128,11 @@ pub fn parse_hunk_header(text: &str) -> Option<HunkRange> {
 /// in a file's header block never inherits the previous file's hunk. `None` ⇒ the
 /// row has no hunk to act on.
 #[must_use]
-pub fn hunk_at_line(lines: &[DiffLine], line: usize) -> Option<HunkRange> {
+pub fn hunk_at_line(lines: &DiffLines, line: usize) -> Option<HunkRange> {
     let mut i = line.min(lines.len().checked_sub(1)?);
     loop {
-        match lines[i].kind {
-            LineKind::Hunk => return parse_hunk_header(&lines[i].text),
+        match lines.kind(i) {
+            LineKind::Hunk => return parse_hunk_header(lines.text(i)),
             // File header / commit header: we've left the hunk body.
             LineKind::FileMeta | LineKind::FileName | LineKind::Meta | LineKind::Stat => {
                 return None;
@@ -4239,20 +4185,15 @@ pub mod tests {
     use crate::test_repo::file_entry as fe;
 
     fn text_row(text: &str) -> DiffLine {
-        DiffLine {
-            text: Arc::from(text),
-            kind: LineKind::Context,
-            old_lineno: None,
-            new_lineno: None,
-        }
+        DiffLine::new(text, LineKind::Context)
     }
 
     #[test]
     fn heap_bytes_weighs_long_lines_by_their_text() {
-        let short = DiffData::with_max_chars(vec![text_row("x"); 2], vec![], 1);
+        let short = DiffData::with_max_chars(vec![text_row("x"); 2].into(), vec![], 1);
         let long_text = "y".repeat(1 << 20);
         let long = DiffData::with_max_chars(
-            vec![text_row("x"), text_row(&long_text)],
+            vec![text_row("x"), text_row(&long_text)].into(),
             vec![],
             long_text.len(),
         );
@@ -4266,7 +4207,7 @@ pub mod tests {
 
     #[test]
     fn heap_bytes_counts_spans_once_set() {
-        let mut d = DiffData::with_max_chars(vec![text_row("abc"); 4], vec![], 3);
+        let mut d = DiffData::with_max_chars(vec![text_row("abc"); 4].into(), vec![], 3);
         let bare = d.heap_bytes();
         d.spans.set(0, vec![(egui::Color32::RED, 0..3); 10]);
         assert!(d.heap_bytes() >= bare + 10 * std::mem::size_of::<highlight::Span>());
@@ -4274,7 +4215,7 @@ pub mod tests {
 
     #[test]
     fn row_bytes_survives_the_display_round_trip() {
-        let d = DiffData::with_max_chars(vec![text_row("hello"); 3], vec![], 5);
+        let d = DiffData::with_max_chars(vec![text_row("hello"); 3].into(), vec![], 5);
         let before = d.heap_bytes();
         let (lines, spans, files, max_chars, failed, tabless, row_bytes) = d.into_parts();
         let back = DiffData::from_parts(lines, spans, files, max_chars, failed, tabless, row_bytes);
@@ -4460,7 +4401,7 @@ pub mod tests {
             ..base_settings()
         };
         let data = diff_of(&repo, oid, s, None);
-        let stat: Vec<&DiffLine> = data
+        let stat: Vec<LineRef<'_>> = data
             .lines
             .iter()
             .filter(|l| l.kind == LineKind::Stat)
@@ -4473,7 +4414,7 @@ pub mod tests {
         // And each file's recorded patch position still points at its own header.
         for f in data.files.iter() {
             let at = f.diff_line_idx.expect("every fixture file has a body");
-            assert_eq!(data.lines[at].kind, LineKind::FileMeta, "{}", f.path);
+            assert_eq!(data.lines.kind(at), LineKind::FileMeta, "{}", f.path);
         }
     }
 
@@ -4749,7 +4690,11 @@ pub mod tests {
             let data = diff_of(&repo, oid, s, None);
             assert_eq!(
                 data.max_chars,
-                data.lines.iter().map(row_chars).max().unwrap_or(0),
+                data.lines
+                    .iter()
+                    .map(|l| row_chars(l.text))
+                    .max()
+                    .unwrap_or(0),
                 "show_stats={show_stats}"
             );
             assert!(data.max_chars > 0, "control: the fixture has rows");
@@ -4930,7 +4875,10 @@ pub mod tests {
             lines.rotate_left(widest);
             rows.extend(lines);
             let (lines, max_chars, _) = rows.finish();
-            assert_eq!(max_chars, lines.iter().map(row_chars).max().unwrap());
+            assert_eq!(
+                max_chars,
+                lines.iter().map(|l| row_chars(&l.text)).max().unwrap()
+            );
             assert_eq!(max_chars, 21);
         }
     }
@@ -4950,7 +4898,10 @@ pub mod tests {
         rows.rewind(mark);
         assert_eq!(rows.len(), 1);
         let (lines, max_chars, _) = rows.finish();
-        assert_eq!(max_chars, lines.iter().map(row_chars).max().unwrap());
+        assert_eq!(
+            max_chars,
+            lines.iter().map(|l| row_chars(&l.text)).max().unwrap()
+        );
     }
 
     /// A reserved row is measured when it is WRITTEN, not when it is reserved: the
@@ -4964,7 +4915,10 @@ pub mod tests {
         assert_eq!(rows.max_chars, 0, "an empty placeholder widens nothing");
         rows.set(1, DiffLine::new("a filled stat row", LineKind::Stat));
         let (lines, max_chars, _) = rows.finish();
-        assert_eq!(max_chars, lines.iter().map(row_chars).max().unwrap());
+        assert_eq!(
+            max_chars,
+            lines.iter().map(|l| row_chars(&l.text)).max().unwrap()
+        );
         assert_eq!(max_chars, "a filled stat row".len());
     }
 
@@ -5046,7 +5000,7 @@ pub mod tests {
         assert_eq!(paths, ["fresh/dir/deep.txt", "new.txt"]);
         let new = &data.files[1];
         assert_eq!((new.additions, new.deletions), (2, 0));
-        assert!(data.lines.iter().any(|l| &*l.text == "+two"), "shown whole");
+        assert!(data.lines.iter().any(|l| l.text == "+two"), "shown whole");
     }
 
     /// A path filter reaches INTO a new directory: libgit2's listing names the directory
@@ -5067,7 +5021,7 @@ pub mod tests {
         let data = get_working_tree_diff(&repo, base_settings(), &scope, BuildEnv::NONE);
         let paths: Vec<&str> = data.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(paths, ["fresh/dir/deep.txt"]);
-        assert!(data.lines.iter().any(|l| &*l.text == "+deep"));
+        assert!(data.lines.iter().any(|l| l.text == "+deep"));
 
         assert!(worktree_has_changes(&repo, &["fresh/dir".into()]));
         assert!(!worktree_has_changes(&repo, &["nowhere".into()]));
@@ -5166,8 +5120,8 @@ pub mod tests {
         );
         let paths: Vec<&str> = data.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(paths, ["a.txt"]);
-        assert_eq!(&*data.lines[1].text, &*w.notice());
-        assert!(data.lines[1].text.starts_with("Untracked files not shown"));
+        assert_eq!(data.lines.text(1), &*w.notice());
+        assert!(data.lines.text(1).starts_with("Untracked files not shown"));
     }
 
     /// One file can spend the byte budget on its own.
@@ -5379,7 +5333,7 @@ pub mod tests {
             BuildEnv::NONE,
         );
         assert!(data.lines.len() > 600);
-        assert_eq!(data.lines.capacity(), data.lines.len());
+        assert_eq!(data.lines.row_capacity(), data.lines.len());
     }
 
     /// The whole point of the probe: cost tracks BYTES READ, not patch size. A one-line
@@ -5532,10 +5486,10 @@ pub mod tests {
 
         // Context rows carry no marker prefix in gitkay (the origin char is
         // excluded from git2's context content), so " one" would find nothing.
-        let row = |text: &str| -> &DiffLine {
+        let row = |text: &str| -> LineRef<'_> {
             data.lines
                 .iter()
-                .find(|l| &*l.text == text)
+                .find(|l| l.text == text)
                 .unwrap_or_else(|| panic!("no {text:?} row in the patch"))
         };
         let n = std::num::NonZeroU32::new;
@@ -5608,9 +5562,9 @@ pub mod tests {
 
     /// A hand-built patch: three files' worth of shapes in one list, so the
     /// gutter's widths are asked of a whole diff rather than of one file.
-    fn gutter_rows() -> Vec<DiffLine> {
+    fn gutter_rows() -> DiffLines {
         let n = std::num::NonZeroU32::new;
-        vec![
+        DiffLines::from(vec![
             DiffLine::new("commit abc", LineKind::Meta),
             DiffLine::new("", LineKind::Blank),
             DiffLine::new("diff --git a/f b/f", LineKind::FileMeta),
@@ -5620,7 +5574,7 @@ pub mod tests {
             DiffLine::with_linenos("+new", LineKind::Add, None, n(100)),
             // git's EOF marker: Context, but carrying neither number.
             DiffLine::new("\\ No newline at end of file", LineKind::Context),
-        ]
+        ])
     }
 
     /// One width per SIDE per diff, taken from the widest number anywhere in it —
@@ -5634,7 +5588,7 @@ pub mod tests {
         assert_eq!(g.chars(), 3 + 4);
 
         let mut out = String::new();
-        g.write(&gutter_rows()[4], &mut out);
+        g.write(gutter_rows().line(4), &mut out);
         assert_eq!(out, " 9   9 ", "a context row states both sides");
     }
 
@@ -5644,20 +5598,23 @@ pub mod tests {
     #[test]
     fn a_side_no_row_carries_gets_no_column_at_all() {
         let n = std::num::NonZeroU32::new;
-        let rows = vec![
+        let rows = DiffLines::from(vec![
             DiffLine::with_linenos("+one", LineKind::Add, None, n(1)),
             DiffLine::with_linenos("+two", LineKind::Add, None, n(2)),
-        ];
+        ]);
         let g = LineNoGutter::measure(&rows);
         assert_eq!(g.chars(), 2);
         let mut out = String::new();
-        g.write(&rows[0], &mut out);
+        g.write(rows.line(0), &mut out);
         assert_eq!(out, "1 ");
 
         // An empty diff has no gutter at all, which is also what the feature being
         // switched off renders as — the default value, asserted here so the render
         // needs no separate is-it-on branch.
-        assert_eq!(LineNoGutter::measure(&[]), LineNoGutter::default());
+        assert_eq!(
+            LineNoGutter::measure(&DiffLines::default()),
+            LineNoGutter::default()
+        );
         assert_eq!(LineNoGutter::default().chars(), 0);
     }
 
@@ -6041,16 +5998,16 @@ pub mod tests {
             .collect();
         (
             RowSpans::blank(lines.len()),
-            Arc::new(lines),
+            Arc::new(DiffLines::from(lines)),
             Arc::new(files),
         )
     }
 
     /// `paned`'s output: spans first so a caller destructuring it cannot silently swap
     /// the two `Arc`s.
-    pub type Paned = (RowSpans, Arc<Vec<DiffLine>>, Arc<Vec<FileEntry>>);
+    pub type Paned = (RowSpans, Arc<DiffLines>, Arc<Vec<FileEntry>>);
 
-    fn rows(lines: &[DiffLine]) -> Vec<String> {
+    fn rows(lines: &DiffLines) -> Vec<String> {
         lines.iter().map(|l| l.text.to_string()).collect()
     }
 
@@ -6222,7 +6179,7 @@ pub mod tests {
         assert!(order_files(&mut lines, &mut spans, &mut files, &[0, 2, 1]));
 
         for (now, line) in lines.iter().enumerate() {
-            let then = was_at[&*line.text];
+            let then = was_at[line.text];
             assert_eq!(
                 spans.slice(now).first().map(|(_, r)| r.start),
                 Some(then),
@@ -6321,20 +6278,20 @@ pub mod tests {
     }
 
     /// Emphasis slots for a hand-built row list.
-    fn blank_emphasis(lines: &[DiffLine]) -> RowEmphasis {
+    fn blank_emphasis(lines: &DiffLines) -> RowEmphasis {
         RowEmphasis::blank(lines.len())
     }
 
     #[test]
     fn word_emphasis_lazy_by_window_and_memoized() {
         // Two change blocks separated by context.
-        let lines = vec![
+        let lines = DiffLines::from(vec![
             DiffLine::new("-foo bar", LineKind::Del),
             DiffLine::new("+foo baz", LineKind::Add),
             DiffLine::new(" ctx", LineKind::Context),
             DiffLine::new("-a b", LineKind::Del),
             DiffLine::new("+a c", LineKind::Add),
-        ];
+        ]);
         let mut emph = blank_emphasis(&lines);
         // Nothing computes until a window asks for it.
         assert!((0..lines.len()).all(|i| !emph.is_set(i)));
@@ -6359,11 +6316,11 @@ pub mod tests {
     fn word_emphasis_window_extends_to_block_boundaries() {
         // The window covers only the Add half of a pair: the walk must still see
         // the full Del-run above it to pair correctly, and emphasizes both sides.
-        let lines = vec![
+        let lines = DiffLines::from(vec![
             DiffLine::new(" ctx", LineKind::Context),
             DiffLine::new("-foo bar", LineKind::Del),
             DiffLine::new("+foo baz", LineKind::Add),
-        ];
+        ]);
         let mut emph = blank_emphasis(&lines);
         emphasize_rows(&lines, &mut emph, 2..3);
         assert!(emphasized(&emph, 1));
@@ -6375,18 +6332,18 @@ pub mod tests {
         // 1 del, 2 add: there is no 1:1 pairing to be had, and aligning the block whole
         // is what gives it emphasis at all — landing on the row the changed word is on,
         // wherever the rewrap put it.
-        let lines = vec![
+        let lines = DiffLines::from(vec![
             DiffLine::new("-one two three", LineKind::Del),
             DiffLine::new("+one two", LineKind::Add),
             DiffLine::new("+four", LineKind::Add),
-        ];
+        ]);
         let mut emph = blank_emphasis(&lines);
         emphasize_rows(&lines, &mut emph, 0..3);
         let shown = |row: usize| -> Vec<&str> {
             assert!(emph.is_set(row), "row {row} must be computed");
             emph.slice(row)
                 .iter()
-                .map(|r| &lines[row].body()[r.clone()])
+                .map(|r| &lines.line(row).body()[r.clone()])
                 .collect()
         };
         assert_eq!(shown(0), ["three"]);
@@ -6399,12 +6356,12 @@ pub mod tests {
         // ONE contiguous changed region holding two blocks — the walk extends through
         // all of it, so the whole-block path needs a window test of its own: it writes a
         // block at a time, and a large rewritten region holds many blocks.
-        let lines = vec![
+        let lines = DiffLines::from(vec![
             DiffLine::new("-one two", LineKind::Del),
             DiffLine::new("+one three", LineKind::Add),
             DiffLine::new("-four five", LineKind::Del),
             DiffLine::new("+four six", LineKind::Add),
-        ];
+        ]);
         let mut emph = blank_emphasis(&lines);
         emphasize_rows(&lines, &mut emph, 2..4);
         assert!(
@@ -6418,11 +6375,11 @@ pub mod tests {
     fn word_emphasis_leaves_a_pure_deletion_alone() {
         // Nothing to align against: every token would come out changed, so the block is
         // refused by `alignment_fits` on its empty side and NOTHING is emphasized.
-        let lines = vec![
+        let lines = DiffLines::from(vec![
             DiffLine::new("-one two", LineKind::Del),
             DiffLine::new("-three", LineKind::Del),
             DiffLine::new(" ctx", LineKind::Context),
-        ];
+        ]);
         let mut emph = blank_emphasis(&lines);
         emphasize_rows(&lines, &mut emph, 0..3);
         assert!(
@@ -6444,12 +6401,12 @@ pub mod tests {
         // changed", `emphasize_rows` wrote the empty ranges in as the block's decision,
         // the pair path below was unreachable, and this drew NOTHING: emphasis the code
         // had before there was a block path at all.
-        let lines = vec![
+        let lines = DiffLines::from(vec![
             DiffLine::new("-    let a = 1;", LineKind::Del),
             DiffLine::new("-    let b = 2;", LineKind::Del),
             DiffLine::new("+    let x = compute(p, q);", LineKind::Add),
             DiffLine::new("+    let y = compute(r, s);", LineKind::Add),
-        ];
+        ]);
         assert!(
             word_diff::block_emphasis(&bodies(&lines, 0..2), &bodies(&lines, 2..4)).is_none(),
             "control: the whole-block alignment must be what refuses here, or this test \
@@ -6468,12 +6425,12 @@ pub mod tests {
         // be recorded on the block's first row all the same — that slot is what says the
         // block is decided — or every later frame re-tokenizes and re-aligns the whole
         // block to be told the same thing.
-        let lines = vec![
+        let lines = DiffLines::from(vec![
             DiffLine::new("-    let a = 1;", LineKind::Del),
             DiffLine::new("-    let b = 2;", LineKind::Del),
             DiffLine::new("+    let x = compute(p, q);", LineKind::Add),
             DiffLine::new("+    let y = compute(r, s);", LineKind::Add),
-        ];
+        ]);
         let mut emph = blank_emphasis(&lines);
         emphasize_rows(&lines, &mut emph, 1..2);
         assert!(
@@ -6498,10 +6455,12 @@ pub mod tests {
                 texts.push((row('+', "B", block * 2 + i), LineKind::Add));
             }
         }
-        let lines: Vec<DiffLine> = texts
-            .iter()
-            .map(|(t, k)| DiffLine::new(t.as_str(), *k))
-            .collect();
+        let lines: DiffLines = DiffLines::from(
+            texts
+                .iter()
+                .map(|(t, k)| DiffLine::new(t.as_str(), *k))
+                .collect::<Vec<_>>(),
+        );
         // Control: each block is affordable on its own, and two do not fit one pass.
         let cells = align_cells(&lines, 0..2, 2..4).expect("a block must be alignable alone");
         assert!(
@@ -6534,10 +6493,12 @@ pub mod tests {
             .map(|i| (format!("-old {filler} {i}"), LineKind::Del))
             .chain((0..rows).map(|i| (format!("+new {filler} {i}"), LineKind::Add)))
             .collect();
-        let lines: Vec<DiffLine> = texts
-            .iter()
-            .map(|(t, kind)| DiffLine::new(t.as_str(), *kind))
-            .collect();
+        let lines: DiffLines = DiffLines::from(
+            texts
+                .iter()
+                .map(|(t, kind)| DiffLine::new(t.as_str(), *kind))
+                .collect::<Vec<_>>(),
+        );
         // Asked through the gate itself, so the fixture cannot drift away from it.
         assert!(
             align_cells(&lines, 0..rows, rows..lines.len()).is_none(),
@@ -6556,10 +6517,10 @@ pub mod tests {
         // A pair over word_diff::MAX_ROW_BYTES is skipped, but marked computed-empty so
         // the per-frame window doesn't re-consider it forever.
         let long = format!("-{}", "x".repeat(word_diff::MAX_ROW_BYTES + 1));
-        let lines = vec![
+        let lines = DiffLines::from(vec![
             DiffLine::new(long.as_str(), LineKind::Del),
             DiffLine::new("+short", LineKind::Add),
-        ];
+        ]);
         let mut emph = blank_emphasis(&lines);
         emphasize_rows(&lines, &mut emph, 0..2);
         assert_eq!(emph.get(0), Some(&Vec::new()));
@@ -6612,7 +6573,7 @@ pub mod tests {
 
     #[test]
     fn hunk_at_line_finds_the_enclosing_hunk() {
-        let lines = vec![
+        let lines = DiffLines::from(vec![
             DiffLine::new("commit abc", LineKind::Meta),
             DiffLine::new("diff --git a/f b/f", LineKind::FileMeta),
             DiffLine::new("--- a/f", LineKind::FileName),
@@ -6621,7 +6582,7 @@ pub mod tests {
             DiffLine::new("+add", LineKind::Add),
             DiffLine::new("@@ -20,3 +20,4 @@", LineKind::Hunk),
             DiffLine::new("+second", LineKind::Add),
-        ];
+        ]);
         // A body row resolves to the hunk above it.
         assert_eq!(hunk_at_line(&lines, 5).unwrap().old_start, 1);
         assert_eq!(hunk_at_line(&lines, 7).unwrap().old_start, 20);
@@ -6631,19 +6592,19 @@ pub mod tests {
 
     #[test]
     fn hunk_at_line_stops_at_the_file_boundary() {
-        let lines = vec![
+        let lines = DiffLines::from(vec![
             DiffLine::new("@@ -1,3 +1,3 @@", LineKind::Hunk),
             DiffLine::new(" ctx", LineKind::Context),
             DiffLine::new("diff --git a/g b/g", LineKind::FileMeta),
             DiffLine::new("--- a/g", LineKind::FileName),
             // Binary bodies print as Context ("Binary files ... differ") with no hunk.
             DiffLine::new("Binary files a/g and b/g differ", LineKind::Context),
-        ];
+        ]);
         // Must NOT walk back past the file header into the previous file's hunk.
         assert_eq!(hunk_at_line(&lines, 4), None);
         assert_eq!(hunk_at_line(&lines, 2), None);
         // Header rows above any file have no hunk either.
-        assert_eq!(hunk_at_line(&[], 0), None);
+        assert_eq!(hunk_at_line(&DiffLines::default(), 0), None);
     }
 
     #[test]

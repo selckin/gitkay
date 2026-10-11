@@ -729,7 +729,7 @@ pub(super) mod tests {
             .lines
             .iter()
             .filter(|l| l.kind == LineKind::FileName)
-            .map(|l| &*l.text)
+            .map(|l| l.text)
             .collect();
         // Against the prefixes the header above them used, not a hardcoded `a/`:
         // `diff.noprefix` and `diff.mnemonicprefix` move them per repo, and a pair
@@ -739,7 +739,7 @@ pub(super) mod tests {
             .iter()
             .find(|l| l.text.starts_with("diff --git "))
             .expect("the raw header is still there");
-        let (op, np) = header_prefixes(&git_line.text, "a.zip", "a.zip")
+        let (op, np) = header_prefixes(git_line.text, "a.zip", "a.zip")
             .expect("the header libgit2 printed states its own prefixes");
         assert_eq!(
             named,
@@ -790,7 +790,7 @@ pub(super) mod tests {
             .lines
             .iter()
             .filter(|l| l.kind == LineKind::FileName)
-            .map(|l| &*l.text)
+            .map(|l| l.text)
             .collect();
         assert!(
             !named.iter().any(|l| l.contains("/dev/null")),
@@ -1346,7 +1346,11 @@ pub(super) mod tests {
         );
         assert_eq!(
             data.max_chars,
-            data.lines.iter().map(row_chars).max().unwrap_or(0)
+            data.lines
+                .iter()
+                .map(|l| row_chars(l.text))
+                .max()
+                .unwrap_or(0)
         );
         assert!(data.max_chars > 400, "the converted body is the widest row");
     }

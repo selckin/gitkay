@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::diff::{
-    CommitStats, DiffData, DiffLine, DiffSettings, DiffSource, FileEntry, LineKind, RowScope,
-    stats_of_files,
+    CommitStats, DiffData, DiffLine, DiffLines, DiffSettings, DiffSource, FileEntry, LineKind,
+    RowScope, stats_of_files,
 };
 
 /// File magic. Any change to the byte layout below bumps `VERSION`; a version
@@ -285,7 +285,7 @@ fn encode(data: &DiffData) -> Vec<u8> {
     put_u64(&mut out, data.lines.len() as u64);
     for l in data.lines.iter() {
         out.push(kind_tag(l.kind));
-        put_str(&mut out, &l.text);
+        put_str(&mut out, l.text);
         // 0 stands for `None`: git's line numbers are 1-based, which is why the
         // field is a `NonZeroU32` in the first place.
         put_u32(&mut out, l.old_lineno.map_or(0, NonZeroU32::get));
@@ -312,18 +312,13 @@ fn decode(bytes: &[u8]) -> Option<DiffData> {
         let text = Arc::<str>::from(r.str()?);
         let old_lineno = NonZeroU32::new(r.u32()?);
         let new_lineno = NonZeroU32::new(r.u32()?);
-        lines.push(DiffLine {
-            text,
-            kind,
-            old_lineno,
-            new_lineno,
-        });
+        lines.push(DiffLine::with_linenos(text, kind, old_lineno, new_lineno));
     }
 
     // Trailing bytes mean the file is not what this version writes.
     (r.pos == bytes.len()).then(|| DiffData {
         tabless,
-        ..DiffData::with_max_chars(lines, files, max_chars)
+        ..DiffData::with_max_chars(DiffLines::from(lines), files, max_chars)
     })
 }
 
@@ -1124,15 +1119,9 @@ mod tests {
     use crate::diff::BuildEnv;
     use crate::diff::{DiffData, DiffLine, FileEntry, LineKind};
     use std::num::NonZeroU32;
-    use std::sync::Arc;
 
     fn line(text: &str, kind: LineKind, old: u32, new: u32) -> DiffLine {
-        DiffLine {
-            text: Arc::from(text),
-            kind,
-            old_lineno: NonZeroU32::new(old),
-            new_lineno: NonZeroU32::new(new),
-        }
+        DiffLine::with_linenos(text, kind, NonZeroU32::new(old), NonZeroU32::new(new))
     }
 
     /// Every field the store claims to carry survives a round trip. Spans are
@@ -1148,7 +1137,8 @@ mod tests {
                 line("-old", LineKind::Del, 1, 0),
                 line("+new", LineKind::Add, 0, 1),
                 line(" ctx", LineKind::Context, 2, 2),
-            ],
+            ]
+            .into(),
             vec![FileEntry {
                 path: "x.rs".to_string(),
                 old_path: Some("y.rs".to_string()),
@@ -1200,7 +1190,7 @@ mod tests {
     fn a_non_utf8_path_survives_as_bytes() {
         let raw = vec![0x66, 0x6f, 0xff, 0x6f]; // "fo\xffo"
         let data = DiffData::with_max_chars(
-            vec![],
+            vec![].into(),
             vec![FileEntry {
                 path: String::from_utf8_lossy(&raw).into_owned(),
                 old_path: None,
@@ -1260,7 +1250,7 @@ mod tests {
     /// wrong-version payload is simply not an entry.
     #[test]
     fn a_corrupt_payload_decodes_to_none() {
-        let good = encode(&DiffData::with_max_chars(vec![], vec![], 0));
+        let good = encode(&DiffData::with_max_chars(vec![].into(), vec![], 0));
         assert!(decode(&good).is_some(), "control");
 
         assert!(decode(b"").is_none(), "empty");
@@ -1305,9 +1295,9 @@ mod tests {
     /// floor here rather than leaving a hand-copied number behind.
     #[test]
     fn the_minimum_element_sizes_match_the_encoder() {
-        let base = encode(&DiffData::with_max_chars(vec![], vec![], 0)).len();
+        let base = encode(&DiffData::with_max_chars(vec![].into(), vec![], 0)).len();
         let one_line = encode(&DiffData::with_max_chars(
-            vec![line("", LineKind::Context, 0, 0)],
+            vec![line("", LineKind::Context, 0, 0)].into(),
             vec![],
             0,
         ))
@@ -1315,7 +1305,7 @@ mod tests {
         assert_eq!(one_line - base, LINE_MIN_BYTES, "line floor");
 
         let one_file = encode(&DiffData::with_max_chars(
-            vec![],
+            vec![].into(),
             vec![crate::test_repo::file_entry("", None)],
             0,
         ))
@@ -1328,9 +1318,10 @@ mod tests {
     /// context lines are the densest a diff gets: nothing but the fixed fields.
     #[test]
     fn the_count_bound_admits_a_real_dense_diff() {
-        let lines: Vec<DiffLine> = (0..500)
+        let lines: DiffLines = (0..500)
             .map(|_| line("", LineKind::Context, 1, 1))
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
         let data = DiffData::with_max_chars(lines, vec![], 0);
         assert_eq!(decode(&encode(&data)).expect("decodes").lines.len(), 500);
 
@@ -1339,7 +1330,7 @@ mod tests {
         let files: Vec<FileEntry> = (0..200)
             .map(|_| crate::test_repo::file_entry("", None))
             .collect();
-        let data = DiffData::with_max_chars(vec![], files, 0);
+        let data = DiffData::with_max_chars(vec![].into(), files, 0);
         assert_eq!(decode(&encode(&data)).expect("decodes").files.len(), 200);
     }
 
@@ -1896,7 +1887,7 @@ mod tests {
         let (_d, repo) = temp_repo();
         commit_file(&repo, "a.txt", "one\n", "c");
         let (_t, store) = temp_store(&repo);
-        let data = DiffData::with_max_chars(vec![], vec![], 0);
+        let data = DiffData::with_max_chars(vec![].into(), vec![], 0);
         for source in [DiffSource::Uncommitted, DiffSource::Staged] {
             store.save(&RowScope::new(source), settings(), &data);
         }
@@ -1938,7 +1929,7 @@ mod tests {
         store.save(
             &scope_of(oid),
             settings(),
-            &DiffData::with_max_chars(vec![], vec![], 0),
+            &DiffData::with_max_chars(vec![].into(), vec![], 0),
         );
         let names: Vec<String> = std::fs::read_dir(store.root())
             .unwrap()

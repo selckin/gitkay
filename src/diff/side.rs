@@ -42,7 +42,7 @@
 
 use std::ops::Range;
 
-use super::{DiffLine, LineKind, RowSlice, WrapIndex, WrapKey};
+use super::{DiffLines, LineKind, LineRef, RowSlice, WrapIndex, WrapKey};
 
 /// Hidden runs one index will hold before it gives up.
 ///
@@ -149,11 +149,11 @@ impl SideIndex {
     /// Measure `lines` under `side`, over the wrap index the pane is drawing with (or
     /// `None` when soft wrap is off, where a line is its own row).
     ///
-    /// One O(lines) pass reading `DiffLine::kind` and nothing else — no text, unlike
+    /// One O(lines) pass reading `DiffLines::kind` and nothing else — no text, unlike
     /// `WrapIndex::build`'s tab census, which is why this can be rebuilt on a resize
     /// frame beside a `rewidth` without doubling its cost. The wrap index is consulted
     /// once per run BOUNDARY (an O(log) search), not once per hidden line.
-    pub fn build(lines: &[DiffLine], side: DiffSide, wrap: Option<&WrapIndex>) -> Self {
+    pub fn build(lines: &DiffLines, side: DiffSide, wrap: Option<&WrapIndex>) -> Self {
         Self::build_capped(lines, side, wrap, MAX_HIDDEN_RUNS)
     }
 
@@ -161,7 +161,7 @@ impl SideIndex {
     /// prove that a refused index maps exactly as `Both` does. A `const` cannot be
     /// varied to show that.
     fn build_capped(
-        lines: &[DiffLine],
+        lines: &DiffLines,
         side: DiffSide,
         wrap: Option<&WrapIndex>,
         max_runs: usize,
@@ -175,12 +175,12 @@ impl SideIndex {
         let mut removed = 0usize;
         let mut i = 0usize;
         while i < lines.len() {
-            if lines[i].kind != hidden {
+            if lines.kind(i) != hidden {
                 i += 1;
                 continue;
             }
             let start = i;
-            while i < lines.len() && lines[i].kind == hidden {
+            while i < lines.len() && lines.kind(i) == hidden {
                 i += 1;
             }
             // The run's own rows, taken from its two boundaries rather than summed over
@@ -412,7 +412,7 @@ impl<'a> RowMap<'a> {
 
     /// Which slice of `line` the `sub`-th of its visual rows draws. Purely a wrapping
     /// question — a line the filter keeps is drawn whole, exactly as it was.
-    pub fn slice(&self, line_idx: usize, line: &DiffLine, sub: usize) -> RowSlice {
+    pub fn slice(&self, line_idx: usize, line: LineRef<'_>, sub: usize) -> RowSlice {
         self.wrap
             .map_or_else(|| RowSlice::whole(line), |w| w.slice(line_idx, line, sub))
     }
@@ -431,8 +431,8 @@ mod tests {
     /// ```text
     /// 0 @@   1 ctx   2 -a   3 -b   4 +A   5 ctx   6 -c   7 +C   8 +D
     /// ```
-    fn sample() -> Vec<DiffLine> {
-        vec![
+    fn sample() -> DiffLines {
+        DiffLines::from(vec![
             line("@@ -1,4 +1,4 @@", LineKind::Hunk),
             line(" ctx", LineKind::Context),
             line("-a", LineKind::Del),
@@ -442,12 +442,12 @@ mod tests {
             line("-c", LineKind::Del),
             line("+C", LineKind::Add),
             line("+D", LineKind::Add),
-        ]
+        ])
     }
 
     /// The lines a mode keeps, computed the obvious slow way rather than through
     /// anything the index shares.
-    fn visible(lines: &[DiffLine], side: DiffSide) -> Vec<usize> {
+    fn visible(lines: &DiffLines, side: DiffSide) -> Vec<usize> {
         lines
             .iter()
             .enumerate()
@@ -457,7 +457,7 @@ mod tests {
     }
 
     fn map<'a>(
-        lines: &[DiffLine],
+        lines: &DiffLines,
         wrap: Option<&'a WrapIndex>,
         sides: Option<&'a SideIndex>,
     ) -> RowMap<'a> {
@@ -530,11 +530,11 @@ mod tests {
 
     #[test]
     fn a_run_at_the_very_start_is_handled() {
-        let lines = vec![
+        let lines = DiffLines::from(vec![
             line("-a", LineKind::Del),
             line("-b", LineKind::Del),
             line("+A", LineKind::Add),
-        ];
+        ]);
         let idx = SideIndex::build(&lines, DiffSide::New, None);
         let m = map(&lines, None, Some(&idx));
         assert_eq!(m.total_rows(), 1);
@@ -546,7 +546,7 @@ mod tests {
 
     #[test]
     fn everything_hidden_leaves_no_rows() {
-        let lines = vec![line("+A", LineKind::Add), line("+B", LineKind::Add)];
+        let lines = DiffLines::from(vec![line("+A", LineKind::Add), line("+B", LineKind::Add)]);
         let idx = SideIndex::build(&lines, DiffSide::Old, None);
         let m = map(&lines, None, Some(&idx));
         assert_eq!(m.total_rows(), 0);
@@ -594,13 +594,13 @@ mod tests {
 
     /// Wide lines so soft wrapping is really in play, with the hidden run wrapping
     /// too: the run's removed rows are its ROWS, not its lines.
-    fn wide() -> Vec<DiffLine> {
-        vec![
+    fn wide() -> DiffLines {
+        DiffLines::from(vec![
             line(" ctx", LineKind::Context),
             line(&format!("-{}", "x".repeat(250)), LineKind::Del),
             line(&format!("+{}", "y".repeat(250)), LineKind::Add),
             line(" tail", LineKind::Context),
-        ]
+        ])
     }
 
     #[test]
@@ -654,11 +654,14 @@ mod tests {
         let w = WrapIndex::build(&lines, 100, gutter, false);
         let idx = SideIndex::build(&lines, DiffSide::New, Some(&w));
         let m = map(&lines, Some(&w), Some(&idx));
-        assert_eq!(m.slice(2, &lines[2], 0), w.slice(2, &lines[2], 0));
-        assert_eq!(m.slice(2, &lines[2], 1), w.slice(2, &lines[2], 1));
+        assert_eq!(m.slice(2, lines.line(2), 0), w.slice(2, lines.line(2), 0));
+        assert_eq!(m.slice(2, lines.line(2), 1), w.slice(2, lines.line(2), 1));
 
         let flat = map(&lines, None, Some(&idx));
-        assert_eq!(flat.slice(2, &lines[2], 0), RowSlice::whole(&lines[2]));
+        assert_eq!(
+            flat.slice(2, lines.line(2), 0),
+            RowSlice::whole(lines.line(2))
+        );
     }
 
     /// `rewrap` keeps the runs a re-wrap cannot move and re-measures only their rows,

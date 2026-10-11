@@ -259,7 +259,22 @@ and the wiring. **A bound lives in the module that enforces it**, not at the roo
 consistency block that checks it, so a reader adjusting a number meets its
 constraints in the same file. What the root still holds are the UI's own samples and
 the diff-cache budget derivation the pool's bounds are fractions of. Those modules: `src/diff.rs` (the diff **data** layer: `DiffLine` /
-`DiffData` / `FileEntry` / `DiffSettings`, `PerRow` and its two aliases
+`DiffData` / `FileEntry` / `DiffSettings` — a built diff's rows are READ through
+`DiffLines` (`src/diff/lines.rs`: `line(i)` gives a `Copy` `LineRef` view that keeps
+`DiffLine`'s field names, plus `text(i)`, `kind(i)`, `linenos(i)`, `rendered_len(i)`,
+`iter()`/`range(r)`), and `DiffLine` is only the INPUT row a build pushes, its fields
+private to `diff` so the compiler proves nothing outside it reads a stored row any other
+way — which is what lets the representation behind `DiffLines` change without a reader
+noticing. **The iteration contract**: `iter()`/`range()` return the named `Lines`, whose
+`nth`/`nth_back`/`count`/`size_hint` delegate to the slice iterator, so reaching row k
+is O(1); reach a start with `range(start..end)`, never `.skip(start)` over a mapped
+iterator (`Map` does not forward `nth`, which would make the per-file pending scan
+O(files × lines) on the UI thread); and a pass that needs no text reads
+`kind(i)`/`linenos(i)`/`lineno_on(i, side)`/`anchor_point(i)`/`rendered_len(i)`, never a
+`LineRef`, since a view touches the text through `str`'s boundary check.
+`diff::views()` — test-only, a thread-local count of the views a thread has
+materialized — is the guard: the suite pins the jump, the range and the pending scan by
+it rather than by a clock. `PerRow` and its two aliases
 `RowSpans`/`RowEmphasis` — what the DISPLAY derives per row, held BESIDE the rows
 rather than inside them, which is what lets the row array be shared with the highlight
 worker instead of copied for it, and CHUNKED (a chunk of slots is allocated on the
@@ -299,7 +314,7 @@ rather than `truncate`, because a running maximum cannot be un-maxed by dropping
 outlive the text. `DiffData::new`, which rescans, is now `#[cfg(test)]` — nothing in the
 app traverses a finished diff for this),
 `LineNoGutter` (the line-number column's widths and per-row text — pure, and here
-rather than in `main.rs` because it is a question about `DiffLine` data),
+rather than in `main.rs` because it is a question about `DiffLines` data),
 the scroll anchor (its own child module,
 `src/diff/anchor.rs`: `DiffAnchor` / `capture_anchor` / `resolve_anchor` — pure,
 so all five resolution rungs are unit-testable), soft wrapping (likewise its own
@@ -386,7 +401,7 @@ and the pending-file list — where it used to be handed a copy of the whole dif
 measured 12.0s on the frame loop at 76.5M lines; and it REPORTS its own end
 (`HighlightMsg::Settled`, from a drop guard, so a superseded or panicking pass says so
 too), which is what the prefetch band waits on. Separate from `highlight.rs`, which knows syntect and
-nothing about diffs: this half knows `DiffLine`, `FileEntry` and the viewport, and
+nothing about diffs: this half knows `DiffLines`, `FileEntry` and the viewport, and
 is about ORDER rather than colour. **Tokenizing happens on a fixed set of long-lived threads**: `gitkay-highlight`
 (`HighlightService` — every visible pass, and the startup prewarm between passes) and the
 prefetch pool's `gitkay-colour-{k}` (see `prefetch.rs`). The reason is memory, not speed:
@@ -634,7 +649,7 @@ out changed, which is a solid highlight rather than information. That is
 it there is what makes the predicate's "the whole question" claim true — carried in
 `emphasize_rows` instead, only the one caller that remembered it was covered, and the
 block was never marked decided, so it was re-weighed on every frame it stayed on screen.
-The `DiffLine`-aware driver `emphasize_rows` lives in `src/diff.rs`, and is
+The `DiffLines`-aware driver `emphasize_rows` lives in `src/diff.rs`, and is
 **lazy per viewport**: each row's emphasis is a `RowEmphasis` slot (unset = not
 computed, as an unset `RowSpans` slot is), and `ensure_visible_word_emphasis` fills only the
 rows around the visible window — plus any pending scroll target — every frame.
@@ -1621,7 +1636,7 @@ sorted drivers keep the same rows with the same rewritten parents.
   which is the one that fails silently.
   The **line-number gutter** (`diff::LineNoGutter`, a persisted toolbar checkbox,
   off until ticked) is render-only in the strongest sense:
-  the numbers are `DiffLine::old_lineno`/`new_lineno`, which every diff already
+  the numbers are `LineRef::old_lineno`/`new_lineno`, which every diff already
   carries for the scroll anchor and the store already encodes — so it keys nothing,
   invalidates nothing, and a stored diff from before the feature renders them. Its
   widths are measured ONCE per diff, **lazily**: `GitkApp::diff_linenos` is an
@@ -1734,7 +1749,7 @@ sorted drivers keep the same rows with the same rewritten parents.
   Where the row IS comes from `SidebarFrame::current_rect`, filled by `draw_file_row`:
   the list is not virtualized and its rows are not uniform (directory headers and
   indented file rows), so there is no arithmetic the caller could use instead. What makes the anchor possible is
-  `DiffLine::old_lineno`/`new_lineno`, recorded in `append_diff_body` from
+  `LineRef::old_lineno`/`new_lineno`, recorded in `append_diff_body` from
   git2's **origin char** and not from `LineKind`: git2 reports a line number
   on its EOF markers too, and those origins have already been folded into
   `LineKind::Context` by the time only the kind is left.
@@ -1768,7 +1783,7 @@ sorted drivers keep the same rows with the same rewritten parents.
   306MB that module refuses. Each run carries its line range, the view row it collapses
   at and the running total of rows removed through it, so both directions are one
   binary search with no array beside it that could disagree. The build is one O(lines)
-  pass reading `DiffLine::kind` and no text at all — unlike `WrapIndex::build`'s tab
+  pass reading `DiffLines::kind` and no text at all — unlike `WrapIndex::build`'s tab
   census — and consults the wrap index once per run BOUNDARY (`row_of_line`, itself a
   binary search), not once per hidden line. **Runs are strictly increasing in view
   row**, two maximal runs being separated by at least one visible line: that is what
@@ -2469,7 +2484,7 @@ ones that actually fail when the write is removed.
   caps what `diff_row_job` lays out, and `window_spans`/`window_ranges` cut the spans and
   emphasis with it, since both index into the body. A straddling span is TRUNCATED, not
   dropped: `append_body`'s span path emits only the spans, so dropping one takes visible
-  text with it. **Render-only** — `DiffLine::text` is untouched, so search, word diff,
+  text with it. **Render-only** — the row's text is untouched, so search, word diff,
   the anchor, the store and the write layer still see the whole line — and never silent
   (`append_clip_marker`). `content_chars` is capped to match, or the horizontal scroll
   runs tens of millions of pixels into blank. This is the backstop for the toolbar's

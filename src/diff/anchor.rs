@@ -19,7 +19,7 @@
 
 use std::num::NonZeroU32;
 
-use super::{DiffLine, FileEntry, file_index_at_line_opt, file_line_ranges, file_line_starts};
+use super::{DiffLines, FileEntry, file_index_at_line_opt, file_line_ranges, file_line_starts};
 
 /// Which side of the diff an anchor's line number names. A context row has both
 /// and prefers `New`: the post-image is the file as it looks now, which is what
@@ -60,7 +60,7 @@ pub struct DiffAnchor {
 /// `None` when the diff holds no numbered row at all — an empty pane, or a
 /// binary-only diff — because there is then nothing to re-find.
 pub fn capture_anchor(
-    lines: &[DiffLine],
+    lines: &DiffLines,
     files: &[FileEntry],
     top_row: usize,
     visible_rows: usize,
@@ -76,7 +76,7 @@ pub fn capture_anchor(
     // `visible_rows` is 0 until the first render has stored a height, and the
     // centre then collapses onto `top`, which is the pre-centring behaviour.
     let centre = top.saturating_add(visible_rows / 2).min(last);
-    let numbered = |r: usize| lines[r].anchor_point().is_some();
+    let numbered = |r: usize| lines.anchor_point(r).is_some();
     let row = (centre..lines.len())
         .find(|&r| numbered(r))
         .or_else(|| (0..centre).rev().find(|&r| numbered(r)))?;
@@ -85,7 +85,7 @@ pub fn capture_anchor(
     // only possible when nothing at or after it is numbered — gives 0, which is
     // the fallback's rule.
     let delta = row.saturating_sub(top);
-    let (side, lineno) = lines[row].anchor_point()?;
+    let (side, lineno) = lines.anchor_point(row)?;
     let fi = file_index_at_line_opt(&file_line_starts(files), row)?;
     Some(DiffAnchor {
         path: files.get(fi)?.path_bytes.clone(),
@@ -113,7 +113,7 @@ pub fn capture_anchor(
 /// next surviving line rather than the nearest in either direction, which is
 /// marginally further in line-number terms but does not read as the view jumping
 /// the wrong way.
-pub fn resolve_anchor(anchor: &DiffAnchor, lines: &[DiffLine], files: &[FileEntry]) -> usize {
+pub fn resolve_anchor(anchor: &DiffAnchor, lines: &DiffLines, files: &[FileEntry]) -> usize {
     // The exact path match must run FIRST and win outright: a file's own entry
     // is always the correct identity when one exists. That ordering is load-
     // bearing and is what `a_copy_source_does_not_steal_an_anchor_meant_for_itself`
@@ -161,8 +161,8 @@ pub fn resolve_anchor(anchor: &DiffAnchor, lines: &[DiffLine], files: &[FileEntr
             .find_map(|(i, s, e)| (i == fi).then_some((s, e)))
             .unwrap_or_else(|| (header.min(lines.len()), lines.len()));
         if let Some(row) = (start..end).find(|&r| {
-            lines[r]
-                .lineno_on(anchor.side)
+            lines
+                .lineno_on(r, anchor.side)
                 .is_some_and(|n| n >= anchor.lineno)
         }) {
             return row.saturating_sub(anchor.delta);
@@ -224,7 +224,7 @@ pub fn resolve_anchor(anchor: &DiffAnchor, lines: &[DiffLine], files: &[FileEntr
 /// pre-file header region — in both cases there is nothing to schedule around.
 pub fn anchor_hint(
     anchor: &DiffAnchor,
-    lines: &[DiffLine],
+    lines: &DiffLines,
     files: &[FileEntry],
 ) -> Option<(usize, usize)> {
     let row = resolve_anchor(anchor, lines, files);
@@ -342,7 +342,7 @@ mod tests {
 
         let last = data.lines.len() - 1;
         assert!(
-            data.lines[last].new_lineno.is_none() && data.lines[last].old_lineno.is_none(),
+            data.lines.linenos(last).1.is_none() && data.lines.linenos(last).0.is_none(),
             "fixture must end on an unnumbered marker row"
         );
         let got = capture_anchor(&data.lines, &data.files, last, 0).expect("an anchor");
@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn capture_anchor_is_none_without_a_numbered_row() {
         use crate::test_repo::{commit_bytes, temp_repo};
-        assert_eq!(capture_anchor(&[], &[], 0, 0), None);
+        assert_eq!(capture_anchor(&DiffLines::default(), &[], 0, 0), None);
 
         let (_d, repo) = temp_repo();
         commit_bytes(&repo, "b.dat", &[0, 1, 2, 3], "base");
@@ -396,11 +396,11 @@ mod tests {
         // Park the viewport top on the second hunk's header — the case that
         // motivated this: a structural row, carrying no line number of its own.
         let hdr = (0..data.lines.len())
-            .filter(|&r| data.lines[r].kind == LineKind::Hunk)
+            .filter(|&r| data.lines.kind(r) == LineKind::Hunk)
             .nth(1)
             .expect("two hunks");
         assert!(
-            data.lines[hdr].anchor_point().is_none(),
+            data.lines.anchor_point(hdr).is_none(),
             "header is unnumbered"
         );
 
@@ -433,18 +433,18 @@ mod tests {
         let (_d, repo, oid) = two_hunk_repo();
         let data = diff_of(&repo, oid, base_settings(), None);
         let hdr = (0..data.lines.len())
-            .filter(|&r| data.lines[r].kind == LineKind::Hunk)
+            .filter(|&r| data.lines.kind(r) == LineKind::Hunk)
             .nth(1)
             .expect("two hunks");
         let got = capture_anchor(&data.lines, &data.files, hdr, 0).expect("an anchor");
 
         let first_below = (hdr..data.lines.len())
-            .find(|&r| data.lines[r].anchor_point().is_some())
+            .find(|&r| data.lines.anchor_point(r).is_some())
             .expect("a numbered row below the header");
         assert_eq!(got.delta, first_below - hdr);
         assert_eq!(
             Some((got.side, got.lineno)),
-            data.lines[first_below].anchor_point()
+            data.lines.anchor_point(first_below)
         );
     }
 
@@ -516,7 +516,7 @@ mod tests {
             .find(|&(i, _, _)| data.files[i].path == path)
             .unwrap_or_else(|| panic!("{path} has no patch body"));
         (start..end)
-            .find(|&r| data.lines[r].lineno_on(side) == std::num::NonZeroU32::new(n))
+            .find(|&r| data.lines.lineno_on(r, side) == std::num::NonZeroU32::new(n))
             .unwrap_or_else(|| panic!("no row for {path} {side:?} line {n}"))
     }
 
@@ -593,7 +593,7 @@ mod tests {
 
         let got = resolve_anchor(&anchor, &narrow.lines, &narrow.files);
         assert_eq!(
-            narrow.lines[got].new_lineno,
+            narrow.lines.linenos(got).1,
             std::num::NonZeroU32::new(69),
             "rung 2: the first surviving line at or after 64"
         );
@@ -802,13 +802,16 @@ mod tests {
             delta: 0,
         };
         assert_eq!(
-            resolve_anchor(&anchor(b"c0.txt"), &[], &files),
+            resolve_anchor(&anchor(b"c0.txt"), &DiffLines::default(), &files),
             9,
             "the neighbour in the PANE is c.txt, not the swept b.zip re-emitted below it"
         );
         // The forward half still reads the list's order: an anchor above everything
         // lands on the first patch drawn, whatever the tail holds.
-        assert_eq!(resolve_anchor(&anchor(b"A.txt"), &[], &files), 3);
+        assert_eq!(
+            resolve_anchor(&anchor(b"A.txt"), &DiffLines::default(), &files),
+            3
+        );
     }
 
     /// Rung 5. The anchored file is the only file and has lost its body, so
@@ -834,7 +837,7 @@ mod tests {
         let anchor = capture_anchor(&shown.lines, &shown.files, row, 0).expect("an anchor");
         assert_eq!(resolve_anchor(&anchor, &hidden.lines, &hidden.files), 0);
         assert_eq!(
-            resolve_anchor(&anchor, &[], &[]),
+            resolve_anchor(&anchor, &DiffLines::default(), &[]),
             0,
             "an empty diff has nowhere to land"
         );
@@ -994,7 +997,7 @@ mod tests {
         // find the first and resolve into it.
         let (fi, start, end) = file_line_ranges(&data.files, data.lines.len())[1];
         let row = (start..end)
-            .find(|&r| data.lines[r].new_lineno == std::num::NonZeroU32::new(2))
+            .find(|&r| data.lines.linenos(r).1 == std::num::NonZeroU32::new(2))
             .expect("the second file's changed line");
         let anchor = capture_anchor(&data.lines, &data.files, row, 0).expect("an anchor");
         assert_eq!(anchor.path, data.files[fi].path_bytes);
@@ -1207,6 +1210,6 @@ mod tests {
         let row = row_of(&data, "f.txt", AnchorSide::New, 70);
         let anchor = capture_anchor(&data.lines, &data.files, row, 0).expect("an anchor");
 
-        assert_eq!(anchor_hint(&anchor, &[], &[]), None);
+        assert_eq!(anchor_hint(&anchor, &DiffLines::default(), &[]), None);
     }
 }

@@ -2096,7 +2096,7 @@ mod tests {
         let row = data
             .lines
             .iter()
-            .position(|l| &*l.text == "+two")
+            .position(|l| l.text == "+two")
             .expect("the untracked file's content is in the diff");
         let hunk = hunk_at_line(&data.lines, row).expect("that row is inside a hunk");
         let file = data.files.iter().find(|f| f.path == "new.txt").unwrap();
@@ -2123,7 +2123,7 @@ mod tests {
             &RowScope::new(DiffSource::Uncommitted),
             BuildEnv::NONE,
         );
-        let row = data.lines.iter().position(|l| &*l.text == "+two").unwrap();
+        let row = data.lines.iter().position(|l| l.text == "+two").unwrap();
         let hunk = hunk_at_line(&data.lines, row).unwrap();
         let file = data
             .files
@@ -2203,7 +2203,7 @@ mod tests {
                 &RowScope::new(DiffSource::Uncommitted),
                 BuildEnv::NONE,
             );
-            let row = data.lines.iter().position(|l| &*l.text == "+two").unwrap();
+            let row = data.lines.iter().position(|l| l.text == "+two").unwrap();
             let hunk = hunk_at_line(&data.lines, row).unwrap();
             let file = data.files.iter().find(|f| f.path == "new.txt").unwrap();
             write_file(&repo, "new.txt", rewrite);

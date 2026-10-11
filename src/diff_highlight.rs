@@ -2,7 +2,7 @@
 //! and on which thread.
 //!
 //! Separate from `highlight.rs`, which knows about syntect and nothing about diffs —
-//! this is the half that knows about `DiffLine`, `FileEntry` and the viewport, and it
+//! this is the half that knows about `DiffLines`, `FileEntry` and the viewport, and it
 //! is all about ORDER rather than about colour. Highlighting a large diff costs
 //! seconds, so nothing here does it in one pass: the worker colours the file the
 //! reader is looking at first (`pick_file`), in `HIGHLIGHT_CHUNK` batches, and a
@@ -21,7 +21,7 @@
 
 use std::sync::{Arc, mpsc};
 
-use crate::diff::{DiffLine, FileEntry, RowSpans, file_line_ranges};
+use crate::diff::{DiffLines, FileEntry, RowSpans, file_line_ranges};
 use crate::highlight::{self, DiffBg, FileState, Highlighter};
 use crate::{Epoch, FileWindow, VisibleRange, config, spawn_guarded};
 
@@ -146,7 +146,7 @@ impl Drop for SettleOnExit {
 /// the per-file highlight `state`. Structural lines are skipped.
 pub fn tokenize_range(
     hl: &Highlighter,
-    lines: &[DiffLine],
+    lines: &DiffLines,
     state: &mut FileState<'_>,
     start: usize,
     end: usize,
@@ -155,7 +155,12 @@ pub fn tokenize_range(
     // One scratch buffer for the whole range — tokenize_line would otherwise
     // allocate a newline-terminated copy of every single line.
     let mut buf = String::new();
-    for (i, line) in lines.iter().enumerate().take(end).skip(start) {
+    // The same forgiveness `take(end).skip(start)` had: an `end` past the diff and an
+    // inverted range both give nothing. Reached through `range`, which jumps to
+    // `start`, so a chunk deep inside a large file views only its own rows.
+    let end = end.min(lines.len());
+    let start = start.min(end);
+    for (i, line) in (start..end).zip(lines.range(start..end)) {
         // Only code lines are tokenized; structural lines keep no spans.
         if !line.kind.is_code() {
             continue;
@@ -319,7 +324,7 @@ impl HighlightBudget {
 /// The budget is tested at chunk boundaries rather than once per file, so a single
 /// enormous file overruns it by at most a chunk.
 pub fn highlight_diff_within(
-    lines: &[DiffLine],
+    lines: &DiffLines,
     spans: &mut RowSpans,
     files: &[FileEntry],
     hl: &Highlighter,
@@ -357,7 +362,7 @@ pub fn highlight_diff_within(
 /// unbounded — the prefetch worker's whole-diff pass, and the UI-thread fallback
 /// when the highlight thread cannot be spawned.
 pub fn highlight_diff(
-    lines: &[DiffLine],
+    lines: &DiffLines,
     spans: &mut RowSpans,
     files: &[FileEntry],
     hl: &Highlighter,
@@ -415,17 +420,15 @@ pub fn requeue_file(pending: &mut Vec<(usize, usize, usize)>, file: (usize, usiz
 /// Structural lines never carry spans and are ignored; a range with no code
 /// lines is vacuously done.
 pub fn file_fully_highlighted(
-    lines: &[DiffLine],
+    lines: &DiffLines,
     spans: &RowSpans,
     start: usize,
     end: usize,
 ) -> bool {
-    lines
-        .iter()
-        .enumerate()
-        .take(end)
-        .skip(start)
-        .all(|(i, l)| !l.kind.is_code() || spans.is_set(i))
+    // Kinds only, no row view: this runs once per file on the UI thread at every
+    // install (`pending_files`), so it must neither touch the text nor step to `start`.
+    let end = end.min(lines.len());
+    (start.min(end)..end).all(|i| !lines.kind(i).is_code() || spans.is_set(i))
 }
 
 /// May the band be warmed this frame?
@@ -468,7 +471,7 @@ pub const fn band_warmable(syntax_enabled: bool, have_highlighter: bool, settled
 /// or partially-highlighted diff only re-tokenizes what's missing, and binary
 /// files never appear at all — see `highlight_ranges`.
 pub fn pending_files(
-    lines: &[DiffLine],
+    lines: &DiffLines,
     spans: &RowSpans,
     files: &[FileEntry],
 ) -> Vec<(usize, usize, usize)> {
@@ -490,7 +493,7 @@ pub fn pending_files(
 /// whether to spawn at all.
 pub struct HighlightJob {
     pub hl: Arc<Highlighter>,
-    pub lines: Arc<Vec<DiffLine>>,
+    pub lines: Arc<DiffLines>,
     pub files: Arc<Vec<FileEntry>>,
     /// File ranges still holding an unhighlighted code line, in file order.
     pub pending: Vec<(usize, usize, usize)>,
@@ -931,13 +934,13 @@ mod tests {
     use super::*;
     use crate::diff;
     use crate::diff::BuildEnv;
-    use crate::diff::LineKind;
+    use crate::diff::{DiffLine, LineKind};
     use crate::test_repo::file_entry as fe;
     use crate::test_repo::temp_repo;
     use crate::tests::probe_settings;
 
     fn job(
-        lines: Vec<DiffLine>,
+        lines: DiffLines,
         generation: u64,
         current_gen: Epoch,
         tx: mpsc::Sender<HighlightMsg>,
@@ -962,6 +965,46 @@ mod tests {
         }
     }
 
+    /// The pending scan runs on the UI thread at every install, once per file, and
+    /// reads KINDS — a row view per line would make it O(files × lines).
+    #[test]
+    fn the_pending_scan_reads_kinds_and_never_text() {
+        let lines = DiffLines::from(
+            (0..5_000)
+                .map(|i| DiffLine::new(format!("+x{i}"), LineKind::Add))
+                .collect::<Vec<_>>(),
+        );
+        let files: Vec<_> = (0..50)
+            .map(|f| fe(&format!("f{f}.rs"), Some(f * 100)))
+            .collect();
+        let before = crate::diff::views();
+        let pending = pending_files(&lines, &RowSpans::blank(lines.len()), &files);
+        assert_eq!(pending.len(), 50, "control: every file still owes colour");
+        assert_eq!(crate::diff::views() - before, 0);
+    }
+
+    /// A chunk of a large file views exactly the rows it tokenizes, and keeps the
+    /// old take/skip forgiveness for an end past the diff and an inverted range.
+    #[test]
+    fn tokenizing_a_range_views_only_that_range() {
+        let hl = highlight::test_highlighter();
+        let lines = DiffLines::from(
+            (0..10_000)
+                .map(|_| DiffLine::new("+let x = 1;", LineKind::Add))
+                .collect::<Vec<_>>(),
+        );
+        let mut state = hl.new_file_state("x.rs");
+        let before = crate::diff::views();
+        let got = tokenize_range(&hl, &lines, &mut state, 9_000, 9_010);
+        assert_eq!(
+            got.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            (9_000..9_010).collect::<Vec<_>>()
+        );
+        assert_eq!(crate::diff::views() - before, 10);
+        assert!(tokenize_range(&hl, &lines, &mut state, 10_005, 20_000).is_empty());
+        assert!(tokenize_range(&hl, &lines, &mut state, 50, 40).is_empty());
+    }
+
     /// The service runs every pass it is given, in order, on one thread: a superseded
     /// pass still reports that it ended (the band waits on that), and the current one
     /// colours. Nothing is dropped for being stale — `highlight_worker` bails on its
@@ -973,7 +1016,7 @@ mod tests {
         let current_gen = Epoch::default();
         let stale = current_gen.bump();
         let current = current_gen.bump();
-        let line = || vec![DiffLine::new("let x = 1;", LineKind::Context)];
+        let line = || DiffLines::from(vec![DiffLine::new("let x = 1;", LineKind::Context)]);
         assert!(
             service
                 .submit_pass(job(line(), stale, current_gen.clone(), tx.clone()))
@@ -1071,14 +1114,14 @@ mod tests {
     #[test]
     fn highlight_diff_colors_code_and_skips_structure() {
         let hl = highlight::test_highlighter();
-        let lines = vec![
+        let lines = DiffLines::from(vec![
             DiffLine::new("commit abc123", LineKind::Meta),
             DiffLine::new("diff --git a/x.rs b/x.rs", LineKind::FileMeta),
             DiffLine::new("@@ -1 +1 @@", LineKind::Hunk),
             DiffLine::new("+fn main() {}", LineKind::Add),
             DiffLine::new("-let old = 0;", LineKind::Del),
             DiffLine::new("let x = 1;", LineKind::Context),
-        ];
+        ]);
         // file's diff starts at the "diff --git" line
         let files = vec![fe("x.rs", Some(1))];
         let mut spans = RowSpans::blank(lines.len());
@@ -1100,14 +1143,14 @@ mod tests {
 
         // The +/- marker must be stripped before tokenizing (both Add and Del);
         // spans are byte ranges into body(), so reassembling them yields the body.
-        let body3 = lines[3].body();
+        let body3 = lines.line(3).body();
         let added: String = spans
             .slice(3)
             .iter()
             .map(|(_, r)| &body3[r.start..r.end])
             .collect();
         assert_eq!(added, "fn main() {}");
-        let body4 = lines[4].body();
+        let body4 = lines.line(4).body();
         let deleted: String = spans
             .slice(4)
             .iter()
@@ -1122,10 +1165,10 @@ mod tests {
         // cause the commit header at index 0 to be tokenized as code. (In practice
         // git2 positions every delta, so None is a defensive case.)
         let hl = highlight::test_highlighter();
-        let lines = vec![
+        let lines = DiffLines::from(vec![
             DiffLine::new("commit abc123", LineKind::Context), // index 0 — header
             DiffLine::new("+fn foo() {}", LineKind::Add),      // index 1 — real file patch
-        ];
+        ]);
         let files = vec![
             fe("bin.dat", None),   // no patch body
             fe("foo.rs", Some(1)), // real file starts here
@@ -1182,7 +1225,7 @@ mod tests {
         let stale = current_gen.bump();
         current_gen.bump(); // a newer pass has started; `stale` is superseded
 
-        let lines = vec![DiffLine::new("let x = 1;", LineKind::Context)];
+        let lines = DiffLines::from(vec![DiffLine::new("let x = 1;", LineKind::Context)]);
         let files = vec![fe("x.rs", Some(0))];
         highlight_worker(HighlightJob {
             hl: Arc::new(highlight::test_highlighter()),
@@ -1256,12 +1299,12 @@ mod tests {
     #[test]
     fn a_colour_pass_does_nothing_once_the_deadline_has_passed() {
         let hl = highlight::test_highlighter();
-        let lines = vec![
+        let lines = DiffLines::from(vec![
             DiffLine::new("diff --git a/x.rs b/x.rs", LineKind::FileMeta),
             DiffLine::new("@@ -1 +1 @@", LineKind::Hunk),
             DiffLine::new("+fn main() {}", LineKind::Add),
             DiffLine::new("let x = 1;", LineKind::Context),
-        ];
+        ]);
         let files = vec![fe("x.rs", Some(0))];
         let mut spans = RowSpans::blank(lines.len());
         let past = std::time::Instant::now()
@@ -1302,12 +1345,12 @@ mod tests {
     #[test]
     fn a_colour_pass_colours_everything_without_a_budget() {
         let hl = highlight::test_highlighter();
-        let lines = vec![
+        let lines = DiffLines::from(vec![
             DiffLine::new("diff --git a/x.rs b/x.rs", LineKind::FileMeta),
             DiffLine::new("@@ -1 +1 @@", LineKind::Hunk),
             DiffLine::new("+fn main() {}", LineKind::Add),
             DiffLine::new("let x = 1;", LineKind::Context),
-        ];
+        ]);
         let files = vec![fe("x.rs", Some(0))];
         let mut spans = RowSpans::blank(lines.len());
 
@@ -1335,13 +1378,14 @@ mod tests {
     #[test]
     fn a_colour_pass_stops_at_the_row_bound() {
         let hl = highlight::test_highlighter();
-        let mut lines = vec![DiffLine::new(
+        let mut rows = vec![DiffLine::new(
             "diff --git a/x.rs b/x.rs",
             LineKind::FileMeta,
         )];
         for i in 0..200 {
-            lines.push(DiffLine::new(format!("let x{i} = {i};"), LineKind::Context));
+            rows.push(DiffLine::new(format!("let x{i} = {i};"), LineKind::Context));
         }
+        let lines = DiffLines::from(rows);
         let files = vec![fe("x.rs", Some(0))];
         let mut spans = RowSpans::blank(lines.len());
         // Far enough that the clock never bites; the row bound is what stops it.
@@ -1392,18 +1436,19 @@ mod tests {
         let hl = highlight::test_highlighter();
         // Forty rows of commit message, then the file — a bound of 10 rows sits well
         // above where the first code line is.
-        let mut lines: Vec<DiffLine> = (0..40)
+        let mut rows: Vec<DiffLine> = (0..40)
             .map(|i| DiffLine::new(format!("message line {i}"), LineKind::Meta))
             .collect();
-        lines.push(DiffLine::new(
+        rows.push(DiffLine::new(
             "diff --git a/x.rs b/x.rs",
             LineKind::FileMeta,
         ));
         // Longer than one chunk, so the bound is what stops it rather than the file
         // simply running out — otherwise this would pass by finishing.
         for i in 0..400 {
-            lines.push(DiffLine::new(format!("let x{i} = {i};"), LineKind::Context));
+            rows.push(DiffLine::new(format!("let x{i} = {i};"), LineKind::Context));
         }
+        let lines = DiffLines::from(rows);
         let files = vec![fe("x.rs", Some(40))];
         let mut spans = RowSpans::blank(lines.len());
 
@@ -1443,7 +1488,7 @@ mod tests {
         let files = vec![fe("a.rs", Some(0)), fe("b.rs", Some(2))];
 
         for first in 0..files.len() {
-            let lines = build();
+            let lines = DiffLines::from(build());
             let mut spans = RowSpans::blank(lines.len());
             highlight_diff_within(
                 &lines,

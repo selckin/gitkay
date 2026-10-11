@@ -113,7 +113,7 @@ pub fn test_highlighter_with(languages: &[(&str, &str)]) -> Highlighter {
 }
 
 /// A run of text sharing one foreground color: the color plus the byte range
-/// `[start, end)` of the run *within the line's own text* (`DiffLine::body()`).
+/// `[start, end)` of the run *within the line's own text* (`LineRef::body()`).
 /// Storing a range instead of an owned `String` avoids duplicating the line text
 /// (the line already owns it) and the per-token allocation — roughly halving the
 /// memory a highlighted (and cached) diff holds.
@@ -610,7 +610,7 @@ impl Highlighter {
         // slice of the buffer, so a token's byte offset within it equals its
         // offset within `code` (the '\n' is appended last). We record that range
         // rather than copying the text — the range indexes into `code`, which is
-        // exactly `DiffLine::body()` at render time.
+        // exactly `LineRef::body()` at render time.
         buf.clear();
         buf.push_str(head);
         buf.push('\n');

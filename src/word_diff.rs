@@ -1,7 +1,7 @@
 //! Word diff over a change block: given its `-` and `+` lines, find the changed token
 //! runs on each side so the UI can emphasise just what actually changed. Pure — no
 //! egui or git2 — which is why it lives on its own with its own tests. The
-//! `DiffLine`-aware driver that walks change blocks and calls `block_emphasis` here is
+//! `DiffLines`-aware driver that walks change blocks and calls `block_emphasis` here is
 //! `emphasize_rows` in `diff.rs`.
 //!
 //! The alignment runs over a block's rows CONCATENATED, with the line break between two

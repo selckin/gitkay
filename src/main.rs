@@ -42,11 +42,11 @@ mod workers;
 use config::{FileListLayout, Fonts, Role};
 use datefmt::{RELATIVE_DATE_SAMPLE, format_commit_time, format_relative_time};
 use diff::{
-    BuildEnv, CommitKind, CommitStats, DiffAnchor, DiffData, DiffLine, DiffPhase, DiffProgress,
-    DiffProgressReport, DiffSettings, DiffSource, FileEntry, LineKind, LineNoGutter, RowScope,
-    StatsWant, capture_anchor, emphasize_rows, file_index_at_line, file_index_at_line_opt,
-    file_line_starts, get_diff_data, hash_diff_content, is_real_commit, next_file_line,
-    resolve_anchor,
+    BuildEnv, CommitKind, CommitStats, DiffAnchor, DiffData, DiffLines, DiffPhase, DiffProgress,
+    DiffProgressReport, DiffSettings, DiffSource, FileEntry, LineKind, LineNoGutter, LineRef,
+    RowScope, StatsWant, capture_anchor, emphasize_rows, file_index_at_line,
+    file_index_at_line_opt, file_line_starts, get_diff_data, hash_diff_content, is_real_commit,
+    next_file_line, resolve_anchor,
 };
 use diff_cache::DiffCache;
 use diff_highlight::{
@@ -1515,7 +1515,7 @@ const WRAP_INDEX_SLOW: std::time::Duration = std::time::Duration::from_millis(5)
 fn resync_wrap_index(
     index: &mut Option<diff::WrapIndex>,
     wrap: bool,
-    lines: &[DiffLine],
+    lines: &DiffLines,
     tabless: bool,
     cols: usize,
     gutter: LineNoGutter,
@@ -1574,7 +1574,7 @@ fn resync_wrap_index(
 fn resync_side_index(
     index: &mut Option<diff::SideIndex>,
     side: diff::DiffSide,
-    lines: &[DiffLine],
+    lines: &DiffLines,
     wrap: Option<&diff::WrapIndex>,
 ) -> bool {
     if side == diff::DiffSide::Both {
@@ -2799,7 +2799,7 @@ fn body_sections(
 /// worst case — every visible row that long — of roughly 40MB of vertices instead of an
 /// unbounded one.
 ///
-/// **A RENDER cap and nothing else.** `DiffLine::text` is untouched, so search, word
+/// **A RENDER cap and nothing else.** The row's text is untouched, so search, word
 /// diff, the scroll anchor, the persistent store, the diffstat and every write action
 /// still see the whole line; only the glyphs stop. And it is never silent — see
 /// `clip_row_text`.
@@ -2962,7 +2962,7 @@ struct RowStyle<'a> {
 /// line's text stays in one column: the numbers belong to the line, not to each row
 /// it takes.
 fn diff_row_job(
-    line: &DiffLine,
+    line: LineRef<'_>,
     row: RowStyle<'_>,
     palette: &highlight::DiffPalette,
     font_id: &egui::FontId,
@@ -3468,7 +3468,7 @@ struct GitkApp {
     /// rather than a copy of every row (12.0s on the frame loop, at 76.5M lines). They
     /// are immutable while displayed; `resync_file_layout`'s re-lay is the one writer,
     /// through `Arc::make_mut`.
-    diff_lines: Arc<Vec<DiffLine>>,
+    diff_lines: Arc<DiffLines>,
     diff_files: Arc<Vec<FileEntry>>,
     /// The rows' syntax spans, indexed alongside `diff_lines`. Filled by the highlight
     /// worker's batches, carried into the cache with the diff (a revisit keeps its
@@ -4645,7 +4645,7 @@ impl GitkApp {
         // load_selected_diff on the StartupDiff::NeedsLoad pass. With no commits
         // there's nothing to load, so go straight to Done — and the install below
         // re-decides it for the list it brings.
-        let diff_lines: Arc<Vec<DiffLine>> = Arc::default();
+        let diff_lines: Arc<DiffLines> = Arc::default();
         let diff_files: Arc<Vec<FileEntry>> = Arc::default();
         let current_diff_key: Option<DiffCacheKey> = None;
 
@@ -9722,7 +9722,7 @@ impl eframe::App for GitkApp {
                             }
                         },
                         |i, sub| {
-                            let line = &lines[i];
+                            let line = lines.line(i);
                             let slice = map.slice(i, line, sub);
                             let (job, row_bg) = diff_row_job(
                                 line,
@@ -10153,7 +10153,7 @@ fn main() -> eframe::Result {
 mod tests {
 
     use super::*;
-    use crate::diff::{LineStats, RowSpans, oid_staged, oid_uncommitted};
+    use crate::diff::{DiffLine, LineStats, RowSpans, oid_staged, oid_uncommitted};
     use crate::diff_highlight::{file_fully_highlighted, pending_files, pick_file, requeue_file};
     use crate::history::load_commits;
     use crate::test_repo::{commit_file, commit_index, commit_rename, rename_file, temp_repo};
@@ -10518,15 +10518,18 @@ mod tests {
 
     #[test]
     fn diff_line_body_strips_marker_by_kind() {
-        assert_eq!(DiffLine::new("+added", LineKind::Add).body(), "added");
-        assert_eq!(DiffLine::new("-removed", LineKind::Del).body(), "removed");
-        assert_eq!(
-            DiffLine::new("context", LineKind::Context).body(),
-            "context"
-        );
-        assert_eq!(DiffLine::new("@@ hunk", LineKind::Hunk).body(), "@@ hunk");
+        let body = |text: &str, kind| {
+            DiffLines::from(vec![DiffLine::new(text, kind)])
+                .line(0)
+                .body()
+                .to_string()
+        };
+        assert_eq!(body("+added", LineKind::Add), "added");
+        assert_eq!(body("-removed", LineKind::Del), "removed");
+        assert_eq!(body("context", LineKind::Context), "context");
+        assert_eq!(body("@@ hunk", LineKind::Hunk), "@@ hunk");
         // A marker-only add/del line → empty body, no panic.
-        assert_eq!(DiffLine::new("+", LineKind::Add).body(), "");
+        assert_eq!(body("+", LineKind::Add), "");
     }
 
     #[test]
@@ -10535,13 +10538,14 @@ mod tests {
         let palette = hl.palette().clone();
         let fid = egui::FontId::monospace(13.0);
         let bg = |text: &str, kind| {
-            let line = DiffLine::new(text, kind);
+            let row = DiffLines::from(vec![DiffLine::new(text, kind)]);
+            let line = row.line(0);
             diff_row_job(
-                &line,
+                line,
                 RowStyle {
                     spans: &[],
                     emphasis: &[],
-                    slice: &diff::RowSlice::whole(&line),
+                    slice: &diff::RowSlice::whole(line),
                 },
                 &palette,
                 &fid,
@@ -10586,13 +10590,14 @@ mod tests {
                 LineKind::Del => format!("-{huge}"),
                 _ => huge.clone(),
             };
-            let line = DiffLine::new(text.as_str(), kind);
+            let row = DiffLines::from(vec![DiffLine::new(text.as_str(), kind)]);
+            let line = row.line(0);
             let (job, _) = diff_row_job(
-                &line,
+                line,
                 RowStyle {
                     spans: &[],
                     emphasis: &[],
-                    slice: &diff::RowSlice::whole(&line),
+                    slice: &diff::RowSlice::whole(line),
                 },
                 &palette,
                 &fid,
@@ -10619,13 +10624,14 @@ mod tests {
         let hl = highlight::test_highlighter();
         let palette = hl.palette().clone();
         let fid = egui::FontId::monospace(13.0);
-        let line = DiffLine::new("+let x = 1;", LineKind::Add);
+        let row = DiffLines::from(vec![DiffLine::new("+let x = 1;", LineKind::Add)]);
+        let line = row.line(0);
         let (job, _) = diff_row_job(
-            &line,
+            line,
             RowStyle {
                 spans: &[(palette.foreground, 0..3)],
                 emphasis: &[],
-                slice: &diff::RowSlice::whole(&line),
+                slice: &diff::RowSlice::whole(line),
             },
             &palette,
             &fid,
@@ -10645,13 +10651,14 @@ mod tests {
         let fid = egui::FontId::monospace(13.0);
         // Three bytes a character, so a byte-index cut lands mid-character.
         let text = format!("+{}", "日".repeat(MAX_ROW_RENDER_CHARS * 2));
-        let line = DiffLine::new(text.as_str(), LineKind::Add);
+        let row = DiffLines::from(vec![DiffLine::new(text.as_str(), LineKind::Add)]);
+        let line = row.line(0);
         let (job, _) = diff_row_job(
-            &line,
+            line,
             RowStyle {
                 spans: &[],
                 emphasis: &[],
-                slice: &diff::RowSlice::whole(&line),
+                slice: &diff::RowSlice::whole(line),
             },
             &palette,
             &fid,
@@ -10740,12 +10747,12 @@ mod tests {
         let n = std::num::NonZeroU32::new;
         let body = "abcdefghij".repeat(10);
         let body = body.as_str();
-        let lines = vec![DiffLine::with_linenos(
+        let lines = DiffLines::from(vec![DiffLine::with_linenos(
             format!("+{body}"),
             LineKind::Add,
             None,
             n(7),
-        )];
+        )]);
         let g = LineNoGutter::measure(&lines);
         // One digit and a space, on the new side only.
         assert_eq!(g.chars(), 2);
@@ -10758,9 +10765,9 @@ mod tests {
         assert_eq!(rows, body.len().div_ceil(cols - prefix_len));
         let mut drawn = String::new();
         for sub in 0..rows {
-            let slice = idx.slice(0, &lines[0], sub);
+            let slice = idx.slice(0, lines.line(0), sub);
             let (job, _) = diff_row_job(
-                &lines[0],
+                lines.line(0),
                 RowStyle {
                     spans: &[],
                     emphasis: &[],
@@ -10845,10 +10852,10 @@ mod tests {
     #[test]
     fn dropping_the_wrap_index_reports_a_move_exactly_as_building_one_does() {
         let g = LineNoGutter::default();
-        let lines = vec![
+        let lines = DiffLines::from(vec![
             DiffLine::new("x".repeat(400), LineKind::Context),
             DiffLine::new("short", LineKind::Context),
-        ];
+        ]);
         let mut index = None;
 
         // Off, and nothing to drop: no move, on this frame or any after it.
@@ -10888,11 +10895,11 @@ mod tests {
     #[test]
     fn a_diff_rows_menu_id_follows_its_line_across_a_re_wrap() {
         let g = LineNoGutter::default();
-        let lines = vec![
+        let lines = DiffLines::from(vec![
             DiffLine::new("commit abc", LineKind::Meta),
             DiffLine::new("x".repeat(400), LineKind::Context),
             DiffLine::new("tail", LineKind::Context),
-        ];
+        ]);
 
         // The ids under the pointer at `y`, for one wrap index and one salt.
         let ids_at =
@@ -11126,11 +11133,11 @@ mod tests {
     /// would show as a row of the wrong file rather than as a failing assertion.
     #[test]
     fn a_wrapped_pane_lays_out_visual_rows_and_reports_lines() {
-        let lines = vec![
+        let lines = DiffLines::from(vec![
             DiffLine::new("commit abc", LineKind::Meta),
             DiffLine::new("x".repeat(400), LineKind::Context),
             DiffLine::new("tail", LineKind::Context),
-        ];
+        ]);
         let cols = 40;
         let idx = diff::WrapIndex::build(&lines, cols, LineNoGutter::default(), false);
         assert!(idx.total_rows() > 3, "the long line has to actually wrap");
@@ -11216,12 +11223,12 @@ mod tests {
     #[test]
     fn dropping_the_side_index_reports_a_move_exactly_as_building_one_does() {
         use diff::DiffSide;
-        let lines = vec![
+        let lines = DiffLines::from(vec![
             DiffLine::new("@@ -1,2 +1,2 @@", LineKind::Hunk),
             DiffLine::new("-a", LineKind::Del),
             DiffLine::new("+A", LineKind::Add),
             DiffLine::new(" ctx", LineKind::Context),
-        ];
+        ]);
         let g = LineNoGutter::default();
         let mut index = None;
         let resync = |index: &mut Option<diff::SideIndex>, side, wrap| {
@@ -11263,14 +11270,14 @@ mod tests {
     #[test]
     fn a_filtered_pane_lays_out_fewer_rows_and_still_reports_lines() {
         use diff::DiffSide;
-        let lines = vec![
+        let lines = DiffLines::from(vec![
             DiffLine::new("@@ -1,3 +1,3 @@", LineKind::Hunk),
             DiffLine::new(" ctx", LineKind::Context),
             DiffLine::new("-a", LineKind::Del),
             DiffLine::new("-b", LineKind::Del),
             DiffLine::new("+A", LineKind::Add),
             DiffLine::new(" tail", LineKind::Context),
-        ];
+        ]);
         // Which lines each mode is expected to draw, spelled out rather than derived
         // through anything under test.
         let expect = |side: DiffSide| -> Vec<usize> {
@@ -11364,17 +11371,17 @@ mod tests {
         let palette = hl.palette().clone();
         let fid = egui::FontId::monospace(13.0);
         let n = std::num::NonZeroU32::new;
-        let lines = vec![
+        let lines = DiffLines::from(vec![
             DiffLine::new("commit abc", LineKind::Meta),
             DiffLine::new("@@ -9,2 +9,2 @@", LineKind::Hunk),
             DiffLine::with_linenos("ctx", LineKind::Context, n(9), n(9)),
             DiffLine::with_linenos("-old", LineKind::Del, n(10), None),
             DiffLine::with_linenos("+new", LineKind::Add, None, n(100)),
-        ];
+        ]);
         let g = LineNoGutter::measure(&lines);
         let row = |i: usize, g| {
-            let slice = diff::RowSlice::whole(&lines[i]);
-            diff_row_job(&lines[i], plain(&slice), &palette, &fid, g, false, true)
+            let slice = diff::RowSlice::whole(lines.line(i));
+            diff_row_job(lines.line(i), plain(&slice), &palette, &fid, g, false, true)
                 .0
                 .text
         };
@@ -11400,10 +11407,18 @@ mod tests {
         // sit one column left of the changed ones, beside a column of numbers
         // that lines up perfectly.
         let flat = |i: usize| {
-            let slice = diff::RowSlice::whole(&lines[i]);
-            diff_row_job(&lines[i], plain(&slice), &palette, &fid, g, false, false)
-                .0
-                .text
+            let slice = diff::RowSlice::whole(lines.line(i));
+            diff_row_job(
+                lines.line(i),
+                plain(&slice),
+                &palette,
+                &fid,
+                g,
+                false,
+                false,
+            )
+            .0
+            .text
         };
         assert_eq!(flat(2), " 9   9  ctx");
         assert_eq!(flat(3), "10     -old");
@@ -11444,7 +11459,7 @@ mod tests {
         let span = || (egui::Color32::WHITE, 0..1);
 
         // Structural-only range is vacuously done.
-        let structural = vec![DiffLine::new("@@ -1 +1 @@", LineKind::Hunk)];
+        let structural = DiffLines::from(vec![DiffLine::new("@@ -1 +1 @@", LineKind::Hunk)]);
         assert!(file_fully_highlighted(
             &structural,
             &RowSpans::blank(1),
@@ -11453,21 +11468,21 @@ mod tests {
         ));
 
         // All code lines set (incl. one set to no tokens at all); structural ignored.
-        let done = vec![
+        let done = DiffLines::from(vec![
             DiffLine::new("+a", LineKind::Add),
             DiffLine::new("+", LineKind::Add),
             DiffLine::new("@@ -1 +1 @@", LineKind::Hunk),
-        ];
+        ]);
         let mut spans = RowSpans::blank(3);
         spans.set(0, vec![span()]);
         spans.set(1, Vec::new()); // highlighted, produced no tokens
         assert!(file_fully_highlighted(&done, &spans, 0, 3));
 
         // One code line still unset ⇒ not done.
-        let partial = vec![
+        let partial = DiffLines::from(vec![
             DiffLine::new("+a", LineKind::Add),
             DiffLine::new("+b", LineKind::Add),
-        ];
+        ]);
         let mut spans = RowSpans::blank(2);
         spans.set(0, vec![span()]);
         assert!(!file_fully_highlighted(&partial, &spans, 0, 2));
@@ -11479,14 +11494,14 @@ mod tests {
     #[test]
     fn a_row_outside_every_file_range_is_not_pending() {
         let span = || (egui::Color32::WHITE, 0..1);
-        let lines = vec![
+        let lines = DiffLines::from(vec![
             DiffLine::new("commit abc", LineKind::Meta), // 0 header (structural)
             // 1: a `Context` line outside any file range (as a no-patch/binary
             // file's placeholder would be) — is_code, but never tokenized.
             DiffLine::new("Binary files differ", LineKind::Context),
             DiffLine::new("+a", LineKind::Add),     // 2 file code
             DiffLine::new(" b", LineKind::Context), // 3 file code
-        ];
+        ]);
         let files = vec![fe("x.rs", Some(2))]; // file's range starts at index 2
         let mut spans = RowSpans::blank(lines.len());
         spans.set(2, vec![span()]);
@@ -11504,13 +11519,13 @@ mod tests {
         // file A starts at line 1 [1,3): both code lines Some ⇒ done.
         // file B starts at line 3 [3,5): one code line None ⇒ pending.
         let span = || (egui::Color32::WHITE, 0..1);
-        let lines = vec![
+        let lines = DiffLines::from(vec![
             DiffLine::new("diff --git", LineKind::FileMeta), // 0 (pre-file header)
             DiffLine::new("+a0", LineKind::Add),
             DiffLine::new("+a1", LineKind::Add), // file A: [1,3)
             DiffLine::new("+b0", LineKind::Add),
             DiffLine::new("+b1", LineKind::Add), // file B: [3,5)
-        ];
+        ]);
         let files = vec![fe("a.rs", Some(1)), fe("b.rs", Some(3))];
         let mut spans = RowSpans::blank(lines.len());
         for row in [1, 2, 3] {
@@ -12908,7 +12923,7 @@ mod tests {
         let body = data
             .lines
             .iter()
-            .map(|l| &*l.text)
+            .map(|l| l.text)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
@@ -13339,10 +13354,10 @@ mod tests {
         for f in entries.iter() {
             let start = f.diff_line_idx.expect("every fixture file has a body");
             assert!(
-                lines[start].text.starts_with(&f.path),
+                lines.text(start).starts_with(&f.path),
                 "{} claims line {start}, which reads {}",
                 f.path,
-                lines[start].text
+                lines.text(start)
             );
         }
         // Re-deriving over the laid-out entries is the identity — what makes the
