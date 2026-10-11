@@ -435,7 +435,13 @@ reload is why the drain re-keys an adopted result whose key moved in span fields
 (`spans_alone_moved`) through `rekey_for_install`, the foreground drain's own re-key (spans
 blanked when theme, syntax or the grammar map moved), and installs it; a key moved in anything diff-shaping
 (settings, drivers) is not this view's diff, is dropped, and the claim-gone fallback builds
-the real one. While the reader waits on an adopted warm the drain asks for a repaint every
+the real one. **Every re-key of a built diff goes through `respan`** — the config reload's
+re-key of the displayed diff and `rekey_for_install` alike: span fields follow the current
+state, and what the rows were BUILT under (settings, drivers, content hash) stays. The
+reload once re-keyed the displayed diff wholesale from `diff_cache_key`, which gave
+old-settings rows the settings of a still-pending toolbar rebuild; that rebuild then looked
+already shown and was dropped, leaving the old content up. `respan` destructures the key
+exhaustively, so a new `DiffCacheKey` field must be classified there to compile. While the reader waits on an adopted warm the drain asks for a repaint every
 `LOADING_TICK`, because a claim released without a send wakes nothing. `adopted_warm` is
 cleared by `load_selected_diff` (a fresh decision) and `apply_loaded_diff` (the wait is
 over). When `load_selected_diff` finds the reader LEFT it — the selection or its key moved —

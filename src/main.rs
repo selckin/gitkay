@@ -4118,6 +4118,32 @@ fn spans_alone_moved(arrived: &DiffCacheKey, current: &DiffCacheKey) -> bool {
     } == *current
 }
 
+/// `built` — the key a diff was built (or last re-keyed) under — with its SPAN fields
+/// (theme, syntax on/off, grammar map) taken from `fresh`, the key the current state
+/// would give. Everything the content was built under (settings, drivers, its content
+/// hash) stays `built`'s: re-keying the displayed diff from `diff_cache_key` wholesale
+/// gave old-settings rows the settings a still-pending toolbar rebuild was for, and
+/// that rebuild then looked "already shown" and was dropped. Exhaustive on purpose — a
+/// field added to `DiffCacheKey` fails to compile here until it is classified.
+const fn respan(built: &DiffCacheKey, fresh: &DiffCacheKey) -> DiffCacheKey {
+    let &DiffCacheKey {
+        oid,
+        settings,
+        content,
+        drivers,
+        theme: _,
+        enabled: _,
+        languages: _,
+    } = built;
+    DiffCacheKey {
+        oid,
+        settings,
+        content,
+        drivers,
+        ..*fresh
+    }
+}
+
 /// Whether a result built under `from` carries spans that are wrong under `to`: the
 /// theme, syntax on/off, or the grammar map moved between them. Shared by both
 /// re-keying installs (`GitkApp::rekey_for_install`).
@@ -5181,7 +5207,13 @@ impl GitkApp {
     /// diff (`self.diff_spans.clear()`) so the post-install pass recolours from
     /// scratch — same mechanism, applied to the arriving result instead of the field.
     fn rekey_for_install(&self, key: &DiffCacheKey, data: &mut DiffData) -> DiffCacheKey {
-        let fresh = finalize_diff_key(self.diff_cache_key(key.oid), CommitKind::of(key.oid), data);
+        // Span fields from now, everything else from what the result was built under
+        // (`respan`): a result's rows are its own key's diff, whatever the toolbar says.
+        let fresh = finalize_diff_key(
+            respan(key, &self.diff_cache_key(key.oid)),
+            CommitKind::of(key.oid),
+            data,
+        );
         if spans_outlived(key, &fresh) {
             data.spans.clear();
         }
@@ -8398,15 +8430,13 @@ impl GitkApp {
                     // none of them says anything about colour any more.
                     self.diff_spans.clear();
                     // Re-key the live diff so its eventual stash lands under the
-                    // new theme/enabled, not the old key. Rebuilt through
-                    // diff_cache_key (settings are still the pre-reload ones the
-                    // displayed diff was built with) rather than patched
-                    // member-wise, so a future key field can't be left stale
-                    // here; only the virtual entries' content hash carries over.
-                    self.current_diff_key = self.current_diff_key.take().map(|k| DiffCacheKey {
-                        content: k.content,
-                        ..self.diff_cache_key(k.oid)
-                    });
+                    // new span settings — and ONLY those (`respan`): the displayed
+                    // diff keeps the settings it was built with, which are not
+                    // `diff_settings` while a toolbar rebuild is still in flight.
+                    self.current_diff_key = self
+                        .current_diff_key
+                        .take()
+                        .map(|k| respan(&k, &self.diff_cache_key(k.oid)));
                     // Bumps the generation so an in-flight old-theme worker's
                     // queued spans are dropped, not applied for a frame.
                     self.invalidate_diff_highlight();
@@ -13289,6 +13319,44 @@ mod tests {
     /// still the diff the reader is waiting for — the span fields decide colour, not
     /// content — so it is re-keyed and installed. Anything else that moved (settings,
     /// drivers, content) means its rows are not that diff.
+    /// A diff's span fields follow a reload; what it was BUILT under does not. The
+    /// regression: a toolbar toggle had already moved `diff_settings` while its rebuild
+    /// was in flight, a theme reload re-keyed the displayed (old-settings) diff with the
+    /// NEW settings, and the rebuild then looked "already shown" and was dropped — the
+    /// old content stayed on screen under the new settings' key.
+    #[test]
+    fn respan_moves_only_the_span_fields_of_a_built_diffs_key() {
+        use highlight::EmbeddedThemeName as T;
+        let built = DiffCacheKey {
+            oid: oid(1),
+            settings: ds(),
+            theme: T::CatppuccinMocha,
+            enabled: true,
+            content: 5,
+            drivers: 6,
+            languages: 0,
+        };
+        let mut now = ds();
+        now.context += 1; // the toolbar moved the settings; the rebuild is in flight
+        let fresh = DiffCacheKey {
+            oid: oid(1),
+            settings: now,
+            theme: T::CatppuccinLatte,
+            enabled: false,
+            content: 0,
+            drivers: 9,
+            languages: 7,
+        };
+        let respanned = respan(&built, &fresh);
+        assert!(respanned.settings == built.settings, "built under, so kept");
+        assert_eq!(respanned.drivers, built.drivers, "built under, so kept");
+        assert_eq!(respanned.content, built.content, "its content, so kept");
+        assert_eq!(respanned.oid, built.oid);
+        assert_eq!(respanned.theme, T::CatppuccinLatte, "span field follows");
+        assert!(!respanned.enabled, "span field follows");
+        assert_eq!(respanned.languages, 7, "span field follows");
+    }
+
     #[test]
     fn only_a_key_moved_by_span_settings_alone_is_rekeyed_for_an_adopted_wait() {
         use highlight::EmbeddedThemeName as T;
