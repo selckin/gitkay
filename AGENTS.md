@@ -441,7 +441,11 @@ state, and what the rows were BUILT under (settings, drivers, content hash) stay
 reload once re-keyed the displayed diff wholesale from `diff_cache_key`, which gave
 old-settings rows the settings of a still-pending toolbar rebuild; that rebuild then looked
 already shown and was dropped, leaving the old content up. `respan` destructures the key
-exhaustively, so a new `DiffCacheKey` field must be classified there to compile.
+exhaustively, so a new `DiffCacheKey` field must be classified there to compile. The
+same holds for a FOREGROUND load the reader is waiting on: `awaiting` (`awaits`) accepts a
+result whose key differs from the current one in span fields only, and both drains install
+it through `rekey_for_install`; with exact equality a bounced-back load hit by a theme or
+grammar reload was neither installed nor cached, and nothing re-dispatched it.
 While the reader waits on an adopted warm the drain asks for a repaint every
 `LOADING_TICK`, because a claim released without a send wakes nothing. `adopted_warm` is
 cleared by `load_selected_diff` (a fresh decision), `apply_loaded_diff` (the wait is
@@ -1070,7 +1074,11 @@ sorted drivers keep the same rows with the same rewritten parents.
   per-frame resubmission is comparing the target list against `stats_submitted`, which
   is why `invalidate_commit_stats` must clear that list — leave it and the next dispatch
   finds it unchanged against a cleared map and never re-queues, the same silently-stuck
-  column by a different route.
+  column by a different route. **A stats result dropped as stale clears it too**
+  (`drain_stats_results`): a job still running across an invalidation keeps its oid in
+  `busy_stats`, so the coordinator refuses the row's fresh job, and once the stale result
+  is dropped an unchanged target list would never offer the row again until the view
+  moved.
   That comparison is the gate precisely because it **cannot go stale**: it is recomputed
   every frame from the same state it gates on. A cheaper *precondition* in front of it —
   "skip unless the view moved or the map changed" — has to enumerate every way the list

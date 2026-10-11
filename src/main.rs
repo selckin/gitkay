@@ -1091,6 +1091,31 @@ fn invalidate_stats_state(
     epoch.bump();
 }
 
+/// Install the stats results that landed this frame. A result from before the last
+/// invalidation is dropped — and clears `submitted`, so the next dispatch offers its row
+/// again: while that job ran, the coordinator refused the row's fresh job as busy
+/// (`busy_stats` is per oid), and with the target list unchanged nothing else would
+/// re-offer it until the view moved.
+fn drain_stats_results(
+    known: &mut HashMap<git2::Oid, Option<CommitStats>>,
+    submitted: &mut Vec<git2::Oid>,
+    epoch: &Epoch,
+    landed: impl IntoIterator<Item = StatsResult>,
+) {
+    for StatsResult {
+        epoch: at,
+        oid,
+        stats,
+    } in landed
+    {
+        if epoch.is_current(at) {
+            install_stats_result(known, oid, stats);
+        } else {
+            submitted.clear();
+        }
+    }
+}
+
 /// Install one landed stats result. A `None` (failed) result must never clobber an
 /// existing `Some(_)`.
 ///
@@ -4118,6 +4143,21 @@ fn spans_alone_moved(arrived: &DiffCacheKey, current: &DiffCacheKey) -> bool {
     } == *current
 }
 
+/// Whether an arriving result for `key` is the diff the reader is waiting on: a load is
+/// armed, its row is selected, and `key` differs from the `current` key at most in span
+/// fields. A span-settings reload (theme, syntax on/off, grammar map) moves the current
+/// key under a waiting load without dispatching anything, so exact equality left it
+/// neither installed nor cached — the installers `respan` the key and blank the spans
+/// instead (`GitkApp::rekey_for_install`).
+fn awaits(
+    load_armed: bool,
+    selected: Option<git2::Oid>,
+    key: &DiffCacheKey,
+    current: &DiffCacheKey,
+) -> bool {
+    load_armed && selected == Some(key.oid) && spans_alone_moved(key, current)
+}
+
 /// `built` — the key a diff was built (or last re-keyed) under — with its SPAN fields
 /// (theme, syntax on/off, grammar map) taken from `fresh`, the key the current state
 /// would give. Everything the content was built under (settings, drivers, its content
@@ -5172,16 +5212,19 @@ impl GitkApp {
 
     /// True when the UI is sitting in the loading state waiting for exactly this
     /// diff: a load is armed, the selected commit is the key's oid, and the key
-    /// matches the current settings/theme. The drains install an arriving result
+    /// matches the current one up to span fields (`awaits`). The drains install an arriving result
     /// that passes this — current epoch or not — which is what lets a re-selection
     /// adopt an in-flight worker instead of stacking a duplicate. Real commits
     /// only: a virtual key is content-keyed, so two computes of it aren't "the
     /// same diff" and those always take a fresh worker.
     fn awaiting(&self, key: &DiffCacheKey) -> bool {
-        self.diff_load.is_some()
-            && is_real_commit(key.oid)
-            && self.selected_oid() == Some(key.oid)
-            && self.key_is_current(key)
+        is_real_commit(key.oid)
+            && awaits(
+                self.diff_load.is_some(),
+                self.selected_oid(),
+                key,
+                &self.diff_cache_key(key.oid),
+            )
     }
 
     /// The key a finished diff installs under, re-derived from CURRENT state, with
@@ -6074,20 +6117,23 @@ impl GitkApp {
     /// but a re-dispatch after `handle_git_reload` retries a failed row can put two
     /// results in flight for it.
     fn drain_commit_stats(&mut self) {
-        while let Ok(StatsResult { epoch, oid, stats }) = self.stats_rx.try_recv() {
-            if !self.stats_epoch.is_current(epoch) {
-                continue;
-            }
-            install_stats_result(&mut self.commit_stats, oid, stats);
-        }
+        let landed: Vec<StatsResult> = self.stats_rx.try_iter().collect();
+        drain_stats_results(
+            &mut self.commit_stats,
+            &mut self.stats_submitted,
+            &self.stats_epoch,
+            landed,
+        );
     }
 
     /// Drop every cached stat, because the question they answer changed.
     ///
     /// Also clears what the pool still has queued, and the record of what was last
     /// submitted — otherwise the next dispatch would compare against a stale list, find
-    /// it unchanged, and never re-queue. A row already being computed needs no handling:
-    /// its claim releases on its own and the epoch check discards its result.
+    /// it unchanged, and never re-queue. A row already being computed has its claim
+    /// released on its own and its result discarded by the epoch check — and that
+    /// discard clears `stats_submitted` again (`drain_stats_results`), because the
+    /// coordinator refused the row's fresh job as busy while the old one ran.
     ///
     /// The steps live in `invalidate_stats_state` so the regression test drives the real
     /// thing rather than a copy.
@@ -8920,7 +8966,11 @@ impl WarmDrain for GitkApp {
             // result is cached rather than installed over this one.
             WarmDisposition::Install => {
                 self.diff_load_epoch.bump();
-                self.install_preferring_cache(key, data);
+                // Awaited may mean "differs in span fields only" (`awaits`): install
+                // under the current key, with spans coloured under old settings blanked.
+                let mut data = data;
+                let fresh = self.rekey_for_install(&key, &mut data);
+                self.install_preferring_cache(fresh, data);
             }
             WarmDisposition::Cache => self.cache_diff(key, data),
             // Settings, theme or the grammar map changed while the worker ran; the key
@@ -13319,6 +13369,89 @@ mod tests {
     /// still the diff the reader is waiting for — the span fields decide colour, not
     /// content — so it is re-keyed and installed. Anything else that moved (settings,
     /// drivers, content) means its rows are not that diff.
+    /// A load the reader is waiting on stays awaited across a span-settings reload
+    /// (theme, syntax, grammar map): the rows are still this view's diff, only their
+    /// colours are stale. Exact key equality left a bounced-back foreground load
+    /// neither installed nor cached, and nothing re-dispatched — "Loading…" for good.
+    #[test]
+    fn a_load_stays_awaited_across_a_span_only_reload_but_not_a_settings_change() {
+        use highlight::EmbeddedThemeName as T;
+        let current = DiffCacheKey {
+            oid: oid(1),
+            settings: ds(),
+            theme: T::CatppuccinLatte,
+            enabled: true,
+            content: 0,
+            drivers: 0,
+            languages: 0,
+        };
+        let built = |f: fn(&mut DiffCacheKey)| {
+            let mut k = current.clone();
+            f(&mut k);
+            k
+        };
+        let sel = Some(oid(1));
+        assert!(awaits(true, sel, &current, &current));
+        assert!(awaits(
+            true,
+            sel,
+            &built(|k| k.theme = T::CatppuccinMocha),
+            &current
+        ));
+        assert!(awaits(true, sel, &built(|k| k.languages = 3), &current));
+        assert!(!awaits(
+            true,
+            sel,
+            &built(|k| k.settings.context += 1),
+            &current
+        ));
+        assert!(!awaits(false, sel, &current, &current), "no load armed");
+        assert!(
+            !awaits(true, Some(oid(2)), &current, &current),
+            "reader moved on"
+        );
+    }
+
+    /// A stats result dropped as stale (its job outlived an invalidation) must make the
+    /// next dispatch re-submit: while that job ran, the coordinator refused the row's
+    /// fresh job as busy, and an unchanged target list would never offer it again.
+    #[test]
+    fn a_stale_stats_result_forces_the_next_dispatch_to_resubmit() {
+        let epoch = Epoch::default();
+        let stale = epoch.current();
+        epoch.bump();
+        let mut known = HashMap::new();
+        let mut submitted = vec![oid(1)];
+        drain_stats_results(
+            &mut known,
+            &mut submitted,
+            &epoch,
+            [StatsResult {
+                epoch: stale,
+                oid: oid(1),
+                stats: None,
+            }],
+        );
+        assert!(known.is_empty(), "a stale result installs nothing");
+        assert!(submitted.is_empty(), "and the next dispatch submits again");
+        let mut submitted = vec![oid(1)];
+        drain_stats_results(
+            &mut known,
+            &mut submitted,
+            &epoch,
+            [StatsResult {
+                epoch: epoch.current(),
+                oid: oid(1),
+                stats: None,
+            }],
+        );
+        assert_eq!(
+            submitted,
+            vec![oid(1)],
+            "a current result leaves the gate alone"
+        );
+    }
+
     /// A diff's span fields follow a reload; what it was BUILT under does not. The
     /// regression: a toolbar toggle had already moved `diff_settings` while its rebuild
     /// was in flight, a theme reload re-keyed the displayed (old-settings) diff with the
