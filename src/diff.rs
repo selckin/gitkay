@@ -2875,7 +2875,11 @@ pub fn build_diff_data<'r>(
             bytes.parallel_ceiling()
         );
     }
-    let (lines, max_chars, tabless) = rows.finish();
+    let (mut lines, max_chars, tabless) = rows.finish();
+    // The rows grew by doubling, so up to half the buffer is spare — 1.84GB of it on a
+    // 76.5M-row sequential build, all of it charged to the cache by `heap_bytes`. On a
+    // buffer that large the shrink is an `mremap`, not a copy.
+    lines.shrink_to_fit();
     DiffData {
         textconv_failed: failed,
         tabless,
@@ -5360,6 +5364,22 @@ pub mod tests {
         );
         assert_eq!(data.files.len(), 1);
         assert_eq!(data.files[0].path, "f.txt");
+    }
+
+    /// A finished diff holds no spare row capacity. The rows grow by doubling, so a
+    /// sequential build ended up to 2x its length: measured on a 76.5M-row commit,
+    /// 134M slots (4.29GB) for 2.45GB of rows, which `heap_bytes` charged the cache for.
+    #[test]
+    fn a_finished_diff_holds_no_spare_row_capacity() {
+        let (_dir, repo, oid) = synthetic_rewrite_repo(300);
+        let data = get_diff_data(
+            &repo,
+            &RowScope::new(DiffSource::Commit(oid)),
+            base_settings(),
+            BuildEnv::NONE,
+        );
+        assert!(data.lines.len() > 600);
+        assert_eq!(data.lines.capacity(), data.lines.len());
     }
 
     /// The whole point of the probe: cost tracks BYTES READ, not patch size. A one-line
