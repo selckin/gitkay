@@ -5106,6 +5106,18 @@ impl GitkApp {
         // load, or nothing if the pane already blanked to a placeholder) before it's
         // replaced, so a later revisit restores it instantly.
         self.stash_current_diff();
+        // What the reader actually waited, from the first dispatch of this run of
+        // loading (`DiffLoadState::started` survives re-dispatch) to the install. Only
+        // when the armed load is FOR this row: a cache hit installs over a load still
+        // armed for the row the reader just left, whose wait is not this diff's.
+        if let Some(load) = self.diff_load.as_ref().filter(|load| load.oid == oid) {
+            log::debug!(
+                "perf: diff shown {oid} ({} lines, {}) after {:?}",
+                data.lines.len(),
+                if load.is_rebuild { "rebuild" } else { "switch" },
+                load.started.elapsed()
+            );
+        }
         self.diff_load = None;
         // Harvest the INCOMING diff's numbers, not only the outgoing one's.
         // `stash_current_diff` → `cache_diff` covers the diff being replaced, which
