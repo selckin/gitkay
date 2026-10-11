@@ -3884,9 +3884,12 @@ struct GitkApp {
     /// The key whose prefetch warm the reader's click adopted instead of building it
     /// again (`dispatch_diff_load`). Watched by `drain_worker_results`: if the warm's
     /// claim goes without its result being installed, the foreground load is
-    /// dispatched after all. Cleared by `load_selected_diff` (a fresh decision — and
-    /// `unadopt_warm`ed there when the reader left it), and by `apply_loaded_diff` (the
-    /// wait is over) and `clear_failed_load` (nothing waits), both via `end_adoption`.
+    /// dispatched after all. Cleared by `load_selected_diff` when the reader left it
+    /// (and `unadopt_warm`ed there) — a key moved in span fields alone has not left it,
+    /// and `dispatch_diff_load` re-adopts it under this key — and by every end of the
+    /// wait, which all go through `end_wait` (an install, a failed load, no selection,
+    /// the diff already on screen). It keeps the key the warm was CLAIMED under, which a
+    /// span-settings reload may since have moved the current key away from.
     adopted_warm: Option<DiffCacheKey>,
     /// Background history loads (lazy-load extension + watcher rebuild). Results
     /// return over this channel; `history_epoch` supersedes stale ones; the
@@ -5316,20 +5319,21 @@ impl GitkApp {
         // re-enter here for the same selection, cancelling that click's
         // in-flight load through the early-return path's epoch bump.
         self.deferred_diff_load_at = None;
-        // The reader moved on, or a fresh decision is being made: whichever, a warm
-        // adopted for the last one is no longer what this load waits on. If the reader
-        // LEFT it — the selection or its key moved — it goes back to being speculative,
-        // or it would keep skipping colour and shipping an oversized row nobody waits
-        // for to the UI thread to be freed there. Not for the same key: the dispatch
-        // below re-adopts it, and dropping the flag in between would let the warm see
-        // an instant in which nobody had adopted it. A return to the row re-adopts too.
-        if let Some(adopted) = self.adopted_warm.take()
-            && self
+        // If the reader LEFT the diff an adopted warm is building — the selection moved,
+        // or its key moved in anything diff-shaping — the warm goes back to being
+        // speculative, or it would keep skipping colour and shipping an oversized row
+        // nobody waits for to the UI thread to be freed there. A return to the row
+        // re-adopts it. Still the same diff — the same key, or one a span-settings
+        // reload moved in span fields alone (`spans_alone_moved`, the rule `awaits`
+        // installs its result by) — it stays adopted, and the dispatch below waits on
+        // it again rather than building the same diff a second time. Not unadopted in
+        // between either: the warm would see an instant in which nobody had adopted it.
+        let left = self.adopted_warm.as_ref().is_some_and(|adopted| {
+            !self
                 .selected_oid()
-                .map(|oid| self.diff_cache_key(oid))
-                .as_ref()
-                != Some(&adopted)
-        {
+                .is_some_and(|oid| spans_alone_moved(adopted, &self.diff_cache_key(oid)))
+        });
+        if left && let Some(adopted) = self.adopted_warm.take() {
             unadopt_warm(&self.inflight_diffs, &adopted);
         }
         // Already showing this exact diff (same commit + options)? Then there's nothing
@@ -5348,7 +5352,7 @@ impl GitkApp {
         if let Some(oid) = self.selected_oid()
             && self.shows_current(&self.diff_cache_key(oid))
         {
-            if self.diff_load.take().is_some() {
+            if self.end_wait(None) {
                 self.diff_load_epoch.bump();
             }
             // Drop any restore target queued for the abandoned navigation — left
@@ -5375,7 +5379,7 @@ impl GitkApp {
             // No selection: supersede any in-flight load, stash the outgoing diff for a
             // later revisit, and clear the pane.
             self.diff_load_epoch.bump();
-            self.diff_load = None;
+            self.end_wait(None);
             self.stash_current_diff();
             self.clear_diff_pane();
             return;
@@ -5836,14 +5840,31 @@ impl GitkApp {
         }
     }
 
+    /// The reader's wait is over: no load is armed any more, and so no warm is adopted
+    /// either (`end_adoption`, with `installed` the diff now on screen, if the wait
+    /// ended in one). `true` when a load was armed.
+    ///
+    /// The ONE place the loading state is cleared, so no way of ending a wait can leave
+    /// a warm adopted behind it — which the identical-key return of
+    /// `install_preferring_cache` once did, clearing the load alone: the warm kept
+    /// skipping colour and shipping oversized rows to the UI thread for a reader who was
+    /// no longer waiting on anything.
+    fn end_wait(&mut self, installed: Option<&DiffCacheKey>) -> bool {
+        let armed = self.diff_load.take().is_some();
+        self.end_adoption(installed);
+        armed
+    }
+
     /// The wait on an adopted warm is over. A warm adopted for anything but the diff now
-    /// installed (`installed`) is unadopted, so it goes back to colouring and to dropping
+    /// installed (`installed`) is unadopted — "the same diff" being the one
+    /// `spans_alone_moved` names, so a warm that installs re-keyed after a span-settings
+    /// reload is not released just after it delivered — so it goes back to colouring and to dropping
     /// an oversized row on the worker instead of shipping it to the UI thread to be freed:
     /// an install of the selected row can land while the adoption was for another key
     /// (a stale result for a newly selected row during the search debounce).
     fn end_adoption(&mut self, installed: Option<&DiffCacheKey>) {
         if let Some(adopted) = self.adopted_warm.take()
-            && installed != Some(&adopted)
+            && !installed.is_some_and(|key| spans_alone_moved(&adopted, key))
         {
             unadopt_warm(&self.inflight_diffs, &adopted);
         }
@@ -5853,10 +5874,9 @@ impl GitkApp {
     /// spinner, stash what is on screen (a revisit is instant) and blank the pane, so
     /// nothing is misattributed to the selected row and re-selecting it retries.
     fn clear_failed_load(&mut self) {
-        self.diff_load = None;
         // Nothing waits on an adopted warm once no load is armed: hand a still-running
         // one back to the band (colour, drop an oversized row on the worker).
-        self.end_adoption(None);
+        self.end_wait(None);
         self.stash_current_diff();
         self.clear_diff_pane();
     }
@@ -5890,8 +5910,7 @@ impl GitkApp {
                 load.started.elapsed()
             );
         }
-        self.diff_load = None;
-        self.end_adoption(Some(&key));
+        self.end_wait(Some(&key));
         // Harvest the INCOMING diff's numbers, not only the outgoing one's.
         // `stash_current_diff` → `cache_diff` covers the diff being replaced, which
         // left the SELECTED row — the one commit whose diff is guaranteed to exist —
@@ -5990,7 +6009,7 @@ impl GitkApp {
         // sit dangling until some LATER same-oid install consumed it — the oid
         // tag alone can't catch that, since the oid would still match.
         if self.shows_current(&key) {
-            self.diff_load = None;
+            self.end_wait(Some(&key));
             self.pending_anchor = None;
             reaper::dispose(data);
             return;
@@ -6067,6 +6086,13 @@ impl GitkApp {
         {
             log::debug!("diff-load: adopt in-flight worker for {}", key.oid);
             self.arm_diff_load(key.oid, running, same_oid_rebuild, false);
+            // The wait is on that worker now, not on a warm `load_selected_diff` kept.
+            // Accepted rare case: a warm kept across a span-only key move is released
+            // here. If that queued foreground worker then gives up before building and
+            // the drain re-dispatches, `adopt_warm(current key)` misses the warm (it is
+            // claimed under the old key) and the diff is built twice — accepted, because
+            // `try_claim` never lets a foreground and a warm hold the same key.
+            self.end_adoption(None);
             return;
         }
         // A prefetch warm is already building this key, and it is one worth waiting
@@ -6078,14 +6104,22 @@ impl GitkApp {
         // (`adopted_warm_undelivered`) dispatches the foreground load after all.
         // Any other claim — a multi-delta warm, a cheap row — proceeds as below and
         // accepts the duplicate.
-        if is_real_commit(key.oid) && adopt_warm(&self.inflight_diffs, &key) {
+        //
+        // The warm is claimed under the key it was dispatched with. A warm already
+        // adopted for this diff (`load_selected_diff` keeps only that one) is asked for
+        // under ITS key: a span-settings reload since then moved `key` in span fields
+        // alone, `adopt_warm(key)` would miss the claim, and its result still installs,
+        // re-keyed (`awaits`, `rekey_for_install`). Taken either way, so a claim that
+        // has gone falls through to the foreground load with nothing left adopted.
+        let warm = self.adopted_warm.take().unwrap_or_else(|| key.clone());
+        if is_real_commit(key.oid) && adopt_warm(&self.inflight_diffs, &warm) {
             log::debug!(
                 "diff-load: {} is already being built by a warm; waiting for it",
                 key.oid
             );
             let progress = Arc::new(DiffProgress::default());
             self.arm_diff_load(key.oid, progress, same_oid_rebuild, true);
-            self.adopted_warm = Some(key);
+            self.adopted_warm = Some(warm);
             return;
         }
         let progress = Arc::new(DiffProgress::default());
@@ -6192,7 +6226,7 @@ impl GitkApp {
                 // doesn't stick on the placeholder; the previous diff stays on screen.
                 Err(e) => {
                     log::warn!("diff-load fallback: repo discover failed: {e}");
-                    self.diff_load = None;
+                    self.end_wait(None);
                 }
             }
         }
@@ -14750,6 +14784,170 @@ mod tests {
         };
         assert!(!drain_warms(&mut w));
         assert!(w.channel.is_empty(), "the neighbours were drained");
+    }
+
+    /// A real app over `repo`, its history walked and no frame run, so nothing has
+    /// been dispatched: what a test then does is the only thing that happens.
+    fn idle_app(dir: &tempfile::TempDir) -> HeadlessApp {
+        HeadlessApp::new(dir.path().to_str().unwrap(), cli::Scope::default())
+    }
+
+    /// Select `oid`'s row without loading it — what the search debounce does.
+    fn select_row(app: &mut GitkApp, oid: git2::Oid) {
+        app.selected = Some(app.commit_index_by_oid[&oid]);
+    }
+
+    /// A prefetch warm building `oid`'s diff under the key the app would give it now,
+    /// claimed adoptable (one blob dominates the row). Held by the returned claim.
+    fn adoptable_warm(app: &GitkApp, oid: git2::Oid) -> InflightClaim {
+        InflightClaim::try_claim(
+            &app.inflight_diffs,
+            app.diff_cache_key(oid),
+            ClaimKind::Warm {
+                adoptable: true,
+                adopted: false,
+            },
+        )
+        .expect("nothing else claims the key")
+    }
+
+    /// `oid`'s diff as a build under the app's current settings produces it.
+    fn built_diff(repo: &git2::Repository, app: &GitkApp, oid: git2::Oid) -> DiffData {
+        get_diff_data(
+            repo,
+            &RowScope::new(DiffSource::Commit(oid)),
+            app.diff_settings,
+            BuildEnv::NONE,
+        )
+    }
+
+    /// The reader adopted the warm building a row, and a span-settings reload then moved
+    /// the current key in span fields alone. Every history drain calls
+    /// `load_selected_diff`, and that call must still see the same diff: unadopting the
+    /// warm there, and missing `adopt_warm` under the new key, started a foreground
+    /// build of the very diff the warm was building — both holding the blob at once,
+    /// one result thrown away. The warm's result, under the key it was claimed with,
+    /// then installs re-keyed to the current one.
+    #[test]
+    fn a_span_only_key_move_keeps_the_adopted_warm() {
+        let (dir, repo) = temp_repo();
+        commit_file(&repo, "a.txt", "1\n", "base");
+        let tip = commit_file(&repo, "a.txt", "1\n2\n", "grow");
+        let mut h = idle_app(&dir);
+        let app = &mut h.app;
+        select_row(app, tip);
+        let claim = adoptable_warm(app, tip);
+        app.load_selected_diff();
+        let adopted = app.diff_cache_key(tip);
+        assert!(
+            app.adopted_warm.as_ref() == Some(&adopted),
+            "the click adopted it"
+        );
+        assert!(claim.adopted());
+
+        // Syntax on/off: a span field, reloaded without dispatching anything.
+        app.span_settings.enabled = !app.span_settings.enabled;
+        let current = app.diff_cache_key(tip);
+        assert!(
+            current != adopted && spans_alone_moved(&adopted, &current),
+            "control: the key moved, in span fields alone"
+        );
+
+        app.load_selected_diff();
+        assert!(claim.adopted(), "the warm is still the one being waited on");
+        assert!(app.adopted_warm.as_ref() == Some(&adopted));
+        assert!(
+            app.diff_load.as_ref().is_some_and(|l| l.adopted),
+            "still an adopted wait"
+        );
+        assert!(
+            !is_claimed(&app.inflight_diffs, &current),
+            "no foreground build of the same diff"
+        );
+
+        // The warm delivers under its own key, then releases its claim.
+        let data = built_diff(&repo, app, tip);
+        app.take_warm(WarmResult {
+            key: adopted,
+            data,
+            cacheable: true,
+        });
+        drop(claim);
+        assert!(
+            app.current_diff_key.as_ref() == Some(&current),
+            "installed, re-keyed to now"
+        );
+        assert!(app.diff_load.is_none(), "the wait is over");
+        assert!(app.adopted_warm.is_none());
+    }
+
+    /// A re-keyed install of the adopted warm is the same diff: ending the wait with the
+    /// current key, which differs from the adopted one in span fields alone, leaves the
+    /// warm adopted, while an install of any other diff releases it.
+    #[test]
+    fn a_re_keyed_install_ends_only_an_adoption_for_another_diff() {
+        let (dir, repo) = temp_repo();
+        commit_file(&repo, "a.txt", "1\n", "base");
+        let tip = commit_file(&repo, "a.txt", "1\n2\n", "grow");
+        let mut h = idle_app(&dir);
+        let app = &mut h.app;
+        select_row(app, tip);
+        let claim = adoptable_warm(app, tip);
+        app.load_selected_diff();
+        let adopted = app.diff_cache_key(tip);
+        assert!(app.adopted_warm.as_ref() == Some(&adopted) && claim.adopted());
+
+        app.span_settings.enabled = !app.span_settings.enabled;
+        let current = app.diff_cache_key(tip);
+        assert!(
+            current != adopted && spans_alone_moved(&adopted, &current),
+            "control: the key moved, in span fields alone"
+        );
+        app.end_adoption(Some(&current));
+        assert!(app.adopted_warm.is_none(), "the wait is over");
+        assert!(claim.adopted(), "the same diff: the warm stays adopted");
+
+        // Control: an install of a diff-shaping different key does release it.
+        app.adopted_warm = Some(adopted);
+        let mut other = current;
+        other.settings.context += 1;
+        app.end_adoption(Some(&other));
+        assert!(!claim.adopted(), "another diff: the warm is released");
+    }
+
+    /// An install can land on the key already on screen while a warm is adopted for
+    /// another row: here the reader clicked B (adopting its warm), the search debounce
+    /// moved the selection back to A without a load, and A's diff arrived again. That
+    /// ends the wait, so it must end the adoption too — left adopted, B's warm keeps
+    /// skipping colour and ships an oversized row to the UI thread for nobody.
+    #[test]
+    fn an_install_of_the_key_on_screen_ends_the_adoption() {
+        let (dir, repo) = temp_repo();
+        let a = commit_file(&repo, "a.txt", "1\n", "base");
+        let b = commit_file(&repo, "a.txt", "1\n2\n", "grow");
+        let mut h = idle_app(&dir);
+        let app = &mut h.app;
+        select_row(app, a);
+        let key_a = app.diff_cache_key(a);
+        let data = built_diff(&repo, app, a);
+        app.install(&key_a, data);
+        assert!(app.current_diff_key.as_ref() == Some(&key_a), "A on screen");
+
+        select_row(app, b);
+        let claim = adoptable_warm(app, b);
+        app.load_selected_diff();
+        assert!(claim.adopted(), "the click on B adopted its warm");
+
+        select_row(app, a);
+        let data = built_diff(&repo, app, a);
+        app.install(&key_a, data);
+        assert!(
+            app.current_diff_key.as_ref() == Some(&key_a),
+            "A kept on screen"
+        );
+        assert!(app.diff_load.is_none(), "the wait is over");
+        assert!(!claim.adopted(), "so B's warm is speculative again");
+        assert!(app.adopted_warm.is_none());
     }
 
     /// egui's default `InputOptions::zoom_modifier`, which is what the app reads

@@ -580,13 +580,30 @@ the new diff's colour pass has started. It is conditional because an install tha
 identical on-screen copy leaves nothing for `ensure_diff_highlighted` to look at, so nothing
 would write `true` back and the band would stay shut.
 While the reader waits on an adopted warm the drain asks for a repaint every
-`LOADING_TICK`, because a claim released without a send wakes nothing. `adopted_warm` is
-cleared by `load_selected_diff` (a fresh decision), `apply_loaded_diff` (the wait is
-over) and `clear_failed_load` (no load is armed to wait) — those two through `end_adoption`,
-which unadopts a warm adopted for any key but the one installed — and the claim-gone fallback itself (which `take`s it before dispatching the real load). When `load_selected_diff` finds the reader LEFT it — the selection or its key moved —
+`LOADING_TICK`, because a claim released without a send wakes nothing. **Every end of a
+wait goes through `GitkApp::end_wait`**, the one place `diff_load` is cleared: it ends the
+adoption too (`end_adoption`, which unadopts a warm adopted for any diff but the one
+installed — a key moved in span fields alone (`spans_alone_moved`) is the same diff). So an install (`apply_loaded_diff`), a failed load (`clear_failed_load`), the
+identical-key return of `install_preferring_cache`, `load_selected_diff` finding the diff
+already on screen or nothing selected, and the dispatch fallback that finds no repository
+all end it alike. The identical-key return once cleared the load alone, so an install
+landing on the key on screen while a warm was adopted for another row (the search debounce
+moving the selection back) left that warm adopted for nobody — skipping colour and shipping
+oversized rows to the UI thread. `adopted_warm` is otherwise cleared by `load_selected_diff`
+when the reader left it, by `dispatch_diff_load` when it finds a foreground worker already
+building the key (the wait is on that worker instead), and by the claim-gone fallback itself
+(which `take`s it before dispatching the real load). When `load_selected_diff` finds the reader LEFT it — the selection moved, or its key moved
+in anything diff-shaping —
 it also `unadopt_warm`s the claim, so the warm goes back to colouring and to dropping an
 oversized row on the worker instead of shipping it to the UI thread to be freed; a return to
-the row adopts it again. A warm's colour pass is handed to the `gitkay-colour-{k}` tokenizer
+the row adopts it again. **A key moved in span fields alone has not left it**, by the same
+predicate `awaits` installs the warm's result by (`spans_alone_moved` — one definition,
+not a second "span-only" rule): the adoption is kept, and `dispatch_diff_load` asks
+`adopt_warm` for the ADOPTED key, the one the warm is claimed under, rather than the moved
+one. Every history drain calls `load_selected_diff`, so comparing exactly there meant a theme,
+syntax or grammar reload followed by a scroll page unadopted the warm, missed it under the
+new key and built the same diff in the foreground beside it — both holding the blob, one
+result thrown away. The kept warm's result installs re-keyed like any span-moved arrival. A warm's colour pass is handed to the `gitkay-colour-{k}` tokenizer
 (`SPECULATIVE_TOKENIZERS`) together with the built diff and the row's in-flight claim, and
 the worker returns at once. The tokenizer keeps up to `TOKENIZER_QUEUE_CAP` warms ordered
 nearest to where the reader is NOW (`PrefetchTarget::row` against the anchor — `prefetch_anchor`,
