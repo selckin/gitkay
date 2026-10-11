@@ -153,9 +153,9 @@ pub enum WarmDepth {
     /// `ensure_diff_highlighted` colours it on install. Far cheaper per row in CPU
     /// and meaningfully cheaper in memory (measured ~115-130 B/line against
     /// ~400-450 B — see `DIFF_CACHE_LINE_CEILING`; a `highlight::Span` is `(Color32, Range<usize>)`,
-    /// byte offsets into the line's shared `Arc<str>`, NOT an owned string per
-    /// token, and none of them is allocated at all for a `DiffOnly` entry), which is
-    /// what makes a full-window band reachable at all.
+    /// byte offsets into the line's text in the diff's shared arena, NOT an owned
+    /// string per token, and none of them is allocated at all for a `DiffOnly` entry),
+    /// which is what makes a full-window band reachable at all.
     DiffOnly,
 }
 
@@ -2155,8 +2155,8 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
     // (`target.probed` being `None`) and defers it there.
     //
     // `load_stats`, not `load`: this wants three integers off the entry's file table,
-    // and decoding the rows to reach them meant an `Arc<str>` per line — materialised
-    // and dropped, 400k of them on a 400k-line entry. Same key, same numbers.
+    // and decoding the rows to reach them meant copying every line into an arena —
+    // materialised and dropped, 400k rows on a 400k-line entry. Same key, same numbers.
     if job.want.needs_line_counts()
         && let Some(store) = store_of(&ctx.deps.store)
         && let Some(stats) = store.load_stats(&job.scope, job.settings)

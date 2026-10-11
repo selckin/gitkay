@@ -11,9 +11,6 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 mod anchor;
-// Wired in by the arena-rows swap, which deletes this `allow`. `allow`, not
-// `expect`: dead in the bin target, live in the test target (AGENTS.md).
-#[allow(dead_code)]
 mod arena;
 mod convert;
 mod lines;
@@ -21,6 +18,8 @@ mod side;
 mod wrap;
 
 pub use anchor::{AnchorSide, DiffAnchor, anchor_hint, capture_anchor, resolve_anchor};
+use arena::{ArenaFull, ArenaMark, Row, TextArena};
+pub use arena::{ArenaLimits, ArenaWriter};
 use convert::{
     ConvertCtx, DEFAULT_PREFIXES, DeltaDrivers, DeltaModes, HeaderOf, Substitution, delta_modes,
     delta_path, emit_converted, header_prefixes, modes_from_header, move_to_end, side_path_bytes,
@@ -436,23 +435,21 @@ impl<T> PerRow<Vec<T>> {
     }
 }
 
-/// One row as a build PUSHES it — the input type. A built diff's rows are read
-/// through `DiffLines` (`line(i)` gives a `LineRef`, `kind(i)`/`text(i)` a field), and
-/// the fields here are private to `diff` so nothing outside it reads a stored row any
-/// other way: that is what lets the representation behind `DiffLines` change without
-/// a reader noticing.
+/// One row as a build PUSHES it — the input row, and nothing a built diff holds. Its
+/// text is COPIED into the diff's text arena when it is pushed (`DiffRows::push`), and
+/// a built diff's rows are read through `DiffLines` (`line(i)` gives a `LineRef`,
+/// `kind(i)`/`text(i)` a field). The fields are private to `diff`, so nothing outside
+/// it can read a stored row any other way: that is what let the representation behind
+/// `DiffLines` change without a reader noticing.
+///
+/// Only the rows a builder assembles itself come through here — the commit header, a
+/// virtual row's title, the file-name rows: a handful per file. A patch row is written
+/// from its parts straight into the arena (`DiffRows::push_parts`) and never is a
+/// `DiffLine`, which is what keeps the build free of a per-row allocation.
 #[derive(Clone)]
 pub struct DiffLine {
-    /// The line text, shared (`Arc`) so handing the diff to the highlight worker
-    /// clones refcounts, not strings. Immutable after the build — as is every other
-    /// field here, which is what lets the whole row array be shared rather than copied;
-    /// what the display derives per row lives in `PerRow` beside it.
-    ///
-    /// `Arc<str>` and not `Arc<String>`: the bytes live inside the allocation instead
-    /// of behind a second pointer, which is ONE allocation per row rather than two on
-    /// the hottest path in the build, and ~24 B less heap per row (1.8GB on a
-    /// 76.5M-line diff) against 8 B more in the row itself.
-    text: Arc<str>,
+    /// The line text, owned until the push copies it into the arena.
+    text: String,
     kind: LineKind,
     /// This row's line numbers in the pre- and post-image, straight from git2's
     /// own `DiffLine` — the stable identity a scroll anchor re-finds a line by
@@ -469,11 +466,10 @@ pub struct DiffLine {
 }
 
 impl DiffLine {
-    /// `impl Into<Arc<str>>` so a `&str` becomes one allocation and a `String` is
-    /// consumed. The patch pass does NOT come through here with a `format!` result —
-    /// see `DiffRows::push_parts`, which builds each row's text in a reused buffer,
-    /// since this is one allocation per line of the whole diff.
-    pub fn new(text: impl Into<Arc<str>>, kind: LineKind) -> Self {
+    /// `impl Into<String>` so a `format!` result is moved in rather than copied. The
+    /// patch pass does NOT come through here — see `DiffRows::push_parts`, which writes
+    /// a row's parts straight into the arena.
+    pub fn new(text: impl Into<String>, kind: LineKind) -> Self {
         Self {
             text: text.into(),
             kind,
@@ -482,13 +478,13 @@ impl DiffLine {
         }
     }
 
-    /// `new` plus git's line numbers for a patch row. Only `append_diff_body` and the
-    /// store's decode call it — every structural construction site (the header builders, the
-    /// stat block, the blanks, the test fixtures) keeps `new` and its
-    /// `None`/`None`, which is what keeps a two-field addition from becoming a
-    /// sweep of the whole module.
+    /// `new` plus git's line numbers, for a suite assembling numbered rows by hand.
+    /// Test-only: the app's numbered rows are patch rows, which the build and the
+    /// store's decoder write straight into the arena with their numbers
+    /// (`DiffRows::push_parts`, `ArenaWriter::push_parts`) and never as a `DiffLine`.
+    #[cfg(test)]
     pub fn with_linenos(
-        text: impl Into<Arc<str>>,
+        text: impl Into<String>,
         kind: LineKind,
         old_lineno: Option<NonZeroU32>,
         new_lineno: Option<NonZeroU32>,
@@ -977,8 +973,9 @@ pub type DiffParts = (
 pub struct DiffData {
     /// The rows, shared rather than owned: immutable from the moment a build returns,
     /// so the pane, the cache and the highlight worker all hold the same allocation and
-    /// every hand-off between them is a refcount bump. `order_files` is the one thing
-    /// that writes them afterwards, through `Arc::make_mut`.
+    /// every hand-off between them is a refcount bump. `order_files` never writes them:
+    /// it REPLACES this `Arc` with new rows over the same text arena, so a worker still
+    /// holding the old one keeps reading the order it was handed.
     pub lines: Arc<DiffLines>,
     /// The rows' syntax spans, indexed alongside `lines`. Part of the diff because the
     /// LRU deliberately hands a revisited commit its colour back (see
@@ -1023,13 +1020,12 @@ pub struct DiffData {
     /// decoded from a store written before this existed, simply pay the scan as it
     /// always did.
     pub tabless: bool,
-    /// Heap bytes the ROWS hold: each row struct plus its text allocation (the `Arc`
-    /// header included). Summed once where the rows are assembled — on the building
-    /// worker, or the store's decoding one — and carried across the display boundary,
-    /// so weighing a diff for the cache never walks its rows on the UI thread. Rows
-    /// moved by `order_files` keep their allocations; a re-lay rebuilds the row array at
-    /// exact capacity, so this may over-state by the build's spare capacity (the safe
-    /// direction).
+    /// Heap bytes the ROWS hold: the 20 B rows plus the text arena's chunks
+    /// (`DiffLines::heap_bytes`, exact and O(chunks)). Taken once where the rows are
+    /// assembled — on the building worker, or the store's decoding one — and carried
+    /// across the display boundary, so weighing a diff never touches its rows on the UI
+    /// thread. A re-lay by `order_files` builds a row array of the same length at exact
+    /// capacity over the same arena, so the figure still holds.
     pub row_bytes: usize,
 }
 
@@ -1253,18 +1249,12 @@ fn holds_tab(text: &str) -> bool {
 /// limit already.
 ///
 /// A patch row is written from its PARTS (`push_parts`: the `+`/`-` marker and the
-/// piece), so no caller assembles a row's text: where it is assembled is this type's
-/// business, and so is the buffer it is assembled in.
+/// piece), so no caller assembles a row's text: the parts are copied straight into the
+/// arena's tail, and where a row's text lives is this type's business.
 struct DiffRows {
-    lines: Vec<DiffLine>,
-    /// Where `push_parts` assembles a row before it is copied into its `Arc` — the
-    /// reused buffer every patch pass used to carry as a fourth argument.
-    ///
-    /// Reused rather than a `format!` per row: a patch row is pushed once per line of
-    /// the diff, and `format!` allocates a `String` that is then copied again into the
-    /// `Arc`. Reused, the row costs one allocation — measured at 36% off the per-line
-    /// construction over a 900k-line diff.
-    buf: String,
+    /// The rows and their text, written straight into the arena's tail: a patch row's
+    /// parts are copied there once and nothing is allocated for the row itself.
+    arena: ArenaWriter,
     max_chars: usize,
     /// Is every row pushed so far free of TABs? See `DiffData::tabless`.
     tabless: bool,
@@ -1274,7 +1264,8 @@ struct DiffRows {
 /// `DiffRows`: the merge hands it to `extend_measured` whole, so what a part carries can
 /// change without its users noticing.
 struct RowsPart {
-    rows: Vec<DiffLine>,
+    rows: Vec<Row>,
+    text: TextArena,
     max_chars: usize,
     tabless: bool,
 }
@@ -1286,11 +1277,11 @@ impl RowsPart {
     }
 }
 
-/// A point in a `DiffRows` a build can rewind to. Carries the widest row seen at that
-/// point as well as the row count — see `DiffRows::rewind`.
+/// A point in a `DiffRows` a build can rewind to: the arena's position, and the widest
+/// row seen at that point — see `DiffRows::rewind`.
 #[derive(Clone, Copy)]
 struct RowMark {
-    len: usize,
+    arena: ArenaMark,
     max_chars: usize,
     tabless: bool,
 }
@@ -1299,9 +1290,18 @@ impl DiffRows {
     /// Start from rows the caller assembled itself — a diff's header block — measuring
     /// them: a commit message line is routinely the widest row in a small diff.
     fn new(lines: Vec<DiffLine>) -> Self {
+        Self::start(ArenaLimits::DEFAULT, lines)
+    }
+
+    /// An empty `DiffRows` cutting its text under `limits` — a test's small chunk cap.
+    #[cfg(test)]
+    fn with_limits(limits: ArenaLimits) -> Self {
+        Self::start(limits, Vec::new())
+    }
+
+    fn start(limits: ArenaLimits, lines: Vec<DiffLine>) -> Self {
         let mut rows = Self {
-            lines: Vec::new(),
-            buf: String::new(),
+            arena: ArenaWriter::new(limits),
             max_chars: 0,
             tabless: true,
         };
@@ -1310,11 +1310,12 @@ impl DiffRows {
     }
 
     const fn len(&self) -> usize {
-        self.lines.len()
+        self.arena.len()
     }
 
-    /// One row whose text is the concatenation of `parts`, assembled in `buf` — a patch
-    /// row is its `+`/`-` marker and its piece, and the caller hands them over apart.
+    /// One row whose text is the concatenation of `parts` — a patch row is its `+`/`-`
+    /// marker and its piece, and the caller hands them over apart. They are copied into
+    /// the arena's tail, and the text measured is the one stored there.
     fn push_parts(
         &mut self,
         kind: LineKind,
@@ -1322,25 +1323,20 @@ impl DiffRows {
         new_lineno: Option<NonZeroU32>,
         parts: &[&str],
     ) {
-        self.buf.clear();
-        for p in parts {
-            self.buf.push_str(p);
-        }
-        widen(&mut self.max_chars, &self.buf);
-        self.tabless &= !holds_tab(&self.buf);
-        self.lines.push(DiffLine::with_linenos(
-            self.buf.as_str(),
+        let text = self.arena.push_parts(kind, old_lineno, new_lineno, parts);
+        widen(&mut self.max_chars, text);
+        self.tabless &= !holds_tab(text);
+    }
+
+    /// A row the caller already holds — a header or file-name row — copied in.
+    fn push(&mut self, line: DiffLine) {
+        let DiffLine {
+            text,
             kind,
             old_lineno,
             new_lineno,
-        ));
-    }
-
-    /// A row the caller already holds — a header or file-name row — moved in whole.
-    fn push(&mut self, line: DiffLine) {
-        widen(&mut self.max_chars, &line.text);
-        self.tabless &= !holds_tab(&line.text);
-        self.lines.push(line);
+        } = line;
+        self.push_parts(kind, old_lineno, new_lineno, &[text.as_str()]);
     }
 
     fn extend(&mut self, lines: impl IntoIterator<Item = DiffLine>) {
@@ -1351,10 +1347,10 @@ impl DiffRows {
 
     /// `n` empty placeholder rows for `set` to fill once the counts they state are
     /// final — the diffstat block, which is drawn above the patch but counts what the
-    /// patch pass finds. Empty, so they widen nothing until they are written.
+    /// patch pass finds. Empty, so they widen nothing and write no text until they are
+    /// written.
     fn reserve_blank(&mut self, n: usize, kind: LineKind) {
-        self.lines
-            .resize_with(self.lines.len() + n, || DiffLine::new("", kind));
+        self.arena.reserve_blank(n, kind);
     }
 
     /// Write `text` into a row `reserve_blank` put there, as a `kind` row with no line
@@ -1362,28 +1358,27 @@ impl DiffRows {
     /// was: the reservation is exact by construction, and a mismatch must not panic in
     /// the middle of a build.
     fn set(&mut self, i: usize, kind: LineKind, text: &str) {
-        if let Some(slot) = self.lines.get_mut(i) {
+        if let Some(text) = self.arena.set(i, kind, text) {
             widen(&mut self.max_chars, text);
             self.tabless &= !holds_tab(text);
-            *slot = DiffLine::new(text, kind);
         }
     }
 
     const fn mark(&self) -> RowMark {
         RowMark {
-            len: self.lines.len(),
+            arena: self.arena.mark(),
             max_chars: self.max_chars,
             tabless: self.tabless,
         }
     }
 
-    /// Drop everything pushed since `mark`, INCLUDING its contribution to the widest
-    /// row. A running maximum cannot be un-maxed by truncating alone, and what a rewind
-    /// drops is a half-written converted patch about to be replaced by the raw body —
-    /// leaving its width behind would size the scroll range for text no longer on
-    /// screen.
+    /// Drop everything pushed since `mark` — rows and text — INCLUDING its contribution
+    /// to the widest row. A running maximum cannot be un-maxed by truncating alone, and
+    /// what a rewind drops is a half-written converted patch about to be replaced by
+    /// the raw body — leaving its width behind would size the scroll range for text no
+    /// longer on screen.
     fn rewind(&mut self, mark: RowMark) {
-        self.lines.truncate(mark.len);
+        self.arena.rewind(mark.arena);
         self.max_chars = mark.max_chars;
         self.tabless = mark.tabless;
     }
@@ -1395,32 +1390,38 @@ impl DiffRows {
     /// both the rows and the two facts a `push` derived from them. It exists for the
     /// parallel patch pass, whose workers each accumulate into a `DiffRows` of their
     /// own — re-deriving at the merge would be a second traversal of every row of the
-    /// diff, on the thread that just avoided the first.
+    /// diff, on the thread that just avoided the first. The part's large chunks are
+    /// adopted rather than copied (`ArenaWriter::append`).
     fn extend_measured(&mut self, part: RowsPart) {
         self.max_chars = self.max_chars.max(part.max_chars);
         self.tabless &= part.tabless;
-        self.lines.extend(part.rows);
+        self.arena.append(part.rows, part.text);
     }
 
-    /// The rows and what was measured over them, for `build_diff_data`.
+    /// The rows and what was measured over them, for `build_diff_data`. Fails when the
+    /// text needed more chunks than a `u16` names — the build fails rather than wrap.
     ///
-    /// The rows grew by doubling, so up to half the buffer is spare — 1.84GB of it on a
-    /// 76.5M-row sequential build, all of it charged to the cache by `heap_bytes`. On a
-    /// buffer that large the shrink is an `mremap`, not a copy.
-    fn finish(mut self) -> (DiffLines, usize, bool) {
-        self.lines.shrink_to_fit();
-        (DiffLines::from(self.lines), self.max_chars, self.tabless)
+    /// The rows grew by doubling, so up to half the buffer is spare; `ArenaWriter::finish`
+    /// shrinks them, since a diff's row array outlives the build by the whole session it
+    /// is cached for.
+    fn finish(self) -> Result<(DiffLines, usize, bool), ArenaFull> {
+        let (rows, text) = self.arena.finish()?;
+        Ok((
+            DiffLines::from_arena(rows, text),
+            self.max_chars,
+            self.tabless,
+        ))
     }
 
     /// A split-pass worker's rows, for the merge to append with `extend_measured`.
-    /// Not shrunk: the merge moves the rows on into the build's own `DiffRows`, whose
-    /// `finish` gives the spare capacity back once.
-    fn finish_part(self) -> RowsPart {
-        RowsPart {
-            rows: self.lines,
+    fn finish_part(self) -> Result<RowsPart, ArenaFull> {
+        let (rows, text) = self.arena.finish()?;
+        Ok(RowsPart {
+            rows,
+            text,
             max_chars: self.max_chars,
             tabless: self.tabless,
-        }
+        })
     }
 }
 
@@ -2615,7 +2616,9 @@ fn parallel_delta_patches(
                             });
                             ok.ok()?;
                         }
-                        let part = rows.finish_part();
+                        // A worker that ran out of chunk indices abandons the split, and
+                        // the sequential pass runs, as for any worker failure.
+                        let part = rows.finish_part().ok()?;
                         // After the print, which is when the sizes exist.
                         let d = diff.get_delta(i)?;
                         let sizes = (d.old_file().size(), d.new_file().size());
@@ -2868,7 +2871,10 @@ pub fn build_diff_data<'r>(
             bytes.parallel_ceiling()
         );
     }
-    let (lines, max_chars, tabless) = rows.finish();
+    let Ok((lines, max_chars, tabless)) = rows.finish() else {
+        log::warn!("gitkay: cannot diff {what}: its text needs more than 65,536 chunks");
+        return DiffData::empty();
+    };
     DiffData {
         textconv_failed: failed,
         tabless,
@@ -3993,8 +3999,9 @@ pub fn file_line_starts(files: &[FileEntry]) -> Vec<(usize, usize)> {
 /// of the build: the order a diff is READ in is a display decision, and keeping it out
 /// of the builder is what keeps the layout out of `DiffSettings` — and so out of both
 /// cache keys — for a setting that changes no diff data. The cost is one pass over
-/// `lines` at install; `DiffLine`'s text is an `Arc`, so a row moves without touching
-/// its string.
+/// the rows at install: block copies of 20 B rows into a NEW `Arc<DiffLines>` over the
+/// same `Arc<TextArena>` (`DiffLines::gather`), so no text is touched, and a highlight
+/// worker holding the old `Arc` keeps the order its results are indexed by.
 ///
 /// **Idempotent**, which is what lets every install call it: re-ordering an
 /// already-ordered diff yields the identity `order` and returns `false` before
@@ -4030,61 +4037,54 @@ pub fn order_files(
     // skips bodyless files, so it also gives the head region: everything before the
     // first patch belongs to no file and stays where it is.
     let mut span: Vec<Option<(usize, usize)>> = vec![None; n];
-    let ranges = file_line_ranges(files, lines.len());
-    let head = ranges.first().map_or(lines.len(), |&(_, s, _)| s);
-    for &(i, s, e) in &ranges {
+    let bodies = file_line_ranges(files, lines.len());
+    let head = bodies.first().map_or(lines.len(), |&(_, s, _)| s);
+    for &(i, s, e) in &bodies {
         span[i] = Some((s, e));
     }
 
-    // Past every refusal, so take the write handles only now: an identity re-lay — every
-    // cache hit, every flat layout — must not clone a row array the highlight worker is
-    // reading. When it does clone, the rows are 32 B apiece and their text is shared.
-    let lines = Arc::make_mut(lines).rows_mut();
+    // Past every refusal, so take the write handle only now: an identity re-lay — every
+    // cache hit, every flat layout — must not clone an entry list a reader is holding.
     let files = Arc::make_mut(files);
 
-    // Rows are MOVED, never cloned: wrapping in `Option` (free — `Arc<str>`'s niche
-    // keeps the layout identical, so the collect is done in place) lets each row be
-    // `take`n out with a plain memcpy. Leaving a blank `DiffLine` behind instead reads
-    // just as well and is what this did first, but the filler has to be CLONED per row,
-    // which costs an atomic refcount bump on the way in and another on the way out:
-    // 9.8ms against 7.5ms over a 100k-line diff. What is left is the second buffer
-    // itself, which is the price of moving blocks around at all.
-    let mut src: Vec<Option<DiffLine>> = std::mem::take(lines).into_iter().map(Some).collect();
-    let mut src_spans = std::mem::replace(spans, RowSpans::blank(src.len()));
-    let mut out: Vec<DiffLine> = Vec::with_capacity(src.len());
+    // Head region, then each file's block in display order. `start[i]` is where file i
+    // lands.
     let mut start: Vec<Option<usize>> = vec![None; n];
-    // A row and its spans move TOGETHER, in one loop, because they are no longer one
-    // value: leave the spans behind and the pane paints one file's colours onto
-    // another file's text. Only rows that HAVE spans reach `set`, so re-laying a diff
-    // nobody has coloured allocates no slots at all.
-    let mut move_rows =
-        |out: &mut Vec<DiffLine>, spans: &mut RowSpans, r: std::ops::Range<usize>| {
-            for k in r {
-                if let Some(line) = src[k].take() {
-                    let to = out.len();
-                    out.push(line);
-                    if let Some(computed) = src_spans.take(k) {
-                        spans.set(to, computed);
-                    }
-                }
-            }
-        };
-    move_rows(&mut out, spans, 0..head);
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::with_capacity(n + 1);
+    ranges.push(0..head);
+    let mut at = head;
     for &i in order {
         if let Some((s, e)) = span[i] {
-            start[i] = Some(out.len());
-            move_rows(&mut out, spans, s..e);
+            start[i] = Some(at);
+            at += e - s;
+            ranges.push(s..e);
         }
     }
-    *lines = out;
-    // Every row has been moved out, but the buffer itself is one per-row-sized free
-    // (2.4GB at 76.5M rows), which the UI thread does not do.
-    crate::reaper::dispose((src, src_spans));
+    let permuted = lines.gather(&ranges);
+    // A row and its spans move TOGETHER, block by block, because they are not one value:
+    // leave the spans behind and the pane paints one file's colours onto another file's
+    // text. Only rows that HAVE spans reach `set`, so re-laying a diff nobody has
+    // coloured allocates no slots at all.
+    let mut src_spans = std::mem::replace(spans, RowSpans::blank(permuted.len()));
+    let mut to = 0;
+    for r in &ranges {
+        for k in r.clone() {
+            if let Some(computed) = src_spans.take(k) {
+                spans.set(to, computed);
+            }
+            to += 1;
+        }
+    }
+    // A NEW Arc over the same text: a highlight worker holding the old one keeps reading
+    // the rows it was handed, and nothing is cloned but 20 B rows. The old rows (and the
+    // emptied span chunks) go to the reaper, as every freed diff part does.
+    let old = std::mem::replace(lines, Arc::new(permuted));
+    crate::reaper::dispose((old, src_spans));
 
     // The entries take the same walk the rows just did — `for &i in order` — and are
-    // moved out of a source buffer the same way, for the same reason. Tagging each with
-    // its rank and sorting back into it re-derives an order already in hand, at
-    // O(n log n) and a `FileEntry` move per comparison.
+    // moved out of a source buffer, wrapped in `Option` so each is `take`n with a plain
+    // memcpy. Tagging each with its rank and sorting back into it re-derives an order
+    // already in hand, at O(n log n) and a `FileEntry` move per comparison.
     let mut src_files: Vec<Option<FileEntry>> =
         std::mem::take(files).into_iter().map(Some).collect();
     files.reserve_exact(n);
@@ -4263,6 +4263,55 @@ pub mod tests {
         let (lines, spans, files, max_chars, failed, tabless, row_bytes) = d.into_parts();
         let back = DiffData::from_parts(lines, spans, files, max_chars, failed, tabless, row_bytes);
         assert_eq!(back.heap_bytes(), before);
+    }
+
+    /// A diff's row weight is now exact: the row buffer at 20 B a slot plus the chunks'
+    /// bytes, and every arena byte belongs to exactly one row (no dead text).
+    #[test]
+    fn heap_bytes_is_the_row_buffer_plus_the_chunks() {
+        let (_d, repo, oid) = everything_repo();
+        let data = get_diff_data(
+            &repo,
+            &RowScope::new(DiffSource::Commit(oid)),
+            base_settings(),
+            BuildEnv::NONE,
+        );
+        let lines = &data.lines;
+        let text: usize = lines.iter().map(|l| l.text.len()).sum();
+        assert_eq!(lines.row_capacity(), lines.len(), "finish shrank the rows");
+        assert_eq!(
+            lines.heap_bytes(),
+            lines.len() * 20 + lines.text_arena().heap_bytes()
+        );
+        assert_eq!(lines.text_arena().heap_bytes(), text);
+    }
+
+    /// No text at all is no chunk at all, and every row still reads as "".
+    #[test]
+    fn rows_without_text_need_no_chunk() {
+        let lines = DiffLines::from(vec![
+            DiffLine::new("", LineKind::Blank),
+            DiffLine::new("", LineKind::Context),
+        ]);
+        assert_eq!(lines.text_arena().chunk_count(), 0);
+        assert_eq!((lines.text(0), lines.text(1)), ("", ""));
+        assert_eq!(lines.rendered_len(1), 0);
+        assert_eq!(DiffLines::default().iter().count(), 0);
+    }
+
+    /// Running out of chunk indices fails the BUILD (`build_diff_data` reports it as
+    /// failed) rather than wrapping an index onto another file's text.
+    #[test]
+    fn a_build_that_runs_out_of_chunks_fails() {
+        let mut rows = DiffRows::with_limits(ArenaLimits {
+            chunk_cap: 1,
+            adopt_min: 1,
+            max_row: u32::MAX as usize,
+        });
+        for _ in 0..=usize::from(u16::MAX) + 1 {
+            rows.push_parts(LineKind::Context, None, None, &["x"]);
+        }
+        assert!(rows.finish().is_err());
     }
 
     /// The stat block this build writes is byte-for-byte what libgit2 would have
@@ -4917,7 +4966,7 @@ pub mod tests {
                 .collect();
             lines.rotate_left(widest);
             rows.extend(lines);
-            let (lines, max_chars, _) = rows.finish();
+            let (lines, max_chars, _) = rows.finish().expect("fits");
             assert_eq!(
                 max_chars,
                 lines.iter().map(|l| row_chars(l.text)).max().unwrap()
@@ -4940,7 +4989,7 @@ pub mod tests {
         assert!(rows.max_chars > mark.max_chars, "control: the row is wider");
         rows.rewind(mark);
         assert_eq!(rows.len(), 1);
-        let (lines, max_chars, _) = rows.finish();
+        let (lines, max_chars, _) = rows.finish().expect("fits");
         assert_eq!(
             max_chars,
             lines.iter().map(|l| row_chars(l.text)).max().unwrap()
@@ -4968,7 +5017,7 @@ pub mod tests {
         rows.reserve_blank(1, LineKind::Stat);
         rows.set(3, LineKind::Stat, "wider than anything else");
         rows.set(9, LineKind::Stat, "out of range is a no-op");
-        let (lines, max_chars, tabless) = rows.finish();
+        let (lines, max_chars, tabless) = rows.finish().expect("fits");
         assert_eq!(lines.len(), 4);
         assert_eq!(
             lines.line(1),
@@ -4995,8 +5044,7 @@ pub mod tests {
     /// trusts what `finish_part` carried. So a host merged with two parts — one holding
     /// a row wider than anything in the host, one holding a tab — has to come out as if
     /// the same rows had been pushed into it one by one: same rows, same widest row,
-    /// same tab census. And `finish_part` hands its rows on unshrunk, as it documents —
-    /// the merge moves them on and `finish` shrinks once.
+    /// same tab census.
     #[test]
     fn merging_parts_measures_what_pushing_the_same_rows_does() {
         type Row = (
@@ -5056,19 +5104,8 @@ pub mod tests {
         for block in [&wide[..], &tabbed] {
             let mut part = DiffRows::new(Vec::new());
             push_all(&mut part, block);
-            let capacity = part.lines.capacity();
-            let part = part.finish_part();
-            assert_eq!(
-                part.rows.capacity(),
-                capacity,
-                "finish_part does not shrink"
-            );
-            parts.push(part);
+            parts.push(part.finish_part().expect("fits"));
         }
-        assert!(
-            parts[0].rows.capacity() > parts[0].rows.len(),
-            "control: the part has spare capacity to lose"
-        );
         assert!(
             parts[0].tabless && !parts[1].tabless,
             "control: only the second holds a tab"
@@ -5081,8 +5118,8 @@ pub mod tests {
             merged.extend_measured(part);
         }
 
-        let (want, want_chars, want_tabless) = sequential.finish();
-        let (got, got_chars, got_tabless) = merged.finish();
+        let (want, want_chars, want_tabless) = sequential.finish().expect("fits");
+        let (got, got_chars, got_tabless) = merged.finish().expect("fits");
         assert_eq!(
             got.iter().collect::<Vec<_>>(),
             want.iter().collect::<Vec<_>>()
@@ -5103,7 +5140,7 @@ pub mod tests {
         rows.reserve_blank(2, LineKind::Stat);
         assert_eq!(rows.max_chars, 0, "an empty placeholder widens nothing");
         rows.set(1, LineKind::Stat, "a filled stat row");
-        let (lines, max_chars, _) = rows.finish();
+        let (lines, max_chars, _) = rows.finish().expect("fits");
         assert_eq!(
             max_chars,
             lines.iter().map(|l| row_chars(l.text)).max().unwrap()
@@ -6420,6 +6457,45 @@ pub mod tests {
             assert_eq!(rows(&lines), before, "{bad:?}");
             assert_eq!(laid_out(&files), entries, "{bad:?}");
         }
+    }
+
+    /// `order_files` permutes ROWS and leaves the text alone: the same arena, chunk for
+    /// chunk. Rebuilding it in display order would copy every byte on the UI thread.
+    #[test]
+    fn order_files_moves_rows_and_never_the_text() {
+        let (mut spans, mut lines, mut files) =
+            paned(2, &[("src/a.rs", 3), ("Cargo.toml", 2), ("src/b.rs", 1)]);
+        let arena = Arc::clone(lines.text_arena());
+        let chunks = arena.chunk_ptrs();
+        let mut before = rows(&lines);
+        assert!(order_files(&mut lines, &mut spans, &mut files, &[0, 2, 1]));
+        assert!(
+            Arc::ptr_eq(lines.text_arena(), &arena),
+            "the permuted rows share the arena"
+        );
+        assert_eq!(
+            lines.text_arena().chunk_ptrs(),
+            chunks,
+            "and no chunk was rewritten"
+        );
+        let mut after = rows(&lines);
+        before.sort();
+        after.sort();
+        assert_eq!(after, before, "the same texts, re-ordered");
+    }
+
+    /// The highlight worker holds a second `Arc<DiffLines>` across a layout-only reload.
+    /// It keeps the rows it was handed (its results name rows by index), and both share
+    /// one arena: the re-lay copied 20 B rows and no text (§4.5).
+    #[test]
+    fn a_held_copy_keeps_its_rows_while_order_files_relays_the_pane() {
+        let (mut spans, mut lines, mut files) = paned(1, &[("src/a.rs", 2), ("Cargo.toml", 1)]);
+        let worker = Arc::clone(&lines);
+        let was = rows(&worker);
+        assert!(order_files(&mut lines, &mut spans, &mut files, &[1, 0]));
+        assert_eq!(rows(&worker), was, "the worker's view did not move");
+        assert_ne!(rows(&lines), was, "control: the pane's did");
+        assert!(Arc::ptr_eq(worker.text_arena(), lines.text_arena()));
     }
 
     #[test]

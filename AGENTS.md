@@ -294,12 +294,39 @@ parent" diff — the pane, the path filter, the `--follow` tracer — goes throu
 `commit_parent_diff`), the diff-shaping `DiffOptions` helpers, the word-diff
 emphasis driver, the content hash, the file-boundary lookups and `order_files` (the
 display-order re-lay the file-list sidebar drives — see **Bottom panel**),
-`DiffLine`'s text being an `Arc<str>` rather than an `Arc<String>` — the bytes live
-inside the allocation, so a row costs ONE allocation on the build's hottest path
-instead of two, and `DiffRows::push_parts` assembles each row in a reused buffer rather
-than a `format!` (measured 36% off the per-line construction; the row itself grows
-8 B and the heap per row shrinks ~24 B — the `String` header that is no longer
-between the `Arc` and the bytes — which is 1.8GB on a 76.5M-line diff),
+the row representation (a built diff's rows are 20 B `Copy` records — `arena::Row`:
+chunk, offset, length, kind, line numbers — pointing into ONE text arena per diff,
+`src/diff/arena.rs`, cut into chunks of at most `CHUNK_CAP` (64 MiB), and shared as
+`DiffLines { rows: Vec<Row>, text: Arc<TextArena> }`. **Why**: one allocation per row
+was ~40 B of row and malloc overhead on top of its text — 3 GB on the 76.5M-line diff —
+and per-row frees went back to glibc's arenas and stayed there, ~4 GB resident after the
+diff was gone; 64 MiB chunks sit far above the mmap threshold and are unmapped when the
+diff is freed. A patch row (`push_patch_line`) and a decoded store row are copied
+straight into the arena's tail, so neither a build nor a decode allocates per row; only
+the input `DiffLine`s a builder assembles itself (the header, file-name rows — a handful
+per file) own a `String`, copied in when pushed. **The invariants**, each pinned in
+`arena`'s suite: the tail takes its chunk index when its first byte is written and is
+sealed into that same slot, and anything else that adds a chunk (an oversized row, an
+adopted part chunk) takes the next free index WITHOUT sealing the tail — sealing it there
+would, on a split merge whose ≥ `ADOPT_MIN` deltas alternate with small ones, seal a
+sliver of tail and reserve a fresh whole one per alternation, chunk and VMA counts
+growing with the alternations rather than the text; a tail past the
+first chunk is reserved whole at the cap, because a tail doubling up from small sizes
+reallocs by memcpy below the mmap threshold — and `write` asks that by CAPACITY, so a
+tail a rewind brought back from a sealed chunk (a `Box<str>`, capacity = length) is
+topped up like a fresh one rather than doubling again; a row over the cap gets its own
+exactly-sized chunk; `set` fills only a `reserve_blank` row (`debug_assert`), never one
+older than an outstanding mark; `rewind` drops the chunks indexed since the mark and
+takes a tail sealed since back out of the slot the mark recorded, leaving the chunks
+indexed after it before the mark where they are (and, rewound back into the first chunk, its growing as a
+`String` does); a split-pass part's chunks of at least `ADOPT_MIN` are ADOPTED by
+the merge while two indices of headroom remain, anything else copied into the tail the
+merge found; and a chunk index
+past `u16::MAX` FAILS the build rather than wrapping onto another file's text —
+`build_diff_data` returns `DiffData::empty()` with a `warn`, a split worker abandons the
+split for the sequential pass, the store's decode misses. `DiffLines::heap_bytes` is
+`rows.capacity() × 20 + Σ chunk bytes`: exact (no per-row blocks for malloc to round up)
+and O(chunks), which is why `finish` shrinks the rows),
 `DiffRows` (the rows a build is accumulating, plus the widest one measured AS THEY ARE
 PUSHED — `DiffData::max_chars` sizes the pane's horizontal scroll range and used to be
 rescanned off the finished diff, a second traversal of rows that are cache-cold by
@@ -309,17 +336,19 @@ can be added without being measured — the commit-message header and the diffst
 are as able to hold the widest row as a patch line is, and a missed one UNDER-reports,
 which is the direction that truncates the scroll range — and the three signatures
 carrying the rows gain no argument for it, `append_diff_body` being at clippy's limit
-already. A patch row is written from its PARTS
-(`push_parts(kind, linenos, &[prefix, piece])`) and `set` takes the text it writes, so
-no caller assembles a row: the reused buffer `push_patch_line` used to carry as an
-argument through three callers is `DiffRows`' own, and `finish` hands back
-`DiffLines` already shrunk to fit. A split-pass worker hands back a `RowsPart` (its rows
-plus what was measured over them, opaque outside `DiffRows`, from `finish_part`, which
-does not shrink), and the merge appends it with `extend_measured`. `mark`/`rewind`
-rather than `truncate`, because a running maximum cannot be un-maxed by dropping rows:
-`emit_converted` abandons a half-written converted patch, and its width would otherwise
-outlive the text. `DiffData::new`, which rescans, is now `#[cfg(test)]` — nothing in the
-app traverses a finished diff for this),
+already. It writes through an `ArenaWriter`: a patch row is written from its PARTS
+(`push_parts(kind, linenos, &[prefix, piece])`), copied straight into the arena's tail
+and measured as stored there, and `set` takes the text it writes, so no caller assembles
+a row. `finish` hands back `DiffLines` with the rows shrunk to fit — or `ArenaFull`,
+which fails the build. A split-pass worker hands back a `RowsPart` (its rows, its own
+arena and what was measured over them, opaque outside `DiffRows`, from `finish_part`),
+and the merge appends it with `extend_measured`, which rebases each row through the
+adopted-or-copied chunk map. `mark`/`rewind` rather than `truncate`: the mark carries an
+ARENA position (rows, chunks, the tail's slot and length), so a rewind drops the text as well as the
+rows, and the widest row and tab census as they stood, because a running maximum cannot
+be un-maxed by dropping rows: `emit_converted` abandons a half-written converted patch,
+and its width would otherwise outlive the text. `DiffData::new`, which rescans, is now
+`#[cfg(test)]` — nothing in the app traverses a finished diff for this),
 `LineNoGutter` (the line-number column's widths and per-row text — pure, and here
 rather than in `main.rs` because it is a question about `DiffLines` data),
 the scroll anchor (its own child module,
@@ -342,8 +371,11 @@ diff-side orchestration is `src/diff_highlight.rs`), `src/diff_cache.rs` (weight
 — rows measured where they are assembled, spans kept by `PerRow` as they are written — under
 `diff_cache_byte_budget`, which is the line budget at `BYTES_PER_CACHED_LINE`, so the prefetch
 bounds and the cache still turn on one dial. **The UI thread never frees a diff**: freeing
-one is a pass over every row's allocation, measured at **3.24s** on the frame loop for a
-76.5M-line diff and a dropped frame at a few hundred thousand lines. So `insert` and
+one was a pass over every row's allocation, measured at **3.24s** on the frame loop for a
+76.5M-line diff and a dropped frame at a few hundred thousand lines. Since the rows moved
+into the text arena, freeing the rows is O(chunks) — a few `munmap`s — but the spans of a
+coloured diff are still a free per coloured row, and a send costs ~100ns, so the rule
+stays. So `insert` and
 `retain_keys` hand back what they evict, overwrite or purge instead of dropping it, and
 every place the app lets a diff go — those values, a dropped or refused arrival, the copy
 `install_preferring_cache` declines, the outgoing content `set_diff_content` replaces, the
@@ -351,8 +383,8 @@ spans a re-key or theme change blanks (`PerRow::take_all`) — passes it to
 `reaper::dispose`, unconditionally rather than above a size: a send is ~100ns, and a
 threshold would be one more rule to keep right. What the cache hands back goes through
 `reaper::dispose_all`, which skips an empty list: that is most inserts, and the only
-case not worth a box and a send. `order_files` disposes its emptied source
-buffer the same way: every row was moved out, but the buffer is still N × 32 B. The cost
+case not worth a box and a send. `order_files` disposes the replaced
+`Arc<DiffLines>` (N × 20 B rows) the same way, with the emptied span chunks. The cost
 is a brief overshoot: a bulk purge (a driver change's `retain_keys`, or evicting one giant
 entry) empties the cache's books at once, so the band can re-warm while the old bytes are
 still being freed — bounded by about one cache budget, and the heavy lane's live reading
@@ -369,10 +401,9 @@ block**),
 codec for a diff's structure, key derivation, atomic load/save under its own
 `MAX_ENTRY_BYTES` — an entry the budget could never keep is refused before it is
 even encoded — and the budget-and-temp-sweep pruner),
-`src/diff/arena.rs` (the chunked text arena a diff's rows will point into —
+`src/diff/arena.rs` (the chunked text arena a diff's rows point into —
 `ArenaWriter` writing into chunks of at most `CHUNK_CAP`, the sealed `TextArena`, and
-the 20 B `Row` holding chunk, offset and length; not wired in yet, so its `mod` carries
-the one `#[allow(dead_code)]` the arena-rows swap deletes),
+the 20 B `Row` holding chunk, offset and length; see the row representation above),
 `src/diff/convert.rs` (turning a delta a driver applies to into a readable patch
 body: the substitution point, the synthesized header, the `ignore_ws` sweep, and the
 two mode sources — see **Textconv**),
@@ -1590,15 +1621,19 @@ sorted drivers keep the same rows with the same rewritten parents.
   so the k-th file row IS `diff_files[k]`. `files`' own order is the pane's order
   — the textconv sweep's `move_to_end` and `resolve_anchor`'s rung 4 both rest on
   that — which is why the entries move with the lines rather than only the lines.
-  **The rows' SPANS move with them too**, in the same loop and not in a pass of their
-  own: `RowSpans` is indexed by row, so a row that moves without its spans paints one
-  file's colours onto another file's text. That pairing used to be structural (the
-  spans were a field of the `DiffLine`) and is now this function's to keep —
-  `order_files_moves_each_rows_spans_with_it` pins it. The row array is an `Arc`, so
-  the re-lay takes its write handle through `Arc::make_mut` and does so only **after**
-  every refusal, or an identity re-lay would clone a diff the highlight worker is
-  reading. The emphasis is dropped rather than moved: it covers one viewport and
-  refills on the next frame, where the spans beside it cost seconds to recompute.
+  **The rows' SPANS move with them too**, over the same list of blocks the rows were
+  gathered from: `RowSpans` is indexed by row, so a row that moves without its spans
+  paints one file's colours onto another file's text. That pairing used to be
+  structural (the spans were a field of the `DiffLine`) and is now this function's to
+  keep — `order_files_moves_each_rows_spans_with_it` pins it. **The re-lay never writes
+  the rows it was handed**: after every refusal it builds the permuted rows with
+  `DiffLines::gather` (block copies of 20 B rows) into a NEW `Arc<DiffLines>` over the
+  same `Arc<TextArena>`, and swaps it in. A highlight worker holding the old `Arc` keeps
+  the old order its results are indexed by, and the text is never touched — no
+  `Arc::make_mut` on the rows remains (it stays on `files`, also after every refusal, so
+  an identity re-lay clones nothing). The emphasis is dropped rather than moved: it
+  covers one viewport and refills on the next frame, where the spans beside it cost
+  seconds to recompute.
   **A re-lay that genuinely moves rows also invalidates the highlight generation**,
   and at the permutation rather than at its callers: a highlight worker names its
   results by ROW INDEX, so an in-flight batch computed before the move would paint
@@ -1613,9 +1648,9 @@ sorted drivers keep the same rows with the same rewritten parents.
   re-derived over an already-laid-out diff is the identity, and it returns before
   touching anything — so a cache hit, a store load and the two flat layouts pay an
   O(files) scan and nothing more, and only a genuinely new grouped diff pays one
-  O(lines) pass (rows are MOVED, never cloned — `DiffLine`'s text is an `Arc` and the
-  re-lay never touches the string). Measured warm: ~9µs for an ordinary 8-file /
-  243-line commit, 7.5ms for a 100k-line one, against ~1-10µs for the identity scan.
+  O(lines) pass of 20 B row copies that never touches the text. Measured warm with
+  per-row `Arc`s, before the arena: ~9µs for an ordinary 8-file / 243-line commit,
+  7.5ms for a 100k-line one, against ~1-10µs for the identity scan.
   What that pass costs is filling a second buffer, so it scales with LINES and not
   with how far anything moved; a big commit pays one extra half-frame at install,
   against the seconds its diff took to build.
@@ -2223,8 +2258,13 @@ binary, and — as a pure unit over a hand-built list, since the shape is about 
 alone — the scroll anchor's rung 4 against the swept entry the sweep leaves at the
 tail; and, likewise as pure units, `order_files`: the re-lay that moves the lines and
 the entries together, the bodyless entry that moves without rows, the idempotence
-every install rests on, and the non-permutation refused whole rather than
-half-applied; and `LineNoGutter`: the widths taken over a whole diff, the side no
+every install rests on, the non-permutation refused whole rather than
+half-applied, the re-lay sharing the very same text arena chunk for chunk (it moves
+rows, never text), and a held copy — the highlight worker's `Arc` — keeping its old
+order across the re-lay; and the row container itself: `heap_bytes` held to exactly
+the row buffer at 20 B a slot plus the chunks' bytes over a real build (no dead
+text), rows of no text needing no chunk, and a build that runs out of `u16` chunk
+indices failing rather than wrapping; and `LineNoGutter`: the widths taken over a whole diff, the side no
 row carries being dropped whole, and every patch row filling exactly the width
 `chars()` promises — the two halves the pane reserves and draws with, which is
 what stops them drifting; and `wrap`, whose two mappings are checked against a

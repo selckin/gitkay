@@ -310,14 +310,19 @@ impl DiffViewport {
 ///   speculatively is what fixes the size: 8 × 133,460 ≈ 1.07M, rounded up here for
 ///   headroom.
 ///
-/// **Cost, measured from the structs rather than guessed:** a `DiffLine` is 32 B
-/// (`size_of`), its `Arc<str>` text ~72 B — a 16 B refcount header plus the bytes, with
-/// no `String` in between — and a span 24 B (`highlight::Span` is
-/// `(Color32, Range<usize>)` — byte offsets INTO the shared text, not an owned string
-/// per token, which an earlier version of this comment had wrong and priced ~3× too
-/// high). Spans are no longer part of the row: they live in `PerRow` beside it, so a
-/// `DiffOnly` entry pays none of them. So ~305 B/line highlighted, ~105 B/line for a
-/// `DiffOnly` warm.
+/// **Cost, measured from the structs rather than guessed:** a row is 20 B
+/// (`size_of`), pointing into the diff's text arena, where its text costs its bytes and
+/// nothing more — no per-row header, no allocator overhead — so ~20 B plus the line's
+/// text. A span is 24 B (`highlight::Span` is `(Color32, Range<usize>)` — byte offsets
+/// INTO the shared text, not an owned string per token, which an earlier version of
+/// this comment had wrong and priced ~3× too high). Spans are not part of the row: they
+/// live in `PerRow` beside it, so a `DiffOnly` entry pays none of them.
+///
+/// The figures below were measured while every row was its own allocation (a 32 B row
+/// plus an `Arc<str>` of ~72 B), and the two constants were sized from them. Rows now
+/// weigh ~40% less, so at an unchanged `BYTES_PER_CACHED_LINE` the same byte budget
+/// holds more lines than this ceiling names — the cache itself is byte-weighed and
+/// still fills to its budget.
 ///
 /// Measured on 300 commits each of two real repos (`DiffData::heap_bytes`): a `DiffOnly`
 /// entry runs ~115-130 B/line (worst seen 2,132 B/line, a few very long lines), a
@@ -9187,13 +9192,13 @@ impl Drop for GitkApp {
     /// Hand the app's largest fields to the OS instead of freeing them line by
     /// line.
     ///
-    /// Freeing them is real work and buys nothing: a large diff is millions of
-    /// `DiffLine`s each holding an `Arc<str>`, and the allocator walks every one of
-    /// them to hand the memory back to a process that is about to stop existing.
-    /// Measured on a 76.5M-line diff: **3.24s of a 3.44s exit**, with the window
-    /// already gone — the reader sees gitkay linger after they closed it, and eframe
-    /// drops the app inside its event loop after the last frame, so nothing even
-    /// logged it. The kernel reclaims the whole address space in one operation
+    /// Freeing them is real work and buys nothing: a coloured diff holds a span `Vec`
+    /// per row, and the allocator walks every one of them to hand the memory back to a
+    /// process that is about to stop existing. Measured when each row also owned its
+    /// text (an `Arc` per row), on a 76.5M-line diff: **3.24s of a 3.44s exit**, with
+    /// the window already gone — the reader sees gitkay linger after they closed it,
+    /// and eframe drops the app inside its event loop after the last frame, so nothing
+    /// even logged it. The kernel reclaims the whole address space in one operation
     /// moments later regardless.
     ///
     /// Nothing is skipped but the deallocation: these hold plain memory — `Arc`s,

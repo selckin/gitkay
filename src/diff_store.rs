@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::diff::{
-    CommitStats, DiffData, DiffLine, DiffLines, DiffSettings, DiffSource, FileEntry, LineKind,
-    RowScope, stats_of_files,
+    ArenaLimits, ArenaWriter, CommitStats, DiffData, DiffLines, DiffSettings, DiffSource,
+    FileEntry, LineKind, RowScope, stats_of_files,
 };
 
 /// File magic. Any change to the byte layout below bumps `VERSION`; a version
@@ -143,7 +143,7 @@ impl<'a> Reader<'a> {
     /// actually DESCRIBE — `remaining / min_elem`, not `remaining`.
     ///
     /// The distinction is the whole point. An element costs at least `min_elem`
-    /// bytes on disk but far more in memory (~72 for a `DiffLine`, ~136 for a
+    /// bytes on disk but far more in memory (~20 B per row plus its text, ~136 for a
     /// `FileEntry`), so capping a count of ELEMENTS by a count of BYTES bounds
     /// nothing useful: a 15MB entry — about what `Limits::max_entry_lines`
     /// permits (a speculative warm is now also capped by `Limits::max_entry_bytes`,
@@ -259,8 +259,8 @@ fn encode(data: &DiffData) -> Vec<u8> {
     // **The file table comes before the rows, and that ordering is what `load_stats`
     // is.** The commit-list column wants three integers this table already holds; with
     // the rows in front of it, reaching them meant walking every one — which for a
-    // full `decode` means an `Arc<str>` per line, 400k allocations on a 400k-line entry
-    // to answer a question worth 24 bytes. Nothing else cares which comes first.
+    // full `decode` means copying every line into the arena, 400k rows on a 400k-line
+    // entry, to answer a question worth 24 bytes. Nothing else cares which comes first.
     put_u64(&mut out, data.files.len() as u64);
     for f in data.files.iter() {
         put_str(&mut out, &f.path);
@@ -302,23 +302,22 @@ fn decode(bytes: &[u8]) -> Option<DiffData> {
     let (max_chars, tabless, files) = decode_head(&mut r)?;
 
     let n_lines = r.count(LINE_MIN_BYTES)?;
-    let mut lines = Vec::with_capacity(n_lines);
+    // Straight into the arena, not through `DiffRows`: the entry carries `max_chars` and
+    // `tabless` already, so nothing is re-measured.
+    let mut w = ArenaWriter::with_capacity(ArenaLimits::DEFAULT, n_lines, 0);
     for _ in 0..n_lines {
         let kind = kind_from_tag(r.u8()?)?;
-        // Straight from the mapped bytes into the `Arc`: `DiffLine::text` owns its
-        // bytes inline, and `Arc<str>: From<String>` copies out of the `String` and
-        // drops it — so going through one would allocate and copy twice per line, on
-        // the path the store exists to make fast.
-        let text = Arc::<str>::from(r.str()?);
+        let text = r.str()?; // borrowed out of the entry; copied once, into the arena tail
         let old_lineno = NonZeroU32::new(r.u32()?);
         let new_lineno = NonZeroU32::new(r.u32()?);
-        lines.push(DiffLine::with_linenos(text, kind, old_lineno, new_lineno));
+        w.push_parts(kind, old_lineno, new_lineno, &[text]);
     }
+    let (rows, text) = w.finish().ok()?;
 
     // Trailing bytes mean the file is not what this version writes.
     (r.pos == bytes.len()).then(|| DiffData {
         tabless,
-        ..DiffData::with_max_chars(DiffLines::from(lines), files, max_chars)
+        ..DiffData::with_max_chars(DiffLines::from_arena(rows, text), files, max_chars)
     })
 }
 
@@ -378,8 +377,8 @@ fn decode_head(r: &mut Reader) -> Option<(usize, bool, Vec<FileEntry>)> {
 /// The commit-list column's three numbers, without decoding a single row.
 ///
 /// A stats job wants `files.len()` and two sums, and getting them through `decode` cost
-/// the whole entry: one `Arc<str>` per line, materialised and dropped — 400k
-/// allocations on a 400k-line diff to produce three integers. This reads the header and
+/// the whole entry: every line copied into an arena and dropped — 400k rows on a
+/// 400k-line diff to produce three integers. This reads the header and
 /// the file table and stops, which is why the file table is written first.
 ///
 /// It cannot disagree with the full path: `stats_of_files` is the same function

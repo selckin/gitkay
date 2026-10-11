@@ -78,6 +78,7 @@ impl TextArena {
     pub fn heap_bytes(&self) -> usize {
         self.chunks.iter().map(|c| c.len()).sum()
     }
+    #[cfg(test)]
     pub const fn chunk_count(&self) -> usize {
         self.chunks.len()
     }

@@ -1,16 +1,24 @@
 //! A built diff's rows, read through one door.
 //!
 //! Every reader asks the container — `line(i)`, `text(i)`, `kind(i)`, `iter()`,
-//! `range()` — and never holds a stored row. That is what lets the representation
-//! behind it change (Phase 6: a text arena) without a reader noticing. The view,
-//! `LineRef`, keeps `DiffLine`'s field names so a reader's body reads as before.
+//! `range()` — and never holds a stored row. Behind it a row is a 20 B `Copy` record
+//! pointing into one shared text arena (`super::arena`), and a reader never sees
+//! either. The view, `LineRef`, keeps `DiffLine`'s field names so a reader's body
+//! reads as it did when the rows owned their text.
 
-use super::{AnchorSide, DiffLine, LineKind};
+use super::arena::{Row, TextArena};
+use super::{AnchorSide, LineKind};
 use std::num::NonZeroU32;
 use std::ops::Range;
+use std::sync::Arc;
 
 #[derive(Clone, Default)]
-pub struct DiffLines(Vec<DiffLine>);
+pub struct DiffLines {
+    rows: Vec<Row>,
+    /// Its own `Arc`: `order_files` builds new rows over the same text, and a worker
+    /// holding the old `Arc<DiffLines>` keeps reading the old order (§4.5).
+    text: Arc<TextArena>,
+}
 
 /// One row as a reader sees it. `Copy`, and every accessor takes `self` by value and
 /// returns the CONTAINER's lifetime, so `.map(LineRef::body)` works and a body can
@@ -90,43 +98,64 @@ pub fn views() -> usize {
     VIEWS.with(std::cell::Cell::get)
 }
 
-fn view(l: &DiffLine) -> LineRef<'_> {
+fn view<'a>(text: &'a TextArena, row: &Row) -> LineRef<'a> {
     #[cfg(test)]
     VIEWS.with(|v| v.set(v.get() + 1));
     LineRef {
-        text: &l.text,
-        kind: l.kind,
-        old_lineno: l.old_lineno,
-        new_lineno: l.new_lineno,
+        text: text.text(row),
+        kind: row.kind,
+        old_lineno: row.old_lineno,
+        new_lineno: row.new_lineno,
     }
 }
 
 impl DiffLines {
+    /// The rows a build finished with, over the text they point into.
+    pub fn from_arena(rows: Vec<Row>, text: TextArena) -> Self {
+        Self {
+            rows,
+            text: Arc::new(text),
+        }
+    }
+
+    /// The rows of `ranges`, in that order, over the SAME arena. `order_files`' whole
+    /// permutation: block copies of 20 B rows, no text touched.
+    pub fn gather(&self, ranges: &[Range<usize>]) -> Self {
+        let mut rows = Vec::with_capacity(ranges.iter().map(ExactSizeIterator::len).sum());
+        for r in ranges {
+            rows.extend_from_slice(&self.rows[r.clone()]);
+        }
+        Self {
+            rows,
+            text: Arc::clone(&self.text),
+        }
+    }
+
     pub const fn len(&self) -> usize {
-        self.0.len()
+        self.rows.len()
     }
 
     pub const fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.rows.is_empty()
     }
 
     /// Row `i` as a view. Panics out of range, as a slice index does.
     pub fn line(&self, i: usize) -> LineRef<'_> {
-        view(&self.0[i])
+        view(&self.text, &self.rows[i])
     }
 
     pub fn text(&self, i: usize) -> &str {
-        &self.0[i].text
+        self.text.text(&self.rows[i])
     }
 
     /// Row `i`'s kind, without touching its text.
     pub fn kind(&self, i: usize) -> LineKind {
-        self.0[i].kind
+        self.rows[i].kind
     }
 
     /// Row `i`'s `(old, new)` line numbers, without touching its text.
     pub fn linenos(&self, i: usize) -> (Option<NonZeroU32>, Option<NonZeroU32>) {
-        (self.0[i].old_lineno, self.0[i].new_lineno)
+        (self.rows[i].old_lineno, self.rows[i].new_lineno)
     }
 
     /// `LineRef::lineno_on`, from the row alone.
@@ -144,48 +173,57 @@ impl DiffLines {
     /// `line(i).rendered().len()`, from the row alone — what a pass that only
     /// MEASURES (the wrap index, word diff's weights) reads instead of the text.
     pub fn rendered_len(&self, i: usize) -> usize {
-        rendered_len(self.0[i].kind, self.0[i].text.len())
+        let row = &self.rows[i];
+        rendered_len(row.kind, row.len as usize)
     }
 
     pub fn iter(&self) -> Lines<'_> {
         Lines {
-            rows: self.0.iter(),
+            rows: self.rows.iter(),
+            text: &self.text,
         }
     }
 
     /// Rows `r`, reached in O(1). Panics out of range, as a slice index does.
     pub fn range(&self, r: Range<usize>) -> Lines<'_> {
         Lines {
-            rows: self.0[r].iter(),
+            rows: self.rows[r].iter(),
+            text: &self.text,
         }
     }
 
-    /// Heap bytes the rows hold — today's `rows_heap_bytes`, moved: each row struct
-    /// plus its `Arc<str>` block (header included). O(rows); Task 4 makes it O(chunks).
+    /// Heap bytes the rows hold: `rows.capacity() × 20 + Σ chunk bytes`. O(chunks) and
+    /// exact — no per-row blocks remain for malloc to round up. Two `DiffLines` sharing
+    /// one arena (a re-lay and the copy a worker still holds) each count it in full,
+    /// which over-states, the safe direction for a cache budget.
     pub fn heap_bytes(&self) -> usize {
-        const ARC_HEADER: usize = 2 * std::mem::size_of::<usize>();
-        self.0.capacity() * std::mem::size_of::<DiffLine>()
-            + self
-                .0
-                .iter()
-                .map(|l| ARC_HEADER + l.text.len())
-                .sum::<usize>()
-    }
-
-    /// `order_files`' write handle. Goes in Task 4, when rows stop being moved.
-    pub(super) const fn rows_mut(&mut self) -> &mut Vec<DiffLine> {
-        &mut self.0
+        self.rows.capacity() * std::mem::size_of::<Row>() + self.text.heap_bytes()
     }
 
     #[cfg(test)]
     pub const fn row_capacity(&self) -> usize {
-        self.0.capacity()
+        self.rows.capacity()
+    }
+
+    #[cfg(test)]
+    pub const fn text_arena(&self) -> &Arc<TextArena> {
+        &self.text
     }
 }
 
-impl From<Vec<DiffLine>> for DiffLines {
-    fn from(rows: Vec<DiffLine>) -> Self {
-        Self(rows)
+/// Hand-assembled rows, for the suites: through a real `ArenaWriter`, so a test reads
+/// its rows back the way a build's are read.
+#[cfg(test)]
+impl From<Vec<super::DiffLine>> for DiffLines {
+    fn from(lines: Vec<super::DiffLine>) -> Self {
+        let mut w = super::arena::ArenaWriter::new(super::arena::ArenaLimits::DEFAULT);
+        for l in &lines {
+            w.push_parts(l.kind, l.old_lineno, l.new_lineno, &[l.text.as_str()]);
+        }
+        w.finish().map_or_else(
+            |_| Self::default(),
+            |(rows, text)| Self::from_arena(rows, text),
+        )
     }
 }
 
@@ -202,16 +240,17 @@ impl<'a> IntoIterator for &'a DiffLines {
 /// costs a closure call per skipped row, which made the per-file pending scan
 /// O(files × lines) on the UI thread. Every positioning method here delegates.
 pub struct Lines<'a> {
-    rows: std::slice::Iter<'a, DiffLine>,
+    rows: std::slice::Iter<'a, Row>,
+    text: &'a TextArena,
 }
 
 impl<'a> Iterator for Lines<'a> {
     type Item = LineRef<'a>;
     fn next(&mut self) -> Option<LineRef<'a>> {
-        self.rows.next().map(view)
+        self.rows.next().map(|r| view(self.text, r))
     }
     fn nth(&mut self, n: usize) -> Option<LineRef<'a>> {
-        self.rows.nth(n).map(view)
+        self.rows.nth(n).map(|r| view(self.text, r))
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.rows.size_hint()
@@ -226,10 +265,10 @@ impl<'a> Iterator for Lines<'a> {
 
 impl DoubleEndedIterator for Lines<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        self.rows.next_back().map(view)
+        self.rows.next_back().map(|r| view(self.text, r))
     }
     fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
-        self.rows.nth_back(n).map(view)
+        self.rows.nth_back(n).map(|r| view(self.text, r))
     }
 }
 
@@ -275,6 +314,7 @@ const fn rendered_len(kind: LineKind, len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff::DiffLine;
     use crate::diff::tests::{base_settings, everything_repo};
     use crate::diff::{BuildEnv, DiffSource, RowScope, get_diff_data};
 
