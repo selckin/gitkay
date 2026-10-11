@@ -41,6 +41,11 @@ pub struct Row {
     pub new_lineno: Option<NonZeroU32>,
     pub chunk: u16,
     pub kind: LineKind,
+    /// The TABs in the text, saturating at `u8::MAX` — counted where the row is
+    /// written, in the byte that was padding, so the wrap measure can tell a line that
+    /// fits its row without reading the text again. A saturated count is a lower
+    /// bound; `DiffLines::tab_count` recounts that row's text.
+    pub tabs: u8,
 }
 const _: () = assert!(std::mem::size_of::<Row>() == 20);
 
@@ -53,8 +58,19 @@ impl Row {
             new_lineno: new,
             chunk: 0,
             kind,
+            tabs: 0,
         }
     }
+}
+
+/// `parts`' TABs as `Row::tabs` holds them. Read right after `write` copied the parts,
+/// while they are still in cache, so counting costs no second trip to memory.
+fn count_tabs(parts: &[&str]) -> u8 {
+    let n: usize = parts
+        .iter()
+        .map(|p| memchr::memchr_iter(b'\t', p.as_bytes()).count())
+        .sum();
+    u8::try_from(n).unwrap_or(u8::MAX)
 }
 
 /// The sealed chunks of a finished diff. Immutable once built; shared by `Arc`.
@@ -196,9 +212,36 @@ impl ArenaWriter {
         new: Option<NonZeroU32>,
         parts: &[&str],
     ) -> &str {
-        let row = self.write_row(kind, old, new, parts);
+        let row = self.write_row(kind, old, new, parts, None);
         self.rows.push(row);
         self.view(row)
+    }
+
+    /// The store decoder's door: a row of `text` whose TAB count the caller already
+    /// holds. Decode counts a whole entry's tabs in ONE `memchr` pass over its text
+    /// block and hands each row its share; counted here, a `memchr` set-up per row took
+    /// `bench_store_codec`'s decode from 64ms to 87ms over its 1.8M short rows, where
+    /// the one pass costs ~4ms. Every other writer goes through `push_parts`, which
+    /// counts what it writes.
+    ///
+    /// `tabs` is what `push_parts` would have taken — the text's TABs, saturating at
+    /// `u8::MAX` — and is checked against that in debug builds. A row cut at `max_row`
+    /// is recounted regardless: the count given is for text that was not all kept.
+    pub fn push_counted(
+        &mut self,
+        kind: LineKind,
+        old: Option<NonZeroU32>,
+        new: Option<NonZeroU32>,
+        text: &str,
+        tabs: u8,
+    ) {
+        debug_assert_eq!(
+            tabs,
+            count_tabs(&[text]),
+            "the decoder's count is the text's"
+        );
+        let row = self.write_row(kind, old, new, &[text], Some(tabs));
+        self.rows.push(row);
     }
 
     /// `n` rows of no text, for `set` to fill once their text is known.
@@ -217,7 +260,7 @@ impl ArenaWriter {
             old.len, 0,
             "set fills a reserved blank; anything else leaves dead text in the arena"
         );
-        let row = self.write_row(kind, old.old_lineno, old.new_lineno, &[text]);
+        let row = self.write_row(kind, old.old_lineno, old.new_lineno, &[text], None);
         self.rows[i] = row;
         Some(self.view(row))
     }
@@ -313,12 +356,15 @@ impl ArenaWriter {
         self.write(&[&*chunk], chunk.len())
     }
 
+    /// `tabs` is the parts' TAB count where the caller has it (`push_counted`), and
+    /// `None` to count them here.
     fn write_row(
         &mut self,
         kind: LineKind,
         old: Option<NonZeroU32>,
         new: Option<NonZeroU32>,
         parts: &[&str],
+        tabs: Option<u8>,
     ) -> Row {
         let len: usize = parts.iter().map(|p| p.len()).sum();
         if len == 0 || self.full {
@@ -335,11 +381,14 @@ impl ArenaWriter {
                 new_lineno: new,
                 chunk,
                 kind,
+                tabs: tabs.unwrap_or_else(|| count_tabs(parts)),
             },
             None => Row::blank(kind, old, new),
         }
     }
 
+    /// Counts the cut text again through `write_row`: the tabs cut away are drawn
+    /// nowhere.
     #[cold]
     fn write_truncated(
         &mut self,
@@ -360,7 +409,7 @@ impl ArenaWriter {
                 self.limits.max_row
             );
         }
-        self.write_row(kind, old, new, &[joined.as_str()])
+        self.write_row(kind, old, new, &[joined.as_str()], None)
     }
 
     /// Put `len` bytes somewhere; `None` once the chunk indices have run out.
@@ -486,15 +535,17 @@ mod tests {
 
     /// Texts straddling every boundary a 64-byte cap has — empty, short, just under and
     /// over the cap, several caps long — and multibyte throughout, so an offset taken
-    /// as a byte count would land inside a code point.
+    /// as a byte count would land inside a code point. Tabs throughout too, and now and
+    /// then a run of them either side of where a row's `u8` count saturates.
     fn sample(rng: &mut Rng) -> String {
         const ATOMS: [&str; 6] = ["a", "é", "€", "😀", "\t", " xy"];
-        let len = match rng.below(6) {
+        let len = match rng.below(7) {
             0 => 0,
             1 => 1 + rng.below(8),
             2 => 20 + rng.below(30),
             3 => 60 + rng.below(8),
             4 => 130 + rng.below(70),
+            5 => return "\t".repeat(250 + rng.below(10)) + ATOMS[rng.below(ATOMS.len())],
             _ => 300,
         };
         let mut s = String::new();
@@ -556,12 +607,22 @@ mod tests {
         copied: bool,
         rewound_an_append: bool,
         nested: bool,
+        /// A row holding a tab reached the writer by each door that writes text.
+        set_a_tab: bool,
+        appended_a_tab: bool,
+        saturated: bool,
         alternated: bool,
         adopted_beside_an_open_tail: bool,
         /// A rewind took a tail sealed since the mark back out of its slot — and one
         /// with chunks indexed after it before the mark, which must stay put.
         took_back_a_sealed_tail: bool,
         took_back_a_tail_with_chunks_after_it: bool,
+    }
+
+    /// The TABs in `text` as a row records them, counted by a byte filter rather than
+    /// the arena's own `memchr`: saturating at `u8::MAX`.
+    fn tabs_in(text: &str) -> u8 {
+        u8::try_from(text.bytes().filter(|&b| b == b'\t').count()).unwrap_or(u8::MAX)
     }
 
     /// Names the failing seed: the asserts fire deep inside a run, which knows none.
@@ -642,6 +703,7 @@ mod tests {
                     let s = sample(rng);
                     assert_eq!(self.w.set(i, LineKind::Stat, &s), Some(s.as_str()));
                     self.check_tail_reserved(i..=i);
+                    seen.set_a_tab |= s.contains('\t');
                     self.want[i].text = s;
                 }
                 8 => self.marks.push((
@@ -747,6 +809,7 @@ mod tests {
                 .chunks
                 .iter()
                 .any(|c| !c.is_empty() && c.len() < limits.adopt_min);
+            seen.appended_a_tab |= want.iter().any(|w| w.text.contains('\t'));
             let into_tail: usize = text
                 .chunks
                 .iter()
@@ -773,9 +836,11 @@ mod tests {
             self.appends += 1;
         }
 
-        /// Finish the writer and hold it to the model: every row's text, kind and line
-        /// numbers, and not one byte more than they hold — a byte left behind by a
-        /// rewind, a set or a merge is text no row can reach.
+        /// Finish the writer and hold it to the model: every row's text, kind, line
+        /// numbers and TAB count — the count recomputed from the model's text, so a
+        /// count that a merge, a `set` or a rewind left stale cannot agree with it — and
+        /// not one byte more than they hold: a byte left behind by a rewind, a set or a
+        /// merge is text no row can reach.
         fn finish(self) -> (Vec<Row>, TextArena, Vec<Want>, Vec<usize>) {
             let (rows, text) = self.w.finish().expect("within the chunk limit");
             let got: Vec<Want> = rows
@@ -788,6 +853,9 @@ mod tests {
                 })
                 .collect();
             assert_eq!(got, self.want);
+            for (i, (r, w)) in rows.iter().zip(&self.want).enumerate() {
+                assert_eq!(r.tabs, tabs_in(&w.text), "row {i}'s tab count");
+            }
             assert_eq!(
                 text.heap_bytes(),
                 self.want.iter().map(|w| w.text.len()).sum::<usize>(),
@@ -817,7 +885,8 @@ mod tests {
             for _ in 0..300 {
                 run.step(&mut rng, 2, &mut seen);
             }
-            run.finish();
+            let (rows, ..) = run.finish();
+            seen.saturated |= rows.iter().any(|r| r.tabs == u8::MAX);
         }
         assert!(
             seen.rewound_across_a_seal,
@@ -834,6 +903,12 @@ mod tests {
             "control: some rewind undid an append"
         );
         assert!(seen.nested, "control: some part appended a part of its own");
+        assert!(seen.set_a_tab, "control: some set wrote a tab");
+        assert!(
+            seen.appended_a_tab,
+            "control: some appended part held a tab"
+        );
+        assert!(seen.saturated, "control: some row's tab count saturated");
         assert!(
             seen.alternated,
             "control: some merge alternated large and small"
@@ -1261,6 +1336,20 @@ mod tests {
             "ab€"
         );
         assert_eq!(w.push_parts(LineKind::Meta, None, None, &["abc€"]), "abc");
+    }
+
+    /// A row cut at `max_row` counts the tabs of the text it KEPT: the ones cut away are
+    /// drawn nowhere, and a count that included them would over-state every measure
+    /// built on it.
+    #[test]
+    fn a_truncated_row_counts_the_tabs_it_kept() {
+        let mut w = ArenaWriter::new(ArenaLimits { max_row: 5, ..TINY });
+        assert_eq!(
+            w.push_parts(LineKind::Add, None, None, &["+\t", "\ta\t\t\t"]),
+            "+\t\ta\t"
+        );
+        let (rows, _) = w.finish().expect("fits");
+        assert_eq!(rows[0].tabs, 3);
     }
 
     /// `set` over a row that already holds text would leave that text dead in the arena.

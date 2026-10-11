@@ -149,10 +149,10 @@ impl SideIndex {
     /// Measure `lines` under `side`, over the wrap index the pane is drawing with (or
     /// `None` when soft wrap is off, where a line is its own row).
     ///
-    /// One O(lines) pass reading `DiffLines::kind` and nothing else — no text, unlike
-    /// `WrapIndex::build`'s tab census, which is why this can be rebuilt on a resize
-    /// frame beside a `rewidth` without doubling its cost. The wrap index is consulted
-    /// once per run BOUNDARY (an O(log) search), not once per hidden line.
+    /// One O(lines) pass reading `DiffLines::kind` and nothing else — no text — which
+    /// is why this can be rebuilt on a resize frame beside the wrap index's re-measure
+    /// without doubling its cost. The wrap index is consulted once per run BOUNDARY (an
+    /// O(log) search), not once per hidden line.
     pub fn build(lines: &DiffLines, side: DiffSide, wrap: Option<&WrapIndex>) -> Self {
         Self::build_capped(lines, side, wrap, MAX_HIDDEN_RUNS)
     }
@@ -224,13 +224,14 @@ impl SideIndex {
     /// halves of each `Run` do. Walking the runs is therefore O(runs) with no
     /// allocation, where `build` is O(lines) plus a fresh `Vec<Run>` grown from empty.
     ///
-    /// This is `WrapIndex::rewidth`'s counterpart and exists for the same reason: a
-    /// window-resize drag re-measures on every frame of the drag, and without it the
-    /// side filter charged a second full pass over `diff_lines` beside the wrap
-    /// index's. Measured on a rewrite-heavy synthetic diff at 100 columns, against
-    /// `rewidth` on the same frame:
+    /// It exists because a window-resize drag re-measures the wrap index on every frame
+    /// of the drag, and without it the side filter charged a second full pass over
+    /// `diff_lines` beside the wrap index's. Measured on a rewrite-heavy synthetic diff
+    /// at 100 columns, against the wrap index's re-measure on the same frame (then
+    /// `WrapIndex::rewidth`, a per-line pass; a re-measure now skips the blocks in
+    /// which nothing can wrap, so the wrap column below is an upper bound):
     ///
-    /// | lines | runs | `rewidth` | `build` | `rewrap` |
+    /// | lines | runs | wrap      | `build` | `rewrap` |
     /// |------:|-----:|----------:|--------:|---------:|
     /// |  100k | 12.5k|    851µs  |  450µs  |    42µs  |
     /// |    1M | 125k |   13.7ms  | 5.21ms  |   502µs  |
@@ -558,7 +559,7 @@ mod tests {
         // Wrapping alone, no filter: what `WrapIndex::lines_of_rows` used to assert
         // before `RowMap` became the only place the mapping is composed.
         let lines = ctx_lines(&[10, 300, 10, 10]);
-        let w = WrapIndex::build(&lines, 40, LineNoGutter::default(), false);
+        let w = WrapIndex::build(&lines, 40, LineNoGutter::default());
         let m = map(&lines, Some(&w), None);
         // Line 1 wraps to rows 1..=8 (300 bytes over 39 columns).
         let n = 300_usize.div_ceil(39);
@@ -607,7 +608,7 @@ mod tests {
     fn composed_with_wrapping_a_hidden_run_removes_all_of_its_rows() {
         let lines = wide();
         let gutter = LineNoGutter::default();
-        let w = WrapIndex::build(&lines, 100, gutter, false);
+        let w = WrapIndex::build(&lines, 100, gutter);
         // 1 + n + n + 1 rows, with both wide lines taking the same n.
         let n = w.row_of_line(2) - w.row_of_line(1);
         assert!(n > 1, "the fixture must actually wrap");
@@ -633,7 +634,7 @@ mod tests {
     fn composed_with_wrapping_every_visible_line_round_trips() {
         let lines = wide();
         let gutter = LineNoGutter::default();
-        let w = WrapIndex::build(&lines, 100, gutter, false);
+        let w = WrapIndex::build(&lines, 100, gutter);
         for side in [DiffSide::Old, DiffSide::New] {
             let idx = SideIndex::build(&lines, side, Some(&w));
             let m = map(&lines, Some(&w), Some(&idx));
@@ -651,7 +652,7 @@ mod tests {
         // exactly the slices it did before — including with no wrap index at all.
         let lines = wide();
         let gutter = LineNoGutter::default();
-        let w = WrapIndex::build(&lines, 100, gutter, false);
+        let w = WrapIndex::build(&lines, 100, gutter);
         let idx = SideIndex::build(&lines, DiffSide::New, Some(&w));
         let m = map(&lines, Some(&w), Some(&idx));
         assert_eq!(m.slice(2, lines.line(2), 0), w.slice(2, lines.line(2), 0));
@@ -668,17 +669,17 @@ mod tests {
     /// so it must land where a full `build` at that width would.
     ///
     /// The parity is the whole safety argument for skipping the O(lines) pass —
-    /// `wrap.rs` pins `rewidth` against `build` for exactly the same reason. Checked
-    /// over both modes and several widths, including one where nothing wraps.
+    /// `wrap.rs` pins its block skip against the per-line measure for exactly the same
+    /// reason. Checked over both modes and several widths, including one where nothing wraps.
     #[test]
     fn rewrap_agrees_with_a_full_build_at_the_new_width() {
         let lines = wide();
         let g = LineNoGutter::default();
         for side in [DiffSide::Old, DiffSide::New] {
-            let first = WrapIndex::build(&lines, 100, g, false);
+            let first = WrapIndex::build(&lines, 100, g);
             let mut idx = SideIndex::build(&lines, side, Some(&first));
             for cols in [40, 60, 100, 500] {
-                let w = WrapIndex::build(&lines, cols, g, false);
+                let w = WrapIndex::build(&lines, cols, g);
                 idx.rewrap(Some(&w));
                 let fresh = SideIndex::build(&lines, side, Some(&w));
                 let m = map(&lines, Some(&w), Some(&idx));
@@ -717,10 +718,10 @@ mod tests {
     fn rewrapping_a_refused_index_keeps_it_refused_and_the_identity() {
         let lines = wide();
         let g = LineNoGutter::default();
-        let w = WrapIndex::build(&lines, 100, g, false);
+        let w = WrapIndex::build(&lines, 100, g);
         let mut idx = SideIndex::build_capped(&lines, DiffSide::New, Some(&w), 0);
         assert!(!idx.active());
-        let narrow = WrapIndex::build(&lines, 40, g, false);
+        let narrow = WrapIndex::build(&lines, 40, g);
         idx.rewrap(Some(&narrow));
         assert!(!idx.active());
         assert_eq!(idx.total_rows(), narrow.total_rows(), "still the identity");
@@ -737,7 +738,7 @@ mod tests {
         assert!(idx.covers(lines.len(), DiffSide::Old, None));
         assert!(!idx.covers(lines.len() - 1, DiffSide::Old, None));
         assert!(!idx.covers(lines.len(), DiffSide::New, None));
-        let w = WrapIndex::build(&lines, 100, LineNoGutter::default(), false);
+        let w = WrapIndex::build(&lines, 100, LineNoGutter::default());
         assert!(
             !idx.covers(lines.len(), DiffSide::Old, Some(&w)),
             "a different wrapping re-positions every view row here"

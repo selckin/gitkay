@@ -48,28 +48,34 @@
 //! which charges a tab its real width and lets a character that would straddle the
 //! edge start the next row instead of overflowing it.
 //!
-//! Finding the tabs is the whole cost of that, and it is a pass over the TEXT where
-//! everything else here is a pass over the LINES: measured at ~400ms per GB of
-//! short lines, against 20ms to take their `len()`s. Two things keep it off the
-//! paths that matter. A line whose worst case already fits — `len() + 3×tabs ≤
-//! width` — takes one row with no walk, which is every ordinary source line. And a
-//! diff proven to hold no tab anywhere records that (`tabless`), so `rewidth` — the
-//! rebuild a window drag runs on every frame of the drag — skips the pass entirely
-//! and is the same `len()` arithmetic it always was. That census is the BUILD's
-//! answer where there is one (`DiffData::tabless`), so an install does not re-read the
-//! diff on the frame loop to find out. The 8.3M-character minified
-//! line this module exists for is scanned once, at `memchr` speed (699µs), and not
-//! again while it is on screen.
+//! Knowing which lines hold a tab must not cost a pass over the TEXT, which is
+//! ~400ms per GB of short lines against 20ms for their `len()`s — and an index is built
+//! on the frame loop, on the first frame after every install. So the count is taken
+//! where each row is WRITTEN (`Row::tabs`, by `ArenaWriter`, which already has the
+//! bytes in hand) and read back here as `DiffLines::tab_count`. A line whose worst
+//! case fits — `len() + 3×tabs ≤ width` — takes one row with no walk, which is every
+//! ordinary source line; only a line holding a tab that does NOT fit is read, to be
+//! walked (and `tab_count` also reads the text of a row whose count saturated, 255+
+//! tabs). The 8.3M-character minified line this module exists for has no tab, and is
+//! sliced by arithmetic without its text being read at all.
+//!
+//! Nor does a build visit every line. `DiffLines::wrap_blocks` holds, per `WRAP_BLOCK`
+//! rows, the widest any of them can draw (`len + 3×tabs`, bounded where the count
+//! saturated), and a block no wider than the narrowest body any row is given (`min_body`)
+//! is one in which every line passes that same test — so it is counted as one row a
+//! line, whole. Over the 76.5M-row diff at 75 columns that took the build from 220ms to
+//! 7.6ms on the install frame, and it is what a window drag pays per frame too.
 //!
 //! What a tabbed line costs is not only finding its tabs but SLICING it, and that used
 //! to be paid per row per frame: `slice` restarted `column_rows` from the line's
 //! beginning, so drawing rows `k..k+50` of one such line cost `Σ (k+i)×width` character
-//! decodes and grew with how far the reader had scrolled into it. `measure` already
-//! walks each tabbed line once to count its rows, so it keeps their starts
+//! decodes and grew with how far the reader had scrolled into it. `build` already
+//! walks each tabbed line that wraps once to count its rows, so it keeps their starts
 //! (`MAX_ROW_STARTS`) and `slice` indexes them.
 
 use std::ops::Range;
 
+use super::lines::WRAP_BLOCK;
 use super::{DiffLines, LineKind, LineNoGutter, LineRef};
 
 /// The columns a TAB draws, which is **not** its one byte.
@@ -79,7 +85,7 @@ use super::{DiffLines, LineKind, LineNoGutter, LineRef};
 /// gitkay sets no `FontTweak`, so this is that default. It is the one number the
 /// measure here and the renderer have to agree on: too low and a row overflows the
 /// pane, too high and it breaks early.
-const TAB_COLS: usize = 4;
+pub(super) const TAB_COLS: usize = 4;
 
 /// The narrowest content column count a row is wrapped at, whatever the pane's
 /// width. A pane dragged down to a few columns would otherwise turn one long line
@@ -125,7 +131,7 @@ const NO_STARTS: u32 = u32::MAX;
 /// `first_row` is a running total rather than something derived at query time, so
 /// both directions of the mapping are one binary search over this list and no
 /// prefix-sum array sits beside it that could disagree.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Tall {
     line: usize,
     first_row: usize,
@@ -195,11 +201,6 @@ pub struct WrapIndex {
     gutter: LineNoGutter,
     n_lines: usize,
     total_rows: usize,
-    /// Whether this diff was PROVEN to hold no tab — never merely assumed. False
-    /// covers both "it has one" and "nobody looked", which is what lets a refused
-    /// build (whose scan stopped at the cap) hand back `false` and have `rewidth`
-    /// do the honest thing rather than inherit a claim about lines it never read.
-    tabless: bool,
     tall: Vec<Tall>,
     /// Row-start byte offsets for the tabbed lines that fit `MAX_ROW_STARTS`, packed
     /// end to end and indexed by `Tall::starts_at`. One arena rather than a `Vec` per
@@ -212,58 +213,27 @@ impl WrapIndex {
     /// Measure `lines` against a pane `cols` columns wide with `gutter`'s
     /// line-number columns in front of each patch row.
     ///
-    /// This is the entry point that reads the diff's TEXT, to find its tabs — see the
-    /// module header for why that is the expensive half. `rewidth` is the one to call
-    /// when only the pane moved.
-    ///
-    /// `known_tabless` is the BUILD's answer to the same question
-    /// (`DiffData::tabless`), which it gets for nothing: it is already touching every
-    /// byte of every row it assembles, on a worker, where this runs on the frame loop
-    /// inside the render. Pass `false` — "nobody looked" — and the census runs here as
-    /// it always did, which is what a hand-assembled diff and an entry from an older
-    /// store both do.
-    ///
-    /// One `len()` comparison per line in the common case, plus a pass over the text of
-    /// any line that could hold a tab. O(lines) otherwise: on a diff of tens of millions
-    /// of rows it is tens of milliseconds, which is why the caller only builds one when
-    /// wrapping is actually switched on.
-    pub fn build(
-        lines: &DiffLines,
-        cols: usize,
-        gutter: LineNoGutter,
-        known_tabless: bool,
-    ) -> Self {
-        Self::measure_capped(lines, cols, gutter, known_tabless, MAX_ROW_STARTS)
+    /// A pass over the rows' summary (`DiffLines::wrap_blocks`, one `u32` per
+    /// `WRAP_BLOCK` rows), and over the rows themselves only inside a block whose
+    /// widest row could wrap — so a diff in which nothing wraps, at any width, is
+    /// ~75k comparisons at 76.5M rows. Inside such a block it is one comparison per
+    /// line, off the row's length and its recorded tab count, plus a walk over the
+    /// text of a line that holds a tab and does not fit — see the module header.
+    pub fn build(lines: &DiffLines, cols: usize, gutter: LineNoGutter) -> Self {
+        Self::measure_capped(lines, cols, gutter, MAX_ROW_STARTS, true)
     }
 
-    /// Re-measure the SAME diff at a new width, keeping what this index already
-    /// learned about its text.
-    ///
-    /// Where the tabs are cannot move while the diff does not, so a diff already
-    /// proven tab-free is re-measured on `len()` arithmetic alone — which is what
-    /// keeps a window drag over a huge diff as cheap as it was before tabs were
-    /// counted at all. The line count is checked rather than trusted: it is the
-    /// same thing `covers` asks, and a caller that reaches here with a different
-    /// diff gets a full measure rather than a wrong one.
-    pub fn rewidth(&self, lines: &DiffLines, cols: usize, gutter: LineNoGutter) -> Self {
-        Self::measure_capped(
-            lines,
-            cols,
-            gutter,
-            self.tabless && self.n_lines == lines.len(),
-            MAX_ROW_STARTS,
-        )
-    }
-
-    /// `build` with the row-start arena's ceiling as a parameter, so a test can set it
-    /// to zero and prove what must not regress: that a line the arena could not take is
-    /// sliced exactly as one it could. A `const` cannot be varied to show that.
+    /// `build` with two seams a test needs. The row-start arena's ceiling, so a test can
+    /// set it to zero and prove that a line the arena could not take is sliced exactly
+    /// as one it could — a `const` cannot be varied to show that. And `skip_blocks`, so a
+    /// test can send every block through the per-line pass and prove the skip produces
+    /// what that pass does.
     fn measure_capped(
         lines: &DiffLines,
         cols: usize,
         gutter: LineNoGutter,
-        known_tabless: bool,
         max_starts: usize,
+        skip_blocks: bool,
     ) -> Self {
         let mut tall: Vec<Tall> = Vec::new();
         let mut starts: Vec<usize> = Vec::new();
@@ -273,48 +243,64 @@ impl WrapIndex {
         // for — while looking identical from outside.
         let mut denied = 0usize;
         let mut total_rows: usize = 0;
-        let mut tabless = true;
-        for line in 0..lines.len() {
-            let width = body_cols(lines.kind(line), cols, gutter);
-            // The length comes off the row; the TEXT is read only for the tab census,
-            // so a diff the build proved tab-free is measured without touching it.
-            let len = lines.rendered_len(line);
-            let content = (!known_tabless).then(|| lines.line(line).rendered());
-            let tabs = content.map_or(0, |c| memchr::memchr_iter(b'\t', c.as_bytes()).count());
-            tabless &= tabs == 0;
-            // The columns this line draws, which is exactly what `column_rows` charges
-            // it: every character costs its own byte length except a tab, which costs
-            // `TAB_COLS`. Under the width there is nothing to walk for — one row,
-            // whatever the tabs do inside it.
-            //
-            // **This is the ONLY way out of `tall`, and it has to be**: a line the loop
-            // skips is one `slice` answers for by arithmetic, and that arithmetic gives
-            // back the whole line only while `len <= width` (which this test implies).
-            // A second escape hatch for a line measured at one row would hand `slice` a
-            // line longer than the row it draws, and the tail would be cut where no
-            // horizontal scroll exists to reach it.
-            if len + (TAB_COLS - 1) * tabs <= width {
-                total_rows += 1;
+        let narrowest = min_body(cols, gutter);
+        // The walk counts lines only through the blocks, so a summary that did not
+        // cover every row would silently drop lines.
+        debug_assert_eq!(lines.wrap_blocks().len(), lines.len().div_ceil(WRAP_BLOCK));
+        for (b, &widest) in lines.wrap_blocks().iter().enumerate() {
+            let block = b * WRAP_BLOCK..lines.len().min((b + 1) * WRAP_BLOCK);
+            // The block's widest row is an upper bound on what each of its lines draws
+            // (`len + 3×tabs`), and `narrowest` a lower bound on the body any of them
+            // is given — so at or under it, every line passes the fit test below and
+            // takes one row. That is the test itself, applied to a block at once, and
+            // not a second way out of `tall`.
+            if skip_blocks && widest as usize <= narrowest {
+                total_rows += block.len();
                 continue;
             }
-            // The walk a tabbed line needs, done ONCE: its row starts are recorded
-            // here so `slice` indexes them instead of re-walking from the line's
-            // beginning for every visible row of every frame. A line the arena has no
-            // room for records none and is re-walked, as every tabbed line used to be.
-            let mut starts_at = NO_STARTS;
-            let rows = match content {
-                Some(content) if tabs > 0 => {
+            for line in block {
+                let width = body_cols(lines.kind(line), cols, gutter);
+                let len = lines.rendered_len(line);
+                // Counted when the row was written, so nothing here reads the text to
+                // find out. Over the STORED text, which for an Add/Del row includes the
+                // marker `rendered()` strips — so it can exceed the rendered count (a
+                // marker that is itself a TAB, which no build writes), never fall short
+                // of it. Over-counting only sends a line that fits to the walk below,
+                // which slices `rendered()` and so gets it right anyway.
+                let tabs = lines.tab_count(line);
+                // The columns this line draws, which is exactly what `column_rows`
+                // charges it: every character costs its own byte length except a tab,
+                // which costs `TAB_COLS`. Under the width there is nothing to walk for —
+                // one row, whatever the tabs do inside it.
+                //
+                // **This is the ONLY way out of `tall`, and it has to be**: a line the
+                // loop skips is one `slice` answers for by arithmetic, and that
+                // arithmetic gives back the whole line only while `len <= width` (which
+                // this test implies). A second escape hatch for a line measured at one
+                // row would hand `slice` a line longer than the row it draws, and the
+                // tail would be cut where no horizontal scroll exists to reach it.
+                if len + (TAB_COLS - 1) * tabs <= width {
+                    total_rows += 1;
+                    continue;
+                }
+                // The walk a tabbed line needs, done ONCE: its row starts are recorded
+                // here so `slice` indexes them instead of re-walking from the line's
+                // beginning for every visible row of every frame. A line the arena has
+                // no room for records none and is re-walked, as every tabbed line used
+                // to be.
+                let mut starts_at = NO_STARTS;
+                let rows = if tabs > 0 {
                     let at = starts.len();
                     let mut rows = 0usize;
-                    for r in column_rows(content, width) {
+                    for r in column_rows(lines.line(line).rendered(), width) {
                         rows += 1;
                         if starts.len() < max_starts {
                             starts.push(r.start);
                         }
                     }
-                    // All of this line's starts or none of them: a half-recorded line would
-                    // have `slice` answer some of its rows from the arena and run off the
-                    // end for the rest.
+                    // All of this line's starts or none of them: a half-recorded line
+                    // would have `slice` answer some of its rows from the arena and run
+                    // off the end for the rest.
                     if starts.len() == at + rows {
                         starts_at = u32::try_from(at).unwrap_or(NO_STARTS);
                     } else {
@@ -322,27 +308,29 @@ impl WrapIndex {
                         denied += 1;
                     }
                     rows
+                } else {
+                    // A tab-free line is sliced by arithmetic, off its length alone.
+                    len.div_ceil(width)
+                };
+                if tall.len() >= MAX_WRAPPED_LINES {
+                    log::warn!(
+                        "wrap: {} of {} lines are wider than the pane ({cols} columns) — \
+                         over the {MAX_WRAPPED_LINES}-line index cap, so this diff renders \
+                         unwrapped",
+                        tall.len(),
+                        lines.len(),
+                    );
+                    return Self::inactive(lines.len(), cols, gutter);
                 }
-                // A tab-free line is sliced by arithmetic, off its length alone.
-                _ => len.div_ceil(width),
-            };
-            if tall.len() >= MAX_WRAPPED_LINES {
-                log::warn!(
-                    "wrap: {} of {} lines are wider than the pane ({cols} columns) — over the \
-                     {MAX_WRAPPED_LINES}-line index cap, so this diff renders unwrapped",
-                    tall.len(),
-                    lines.len(),
-                );
-                return Self::inactive(lines.len(), cols, gutter);
+                tall.push(Tall {
+                    line,
+                    first_row: total_rows,
+                    rows,
+                    tabbed: tabs > 0,
+                    starts_at,
+                });
+                total_rows += rows;
             }
-            tall.push(Tall {
-                line,
-                first_row: total_rows,
-                rows,
-                tabbed: tabs > 0,
-                starts_at,
-            });
-            total_rows += rows;
         }
         if denied > 0 {
             log::debug!(
@@ -357,7 +345,6 @@ impl WrapIndex {
             gutter,
             n_lines: lines.len(),
             total_rows,
-            tabless,
             tall,
             starts,
         }
@@ -365,10 +352,6 @@ impl WrapIndex {
 
     /// An index that maps every line to itself — the shape a refused build takes,
     /// so "we gave up" needs no second code path anywhere above this module.
-    ///
-    /// `tabless: false` because the scan stopped where the refusal did: this index
-    /// has read only a prefix of the diff and is in no position to tell `rewidth`
-    /// anything about the rest.
     const fn inactive(n_lines: usize, cols: usize, gutter: LineNoGutter) -> Self {
         Self {
             active: false,
@@ -376,7 +359,6 @@ impl WrapIndex {
             gutter,
             n_lines,
             total_rows: n_lines,
-            tabless: false,
             tall: Vec::new(),
             starts: Vec::new(),
         }
@@ -581,6 +563,14 @@ fn body_cols(kind: LineKind, cols: usize, gutter: LineNoGutter) -> usize {
     cols.saturating_sub(prefix).max(MIN_BODY_COLS)
 }
 
+/// The narrowest body any row can be given at `cols`: a code row inside a patch's,
+/// which carries both the gutter and the marker column. What a block's widest row is
+/// compared against to skip it whole, so it has to be the minimum over every kind —
+/// `min_body_is_the_narrowest_body` holds it to that.
+fn min_body(cols: usize, gutter: LineNoGutter) -> usize {
+    body_cols(LineKind::Add, cols, gutter)
+}
+
 /// The largest character boundary of `s` at or before byte `i` — `str`'s own
 /// `floor_char_boundary`, which is still unstable. At most three steps back, since
 /// a UTF-8 sequence is at most four bytes.
@@ -650,7 +640,7 @@ pub(super) mod tests {
     #[test]
     fn a_diff_that_fits_the_pane_is_the_identity() {
         let lines = ctx_lines(&[0, 10, 40, 79]);
-        let idx = WrapIndex::build(&lines, 100, LineNoGutter::default(), false);
+        let idx = WrapIndex::build(&lines, 100, LineNoGutter::default());
         assert!(idx.active());
         assert_eq!(idx.total_rows(), 4);
         for l in 0..4 {
@@ -663,7 +653,7 @@ pub(super) mod tests {
     fn a_line_exactly_as_wide_as_the_pane_takes_one_row_and_one_byte_more_takes_two() {
         // A context row: no gutter, one marker column, so the body gets 99 of 100.
         let lines = ctx_lines(&[99, 100]);
-        let idx = WrapIndex::build(&lines, 100, LineNoGutter::default(), false);
+        let idx = WrapIndex::build(&lines, 100, LineNoGutter::default());
         assert_eq!(idx.row_of_line(0), 0);
         assert_eq!(idx.row_of_line(1), 1); // the 99-byte line took one row
         assert_eq!(idx.total_rows(), 3); // and the 100-byte one took two
@@ -684,7 +674,7 @@ pub(super) mod tests {
             .collect();
         let lines = ctx_lines(&widths);
         for cols in [20, 47, 100] {
-            let idx = WrapIndex::build(&lines, cols, LineNoGutter::default(), false);
+            let idx = WrapIndex::build(&lines, cols, LineNoGutter::default());
             let rows = brute_force(&lines, cols, LineNoGutter::default());
             let mut row = 0;
             for (l, &n) in rows.iter().enumerate() {
@@ -706,7 +696,7 @@ pub(super) mod tests {
     #[test]
     fn the_slices_of_a_line_tile_it_exactly() {
         let lines = DiffLines::from(vec![line(&"abcdefghij".repeat(30), LineKind::Context)]);
-        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default(), false);
+        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default());
         let rows = idx.total_rows();
         assert!(rows > 1);
         let mut at = 0;
@@ -734,7 +724,7 @@ pub(super) mod tests {
         // being floored.
         let text = "日".repeat(60);
         let lines = DiffLines::from(vec![line(&text, LineKind::Context)]);
-        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default(), false);
+        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default());
         let mut at = 0;
         for sub in 0..idx.total_rows() {
             let s = idx.slice(0, lines.line(0), sub);
@@ -764,14 +754,14 @@ pub(super) mod tests {
     #[test]
     fn a_pane_squeezed_to_nothing_still_wraps_at_a_floor() {
         let lines = ctx_lines(&[1000]);
-        let idx = WrapIndex::build(&lines, 0, LineNoGutter::default(), false);
+        let idx = WrapIndex::build(&lines, 0, LineNoGutter::default());
         assert_eq!(idx.total_rows(), 1000_usize.div_ceil(MIN_BODY_COLS));
     }
 
     #[test]
     fn an_empty_line_still_takes_one_row() {
         let lines = ctx_lines(&[0, 0]);
-        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default(), false);
+        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default());
         assert_eq!(idx.total_rows(), 2);
         assert_eq!(
             idx.slice(0, lines.line(0), 0),
@@ -787,7 +777,7 @@ pub(super) mod tests {
         // One line over the cap is enough to prove the shape; the cap itself is a
         // memory ceiling, not a behaviour.
         let lines = ctx_lines(&vec![200; MAX_WRAPPED_LINES + 1]);
-        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default(), false);
+        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default());
         assert!(!idx.active());
         assert_eq!(idx.total_rows(), lines.len());
         assert_eq!(idx.row_of_line(12_345), 12_345);
@@ -806,7 +796,7 @@ pub(super) mod tests {
     fn covers_asks_about_all_three_inputs() {
         let lines = ctx_lines(&[10, 10]);
         let g = LineNoGutter::default();
-        let idx = WrapIndex::build(&lines, 40, g, false);
+        let idx = WrapIndex::build(&lines, 40, g);
         assert!(idx.covers(2, 40, g));
         assert!(!idx.covers(3, 40, g));
         assert!(!idx.covers(2, 41, g));
@@ -854,7 +844,7 @@ pub(super) mod tests {
             .collect::<Vec<_>>()
             .into();
         for &cols in widths {
-            let idx = WrapIndex::build(&lines, cols, g, false);
+            let idx = WrapIndex::build(&lines, cols, g);
             let width = body_cols(LineKind::Context, cols, g);
             for (i, l) in lines.iter().enumerate() {
                 let rows = idx.row_of_line(i + 1) - idx.row_of_line(i);
@@ -915,7 +905,7 @@ pub(super) mod tests {
         let text = format!("\t\t{}", "abcdefghij".repeat(20));
         let lines = DiffLines::from(vec![line(&text, LineKind::Context)]);
         assert!(
-            WrapIndex::build(&lines, 40, LineNoGutter::default(), false).total_rows() > 1,
+            WrapIndex::build(&lines, 40, LineNoGutter::default()).total_rows() > 1,
             "the fixture has to wrap, or this asserts nothing"
         );
         check_rows(std::slice::from_ref(&text), &[40]);
@@ -937,8 +927,8 @@ pub(super) mod tests {
         let lines = DiffLines::from(vec![line(&text, LineKind::Context)]);
         let width = 40;
 
-        let recorded = WrapIndex::measure_capped(&lines, width, g, false, MAX_ROW_STARTS);
-        let walked = WrapIndex::measure_capped(&lines, width, g, false, 0);
+        let recorded = WrapIndex::measure_capped(&lines, width, g, MAX_ROW_STARTS, true);
+        let walked = WrapIndex::measure_capped(&lines, width, g, 0, true);
         assert!(
             recorded.total_rows() > 3,
             "the fixture has to wrap several times"
@@ -985,43 +975,213 @@ pub(super) mod tests {
         }
     }
 
-    /// The census `rewidth` carries over is an optimisation, so the only thing that
-    /// makes it safe is producing what a full build would — over a diff with tabs,
-    /// one without, and a line count that moved under it.
+    /// Every `LineKind`, each checked against its place in the list by an exhaustive
+    /// match — so a tenth variant fails to compile here rather than being silently left
+    /// out of it.
+    fn every_kind() -> [LineKind; 9] {
+        use LineKind::{Add, Blank, Context, Del, FileMeta, FileName, Hunk, Meta, Stat};
+        let all = [
+            Context, Add, Del, Hunk, Meta, FileMeta, FileName, Stat, Blank,
+        ];
+        for (i, k) in all.into_iter().enumerate() {
+            let at = match k {
+                Context => 0,
+                Add => 1,
+                Del => 2,
+                Hunk => 3,
+                Meta => 4,
+                FileMeta => 5,
+                FileName => 6,
+                Stat => 7,
+                Blank => 8,
+            };
+            assert_eq!(at, i, "{k:?}");
+        }
+        all
+    }
+
+    /// A gutter four digits wide on each side, so a code row inside a patch loses ten
+    /// more columns than a header above the first file does.
+    fn wide_gutter() -> LineNoGutter {
+        LineNoGutter::measure(&DiffLines::from(vec![DiffLine::with_linenos(
+            " x",
+            LineKind::Context,
+            std::num::NonZeroU32::new(1000),
+            std::num::NonZeroU32::new(1000),
+        )]))
+    }
+
+    /// The block skip compares a block's widest row against ONE width, so that width
+    /// has to be the narrowest any row can be given — or a block whose widest row fits
+    /// that width could still hold a row of a narrower kind that does not.
     #[test]
-    fn rewidth_agrees_with_a_full_build() {
-        let g = LineNoGutter::default();
-        let tabbed: DiffLines = ["\tone", "\t\ttwo long enough to wrap somewhere", "three"]
-            .iter()
-            .map(|t| line(t, LineKind::Context))
-            .collect::<Vec<_>>()
-            .into();
-        let plain = ctx_lines(&[10, 300, 10]);
-        for lines in [&tabbed, &plain] {
-            let mut idx = WrapIndex::build(lines, 100, g, false);
-            for cols in [80, 40, 20, 100] {
-                idx = idx.rewidth(lines, cols, g);
-                let fresh = WrapIndex::build(lines, cols, g, false);
-                assert_eq!(idx.total_rows(), fresh.total_rows(), "at cols={cols}");
-                for l in 0..=lines.len() {
-                    assert_eq!(idx.row_of_line(l), fresh.row_of_line(l), "at cols={cols}");
+    fn min_body_is_the_narrowest_body() {
+        for g in [LineNoGutter::default(), wide_gutter()] {
+            for cols in [0, MIN_BODY_COLS, MIN_BODY_COLS + 1, 40, 100, 1000] {
+                let narrowest = every_kind()
+                    .into_iter()
+                    .map(|k| body_cols(k, cols, g))
+                    .min()
+                    .expect("there are kinds");
+                assert_eq!(min_body(cols, g), narrowest, "cols={cols} gutter={g:?}");
+            }
+        }
+        // Control: the gutter really does make the kinds differ.
+        assert_ne!(
+            body_cols(LineKind::Meta, 100, wide_gutter()),
+            body_cols(LineKind::Add, 100, wide_gutter())
+        );
+    }
+
+    /// A seeded generator, so a failure names a fixture that can be rebuilt.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            usize::try_from(self.0 >> 33).expect("31 bits fit") % n.max(1)
+        }
+    }
+
+    /// A row of `kind` whose RENDERED text is `cols` columns wide with `tabs` of them
+    /// being tabs, scattered — `cols - 3 × tabs` bytes. Add/Del rows get their marker.
+    fn row_of(rng: &mut Lcg, kind: LineKind, cols: usize, tabs: usize) -> DiffLine {
+        let bytes = cols - (TAB_COLS - 1) * tabs;
+        let mut body: Vec<char> = std::iter::repeat_n('\t', tabs)
+            .chain(std::iter::repeat_n('x', bytes - tabs))
+            .collect();
+        for i in (1..body.len()).rev() {
+            body.swap(i, rng.below(i + 1));
+        }
+        let body: String = body.into_iter().collect();
+        let text = match kind {
+            LineKind::Add => format!("+{body}"),
+            LineKind::Del => format!("-{body}"),
+            _ => body,
+        };
+        line(&text, kind)
+    }
+
+    /// A row of a random kind, at most `max_cols` columns wide, with a random number
+    /// of its columns spent on tabs.
+    fn random_row(rng: &mut Lcg, max_cols: usize) -> DiffLine {
+        let kind = every_kind()[rng.below(9)];
+        let cols = rng.below(max_cols + 1);
+        let tabs = if rng.below(3) == 0 {
+            rng.below(cols / TAB_COLS + 1)
+        } else {
+            0
+        };
+        row_of(rng, kind, cols, tabs)
+    }
+
+    /// Blocks of `WRAP_BLOCK` rows, each built to land on one side of `narrowest` or
+    /// exactly on it, and a short tail block.
+    fn block_fixture(seed: u64, narrowest: usize) -> DiffLines {
+        let mut rng = Lcg(seed);
+        let mut rows = Vec::new();
+        for regime in 0..7 {
+            let n = if regime == 6 {
+                WRAP_BLOCK / 3
+            } else {
+                WRAP_BLOCK
+            };
+            let mut block: Vec<DiffLine> =
+                (0..n).map(|_| random_row(&mut rng, narrowest)).collect();
+            let at = rng.below(n);
+            let code = [LineKind::Add, LineKind::Del, LineKind::Context][rng.below(3)];
+            match regime {
+                // Every row fits, the widest exactly: the boundary the skip takes.
+                0 => block[at] = row_of(&mut rng, code, narrowest, 0),
+                // One code row a column too wide for the narrowest body.
+                1 => block[at] = row_of(&mut rng, code, narrowest + 1, 0),
+                // Fits by bytes, overflows by one through its tab.
+                2 => block[at] = row_of(&mut rng, code, narrowest + 1, 1),
+                // Fits exactly with tabs in it.
+                3 => block[at] = row_of(&mut rng, code, narrowest, narrowest / TAB_COLS),
+                // A count that saturates, and so is bounded rather than known.
+                4 => block[at] = line(&format!("+{}x", "\t".repeat(300)), LineKind::Add),
+                // Anything, most of it wrapping.
+                _ => {
+                    block = (0..n)
+                        .map(|_| random_row(&mut rng, 3 * narrowest))
+                        .collect();
                 }
-                for r in 0..fresh.total_rows() {
-                    assert_eq!(idx.line_of_row(r), fresh.line_of_row(r), "at cols={cols}");
-                    let (l, sub) = fresh.line_of_row(r);
-                    assert_eq!(
-                        idx.slice(l, lines.line(l), sub),
-                        fresh.slice(l, lines.line(l), sub)
-                    );
+            }
+            rows.extend(block);
+        }
+        rows.into()
+    }
+
+    /// The block skip is a shortcut through `measure`, so the only thing that makes it
+    /// safe is producing exactly what the per-line pass does: the same rows, the same
+    /// tall lines, the same recorded starts. Over blocks either side of the narrowest
+    /// body and exactly on it, with tabs, a saturated count, the gutter on and off, and
+    /// the floor width — and against the brute-force layout too, so the two cannot
+    /// agree on something wrong.
+    #[test]
+    fn block_skip_agrees_with_the_per_line_measure() {
+        for (gi, g) in [LineNoGutter::default(), wide_gutter()]
+            .into_iter()
+            .enumerate()
+        {
+            for cols in [0, MIN_BODY_COLS, MIN_BODY_COLS + 1, 40, 100] {
+                let narrowest = min_body(cols, g);
+                let seed = u64::try_from(cols * 2 + gi).expect("small");
+                let lines = block_fixture(0x5eed_0000 + seed, narrowest);
+                let blocks = lines.wrap_blocks();
+                let edge = u32::try_from(narrowest).expect("small");
+                assert!(
+                    blocks.contains(&edge) && blocks.contains(&(edge + 1)),
+                    "control: blocks on both sides of the boundary at cols={cols}: {blocks:?}"
+                );
+                let skipped = WrapIndex::measure_capped(&lines, cols, g, MAX_ROW_STARTS, true);
+                let walked = WrapIndex::measure_capped(&lines, cols, g, MAX_ROW_STARTS, false);
+                let what = format!("cols={cols} gutter={g:?}");
+                assert_eq!(skipped.total_rows, walked.total_rows, "{what}");
+                assert_eq!(skipped.tall, walked.tall, "{what}");
+                assert_eq!(skipped.starts, walked.starts, "{what}");
+                let rows = brute_force(&lines, cols, g);
+                assert_eq!(skipped.total_rows, rows.iter().sum::<usize>(), "{what}");
+                let mut row = 0;
+                for (l, &n) in rows.iter().enumerate() {
+                    assert_eq!(skipped.row_of_line(l), row, "{what} line {l}");
+                    row += n;
                 }
             }
         }
-        // A different diff that happens to reach here is measured, not assumed:
-        // the carried census describes lines this one does not have.
-        let grew = WrapIndex::build(&tabbed, 100, g, false).rewidth(&plain, 40, g);
+    }
+
+    /// The measure reads a line's TEXT only to walk it — a line holding a tab that does
+    /// not fit its row. Everything else is answered from the row: its length and its
+    /// tab count, recorded when it was written.
+    #[test]
+    fn the_measure_reads_only_the_text_it_walks() {
+        let lines: DiffLines = [
+            ("x".repeat(500), LineKind::Context), // wraps, no tab: arithmetic
+            (format!("\t{}", "x".repeat(10)), LineKind::Context), // a tab, fits
+            (format!("+\t{}", "x".repeat(200)), LineKind::Add), // a tab, wraps: walked
+            ("short".to_string(), LineKind::Meta),
+        ]
+        .into_iter()
+        .map(|(t, k)| line(&t, k))
+        .collect::<Vec<_>>()
+        .into();
+        let before = crate::diff::views();
+        let idx = WrapIndex::build(&lines, 40, LineNoGutter::default());
         assert_eq!(
-            grew.total_rows(),
-            WrapIndex::build(&plain, 40, g, false).total_rows()
+            crate::diff::views() - before,
+            1,
+            "only the walked line is read"
+        );
+        assert_eq!(
+            idx.total_rows(),
+            brute_force(&lines, 40, LineNoGutter::default())
+                .iter()
+                .sum::<usize>()
         );
     }
 }

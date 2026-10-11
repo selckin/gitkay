@@ -7,10 +7,15 @@
 //! reads as it did when the rows owned their text.
 
 use super::arena::{Row, TextArena};
+use super::wrap::TAB_COLS;
 use super::{AnchorSide, LineKind};
 use std::num::NonZeroU32;
 use std::ops::Range;
 use std::sync::Arc;
+
+/// Rows per entry of `DiffLines::wrap_blocks`: one `u32` per 1024 rows, so the 76.5M-row
+/// diff's summary is ~75k entries (300 KB) where its rows are 1.5 GB.
+pub const WRAP_BLOCK: usize = 1024;
 
 #[derive(Clone, Default)]
 pub struct DiffLines {
@@ -18,6 +23,19 @@ pub struct DiffLines {
     /// Its own `Arc`: `order_files` builds new rows over the same text, and a worker
     /// holding the old `Arc<DiffLines>` keeps reading the old order (§4.5).
     text: Arc<TextArena>,
+    summary: Summary,
+}
+
+/// What the line-number gutter and the wrap index would otherwise rescan every row
+/// for on the frame loop — 189 ms and 196 ms over the 76.5M-row diff — taken once,
+/// where the rows are handed over. Kept by the CONSTRUCTORS, both through `summarize`,
+/// so no `DiffLines` exists whose summary was not computed from its own rows.
+#[derive(Clone, Default)]
+struct Summary {
+    max_old: u32,
+    max_new: u32,
+    /// Per `WRAP_BLOCK` rows, the widest any of them can draw (`draw_cols`).
+    blocks: Vec<u32>,
 }
 
 /// One row as a reader sees it. `Copy`, and every accessor takes `self` by value and
@@ -113,19 +131,23 @@ impl DiffLines {
     /// The rows a build finished with, over the text they point into.
     pub fn from_arena(rows: Vec<Row>, text: TextArena) -> Self {
         Self {
+            summary: summarize(&rows),
             rows,
             text: Arc::new(text),
         }
     }
 
     /// The rows of `ranges`, in that order, over the SAME arena. `order_files`' whole
-    /// permutation: block copies of 20 B rows, no text touched.
+    /// permutation: block copies of 20 B rows, no text touched. The summary is taken
+    /// again, since rows moved between blocks; the line-number maxima cannot have
+    /// moved, but beside the blocks in the same pass they cost nothing to retake.
     pub fn gather(&self, ranges: &[Range<usize>]) -> Self {
         let mut rows = Vec::with_capacity(ranges.iter().map(ExactSizeIterator::len).sum());
         for r in ranges {
             rows.extend_from_slice(&self.rows[r.clone()]);
         }
         Self {
+            summary: summarize(&rows),
             rows,
             text: Arc::clone(&self.text),
         }
@@ -133,6 +155,37 @@ impl DiffLines {
 
     pub const fn len(&self) -> usize {
         self.rows.len()
+    }
+
+    /// The largest `(old, new)` line number over all rows; 0 where no row carries that
+    /// side. O(1): what the gutter's widths are measured from.
+    pub const fn max_linenos(&self) -> (u32, u32) {
+        (self.summary.max_old, self.summary.max_new)
+    }
+
+    /// Per block of `WRAP_BLOCK` rows (the last may be short): the max over its rows of
+    /// `rendered_len + (TAB_COLS - 1) × tabs`, or `stored_len × TAB_COLS` where the
+    /// count saturated — the most columns any of them can draw, so a block no wider
+    /// than the narrowest body a row can have is one whose lines all fit their rows.
+    pub fn wrap_blocks(&self) -> &[u32] {
+        &self.summary.blocks
+    }
+
+    /// Row `i`'s exact TAB count: the stored one, or a recount of its text where the
+    /// stored one saturated. Panics out of range, as a slice index does.
+    ///
+    /// Of the STORED text, which for an Add/Del row includes the one-byte marker
+    /// `rendered()` strips — so it exceeds the rendered count where that marker is
+    /// itself a TAB (no build writes one; a crafted store entry could), and never falls
+    /// short of it. The wrap measure relies on only that direction: an over-count sends a
+    /// line that fits to the walk, which slices `rendered()` and gets it right anyway.
+    pub fn tab_count(&self, i: usize) -> usize {
+        let row = &self.rows[i];
+        if row.tabs == u8::MAX {
+            memchr::memchr_iter(b'\t', self.text.text(row).as_bytes()).count()
+        } else {
+            usize::from(row.tabs)
+        }
     }
 
     pub const fn is_empty(&self) -> bool {
@@ -192,12 +245,15 @@ impl DiffLines {
         }
     }
 
-    /// Heap bytes the rows hold: `rows.capacity() × 20 + Σ chunk bytes`. O(chunks) and
-    /// exact — no per-row blocks remain for malloc to round up. Two `DiffLines` sharing
-    /// one arena (a re-lay and the copy a worker still holds) each count it in full,
-    /// which over-states, the safe direction for a cache budget.
+    /// Heap bytes the rows hold: `rows.capacity() × 20 + Σ chunk bytes`, plus the
+    /// summary's 4 B per `WRAP_BLOCK` rows. O(chunks) and exact — no per-row blocks
+    /// remain for malloc to round up. Two `DiffLines` sharing one arena (a re-lay and
+    /// the copy a worker still holds) each count it in full, which over-states, the
+    /// safe direction for a cache budget.
     pub fn heap_bytes(&self) -> usize {
-        self.rows.capacity() * std::mem::size_of::<Row>() + self.text.heap_bytes()
+        self.rows.capacity() * std::mem::size_of::<Row>()
+            + self.summary.blocks.capacity() * std::mem::size_of::<u32>()
+            + self.text.heap_bytes()
     }
 
     #[cfg(test)]
@@ -298,6 +354,41 @@ const fn anchor_point(
         (None, Some(o)) => Some((AnchorSide::Old, o)),
         (None, None) => None,
     }
+}
+
+/// The ONE pass that computes a `Summary`, for both constructors.
+fn summarize(rows: &[Row]) -> Summary {
+    let (mut max_old, mut max_new) = (0, 0);
+    let blocks = rows
+        .chunks(WRAP_BLOCK)
+        .map(|block| {
+            let mut widest = 0;
+            for row in block {
+                max_old = max_old.max(row.old_lineno.map_or(0, NonZeroU32::get));
+                max_new = max_new.max(row.new_lineno.map_or(0, NonZeroU32::get));
+                widest = widest.max(draw_cols(row));
+            }
+            widest
+        })
+        .collect();
+    Summary {
+        max_old,
+        max_new,
+        blocks,
+    }
+}
+
+/// The most columns `row` can draw: each TAB is one byte drawn `TAB_COLS` wide, and
+/// every other byte at most one column. A saturated count says only "at least 255",
+/// so that row is bounded by every STORED byte being a tab: `stored_len × TAB_COLS`, which
+/// is `≥ rendered_len + 3 × stored_tabs` however the marker of an Add/Del row (counted by
+/// `tab_count`, over the stored text) falls. Saturates at `u32::MAX`.
+fn draw_cols(row: &Row) -> u32 {
+    if row.tabs == u8::MAX {
+        return row.len.saturating_mul(TAB_COLS as u32);
+    }
+    let len = u32::try_from(rendered_len(row.kind, row.len as usize)).unwrap_or(u32::MAX);
+    len.saturating_add((TAB_COLS as u32 - 1) * u32::from(row.tabs))
 }
 
 /// What `LineRef::rendered().len()` is, from the row alone: an Add/Del row's text
@@ -405,5 +496,152 @@ mod tests {
         let before = views();
         assert_eq!(lines.range(5_000..5_003).count(), 3);
         assert_eq!(views() - before, 0, "count reads the length, not the rows");
+    }
+
+    /// The summary recomputed from the rows' TEXT: the largest line number per side, the
+    /// TABs per row, and per block of `WRAP_BLOCK` rows the widest worst-case draw —
+    /// `rendered + 3 × tabs`, or `stored × TAB_COLS` where the stored count saturated.
+    /// Tabs are counted by a byte filter, never through `Row::tabs`, so a count the
+    /// arena got wrong cannot agree with itself here — and over the stored text, marker
+    /// included, which is what `tab_count` is defined over.
+    fn recount(lines: &DiffLines) -> ((u32, u32), Vec<u32>, Vec<usize>) {
+        let mut max = (0, 0);
+        let mut blocks: Vec<u32> = Vec::new();
+        let mut tabs = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            max.0 = max.0.max(l.old_lineno.map_or(0, NonZeroU32::get));
+            max.1 = max.1.max(l.new_lineno.map_or(0, NonZeroU32::get));
+            let rendered = l.rendered();
+            let t = l.text.bytes().filter(|&b| b == b'\t').count();
+            tabs.push(t);
+            let cols = if t >= usize::from(u8::MAX) {
+                l.text.len() * TAB_COLS
+            } else {
+                rendered.len() + (TAB_COLS - 1) * t
+            };
+            if i % WRAP_BLOCK == 0 {
+                blocks.push(0);
+            }
+            let block = blocks.last_mut().expect("pushed at the block's first row");
+            *block = (*block).max(u32::try_from(cols).unwrap_or(u32::MAX));
+        }
+        (max, blocks, tabs)
+    }
+
+    /// About two and a half blocks of every row shape the summary has to tell apart:
+    /// Add/Del rows whose marker `rendered` strips, structural rows, tabs in all of
+    /// them, and rows either side of the `u8` count saturating (254, 255, 300 tabs).
+    fn summary_fixture() -> Vec<DiffLine> {
+        let n = |k: usize| NonZeroU32::new(u32::try_from(k).expect("small"));
+        (0..WRAP_BLOCK * 5 / 2 + 7)
+            .map(|i| match (i, i % 7) {
+                (600, _) => DiffLine::new("\t".repeat(254), LineKind::Context),
+                (1500, _) => DiffLine::with_linenos(
+                    format!("+{}z", "\t".repeat(300)),
+                    LineKind::Add,
+                    None,
+                    n(i),
+                ),
+                (2100, _) => {
+                    DiffLine::with_linenos("\t".repeat(255), LineKind::Context, n(9_999), n(i))
+                }
+                (_, 0) => DiffLine::with_linenos(
+                    format!("+{}x{i}", "\t".repeat(i % 5)),
+                    LineKind::Add,
+                    None,
+                    n(i + 1),
+                ),
+                (_, 1) => DiffLine::with_linenos(format!("-\t{i}"), LineKind::Del, n(3 * i), None),
+                (_, 2) => DiffLine::with_linenos(
+                    format!("ctx {i}\tend"),
+                    LineKind::Context,
+                    n(i),
+                    n(i + 2),
+                ),
+                (_, 3) => DiffLine::new(format!("@@ -{i} +{i} @@\t"), LineKind::Hunk),
+                (_, 4) => DiffLine::new("", LineKind::Blank),
+                (_, 5) => DiffLine::new(format!("\tfile{i}.rs"), LineKind::FileName),
+                _ => DiffLine::with_linenos("y".repeat(i % 300), LineKind::Context, n(i), n(i)),
+            })
+            .collect()
+    }
+
+    /// The summary the constructors keep is the one a brute force recounts from the
+    /// text — over a build's rows (`from_arena`) and over a permutation of them
+    /// (`gather`), which moves rows between blocks and so must recompute every block.
+    #[test]
+    fn summary_matches_a_brute_force_recount() {
+        let lines = DiffLines::from(summary_fixture());
+        assert_ne!(lines.len() % WRAP_BLOCK, 0, "control: a short last block");
+        let (max, blocks, tabs) = recount(&lines);
+        assert_eq!(blocks.len(), 3, "control: two and a half blocks");
+        assert!(tabs.contains(&300), "control: a saturated row");
+        assert_eq!(lines.max_linenos(), max);
+        assert_eq!(lines.wrap_blocks(), blocks);
+        for (i, &t) in tabs.iter().enumerate() {
+            assert_eq!(lines.tab_count(i), t, "tab_count({i})");
+        }
+
+        let cuts = [0, 333, 1_499, 1_501, 2_047, lines.len()];
+        let ranges: Vec<Range<usize>> = cuts.windows(2).rev().map(|w| w[0]..w[1]).collect();
+        let moved = lines.gather(&ranges);
+        let (moved_max, moved_blocks, moved_tabs) = recount(&moved);
+        assert_ne!(
+            moved_blocks, blocks,
+            "control: the permutation moved a block's widest row"
+        );
+        assert_eq!(moved_max, max, "a permutation cannot change a max");
+        assert_eq!(moved.max_linenos(), moved_max);
+        assert_eq!(moved.wrap_blocks(), moved_blocks);
+        for (i, &t) in moved_tabs.iter().enumerate() {
+            assert_eq!(moved.tab_count(i), t, "gathered tab_count({i})");
+        }
+    }
+
+    /// A row's count saturates at `u8::MAX`, and `tab_count` recounts the text of one
+    /// that did: 300 tabs read back as 300, not 255.
+    #[test]
+    fn tab_count_recounts_a_saturated_row() {
+        let lines = DiffLines::from(vec![
+            DiffLine::new(format!("+{}", "\t".repeat(300)), LineKind::Add),
+            DiffLine::new("\t".repeat(255), LineKind::Context),
+            DiffLine::new("\t".repeat(254), LineKind::Context),
+        ]);
+        assert_eq!(
+            (0..3).map(|i| lines.tab_count(i)).collect::<Vec<_>>(),
+            [300, 255, 254]
+        );
+    }
+
+    /// A saturated Add row whose marker is itself a TAB, over all-tab text: the fit test
+    /// counts the marker (`tab_count` is of the stored text), so the block must bound
+    /// `rendered_len + 3 × tab_count`, which `rendered_len × TAB_COLS` alone does not.
+    #[test]
+    fn a_saturated_row_is_bounded_by_its_stored_length() {
+        let lines = DiffLines::from(vec![DiffLine::new("	".repeat(300), LineKind::Add)]);
+        let rendered = lines.rendered_len(0);
+        let need = rendered + 3 * lines.tab_count(0);
+        assert!(
+            lines.wrap_blocks()[0] as usize >= need,
+            "{:?} < {need}",
+            lines.wrap_blocks()
+        );
+    }
+
+    /// No rows summarise to nothing, and a side no row carries is 0 — a diff that only
+    /// adds has no pre-image number for the gutter to make room for.
+    #[test]
+    fn an_empty_diff_and_a_missing_side_summarise_to_zero() {
+        let empty = DiffLines::default();
+        assert_eq!(empty.max_linenos(), (0, 0));
+        assert!(empty.wrap_blocks().is_empty());
+        let adds = DiffLines::from(vec![DiffLine::with_linenos(
+            "+a",
+            LineKind::Add,
+            None,
+            NonZeroU32::new(42),
+        )]);
+        assert_eq!(adds.max_linenos(), (0, 42));
+        assert_eq!(adds.wrap_blocks(), [1]);
     }
 }

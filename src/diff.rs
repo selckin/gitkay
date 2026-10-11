@@ -499,9 +499,10 @@ impl DiffLine {
 
 /// The line-number gutter's shape for one diff: the digits each side needs.
 ///
-/// Measured ONCE per diff (`measure`, where the diff installs) and applied to
-/// every row, so the numbers stand in a column rather than each file — or each
-/// row — sizing its own. That is the rule the commit list's `MetaCols` follows,
+/// Derived from the whole diff — `measure` reads it off the rows' summary
+/// (`DiffLines::max_linenos`), O(1), on every frame that draws the gutter — and applied
+/// to every row, so the numbers stand in a column rather than each file — or each row
+/// — sizing its own. That is the rule the commit list's `MetaCols` follows,
 /// for the same reason: a width taken from each row's own text makes every column
 /// left of the widest field step in and out as the list scrolls.
 ///
@@ -524,19 +525,11 @@ impl LineNoGutter {
     /// commit that only adds files has no pre-image number anywhere — gets no
     /// column at all rather than a zero-width one with a separator after it.
     ///
-    /// ONE pass for both sides: this runs on the UI thread at every install,
-    /// including the cache hits and store loads that had no build to hide behind.
-    pub fn measure(lines: &DiffLines) -> Self {
-        let (mut old, mut new) = (0, 0);
-        for i in 0..lines.len() {
-            let (o, n) = lines.linenos(i);
-            if let Some(n) = o {
-                old = old.max(n.get());
-            }
-            if let Some(n) = n {
-                new = new.max(n.get());
-            }
-        }
+    /// Reads `DiffLines::max_linenos`, the summary the rows were built with, so
+    /// it costs nothing however many rows there are: it runs every frame the
+    /// gutter is on, and a scan would be 183ms over a 76.5M-row diff.
+    pub const fn measure(lines: &DiffLines) -> Self {
+        let (old, new) = lines.max_linenos();
         Self {
             old: Self::digits(old),
             new: Self::digits(new),
@@ -958,16 +951,9 @@ pub struct FileEntry {
 }
 
 /// What `DiffData::into_parts` splits into: the rows, their spans, the files, the
-/// precomputed width, the textconv flag and the tab census. Named because a six-value
-/// tuple in a signature says nothing about which value is which.
-pub type DiffParts = (
-    Arc<DiffLines>,
-    RowSpans,
-    Arc<Vec<FileEntry>>,
-    usize,
-    bool,
-    bool,
-);
+/// precomputed width and the textconv flag. Named because a five-value tuple in a
+/// signature says nothing about which value is which.
+pub type DiffParts = (Arc<DiffLines>, RowSpans, Arc<Vec<FileEntry>>, usize, bool);
 
 pub struct DiffData {
     /// The rows, shared rather than owned: immutable from the moment a build returns,
@@ -1001,24 +987,6 @@ pub struct DiffData {
     /// installed. Deliberately absent from the store's byte layout: an entry on disk
     /// has it false by construction, since a failed one is never written.
     pub textconv_failed: bool,
-    /// Was this diff PROVEN to hold no TAB anywhere?
-    ///
-    /// `diff::wrap` has to charge a tab `TAB_COLS` columns for one byte, so an index
-    /// over a diff that might hold one is measured by walking each line's characters
-    /// instead of comparing its `len()` — a pass over the TEXT where the rest is a pass
-    /// over the LINES, ~400ms/GB against 20ms. That pass used to run on the FRAME LOOP,
-    /// inside the render, on the first frame after every install: `set_diff_content`
-    /// drops the index, so the next one is a `build` rather than a `rewidth` and the
-    /// census had nothing to inherit. The build already touches every byte of every row
-    /// it assembles, so it answers the question there instead — `DiffRows` measures it
-    /// at the same push it measures `max_chars` at, which is what makes it true of
-    /// every row rather than of the patch body alone.
-    ///
-    /// **False means "it has one" OR "nobody looked"**, never an assumption — the same
-    /// reading `WrapIndex::tabless` has, and what lets a diff assembled by hand, or
-    /// decoded from a store written before this existed, simply pay the scan as it
-    /// always did.
-    pub tabless: bool,
 }
 
 impl DiffData {
@@ -1079,7 +1047,6 @@ impl DiffData {
             files: Arc::new(files),
             max_chars,
             textconv_failed: false,
-            tabless: false,
         }
     }
 
@@ -1099,9 +1066,8 @@ impl DiffData {
             files,
             max_chars,
             textconv_failed,
-            tabless,
         } = self;
-        (lines, spans, files, max_chars, textconv_failed, tabless)
+        (lines, spans, files, max_chars, textconv_failed)
     }
 
     /// Reassemble what `into_parts` split — the stash path returning the *displayed*
@@ -1115,7 +1081,6 @@ impl DiffData {
         files: Arc<Vec<FileEntry>>,
         max_chars: usize,
         textconv_failed: bool,
-        tabless: bool,
     ) -> Self {
         // The one invariant the split gave up on being structural: index `i` has to mean
         // row `i` in both, so the two lengths have to agree. Every writer goes through
@@ -1131,7 +1096,6 @@ impl DiffData {
             files,
             max_chars,
             textconv_failed,
-            tabless,
         }
     }
 
@@ -1197,19 +1161,6 @@ fn widen(max: &mut usize, text: &str) {
     }
 }
 
-/// Does this row hold a TAB?
-///
-/// Over the raw `text`, where `diff::wrap` asks over `rendered()` — a superset, since
-/// the marker `rendered()` strips is `+`, `-` or a space. So a row this calls tab-free
-/// is tab-free there too, which is the direction that has to hold: the claim is only
-/// ever used to SKIP a scan.
-///
-/// `memchr` rather than a byte loop, for the reason `diff::wrap` gives: 699µs against
-/// 7.4ms over the 8.3MB single line that module exists for.
-fn holds_tab(text: &str) -> bool {
-    memchr::memchr(b'\t', text.as_bytes()).is_some()
-}
-
 /// The rows a diff build is accumulating, with the widest one measured as they go.
 ///
 /// `DiffData::max_chars` sizes the pane's horizontal scroll range, and `DiffData::new`
@@ -1235,8 +1186,6 @@ struct DiffRows {
     /// parts are copied there once and nothing is allocated for the row itself.
     arena: ArenaWriter,
     max_chars: usize,
-    /// Is every row pushed so far free of TABs? See `DiffData::tabless`.
-    tabless: bool,
 }
 
 /// One split-pass worker's rows and what was measured over them. Opaque outside
@@ -1246,7 +1195,6 @@ struct RowsPart {
     rows: Vec<Row>,
     text: TextArena,
     max_chars: usize,
-    tabless: bool,
 }
 
 impl RowsPart {
@@ -1262,7 +1210,6 @@ impl RowsPart {
 struct RowMark {
     arena: ArenaMark,
     max_chars: usize,
-    tabless: bool,
 }
 
 /// The limits a build's arena is cut under: `ArenaLimits::DEFAULT` in the app. Read on
@@ -1298,7 +1245,6 @@ impl DiffRows {
         let mut rows = Self {
             arena: ArenaWriter::new(limits),
             max_chars: 0,
-            tabless: true,
         };
         rows.extend(lines);
         rows
@@ -1320,7 +1266,6 @@ impl DiffRows {
     ) {
         let text = self.arena.push_parts(kind, old_lineno, new_lineno, parts);
         widen(&mut self.max_chars, text);
-        self.tabless &= !holds_tab(text);
     }
 
     /// A row the caller already holds — a header or file-name row — copied in.
@@ -1355,7 +1300,6 @@ impl DiffRows {
     fn set(&mut self, i: usize, kind: LineKind, text: &str) {
         if let Some(text) = self.arena.set(i, kind, text) {
             widen(&mut self.max_chars, text);
-            self.tabless &= !holds_tab(text);
         }
     }
 
@@ -1363,7 +1307,6 @@ impl DiffRows {
         RowMark {
             arena: self.arena.mark(),
             max_chars: self.max_chars,
-            tabless: self.tabless,
         }
     }
 
@@ -1375,7 +1318,6 @@ impl DiffRows {
     fn rewind(&mut self, mark: RowMark) {
         self.arena.rewind(mark.arena);
         self.max_chars = mark.max_chars;
-        self.tabless = mark.tabless;
     }
 
     /// Append a worker's rows, ALREADY measured, with what was measured over them.
@@ -1389,7 +1331,6 @@ impl DiffRows {
     /// adopted rather than copied (`ArenaWriter::append`).
     fn extend_measured(&mut self, part: RowsPart) {
         self.max_chars = self.max_chars.max(part.max_chars);
-        self.tabless &= part.tabless;
         self.arena.append(part.rows, part.text);
     }
 
@@ -1399,13 +1340,9 @@ impl DiffRows {
     /// The rows grew by doubling, so up to half the buffer is spare; `ArenaWriter::finish`
     /// shrinks them, since a diff's row array outlives the build by the whole session it
     /// is cached for.
-    fn finish(self) -> Result<(DiffLines, usize, bool), ArenaFull> {
+    fn finish(self) -> Result<(DiffLines, usize), ArenaFull> {
         let (rows, text) = self.arena.finish()?;
-        Ok((
-            DiffLines::from_arena(rows, text),
-            self.max_chars,
-            self.tabless,
-        ))
+        Ok((DiffLines::from_arena(rows, text), self.max_chars))
     }
 
     /// A split-pass worker's rows, for the merge to append with `extend_measured`.
@@ -1415,7 +1352,6 @@ impl DiffRows {
             rows,
             text,
             max_chars: self.max_chars,
-            tabless: self.tabless,
         })
     }
 }
@@ -2869,13 +2805,12 @@ pub fn build_diff_data<'r>(
             bytes.parallel_ceiling()
         );
     }
-    let Ok((lines, max_chars, tabless)) = rows.finish() else {
+    let Ok((lines, max_chars)) = rows.finish() else {
         log::warn!("gitkay: cannot diff {what}: its text needs more than 65,536 chunks");
         return DiffData::empty();
     };
     DiffData {
         textconv_failed: failed,
-        tabless,
         ..DiffData::with_max_chars(lines, files, max_chars)
     }
 }
@@ -4260,13 +4195,14 @@ pub mod tests {
     fn heap_bytes_survives_the_display_round_trip() {
         let d = DiffData::with_max_chars(vec![text_row("hello"); 3].into(), vec![], 5);
         let before = d.heap_bytes();
-        let (lines, spans, files, max_chars, failed, tabless) = d.into_parts();
-        let back = DiffData::from_parts(lines, spans, files, max_chars, failed, tabless);
+        let (lines, spans, files, max_chars, failed) = d.into_parts();
+        let back = DiffData::from_parts(lines, spans, files, max_chars, failed);
         assert_eq!(back.heap_bytes(), before);
     }
 
     /// A diff's row weight is now exact: the row buffer at 20 B a slot plus the chunks'
-    /// bytes, and every arena byte belongs to exactly one row (no dead text).
+    /// bytes and the wrap summary's 4 B a block, and every arena byte belongs to exactly
+    /// one row (no dead text).
     #[test]
     fn heap_bytes_is_the_row_buffer_plus_the_chunks() {
         let (_d, repo, oid) = everything_repo();
@@ -4281,7 +4217,7 @@ pub mod tests {
         assert_eq!(lines.row_capacity(), lines.len(), "finish shrank the rows");
         assert_eq!(
             lines.heap_bytes(),
-            lines.len() * 20 + lines.text_arena().heap_bytes()
+            lines.len() * 20 + lines.wrap_blocks().len() * 4 + lines.text_arena().heap_bytes()
         );
         assert_eq!(lines.text_arena().heap_bytes(), text);
     }
@@ -4896,41 +4832,52 @@ pub mod tests {
         }
     }
 
-    /// `tabless` is a claim the wrap index SKIPS work on, so it has to be true of every
-    /// row a build emits and not merely of the patch body — a header or diffstat row
-    /// slipping past the census would have `slice` measure a tabbed line by `len()`,
-    /// which under-counts it by three columns per tab and clips text where wrapping
-    /// leaves no horizontal scroll to reach it.
+    /// The wrap index skips whole blocks on the tab counts the rows carry, so a count
+    /// has to be right for every row a build emits, not merely the patch body — a header
+    /// or diffstat row whose tabs went uncounted would be sliced by `len()`, three
+    /// columns short per tab, and clipped where wrapping leaves no horizontal scroll.
     ///
-    /// Checked against a rescan for the same reason `max_chars` is, and over a fixture
-    /// whose commit MESSAGE holds the only tab — the case a census of the patch alone
-    /// gets wrong.
+    /// Held to a recount of each row's text, over a fixture with a tab in the commit
+    /// message, in a file NAME (which the diffstat prints raw, where git's own headers
+    /// quote it) and in the patch.
     #[test]
-    fn tabless_is_true_of_every_row_a_build_emits() {
+    fn every_built_row_carries_its_tab_count() {
         use crate::test_repo::{commit_file, temp_repo};
-        let rescan = |d: &DiffData| d.lines.iter().all(|l| !l.text.contains('\t'));
-
-        let (_d, repo, oid) = everything_repo();
+        let (_d, repo) = temp_repo();
+        commit_file(&repo, "base.txt", "a\n", "base");
+        let oid = commit_file(
+            &repo,
+            "tab\tname.txt",
+            "\tindented\nplain\n",
+            "subject\n\n\tindented body",
+        );
         for show_stats in [false, true] {
             let s = DiffSettings {
                 show_stats,
                 ..base_settings()
             };
             let data = diff_of(&repo, oid, s, None);
-            assert_eq!(data.tabless, rescan(&data), "show_stats={show_stats}");
+            let lines = &data.lines;
+            let recount = |i: usize| lines.text(i).bytes().filter(|&b| b == b'\t').count();
+            let mut kinds = vec![LineKind::Meta, LineKind::Add];
+            if show_stats {
+                kinds.push(LineKind::Stat);
+            }
+            for kind in kinds {
+                assert!(
+                    (0..lines.len()).any(|i| lines.kind(i) == kind && recount(i) > 0),
+                    "control: a {kind:?} row holds a tab (show_stats={show_stats})"
+                );
+            }
+            for i in 0..lines.len() {
+                assert_eq!(
+                    lines.tab_count(i),
+                    recount(i),
+                    "row {i} {:?} (show_stats={show_stats})",
+                    lines.text(i)
+                );
+            }
         }
-
-        // A tab in the commit message and nowhere else: the patch body is clean, so a
-        // census that only watched `push_patch_line` would call this diff tab-free.
-        let (_d, repo) = temp_repo();
-        commit_file(&repo, "f.txt", "a\n", "base");
-        let oid = commit_file(&repo, "f.txt", "a\nb\n", "subject\n\n\tindented body");
-        let data = diff_of(&repo, oid, base_settings(), None);
-        assert!(
-            data.lines.iter().any(|l| l.text.contains('\t')),
-            "control: the header really carries the tab"
-        );
-        assert!(!data.tabless, "and the build must not claim otherwise");
     }
 
     /// `ignore_blank_lines` is git's `--ignore-blank-lines`, and it is not a stronger
@@ -5069,7 +5016,7 @@ pub mod tests {
                 .collect();
             lines.rotate_left(widest);
             rows.extend(lines);
-            let (lines, max_chars, _) = rows.finish().expect("fits");
+            let (lines, max_chars) = rows.finish().expect("fits");
             assert_eq!(
                 max_chars,
                 lines.iter().map(|l| row_chars(l.text)).max().unwrap()
@@ -5092,7 +5039,7 @@ pub mod tests {
         assert!(rows.max_chars > mark.max_chars, "control: the row is wider");
         rows.rewind(mark);
         assert_eq!(rows.len(), 1);
-        let (lines, max_chars, _) = rows.finish().expect("fits");
+        let (lines, max_chars) = rows.finish().expect("fits");
         assert_eq!(
             max_chars,
             lines.iter().map(|l| row_chars(l.text)).max().unwrap()
@@ -5120,7 +5067,7 @@ pub mod tests {
         rows.reserve_blank(1, LineKind::Stat);
         rows.set(3, LineKind::Stat, "wider than anything else");
         rows.set(9, LineKind::Stat, "out of range is a no-op");
-        let (lines, max_chars, tabless) = rows.finish().expect("fits");
+        let (lines, max_chars) = rows.finish().expect("fits");
         assert_eq!(lines.len(), 4);
         assert_eq!(
             lines.line(1),
@@ -5135,7 +5082,11 @@ pub mod tests {
         assert_eq!(lines.linenos(2), (NonZeroU32::new(3), NonZeroU32::new(8)));
         assert_eq!(lines.text(3), "wider than anything else");
         assert_eq!(max_chars, "wider than anything else".len());
-        assert!(!tabless, "the tab in the second part was seen");
+        assert_eq!(
+            lines.tab_count(1),
+            1,
+            "the tab in the second part was counted"
+        );
         assert_eq!(
             lines.row_capacity(),
             lines.len(),
@@ -5147,7 +5098,7 @@ pub mod tests {
     /// trusts what `finish_part` carried. So a host merged with two parts — one holding
     /// a row wider than anything in the host, one holding a tab — has to come out as if
     /// the same rows had been pushed into it one by one: same rows, same widest row,
-    /// same tab census.
+    /// same tab count on every row.
     ///
     /// Under both ways a part's text can enter the host: COPIED (the app's limits, where
     /// no chunk this small reaches `ADOPT_MIN`) and ADOPTED (8-byte chunks adopted from
@@ -5217,7 +5168,6 @@ pub mod tests {
 
         let mut merged = DiffRows::start(limits, header());
         push_all(&mut merged, &host);
-        assert!(merged.tabless, "control: the host holds no tab");
         let mut parts = Vec::new();
         for block in [&wide[..], &tabbed] {
             let mut part = DiffRows::start(limits, Vec::new());
@@ -5229,7 +5179,7 @@ pub mod tests {
             .flat_map(|p| p.text.chunk_ptrs().into_iter().zip(p.text.chunk_lens()))
             .collect();
         assert!(
-            parts[0].tabless && !parts[1].tabless,
+            parts[0].rows.iter().all(|r| r.tabs == 0) && parts[1].rows[0].tabs == 1,
             "control: only the second holds a tab"
         );
         assert!(
@@ -5240,8 +5190,8 @@ pub mod tests {
             merged.extend_measured(part);
         }
 
-        let (want, want_chars, want_tabless) = sequential.finish().expect("fits");
-        let (got, got_chars, got_tabless) = merged.finish().expect("fits");
+        let (want, want_chars) = sequential.finish().expect("fits");
+        let (got, got_chars) = merged.finish().expect("fits");
         if adopts {
             // A pointer survives only a MOVE; a copied chunk is freed by the merge. EVERY
             // part chunk the limits adopt must be present (one surviving by allocator
@@ -5279,8 +5229,13 @@ pub mod tests {
         );
         assert_eq!(got_chars, want_chars);
         assert_eq!(got_chars, "+a row much wider than the host's".len());
-        assert_eq!(got_tabless, want_tabless);
-        assert!(!got_tabless, "the second part's tab survives the merge");
+        let counts = |l: &DiffLines| (0..l.len()).map(|i| l.tab_count(i)).collect::<Vec<_>>();
+        assert_eq!(
+            counts(&got),
+            counts(&want),
+            "every row's tab count survives the merge"
+        );
+        assert_eq!(got.wrap_blocks(), want.wrap_blocks());
     }
 
     /// A reserved row is measured when it is WRITTEN, not when it is reserved: the
@@ -5293,7 +5248,7 @@ pub mod tests {
         rows.reserve_blank(2, LineKind::Stat);
         assert_eq!(rows.max_chars, 0, "an empty placeholder widens nothing");
         rows.set(1, LineKind::Stat, "a filled stat row");
-        let (lines, max_chars, _) = rows.finish().expect("fits");
+        let (lines, max_chars) = rows.finish().expect("fits");
         assert_eq!(
             max_chars,
             lines.iter().map(|l| row_chars(l.text)).max().unwrap()
@@ -5969,6 +5924,17 @@ pub mod tests {
         let mut out = String::new();
         g.write(gutter_rows().line(4), &mut out);
         assert_eq!(out, " 9   9 ", "a context row states both sides");
+    }
+
+    /// A permutation moves rows without changing any number, so the widths taken
+    /// from the gathered rows' retaken summary equal the source's.
+    #[test]
+    fn the_gutter_of_a_gathered_permutation_equals_its_source() {
+        let rows = gutter_rows();
+        let n = rows.len();
+        let moved = rows.gather(&[n / 2..n, 0..n / 2]);
+        assert_eq!(moved.len(), n);
+        assert_eq!(LineNoGutter::measure(&moved), LineNoGutter::measure(&rows));
     }
 
     /// Each side is skipped whole when no row carries it — a commit that only adds
@@ -7476,7 +7442,13 @@ mod parallel_patch_tests {
                             sequential.max_chars, parallel.max_chars,
                             "{what}: max_chars"
                         );
-                        assert_eq!(sequential.tabless, parallel.tabless, "{what}: tabless");
+                        for i in 0..sequential.lines.len() {
+                            assert_eq!(
+                                sequential.lines.tab_count(i),
+                                parallel.lines.tab_count(i),
+                                "{what}: row {i}'s tab count"
+                            );
+                        }
                     }
                 }
             }
@@ -7818,7 +7790,7 @@ mod parallel_patch_tests {
             let gutter = LineNoGutter::measure(&data.lines);
             gutters.push(t.elapsed());
             let t = Instant::now();
-            let index = WrapIndex::build(&data.lines, 100, gutter, data.tabless);
+            let index = WrapIndex::build(&data.lines, 100, gutter);
             wraps.push(t.elapsed());
             wrapped_rows = index.total_rows();
         }

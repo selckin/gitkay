@@ -1515,9 +1515,9 @@ const WRAP_INDEX_SLOW: std::time::Duration = std::time::Duration::from_millis(5)
 /// thereafter, which would pin the scroll offset permanently and make the pane
 /// unscrollable.
 ///
-/// Called from the render and nowhere else, which is what makes it lazy in the way
-/// `diff_linenos` is: a reader who leaves soft wrap off never pays the pass, and
-/// ticking it needs no hook of its own, "off" and "not measured yet" being one `None`.
+/// Called from the render and nowhere else, which is what makes it lazy: a reader
+/// who leaves soft wrap off never pays the pass, and ticking it needs no hook of
+/// its own, "off" and "not measured yet" being one `None`.
 /// Three of the four inputs that invalidate an index are compared here, inside
 /// `WrapIndex::covers`; the fourth — a different diff with the same line count — is
 /// covered by `set_diff_content` and `resync_file_layout` dropping the index outright.
@@ -1525,7 +1525,6 @@ fn resync_wrap_index(
     index: &mut Option<diff::WrapIndex>,
     wrap: bool,
     lines: &DiffLines,
-    tabless: bool,
     cols: usize,
     gutter: LineNoGutter,
 ) -> bool {
@@ -1539,17 +1538,12 @@ fn resync_wrap_index(
         return false;
     }
     let t = std::time::Instant::now();
-    // `rewidth` where there is an index to carry the diff's tab census over, which is
-    // exactly the resize case below: the drag changes the width and nothing else, and
-    // re-finding the tabs is the one part of the measure that reads the text.
-    let built = index.as_ref().map_or_else(
-        || diff::WrapIndex::build(lines, cols, gutter, tabless),
-        |old| old.rewidth(lines, cols, gutter),
-    );
+    let built = diff::WrapIndex::build(lines, cols, gutter);
     let took = t.elapsed();
-    // One `len()` comparison a line, but still O(lines) — and a window resize runs it
-    // every frame of the drag, which is the shape worth seeing in a log before anyone
-    // reaches for a debounce.
+    // One comparison a block where nothing can wrap, but one a LINE inside a block
+    // where something can — so a diff of mostly long lines is still O(lines), and a
+    // window resize runs it every frame of the drag, which is the shape worth seeing
+    // in a log before anyone reaches for a debounce.
     if took > WRAP_INDEX_SLOW {
         log::debug!(
             "perf: wrap index {} lines → {} rows in {took:?} ({cols} cols)",
@@ -3534,8 +3528,8 @@ struct GitkApp {
     wrap: bool,
     /// Where each line sits in visual-row space, for the width the pane last had.
     /// Measured lazily in the render — the first frame that draws a wrapped pane —
-    /// and dropped wherever the content, the width or the gutter moves, exactly as
-    /// `diff_linenos` is. `None` with `wrap` off, which is the identity mapping.
+    /// and dropped wherever the content, the width or the gutter moves.
+    /// `None` with `wrap` off, which is the identity mapping.
     diff_wrap: Option<diff::WrapIndex>,
     /// Which side of the diff the pane shows — the toolbar's "Side", with no config
     /// key behind it. Render-only, like `wrap` above: it hides rows and rebuilds
@@ -3646,27 +3640,10 @@ struct GitkApp {
     highlight_rx: mpsc::Receiver<HighlightMsg>,
     highlight_priority: Option<Arc<VisibleRange>>, // visible file range (lo, hi) the worker prioritises
     diff_max_chars: usize, // widest diff line (chars); sizes the virtualized h-scroll for off-screen lines
-    /// The displayed diff's line-number column widths — measured once for the whole
-    /// diff rather than per row, so the numbers form a column.
-    ///
-    /// `None` ⇒ not measured yet. Filled by the render on the first frame that
-    /// actually draws a gutter and cleared by `set_diff_content`, which is the only
-    /// invalidation there is: with the checkbox off (the default) the scan never
-    /// runs at all, and ticking it needs no re-measure hook, because "off" and "not
-    /// yet measured" are the same state. `set_diff_content` measuring eagerly was
-    /// an O(lines) UI-thread scan on every install — cache hits and store loads
-    /// included, where there is no build to hide it behind — for a value most
-    /// sessions never read.
-    diff_linenos: Option<LineNoGutter>,
     /// Did the displayed diff fall back to a raw body because a textconv driver
     /// failed? Carried across the display so `stash_current_diff` can hand it back to
     /// `cache_diff`, which is the one caller that reassembles a `DiffData` from parts.
     diff_textconv_failed: bool,
-    /// Was the displayed diff PROVEN tab-free by the build that made it
-    /// (`DiffData::tabless`)? What `WrapIndex::build` is told, so the first frame after
-    /// an install does not re-read the diff's text to find out — and, like
-    /// `diff_textconv_failed`, what `from_parts` needs back on the way to the cache.
-    diff_tabless: bool,
     /// Cached per-row galleys for the (un-virtualized) file-list sidebar.
     sidebar_cache: SidebarCache,
     /// Sorted `(patch start line, file index)` for the current diff — the
@@ -4809,9 +4786,7 @@ impl GitkApp {
             _config_watcher: config_watcher,
             config_error_toast: startup_issue.then(std::time::Instant::now),
             diff_max_chars,
-            diff_linenos: None, // no diff yet, and nothing to measure until one draws
             diff_textconv_failed: false,
-            diff_tabless: false,
             sidebar_cache: SidebarCache::default(),
             file_line_starts: Vec::new(),
             file_is_test: Vec::new(),
@@ -5229,7 +5204,6 @@ impl GitkApp {
                 std::mem::take(&mut self.diff_files),
                 self.diff_max_chars,
                 self.diff_textconv_failed,
-                self.diff_tabless,
             );
             // A virtual entry is content-keyed, so each working-tree edit — or, for the
             // range row, each move of its endpoints — produces a fresh hash and the
@@ -5526,30 +5500,16 @@ impl GitkApp {
         // field added to `DiffData` a compile error here rather than a value silently
         // dropped at the display boundary. `max_chars` is precomputed at build time (on
         // the worker), so no per-line rescan happens here.
-        let (lines, spans, files, max_chars, textconv_failed, tabless) = data.into_parts();
+        let (lines, spans, files, max_chars, textconv_failed) = data.into_parts();
         self.diff_max_chars = max_chars;
-        // Drop the previous diff's gutter widths; the render re-measures on the
-        // first frame that needs them, so a session with line numbers off never
-        // pays for the scan. Not a `DiffData` field for the same reason: it would
-        // have to cross `into_parts`/`from_parts` AND the store's byte layout to
-        // carry a value the display can re-derive, and only sometimes wants.
-        // `resync_file_layout` may reorder these lines afterwards; a re-lay moves
-        // rows without changing any number, so a measurement still holds.
-        self.diff_linenos = None;
-        // The wrap index goes for the same reason, but NOT for the same reason it
-        // holds across a re-lay: it is indexed BY line, so a permutation invalidates
-        // it (`resync_file_layout` drops it there too). Here it is simply a
+        // The wrap index is indexed BY line, so a permutation invalidates it
+        // (`resync_file_layout` drops it there too). Here it is simply a
         // different diff — and `WrapIndex::covers` cannot see that, two diffs being
         // free to have the same line count. The side index goes with it for exactly
         // the same reason, `SideIndex::covers` having the same blind spot.
         self.diff_wrap = None;
         self.diff_sides = None;
         self.diff_textconv_failed = textconv_failed;
-        // What the BUILD proved about this diff's tabs, so the index the render is
-        // about to make does not re-read every byte to learn it. Carried on `GitkApp`
-        // for the reason `diff_textconv_failed` is: the display outlives the `DiffData`
-        // it was split out of, and `from_parts` needs it back.
-        self.diff_tabless = tabless;
         // Emphasis is not part of a diff and is not carried across one: it is per
         // viewport, and `ensure_visible_word_emphasis` refills the window on the next
         // frame. Sized here against the incoming rows, which is the one place it can be
@@ -9604,24 +9564,17 @@ impl eframe::App for GitkApp {
                     // diff to a pending target.
                     // The gutter, or a zero-width one when it is switched off — one
                     // value read by both the width below and every row, so the space
-                    // reserved and the space drawn cannot disagree. Measured here, on
-                    // the first frame that draws one, and held until the next install
-                    // clears it: the scan costs nothing to a reader who never ticks
-                    // the box, and ticking it needs no hook of its own.
+                    // reserved and the space drawn cannot disagree. `measure` reads the
+                    // rows' summary, so it is O(1) and needs no cache to invalidate.
                     let linenos = if self.line_numbers {
-                        let measured = self
-                            .diff_linenos
-                            .unwrap_or_else(|| LineNoGutter::measure(&self.diff_lines));
-                        self.diff_linenos = Some(measured);
-                        measured
+                        LineNoGutter::measure(&self.diff_lines)
                     } else {
                         LineNoGutter::default()
                     };
                     // The wrap index, for the pane's CURRENT width and gutter.
-                    // Measured lazily like the gutter above, and for the same
-                    // reasons: a reader who leaves `[diff] wrap` off pays nothing,
-                    // and turning it on needs no hook of its own — "off" and "not
-                    // measured yet" are one state.
+                    // Measured lazily: a reader who leaves soft wrap off pays
+                    // nothing, and turning it on needs no hook of its own — "off"
+                    // and "not measured yet" are one state.
                     //
                     // The width is the pane's less what a solid scrollbar takes.
                     // Subtracted unconditionally, though egui only reserves it when
@@ -9635,7 +9588,6 @@ impl eframe::App for GitkApp {
                         &mut self.diff_wrap,
                         self.wrap,
                         &self.diff_lines,
-                        self.diff_tabless,
                         cols,
                         linenos,
                     );
@@ -10770,7 +10722,7 @@ mod tests {
         // happens at `cols - prefix_len` and not at that floor.
         let cols = 23;
         let prefix_len = g.chars() + 1; // + the marker column
-        let idx = diff::WrapIndex::build(&lines, cols, g, false);
+        let idx = diff::WrapIndex::build(&lines, cols, g);
         let rows = idx.total_rows();
         assert_eq!(rows, body.len().div_ceil(cols - prefix_len));
         let mut drawn = String::new();
@@ -10869,25 +10821,25 @@ mod tests {
         let mut index = None;
 
         // Off, and nothing to drop: no move, on this frame or any after it.
-        assert!(!resync_wrap_index(&mut index, false, &lines, false, 40, g));
-        assert!(!resync_wrap_index(&mut index, false, &lines, false, 40, g));
+        assert!(!resync_wrap_index(&mut index, false, &lines, 40, g));
+        assert!(!resync_wrap_index(&mut index, false, &lines, 40, g));
         assert!(index.is_none());
 
         // Ticked on: built, and a move.
-        assert!(resync_wrap_index(&mut index, true, &lines, false, 40, g));
+        assert!(resync_wrap_index(&mut index, true, &lines, 40, g));
         assert!(index.as_ref().is_some_and(|w| w.total_rows() > lines.len()));
         // Settled: same inputs, no move — or the pane would be pinned every frame
         // and could not be scrolled at all.
-        assert!(!resync_wrap_index(&mut index, true, &lines, false, 40, g));
+        assert!(!resync_wrap_index(&mut index, true, &lines, 40, g));
         // A narrower pane re-wraps: a move.
-        assert!(resync_wrap_index(&mut index, true, &lines, false, 30, g));
+        assert!(resync_wrap_index(&mut index, true, &lines, 30, g));
 
         // Unticked: the index goes, and that IS a move — this is the assertion the
         // bug failed.
-        assert!(resync_wrap_index(&mut index, false, &lines, false, 30, g));
+        assert!(resync_wrap_index(&mut index, false, &lines, 30, g));
         assert!(index.is_none());
         // And exactly once: every frame after the untick is quiet again.
-        assert!(!resync_wrap_index(&mut index, false, &lines, false, 30, g));
+        assert!(!resync_wrap_index(&mut index, false, &lines, 30, g));
     }
 
     /// A diff row's context-menu id follows the LINE it draws, not the visual row.
@@ -10965,7 +10917,7 @@ mod tests {
         // The rows in the order they are drawn, read off by sweeping the pointer down
         // the pane: each row is a contiguous band, so a change of id is the next row.
         let row_ids = |cols: usize| -> Vec<egui::Id> {
-            let wrap = diff::WrapIndex::build(&lines, cols, g, false);
+            let wrap = diff::WrapIndex::build(&lines, cols, g);
             let mut out: Vec<egui::Id> = Vec::new();
             for step in 0..200 {
                 if let Some(id) = row_id_at(&wrap, step as f32 * 2.0)
@@ -10979,8 +10931,8 @@ mod tests {
 
         let (narrow, wide) = (40, 200);
         let (in_, iw) = (
-            diff::WrapIndex::build(&lines, narrow, g, false),
-            diff::WrapIndex::build(&lines, wide, g, false),
+            diff::WrapIndex::build(&lines, narrow, g),
+            diff::WrapIndex::build(&lines, wide, g),
         );
         // Control: the re-wrap has to actually move the last line to another row, and
         // leave a different line on the row it came from.
@@ -11149,7 +11101,7 @@ mod tests {
             DiffLine::new("tail", LineKind::Context),
         ]);
         let cols = 40;
-        let idx = diff::WrapIndex::build(&lines, cols, LineNoGutter::default(), false);
+        let idx = diff::WrapIndex::build(&lines, cols, LineNoGutter::default());
         assert!(idx.total_rows() > 3, "the long line has to actually wrap");
         let lay_out = |wrap: Option<&diff::WrapIndex>| {
             let laid = lay_out_pane(diff::RowMap::new(lines.len(), wrap, None));
@@ -11260,7 +11212,7 @@ mod tests {
 
         // Soft wrap coming on re-positions every view row, which the index notices
         // itself — no report threaded in from the wrap resync.
-        let w = diff::WrapIndex::build(&lines, 100, g, false);
+        let w = diff::WrapIndex::build(&lines, 100, g);
         assert!(resync(&mut index, DiffSide::New, Some(&w)));
         assert!(!resync(&mut index, DiffSide::New, Some(&w)));
 
@@ -14935,8 +14887,8 @@ mod tests {
             },
         )
         .unwrap();
-        app.line_numbers = std::env::var("BENCH_LINENOS").is_ok();
-        app.wrap = std::env::var("BENCH_WRAP").is_ok();
+        app.line_numbers = std::env::var("BENCH_LINENOS").is_ok_and(|v| v == "1");
+        app.wrap = std::env::var("BENCH_WRAP").is_ok_and(|v| v == "1");
         let mut frame = eframe::Frame::_new_kittest();
         let mut installed_at = None;
         let mut max_after = std::time::Duration::ZERO;

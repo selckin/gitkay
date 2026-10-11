@@ -56,9 +56,10 @@ cp target/release/gitkay ~/.local/bin/   # install
   graphene, OpenSSL or cmake; see **Build dependencies** under CI & Release for
   why that list (inherited from the original project) matches nothing in the tree.
 - Rust deps of note: `fontdb` (system-font name → file lookup), `dirs` (XDG paths),
-  `memchr` (finding the tabs `diff::wrap` has to charge four columns for — already in
-  the tree under syntect and toml, and 10× a byte loop on the enormous single line that
-  module exists for: 699µs against 7.4ms over 8.3MB),
+  `memchr` (counting the tabs `diff::wrap` has to charge four columns for, as each row
+  is written and in one pass over a decoded entry's text — already in the tree under
+  syntect and toml, and 10× a byte loop on the enormous single line that module exists
+  for: 699µs against 7.4ms over 8.3MB),
   `serde` + `toml` (config).
 - CLI: `gitkay [-C <dir>] [--all] [--combined] [--first-parent] [<rev>…] [-- <path>…]`,
   `gitkay --reflog [<ref>]`, `gitkay --follow [<rev>…] <path>` (`--follow` needs exactly
@@ -262,7 +263,8 @@ the diff-cache budget derivation the pool's bounds are fractions of. Those modul
 `DiffData` / `FileEntry` / `DiffSettings` — a built diff's rows are READ through
 `DiffLines` (`src/diff/lines.rs`: `line(i)` gives a `Copy` `LineRef` view that keeps
 `DiffLine`'s field names, plus `text(i)`, `kind(i)`, `linenos(i)`, `rendered_len(i)`,
-`iter()`/`range(r)`), and `DiffLine` is only the INPUT row a build pushes, its fields
+`tab_count(i)`, `iter()`/`range(r)`, and the SUMMARY — `max_linenos()` and
+`wrap_blocks()`, see the row representation), and `DiffLine` is only the INPUT row a build pushes, its fields
 private to `diff` so the compiler proves nothing outside it reads a stored row any other
 way — which is what lets the representation behind `DiffLines` change without a reader
 noticing. **The iteration contract**: `iter()`/`range()` return the named `Lines`, whose
@@ -295,9 +297,28 @@ parent" diff — the pane, the path filter, the `--follow` tracer — goes throu
 emphasis driver, the content hash, the file-boundary lookups and `order_files` (the
 display-order re-lay the file-list sidebar drives — see **Bottom panel**),
 the row representation (a built diff's rows are 20 B `Copy` records — `arena::Row`:
-chunk, offset, length, kind, line numbers — pointing into ONE text arena per diff,
+chunk, offset, length, kind, line numbers, and the row's TAB count (`tabs`, in what was
+the padding byte, saturating at `u8::MAX`; `DiffLines::tab_count` recounts the text of
+a saturated row) — pointing into ONE text arena per diff,
 `src/diff/arena.rs`, cut into chunks of at most `CHUNK_CAP` (64 MiB), and shared as
-`DiffLines { rows: Vec<Row>, text: Arc<TextArena> }`. **Why**: one allocation per row
+`DiffLines { rows: Vec<Row>, text: Arc<TextArena>, summary }`. The tab count is taken
+in `ArenaWriter::write_row`, the one door every row with text passes through — a
+truncated row through it again, so it counts what was KEPT — and `append` carries it
+across the split-pass merge. The store's decoder alone hands the count IN
+(`push_counted`, its door): each row's share of one `memchr` pass over the entry's text
+block, since a `memchr` set-up per row took `bench_store_codec`'s decode from 64ms to
+87ms where the one pass costs ~4ms. The count is of the STORED text, so an Add/Del
+row's includes its marker — over `rendered()` it can only over-count, which is the
+direction `wrap` tolerates (see **Soft wrapping**). The **summary** is what two O(rows)
+scans on the frame loop read instead (`LineNoGutter::measure` and `WrapIndex::build`,
+189ms and 196ms over the 76.5M-row diff; now O(1) and 7.6ms): the largest old/new line
+number, and per `WRAP_BLOCK` (1024) rows one
+`u32`, the widest any of them can draw — `rendered_len + 3 × tabs`, or
+`stored_len × TAB_COLS` for a saturated count. **It is kept by the constructors**,
+`from_arena` and `gather`, both through the one `summarize`, so no `DiffLines` exists
+whose summary was not taken from its own rows; `gather` retakes it because a permutation
+moves rows between blocks. It costs a pass over the rows where they are handed over —
+on the build's worker, in the store's decode, and in `order_files`' re-lay. **Why**: one allocation per row
 was ~40 B of row and malloc overhead on top of its text — 3 GB on the 76.5M-line diff —
 and per-row frees went back to glibc's arenas and stayed there, ~4 GB resident after the
 diff was gone; 64 MiB chunks sit far above the mmap threshold and are unmapped when the
@@ -325,7 +346,7 @@ merge found; and a chunk index
 past `u16::MAX` FAILS the build rather than wrapping onto another file's text —
 `build_diff_data` returns `DiffData::empty()` with a `warn`, a split worker abandons the
 split for the sequential pass, the store's decode misses. `DiffLines::heap_bytes` is
-`rows.capacity() × 20 + Σ chunk bytes`: exact (no per-row blocks for malloc to round up)
+`rows.capacity() × 20 + Σ chunk bytes`, plus the summary's 4 B a block: exact (no per-row blocks for malloc to round up)
 and O(chunks), which is why `finish` shrinks the rows),
 `DiffRows` (the rows a build is accumulating, plus the widest one measured AS THEY ARE
 PUSHED — `DiffData::max_chars` sizes the pane's horizontal scroll range and used to be
@@ -345,7 +366,7 @@ arena and what was measured over them, opaque outside `DiffRows`, from `finish_p
 and the merge appends it with `extend_measured`, which rebases each row through the
 adopted-or-copied chunk map. `mark`/`rewind` rather than `truncate`: the mark carries an
 ARENA position (rows, chunks, the tail's slot and length), so a rewind drops the text as well as the
-rows, and the widest row and tab census as they stood, because a running maximum cannot
+rows, and the widest row as it stood, because a running maximum cannot
 be un-maxed by dropping rows: `emit_converted` abandons a half-written converted patch,
 and its width would otherwise outlive the text. `DiffData::new`, which rescans, is now
 `#[cfg(test)]` — nothing in the app traverses a finished diff for this),
@@ -402,9 +423,10 @@ build already has — a port of libgit2's own formatter, which exists so `Diff::
 (a whole second pass over every blob, 38% of a build) never runs; see **Diffstat
 block**),
 `src/diff_store.rs` (the persistent layer below that cache: a hand-rolled binary
-codec for a diff's structure — store `VERSION` 7: header, file table, then fixed 13 B
+codec for a diff's structure — store `VERSION` 8: header, file table, then fixed 13 B
 row records and the rows' text as one block in row order, which decode validates with
-a single UTF-8 pass and copies into one arena chunk, treating the entry as untrusted
+a single UTF-8 pass, counts the tabs of in a single `memchr` pass, and copies into one
+arena chunk, treating the entry as untrusted
 (refusing too what would only panic later, on the frame loop: a row split inside a code
 point, an Add/Del row with no one-byte marker, a file pointing past the rows) —
 key derivation, atomic load/save under its own
@@ -412,7 +434,8 @@ key derivation, atomic load/save under its own
 even encoded — and the budget-and-temp-sweep pruner),
 `src/diff/arena.rs` (the chunked text arena a diff's rows point into —
 `ArenaWriter` writing into chunks of at most `CHUNK_CAP`, the sealed `TextArena`, and
-the 20 B `Row` holding chunk, offset and length; see the row representation above),
+the 20 B `Row` holding chunk, offset, length and tab count; see the row representation
+above),
 `src/diff/convert.rs` (turning a delta a driver applies to into a readable patch
 body: the substitution point, the synthesized header, the `ignore_ws` sweep, and the
 two mode sources — see **Textconv**),
@@ -1694,12 +1717,10 @@ sorted drivers keep the same rows with the same rewritten parents.
   the numbers are `LineRef::old_lineno`/`new_lineno`, which every diff already
   carries for the scroll anchor and the store already encodes — so it keys nothing,
   invalidates nothing, and a stored diff from before the feature renders them. Its
-  widths are measured ONCE per diff, **lazily**: `GitkApp::diff_linenos` is an
-  `Option` the render fills on the first frame that draws a gutter and
-  `set_diff_content` clears — so a reader who never ticks the box pays no scan, and
-  ticking it needs no re-measure hook, because "off" and "not yet measured" are one
-  state. Measuring eagerly at install put an O(lines) UI-thread scan on the cache
-  hits and store loads that have no build to hide it behind. Not a `DiffData` field
+  widths are read from the rows' summary (`DiffLines::max_linenos`, kept by the
+  constructors), so `LineNoGutter::measure` is O(1) and runs each frame the gutter is
+  on; there is no cache to invalidate. A scan there cost 183ms on the first frame
+  over the 76.5M-row diff. Not a `DiffData` field
   either — that would have to cross `into_parts` AND the store's byte layout to
   carry a value the display can re-derive and only sometimes wants. Per-diff rather
   than per-file or per-row for the reason `MetaCols` states for the commit list: a
@@ -1838,8 +1859,8 @@ sorted drivers keep the same rows with the same rewritten parents.
   306MB that module refuses. Each run carries its line range, the view row it collapses
   at and the running total of rows removed through it, so both directions are one
   binary search with no array beside it that could disagree. The build is one O(lines)
-  pass reading `DiffLines::kind` and no text at all — unlike `WrapIndex::build`'s tab
-  census — and consults the wrap index once per run BOUNDARY (`row_of_line`, itself a
+  pass reading `DiffLines::kind` and no text at all, and consults the wrap index once
+  per run BOUNDARY (`row_of_line`, itself a
   binary search), not once per hidden line. **Runs are strictly increasing in view
   row**, two maximal runs being separated by at least one visible line: that is what
   makes both searches unambiguous, and it is asserted rather than left to be inferred.
@@ -1875,13 +1896,15 @@ sorted drivers keep the same rows with the same rewritten parents.
   site.
   A re-wrap under an unchanged diff and mode does NOT rebuild: `SideIndex::rewrap`
   re-measures the runs' row halves in place, since which lines are hidden cannot move
-  under a re-wrap — a run is a maximal span of one `LineKind`. That is
-  `WrapIndex::rewidth`'s counterpart and exists for the same reason, a resize drag
-  re-measuring on every frame of the drag. Measured on a rewrite-heavy diff at 100
-  columns, `build` costs 450µs / 5.21ms / 39.7ms at 100k / 1M / 5M lines beside
-  `rewidth`'s own 851µs / 13.7ms / 61.9ms on the same frame, where `rewrap` costs
-  42µs / 502µs / 2.67ms — so the filter's share of a resize frame drops from ~40-60%
-  of the wrap index's cost to ~4%.
+  under a re-wrap — a run is a maximal span of one `LineKind`. It exists because a
+  resize drag re-measures the wrap index on every frame of the drag. Measured on a
+  rewrite-heavy diff at 100 columns, `build` costs 450µs / 5.21ms / 39.7ms at 100k /
+  1M / 5M lines beside the wrap index's then per-line re-measure (`rewidth`, since
+  retired) at 851µs / 13.7ms / 61.9ms on the same frame, where `rewrap` costs
+  42µs / 502µs / 2.67ms — so the filter's share of a resize frame dropped from ~40-60%
+  of the wrap index's cost to ~4%. The wrap index now skips the blocks where nothing can
+  wrap, so on a diff that mostly fits its own cost is far below those figures, and
+  `rewrap` matters more rather than less.
   `rewrap_agrees_with_a_full_build_at_the_new_width` pins the parity, which is the
   whole safety argument for skipping the pass; a refused index has no runs and stays
   refused, the cap being on the run COUNT, which a re-wrap cannot change. The render combines the
@@ -1953,25 +1976,33 @@ sorted drivers keep the same rows with the same rewritten parents.
   starts are then kept (`MAX_ROW_STARTS`, a 32MB ceiling like the one above) for
   `slice` to index. Restarting that walk per row is quadratic in how far the reader has
   scrolled INTO the line, every frame; past the cap a line falls back to it, and the
-  slices are identical either way. Finding the tabs is a pass over the
-  TEXT where the rest is a pass over the LINES (~400ms/GB of short lines against 20ms
-  for their `len()`s), and two things keep it off the paths that matter: a line whose
-  worst case already fits (`len() + 3×tabs ≤ width`) takes one row with no walk, and a
-  diff proven to hold no tab records that, so `WrapIndex::rewidth` — what a window
-  drag runs every frame — skips the pass entirely. `resync_wrap_index` therefore
-  re-measures through `rewidth` and not `build` whenever it has an index to carry
-  that census over.
-  **The census itself belongs to the BUILD, not to the render.** `set_diff_content`
-  drops the index, so the frame after every commit switch took `build` and re-read
-  every byte of the diff on the frame loop — the module's own promise ("scanned once
-  and not again while it is on screen") held only because the 8.3M-character line it
-  was written for happens to be tab-free. `DiffData::tabless` is the answer the build
-  already had: `DiffRows` folds it in at the same push it measures `max_chars` at, so
-  it covers the header and diffstat rows and not just the patch body — a row slipping
-  past would have `slice` measure a tabbed line by `len()`, the one failure mode this
-  is all about. It rides in the store's header beside `max_chars` for the same reason
-  (a store hit is the path that exists to be fast), and `false` means "has one" OR
-  "nobody looked", so an entry from an older store just pays the scan as before.
+  slices are identical either way.
+  **Nothing about the tabs is found by reading the text** — that is ~400ms/GB of short
+  lines against 20ms for their `len()`s, and the index is built on the frame loop, on
+  the first frame after every install. Each row's TAB count is taken where the row is
+  WRITTEN (`Row::tabs`, see the row representation) and read back as
+  `DiffLines::tab_count`: a line whose worst case fits (`len() + 3×tabs ≤ width`)
+  takes one row with no walk, and only a line holding a tab that does NOT fit has its
+  text read, to be walked (`tab_count` also reads the text of a row whose count
+  saturated, 255+ tabs). Nor does a build visit every line: per `WRAP_BLOCK` rows the
+  summary holds the widest any of them can draw, and a block no wider than the
+  narrowest body any row is given (`min_body` — a code row inside a patch, carrying
+  both the gutter and the marker; `min_body_is_the_narrowest_body` holds it to the
+  minimum over every `LineKind`) is one in which every line passes that same test, so
+  it is counted whole. That is the fit test applied to a block at once, **not** a
+  second way out of `tall`. Over the 76.5M-row diff at 75 columns the build went from
+  220ms to 7.6ms on the install frame (`bench_frame_after_install`), and the 900k-line
+  synthetic rewrite's from 4.5ms to 3µs — so a resize simply rebuilds, with nothing
+  carried across a width change. `block_skip_agrees_with_the_per_line_measure` pins
+  the skip against the per-line pass, blocks whose widest row is exactly at and one
+  past `min_body` and a saturated count included. The count is of the STORED text,
+  which for an Add/Del row includes the marker `rendered()` strips, so it can exceed
+  the rendered count (a marker that is itself a TAB — no build writes one) and never
+  falls short of it; an over-count only sends a fitting line to the walk, which slices
+  `rendered()` and gets it right. This replaced `DiffData::tabless`, a diff-wide census
+  the build carried (and the store's header with it, until `VERSION` 8) that could
+  only say "no tab anywhere" — one tab in a diff sent every line of it through a text
+  scan on the frame loop, which is what the 76.5M-row diff paid.
   The index is **sparse**: only the lines that wrap are stored (`line`, `first_row`,
   `rows`), because in an ordinary diff none do and the mapping is the identity. A
   prefix sum over all lines would be 306MB to describe a 76.5M-line diff in which
@@ -1996,8 +2027,7 @@ sorted drivers keep the same rows with the same rewritten parents.
   line needs pinning whenever the mapping under it changes, in either direction. The
   drop reports exactly once (`Option::take`), or the pin would fire every frame and
   the pane could not be scrolled at all. Measured **lazily** in the
-  render, like `diff_linenos` and for the same reason ("off" and "not measured yet"
-  are one `None`), and dropped at three places: `set_diff_content` (a different diff
+  render ("off" and "not measured yet" are one `None`), and dropped at three places: `set_diff_content` (a different diff
   can have the same line count, which `WrapIndex::covers` cannot see),
   `resync_file_layout`'s moved branch (the index names lines by INDEX, so a
   permutation invalidates it while leaving the line count untouched), and by `covers`
@@ -2271,7 +2301,7 @@ every install rests on, the non-permutation refused whole rather than
 half-applied, the re-lay sharing the very same text arena chunk for chunk (it moves
 rows, never text), and a held copy — the highlight worker's `Arc` — keeping its old
 order across the re-lay; and the row container itself: `heap_bytes` held to exactly
-the row buffer at 20 B a slot plus the chunks' bytes over a real build (no dead
+the row buffer at 20 B a slot plus the chunks' bytes and the summary's blocks over a real build (no dead
 text), rows of no text needing no chunk, a build that runs out of `u16` chunk
 indices failing rather than wrapping — at `DiffRows`, and through a real build under
 shrunk limits (`tests::with_build_limits`, a thread-local override `build_limits` reads
@@ -2288,9 +2318,11 @@ byte more takes two — the slices tiling a line exactly, a multi-byte line slic
 character boundaries, the over-cap build falling back to the identity, and the two
 things TAB costs: no row of a tab-indented line drawing past the pane's columns
 (measured against an independent column count, and demonstrated to fail under a byte
-measure), and `rewidth` — which carries the tab census across a width change —
-agreeing with a full build over a tabbed diff, a tab-free one, and a line count that
-moved under it; and `side`, whose subject is a MAPPING rather than a filter — `Both`
+measure), and the block skip — agreeing with the per-line measure over blocks either
+side of the narrowest body and exactly on it, with tabs, a saturated count, the gutter
+on and off and the floor width, that narrowest body being the minimum over every
+`LineKind`, and the measure reading the text of only the lines it walks; and `side`,
+whose subject is a MAPPING rather than a filter — `Both`
 being the identity, each mode keeping exactly the other side's lines, a hidden line
 resolving to its run's collapse point, the runs strictly increasing in view row (the
 invariant both binary searches rest on), a run at the very start and a diff hidden
@@ -2303,7 +2335,9 @@ pushes, reserved rows filled by `set`, nested marks and rewinds, and split-pass 
 a mark later rewound too — under every `adopt_min` either side of 8-to-100-BYTE caps — runs of one-row parts
 alternating adopted and copied chunks among them, each append whose copies fit held to
 keeping the tail it found —
-so the shapes a 64 MiB cap meets on a huge diff happen within a few rows; it also holds
+so the shapes a 64 MiB cap meets on a huge diff happen within a few rows, and every row's
+tab count is held to a recount of the model's TEXT (runs of tabs either side of the `u8`
+saturating included); it also holds
 `heap_bytes` to exactly the rows' text, the one check that sees dead text a rewind left
 behind — plus pins for the first chunk growing and the tail allocated whole after the
 first seal — a rewound one included, checked after every write the oracle makes into the tail (a push, a `set`, a merge's copies) too —
@@ -2315,7 +2349,10 @@ reservation, a split part reading back
 the same adopted or copied (and adopted chunks moved, not copied), running out of `u16`
 chunk indices failing rather than wrapping — and staying failed across a rewind — the
 merge copying instead of adopting near that limit (pinned by allocation, since adopting
-there ends at the same chunk count), and an over-long row cut on a char boundary),
+there ends at the same chunk count), and an over-long row cut on a char boundary, counting the tabs it kept). `lines`' suite
+holds the summary to a brute-force recount from the text over about two and a half
+blocks of every row shape and over a `gather`ed permutation of them, and `tab_count` to
+the true count of a saturated row,
 `diff_cache` (LRU eviction, and what `insert`/`retain_keys` hand back: the
 overwritten value, the LRU victims in order, the purged values), `reaper` (a disposed
 value is dropped on `gitkay-drop`, not the caller's thread; with no thread, or one that
@@ -2324,13 +2361,15 @@ is gone, it is dropped inline), `diff_store`
 re-laid into a non-identity order, key derivation, load/save
 over real temp repos, the entry cap from both sides (the measured 76.5M-line shape
 refused from its line count alone, and a few enormous lines refused only after
-encoding), the VERSION 7 decode's refusals (a text block claimed past one chunk,
+encoding), the VERSION 8 decode's refusals (a text block claimed past one chunk,
 refused before anything is sized by it; a row split inside a code point; lengths that
 do not sum to the block; trailing bytes; and the two that would panic on render rather
 than in decode — an Add/Del row with no one-byte marker for `LineRef::body`'s `[1..]`
 (empty, or a first character wider than a byte), and a file whose `diff_line_idx` is
-past the rows), a VERSION 6 entry missing and being deleted
-through both `load` and `load_stats`, and the pruner's eviction + temp sweep),
+past the rows), each decoded row's tab count against a recount of its text (the one
+pass over the block handing every row exactly its share), VERSION 6 and 7 entries
+missing and being deleted through both `load` and `load_stats`, and the pruner's
+eviction + temp sweep),
 `word_diff` (LCS word
 alignment), `testcode` (test-path classification per convention, including the
 negatives a looser rule would catch — a test-SUPPORT package under `src/main/`, a
