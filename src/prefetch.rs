@@ -2320,8 +2320,10 @@ fn send_stats_result(ctx: &WorkerCtx, epoch: u64, oid: git2::Oid, stats: Option<
 /// them: `stats_from_data` is what `cache_diff` derives the column from and it guards
 /// the same way, so an exit added later cannot send without it.
 fn send_row_stats(ctx: &WorkerCtx, epoch: u64, oid: git2::Oid, data: &DiffData) {
-    if is_real_commit(oid) {
-        send_stats_result(ctx, epoch, oid, Some(diff::stats_from_data(data)));
+    if is_real_commit(oid)
+        && let Some(stats) = diff::built_stats(data)
+    {
+        send_stats_result(ctx, epoch, oid, Some(stats));
     }
 }
 

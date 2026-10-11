@@ -674,7 +674,13 @@ The big picture, ahead of the detail sections below:
   parent rewrite / `@{n}` numbering are whole-list computations, or when the anchor
   moved (repo changed) — callers then do a full walk
 - `build_ref_map()` — single pass over all refs, O(refs) instead of O(commits × refs)
-- `get_diff_data()` — diff lines with syntax classification + file list with per-file stats and line offsets
+- `get_diff_data()` — diff lines with syntax classification + file list with per-file stats and line offsets.
+  **A git error inside a build returns `DiffData::empty()`, and `DiffData::build_failed` (no
+  rows — a real build always has its header) is the one test for it.** A failed build is kept
+  out of the LRU (`cache_diff`), the persistent store (`worth_persisting`) and every stats
+  harvest (`diff::built_stats`): served from any of them, a transient error (EMFILE, a pack
+  replaced under `git gc`) became a blank pane on every revisit and a "0 files" cell that
+  stood as a real answer.
 
 ### Startup & timing
 Startup work is structured so the window paints as soon as possible; the heavy/IO-bound

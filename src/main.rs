@@ -2497,7 +2497,7 @@ fn worth_persisting(repo: &Repository, scope: &RowScope, data: &DiffData) -> boo
         );
         return false;
     }
-    if data.lines.is_empty() {
+    if data.build_failed() {
         log::debug!(
             "diff store: not storing {} — the build failed",
             scope.source.oid()
@@ -5142,6 +5142,12 @@ impl GitkApp {
             );
             return;
         }
+        if data.build_failed() {
+            // Kept out for the reason `worth_persisting` refuses it: an error is not
+            // an answer, and a revisit should retry rather than serve the blank.
+            log::debug!("diff cache: not keeping {} — the build failed", key.oid);
+            return;
+        }
         let weight = data.heap_bytes();
         self.diff_cache.insert(key, data, weight);
     }
@@ -5194,12 +5200,10 @@ impl GitkApp {
     /// the sidebar either way. (`warm_row`'s two drop sites are a different mechanism —
     /// a channel, not this map — and deliberately send different values.)
     fn harvest_stats(&mut self, key: &DiffCacheKey, data: &DiffData) {
-        if stats_harvestable(key, self.diff_settings, self.drivers_fingerprint()) {
-            install_stats_result(
-                &mut self.commit_stats,
-                key.oid,
-                Some(diff::stats_from_data(data)),
-            );
+        if stats_harvestable(key, self.diff_settings, self.drivers_fingerprint())
+            && let Some(stats) = diff::built_stats(data)
+        {
+            install_stats_result(&mut self.commit_stats, key.oid, Some(stats));
         }
     }
 
@@ -5426,7 +5430,8 @@ impl GitkApp {
         // still be recorded as seen.
         let counts = (CommitKind::of(key.oid).is_virtual()
             && counts_match(&key, self.diff_settings, self.drivers_fingerprint()))
-        .then(|| diff::stats_from_data(&data));
+        .then(|| diff::built_stats(&data))
+        .flatten();
         sync_virtual_stats(
             &mut self.virtual_diff_content,
             &mut self.commit_stats,

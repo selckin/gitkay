@@ -1216,6 +1216,15 @@ impl DiffData {
     pub fn empty() -> Self {
         Self::with_max_chars(Vec::new(), Vec::new(), 0)
     }
+
+    /// Did the build that produced this fail? A real build always has rows — at least
+    /// its header — so no rows means `empty()` came back from an error. Transient
+    /// errors (EMFILE, a pack replaced under `git gc`) are exactly what this covers,
+    /// so a failed build is kept out of every cache and every stats route: served from
+    /// either, a blank pane or "0 files" would outlive the error.
+    pub fn build_failed(&self) -> bool {
+        self.lines.is_empty()
+    }
 }
 
 /// Byte length of the leading directory segments that `a` and `b` share, ending at a
@@ -3882,6 +3891,13 @@ pub fn measured_row_diff<'r>(
 /// Note this is a *sum over the built entries*, so it is correct only for a `DiffData`
 /// built under settings whose counts match — which is why `stats_relevant` excludes
 /// `context` (surrounding lines are never counted) and includes the rename toggles.
+/// The column's numbers from a built diff — `None` when the build failed
+/// (`DiffData::build_failed`), which has no numbers to give. Every route that harvests
+/// counts off a built diff goes through here.
+pub fn built_stats(data: &DiffData) -> Option<CommitStats> {
+    (!data.build_failed()).then(|| stats_from_data(data))
+}
+
 pub fn stats_from_data(data: &DiffData) -> CommitStats {
     stats_of_files(&data.files)
 }
@@ -4556,6 +4572,22 @@ pub mod tests {
         let _restore = Restore(FORCE_PARALLEL.with(std::cell::Cell::get));
         FORCE_PARALLEL.with(|c| c.set(Some(workers)));
         f()
+    }
+
+    /// A build that failed returns `DiffData::empty()` — no rows at all, where any real
+    /// build has at least its header. Its "0 files" must never reach the stats column:
+    /// it would sit there as a real answer until the next invalidation.
+    #[test]
+    fn a_failed_build_has_no_stats_to_give() {
+        let failed = DiffData::empty();
+        assert!(failed.build_failed());
+        assert!(built_stats(&failed).is_none());
+        let built = DiffData::new(
+            vec![DiffLine::new("commit abc", LineKind::Meta)],
+            vec![crate::test_repo::file_entry("a.rs", None)],
+        );
+        assert!(!built.build_failed());
+        assert_eq!(built_stats(&built).map(|s| s.files), Some(1));
     }
 
     /// Baseline `DiffSettings` for every fixture in this module: git's default
