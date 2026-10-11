@@ -4254,7 +4254,8 @@ impl GitkApp {
         // Derived once too, and for the same reason: the prefetch pool and the
         // diff-load worker both bound a build by these, and a second derivation
         // is a second chance for them to disagree.
-        let prefetch_budget = PrefetchBudget::of(cache_line_budget);
+        let cache_byte_budget = diff_cache_byte_budget(cache_line_budget);
+        let prefetch_budget = PrefetchBudget::of(cache_line_budget, cache_byte_budget);
         // The store is OPENED off-thread too, not just pruned there. Opening it
         // fingerprints the repo — canonicalize, up to three attribute-file reads,
         // and a config snapshot that can force a full parse of .git/config,
@@ -4402,7 +4403,7 @@ impl GitkApp {
             highlight_tx,
             highlight_rx,
             highlight_priority: None,
-            diff_cache: DiffCache::new(diff_cache_byte_budget(cache_line_budget)),
+            diff_cache: DiffCache::new(cache_byte_budget),
             diff_deps: DiffDeps {
                 store: diff_store,
                 textconv: Arc::new(Textconv::new()),

@@ -146,7 +146,8 @@ impl<'a> Reader<'a> {
     /// bytes on disk but far more in memory (~72 for a `DiffLine`, ~136 for a
     /// `FileEntry`), so capping a count of ELEMENTS by a count of BYTES bounds
     /// nothing useful: a 15MB entry — about what `Limits::max_entry_lines`
-    /// permits — with a corrupted 8-byte count still admitted 15M lines and
+    /// permits (a speculative warm is now also capped by `Limits::max_entry_bytes`,
+    /// so that is an upper bound) — with a corrupted 8-byte count still admitted 15M lines and
     /// reserved ~1GB, or aborted the process outright on allocation failure. On
     /// the highlight path, which this module's header promises never panics.
     fn count(&mut self, min_elem: usize) -> Option<usize> {
@@ -987,7 +988,8 @@ fn touch(path: &Path) -> std::io::Result<()> {
 }
 
 /// Total entry bytes kept on disk. Sized for measured reality rather than the
-/// worst case: `Limits::max_entry_lines` permits an entry around 15MB, so a
+/// worst case: `Limits::max_entry_lines` permits an entry around 15MB (a warm is
+/// now also capped by `Limits::max_entry_bytes`, which only lowers that), so a
 /// store of maximal entries would hold only ~17 — but a measured band was 21
 /// entries under 1MB, four orders of magnitude apart, so this holds hundreds of
 /// bands in practice.

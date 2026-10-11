@@ -469,6 +469,11 @@ pub struct Limits {
     /// The **display** path is deliberately unbounded: a diff the reader actually
     /// opened is theirs to cache however large, because they are looking at it.
     pub max_entry_lines: usize,
+    /// The same FRACTION of the cache (`MAX_ENTRY_DIVISOR`) applied to its BYTE budget.
+    /// The cache evicts by bytes now, so a row of a few, very long lines passes the line
+    /// cap yet can outweigh the whole budget and displace the band; checked beside
+    /// `max_entry_lines` through [`Limits::entry_too_big`], on the speculative path only.
+    pub max_entry_bytes: usize,
     /// How long a speculative colour pass may run before it stops where it is.
     ///
     /// **A line cap does not bound time, and assuming it did cost 29.6 seconds of one
@@ -528,6 +533,13 @@ impl Limits {
             cost.textconv_note()
         )
     }
+
+    /// Whether a speculative diff of this size is too big to keep beside the band:
+    /// over the line cap OR the byte cap. Lines alone stopped being enough once the
+    /// cache began evicting by bytes.
+    pub const fn entry_too_big(&self, lines: usize, bytes: usize) -> bool {
+        lines > self.max_entry_lines || bytes > self.max_entry_bytes
+    }
 }
 
 /// Everything the speculative machinery bounds itself by, all of it derived from
@@ -543,18 +555,21 @@ pub struct PrefetchBudget {
     /// The per-row bounds a worker applies, shared with the diff-load worker.
     pub limits: Limits,
     /// Lines one dispatch may warm before the coordinator clears both diff lanes,
-    /// so a dispatch cannot evict its own warms.
+    /// so a dispatch cannot evict its own warms. An approximation in lines: the cache
+    /// evicts by bytes, so it holds only while the band is mostly cheap `DiffOnly` rows
+    /// (half the line budget of highlighted rows at ~600 B/line exceeds the byte budget).
     pub line_budget: usize,
 }
 
 impl PrefetchBudget {
     /// The two bounds, from the cache's resolved line budget. The single place
     /// either divisor is applied.
-    pub const fn of(cache_lines: usize) -> Self {
+    pub const fn of(cache_lines: usize, cache_bytes: usize) -> Self {
         Self {
             limits: Limits {
                 max_blob_bytes: PREFETCH_MAX_DIFF_BYTES,
                 max_entry_lines: cache_lines / MAX_ENTRY_DIVISOR,
+                max_entry_bytes: cache_bytes / MAX_ENTRY_DIVISOR,
                 highlight_budget: PREFETCH_HIGHLIGHT_BUDGET,
             },
             line_budget: cache_lines / PREFETCH_LINE_BUDGET_DIVISOR,
@@ -636,7 +651,8 @@ enum Outcome {
     },
     /// Built and handed to the UI. `lines` feeds the dispatch budget.
     Warmed { lines: usize },
-    /// Built, over `Limits::max_entry_lines`, dropped uncached.
+    /// Built, over the speculative cap (`Limits::entry_too_big`: lines or heap bytes),
+    /// dropped uncached.
     Oversized { key: DiffCacheKey, lines: usize },
     /// Built, a textconv driver failed, dropped uncached. See
     /// `Coordinator::unconverted`.
@@ -1640,9 +1656,10 @@ fn run_stats_job(ctx: &WorkerCtx, repo: &Repository, job: &StatsJob) -> Outcome 
             // it for free when it lands. Computing them here as well would pay ~11s twice
             // for one set of bytes, which is the doubling this path exists to remove.
             //
-            // A row whose diff is ALSO over `Limits::max_entry_lines` never reaches
-            // `cache_diff` either — `warm_row` sends the numbers off the built data at
-            // the drop site, which is the exact moment that becomes knowable.
+            // A row whose diff is ALSO over the speculative cap (`Limits::entry_too_big`:
+            // lines or heap bytes) never reaches `cache_diff` either — `warm_row` sends
+            // the numbers off the built data at the drop site, which is the exact moment
+            // that becomes knowable.
             return Outcome::Stats {
                 oid,
                 costly: Some(RowCost::of(&cost)),
@@ -1885,14 +1902,16 @@ fn warm_row(
     );
     let built = t.elapsed();
     let (oid, lines) = (target.key.oid, data.lines.len());
+    let bytes = data.heap_bytes();
     // Too big to hold alongside the rest of the band — caching it would evict many rows
     // the user is equally likely to open, to keep one. Dropped here rather than at the
     // drain, so the highlight below is skipped too.
-    if lines > ctx.limits.max_entry_lines {
+    if ctx.limits.entry_too_big(lines, bytes) {
         log::debug!(
-            "prefetch: drop {oid} ({lines} lines) — over the {}-line speculative cap, \
-             built in {built:?}",
-            ctx.limits.max_entry_lines
+            "prefetch: drop {oid} ({lines} lines, {bytes} bytes) — over the speculative cap \
+             ({} lines / {} bytes), built in {built:?}",
+            ctx.limits.max_entry_lines,
+            ctx.limits.max_entry_bytes
         );
         // The column's numbers would otherwise never arrive for this row: it is
         // blob-heavy, so its stats job sent a file count and stopped, trusting the
@@ -2081,6 +2100,21 @@ mod tests {
     use crate::tests::{ci, memory_reading, oid, probe_settings};
     use crate::{highlight, textconv::Textconv};
 
+    #[test]
+    fn a_speculative_entry_is_too_big_by_lines_or_by_bytes() {
+        let d = MAX_ENTRY_DIVISOR;
+        let limits = PrefetchBudget::of(100 * d, 1_000 * d).limits; // caps: 100 lines, 1,000 bytes
+        assert!(!limits.entry_too_big(100, 1_000), "at both caps: kept");
+        assert!(
+            limits.entry_too_big(101, 10),
+            "over the line cap alone: dropped"
+        );
+        assert!(
+            limits.entry_too_big(3, 1_001),
+            "a few very long lines: under the line cap, over the byte cap - dropped"
+        );
+    }
+
     /// The shared in-flight claim set: one claim per key at a time, released on
     /// drop — including a panicking worker's unwind — so overlapping prefetch /
     /// diff-load dispatches dedupe without ever leaking a claim.
@@ -2264,6 +2298,7 @@ mod tests {
                 limits: Limits {
                     max_blob_bytes: 0,
                     max_entry_lines: usize::MAX,
+                    max_entry_bytes: usize::MAX,
                     highlight_budget: PREFETCH_HIGHLIGHT_BUDGET,
                 },
                 line_budget: usize::MAX,
@@ -2326,6 +2361,7 @@ mod tests {
                 limits: Limits {
                     max_blob_bytes: u64::MAX,
                     max_entry_lines: usize::MAX,
+                    max_entry_bytes: usize::MAX,
                     highlight_budget: budget,
                 },
                 coord: mpsc::channel().0,
@@ -2380,6 +2416,7 @@ mod tests {
             limits: Limits {
                 max_blob_bytes: u64::MAX,
                 max_entry_lines: usize::MAX,
+                max_entry_bytes: usize::MAX,
                 highlight_budget: std::time::Duration::ZERO,
             },
             coord: mpsc::channel().0,
@@ -3115,6 +3152,7 @@ mod tests {
             limits: Limits {
                 max_blob_bytes: u64::MAX,
                 max_entry_lines: usize::MAX,
+                max_entry_bytes: usize::MAX,
                 highlight_budget: PREFETCH_HIGHLIGHT_BUDGET,
             },
             coord: mpsc::channel().0,
@@ -3217,6 +3255,7 @@ mod tests {
             limits: Limits {
                 max_blob_bytes: 0,
                 max_entry_lines: usize::MAX,
+                max_entry_bytes: usize::MAX,
                 highlight_budget: PREFETCH_HIGHLIGHT_BUDGET,
             },
             coord: mpsc::channel().0,
@@ -3301,6 +3340,7 @@ mod tests {
             limits: Limits {
                 max_blob_bytes: u64::MAX,
                 max_entry_lines: usize::MAX,
+                max_entry_bytes: usize::MAX,
                 highlight_budget: PREFETCH_HIGHLIGHT_BUDGET,
             },
             coord: mpsc::channel().0,
@@ -3371,6 +3411,7 @@ mod tests {
             limits: Limits {
                 max_blob_bytes: u64::MAX,
                 max_entry_lines: usize::MAX,
+                max_entry_bytes: usize::MAX,
                 highlight_budget: PREFETCH_HIGHLIGHT_BUDGET,
             },
             coord: mpsc::channel().0,
