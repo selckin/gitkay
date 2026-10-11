@@ -1,10 +1,11 @@
-//! How much memory gitkay may use, read from the system rather than guessed.
+//! How much memory gitkay may use, read from the system rather than guessed — and the
+//! one allocator setting that decides how much of it comes back.
 //!
 //! Everything here is **advisory**. `None` means "this platform won't say", and every
 //! caller falls back to a static default — a missing answer must never stop the app
 //! working. Linux only, because `/proc/meminfo` and the cgroup files are readable with
-//! plain `std::fs` while every other unix needs a `sysctl` FFI call, and this crate
-//! contains no `unsafe`.
+//! plain `std::fs` while every other unix needs a `sysctl` FFI call. The crate's one
+//! `unsafe` is `pin_mmap_threshold` below (glibc only), and nothing here grows a second.
 //!
 //! Parsing is split from reading so the awkward cases (a truncated file, `max`, a
 //! cgroup limit above physical RAM) are unit-testable without a `/proc`.
@@ -46,6 +47,46 @@ pub fn read() -> Option<MemInfo> {
 #[cfg(not(target_os = "linux"))]
 pub const fn read() -> Option<MemInfo> {
     None
+}
+
+/// glibc's `M_MMAP_THRESHOLD` (`malloc.h`).
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const M_MMAP_THRESHOLD: std::ffi::c_int = -3;
+
+/// The size from which a `malloc` gets its own mapping, returned to the kernel on `free`.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const MMAP_THRESHOLD: std::ffi::c_int = 4 << 20;
+
+/// Fix glibc's mmap threshold at `MMAP_THRESHOLD`, so a large buffer is unmapped when it
+/// is freed instead of staying with the process. Returns whether glibc took it.
+///
+/// glibc starts the threshold at 128 KiB and **raises** it to the size of every mapped
+/// block that is freed, up to 32 MiB. libgit2's blob and patch buffers trip that on the
+/// first large diff, and from then on every buffer under 32 MiB is carved from the
+/// arenas, interleaved across eight workers with small live allocations, so freeing it
+/// returns nothing. Measured on a 76.5M-line commit and its neighbours: 0.84–1.26 GB
+/// freed but kept, and 1.10–1.48 GB resident once idle; with the threshold fixed, 17 MB
+/// and 0.27 GB, with build and frame times unchanged. Setting it explicitly is also what
+/// switches the raising off.
+///
+/// mimalloc was measured first and rejected: libgit2 allocates through glibc's `malloc`
+/// whatever Rust's global allocator is, so it left the same arenas full, and it built
+/// the commit 58% slower. Call before any thread starts, so every allocation follows it.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn pin_mmap_threshold() -> bool {
+    unsafe extern "C" {
+        fn mallopt(param: std::ffi::c_int, value: std::ffi::c_int) -> std::ffi::c_int;
+    }
+    // SAFETY: `mallopt` has no preconditions: it takes the arena lock itself, validates
+    // `value` (refusing anything over 32 MiB on 64-bit), and reports by return value,
+    // 1 meaning applied.
+    unsafe { mallopt(M_MMAP_THRESHOLD, MMAP_THRESHOLD) == 1 }
+}
+
+/// Not glibc: its allocator returns memory by its own rules, and there is no such knob.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub const fn pin_mmap_threshold() -> bool {
+    false
 }
 
 /// Bytes gitkay may plan to use: what is available, less `RESERVE_PERCENT` of total.
@@ -152,6 +193,15 @@ MemFree:         1234567 kB
 MemAvailable:   16395942 kB
 Buffers:          123456 kB
 ";
+
+    /// glibc refuses a threshold it cannot honour by returning 0, and the app would then
+    /// keep the raising threshold this exists to switch off — with nothing but a debug
+    /// line to show for it. Pinned here so a value past glibc's ceiling fails a test.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn glibc_accepts_the_pinned_mmap_threshold() {
+        assert!(pin_mmap_threshold());
+    }
 
     #[test]
     fn parses_total_and_available_in_bytes() {

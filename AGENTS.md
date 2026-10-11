@@ -629,9 +629,10 @@ node columns and line segments out — pure and egui-free, a row's colour being 
 INDEX the renderer resolves, which is what lets its suite run on fake oids with no
 repository; see **Graph Layout**),
 `src/mem.rs` (what the system will say about memory —
-`/proc/meminfo` plus the cgroup limit, Linux only, no `unsafe` and no dependency;
-advisory, `None` ⇒ the caller uses its static default. One consumer:
-`diff_cache_line_budget`),
+`/proc/meminfo` plus the cgroup limit, Linux only, no dependency; advisory, `None` ⇒
+the caller uses its static default. One consumer: `diff_cache_line_budget`. Also
+`pin_mmap_threshold`, the crate's one `unsafe`, which `main` calls first; see the
+mmap-threshold pitfall under **Common Pitfalls**),
 `src/datefmt.rs` (a commit timestamp rendered absolutely or as an age — pure, and
 its own module rather than `diff.rs`'s, where it had ended up by accident: it is the
 commit LIST's concern, and the relative form is a port of git's `show_date_relative`
@@ -2594,7 +2595,8 @@ count is a property of the fixture, and asserting it invites a reader to "fix" i
 re-admitting the global config. The residue this does not cover is the system-wide
 `/etc/gitattributes`, which is reached through the sysdirs alone; nothing short of
 libgit2's `GIT_OPT_SET_SEARCH_PATH` (an `unsafe fn` in git2, mutating process-global
-state) removes it, which is not worth `unsafe` in a crate that has none.
+state) removes it, which is not worth `unsafe` for a test fixture (the crate's one
+`unsafe` is `mem::pin_mmap_threshold`, which pays for itself in resident memory).
 
 Read the initial branch back with `repo.head().unwrap().name()` all the same, as
 `default_scope_is_current_branch_only` and the shared `merged_history` fixture do:
@@ -2679,6 +2681,21 @@ env XDG_CACHE_HOME=(mktemp -d) XDG_DATA_HOME=(mktemp -d) BENCH_REPO=… BENCH_RE
 ```
 
 ## Common Pitfalls
+
+- **glibc's mmap threshold is pinned at 4 MiB** (`mem::pin_mmap_threshold`, the first
+  line of `main`). Left alone, glibc raises it to the size of every mapped block that is
+  freed, up to 32 MiB. libgit2's blob and patch buffers trip that on the first large
+  diff, and from then on they are carved from the per-thread arenas and never returned.
+  - **Measured** on a 76.5M-line commit and the heavy lane's 541 MB neighbours: 0.84–1.26 GB
+    freed but kept, and 1.10–1.48 GB resident once idle. Pinned: 17 MB and 0.27 GB, with
+    build, decode and frame times unchanged and the 8-worker build's peak 0.3 GB lower.
+  - **mimalloc does not fix it.** libgit2 allocates through glibc's `malloc` whatever
+    Rust's global allocator is, so the arenas filled just the same, and it built that
+    commit 58% slower with 4.4 GB still resident after the drop. Nor does a periodic
+    `malloc_trim`, which returned only about half of it.
+  - **A headless `GitkApp` test does not go through `main`**, so it runs with glibc's
+    default unless it calls `mem::pin_mmap_threshold` itself. A memory measurement taken
+    that way describes the unpinned app.
 
 - Both scrolled lists (commit list + diff pane) virtualize with egui `show_rows`. An early-egui bottom-gap bug once forced manual pre/post spacers on the commit list; that's fixed as of 0.34 (verified — no gap at end-of-list / few commits / on resize), so `show_rows` is used throughout. Don't reintroduce manual spacers. **`show_rows`' row
   pitch is `row_height` PLUS the item spacing**, and both lists paint at `row_height`,

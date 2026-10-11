@@ -10220,7 +10220,10 @@ fn log_defaults() -> env_logger::Builder {
 }
 
 fn main() -> eframe::Result {
+    // First, before any thread or large buffer exists — see `mem::pin_mmap_threshold`.
+    let pinned = mem::pin_mmap_threshold();
     log_builder().init();
+    log::debug!("memory: mmap threshold pinned: {pinned}");
     let startup_t0 = std::time::Instant::now();
 
     let raw = match cli::parse_flags(std::env::args().skip(1)) {
