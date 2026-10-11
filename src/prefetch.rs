@@ -150,7 +150,7 @@ pub enum WarmDepth {
     /// exactly this way, `RowSpans` holds an `Option` per row, and
     /// `ensure_diff_highlighted` colours it on install. Far cheaper per row in CPU
     /// and meaningfully cheaper in memory (measured ~115-130 B/line against
-    /// ~590-600 B — see `DIFF_CACHE_LINE_CEILING`; a `highlight::Span` is `(Color32, Range<usize>)`,
+    /// ~400-450 B — see `DIFF_CACHE_LINE_CEILING`; a `highlight::Span` is `(Color32, Range<usize>)`,
     /// byte offsets into the line's shared `Arc<str>`, NOT an owned string per
     /// token, and none of them is allocated at all for a `DiffOnly` entry), which is
     /// what makes a full-window band reachable at all.
@@ -556,8 +556,10 @@ pub struct PrefetchBudget {
     pub limits: Limits,
     /// Lines one dispatch may warm before the coordinator clears both diff lanes,
     /// so a dispatch cannot evict its own warms. An approximation in lines: the cache
-    /// evicts by bytes, so it holds only while the band is mostly cheap `DiffOnly` rows
-    /// (half the line budget of highlighted rows at ~600 B/line exceeds the byte budget).
+    /// evicts by bytes, so it holds at the measured rates (half the line budget of
+    /// highlighted rows at ~400-450 B/line is ~270 MB, under the ~348 MB byte budget)
+    /// but not for a band of unusually long lines, which `Limits::entry_too_big` only
+    /// bounds per row.
     pub line_budget: usize,
 }
 

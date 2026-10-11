@@ -320,9 +320,11 @@ impl DiffViewport {
 ///
 /// Measured on 300 commits each of two real repos (`DiffData::heap_bytes`): a `DiffOnly`
 /// entry runs ~115-130 B/line (worst seen 2,132 B/line, a few very long lines), a
-/// highlighted one ~590-600 B/line, because the span `Vec`s carry ~2x spare capacity
-/// (6.8 spans a row against 13.8 capacity). Those figures exclude allocator overhead
-/// (~8-24 B per allocation), so for short lines they sit 10-20% under RSS.
+/// highlighted one ~400-450 B/line — ~5-8 spans a row at 24 B, held at near-exact
+/// capacity since `tokenize_line` sizes its `Vec` up front (an in-place `collect` had
+/// left ~2x the slots, and highlighted entries at ~590-600 B/line). Those figures
+/// exclude allocator overhead (~8-24 B per allocation), so for short lines they sit
+/// 10-20% under RSS.
 ///
 /// The cache weighs entries by those heap bytes, so it fills to its byte budget
 /// (`BYTES_PER_CACHED_LINE` x this ceiling, ~348 MB) whatever the highlighted/`DiffOnly`

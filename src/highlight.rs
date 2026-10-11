@@ -631,20 +631,21 @@ impl Highlighter {
         // and unlike the alternative it fails toward the file reading as it did
         // before the line, rather than toward everything after it in one colour.
         let snapshot = tail.then(|| state.snapshot());
-        let mut spans = state.highlight_line(buf, &self.syntaxes).map_or_else(
+        // Sized up front, tail span included, rather than `collect`ed: these spans live
+        // as long as the diff is cached, and an in-place `collect` over syntect's
+        // larger tuples kept its allocation — ~2x the slots a row needs, which the
+        // cache then pays for by capacity.
+        let ranges = state.highlight_line(buf, &self.syntaxes);
+        let mut spans = Vec::with_capacity(ranges.as_ref().map_or(1, Vec::len) + usize::from(tail));
+        match ranges {
             // A grammar hiccup must never drop the line: render it plain.
-            |_| vec![(self.palette.foreground, 0..head_len)],
-            |ranges| {
-                ranges
-                    .into_iter()
-                    .filter_map(|(style, text)| {
-                        let start = text.as_ptr() as usize - base;
-                        let end = (start + text.len()).min(head_len); // drop the trailing '\n'
-                        (start < end).then(|| (syn_to_egui(style.foreground), start..end))
-                    })
-                    .collect()
-            },
-        );
+            Err(_) => spans.push((self.palette.foreground, 0..head_len)),
+            Ok(ranges) => spans.extend(ranges.into_iter().filter_map(|(style, text)| {
+                let start = text.as_ptr() as usize - base;
+                let end = (start + text.len()).min(head_len); // drop the trailing '\n'
+                (start < end).then(|| (syn_to_egui(style.foreground), start..end))
+            })),
+        }
         // One branch, not two: `snapshot` is `Some` exactly when `tail` is, and the two
         // halves are one rule — a truncated line restores the parser state AND covers
         // the tail no span reaches. Tested apart, they could drift apart.
@@ -1150,6 +1151,31 @@ mod tests {
         let joined: String = spans.iter().map(|(_, r)| &short[r.clone()]).collect();
         assert_eq!(joined, short);
         assert!(spans.iter().all(|(_, r)| r.end <= short.len()));
+    }
+
+    #[test]
+    fn tokenize_line_returns_spans_without_spare_capacity() {
+        // The spans are kept for as long as the diff is cached, and the cache weighs
+        // them by capacity: a `collect` that reused syntect's larger allocation in
+        // place left ~2x the spans a row needed. At most the one slot the trailing
+        // '\n' token would have taken may stay unused.
+        let hl = test_highlighter();
+        let mut state = hl.new_file_state("x.rs");
+        let mut buf = String::new();
+        let long = "x".repeat(MAX_TOKENIZE_CHARS + 10);
+        for code in [
+            "let abcdefghijklmnop = 12345; // trailing comment",
+            "fn f(a: u32, b: &str) -> Option<Vec<u8>> { None }",
+            long.as_str(),
+        ] {
+            let spans = hl.tokenize_line(&mut state, code, &mut buf);
+            assert!(
+                spans.capacity() <= spans.len() + 1,
+                "{} spans in a capacity of {} for {code:.40?}",
+                spans.len(),
+                spans.capacity()
+            );
+        }
     }
 
     #[test]
